@@ -1274,13 +1274,17 @@ install_binary_and_config() {
 
   log "Staging immutable release ${RELEASE_ID}"
   run_root rm -rf "$staging"
-  run_root install -d -m 0755 "$staging" "$staging/gateway-bin" "$staging/sidecar"
+  run_root install -d -m 0755 "$staging" "$staging/gateway-bin" "$staging/sidecar" "$staging/super-instruct"
   run_root install -m 0755 "${BUILD_DIR}/${APP_NAME}" "$staging/${APP_NAME}"
   run_root install -m 0755 "${BUILD_DIR}/${HANDOFF_NAME}" "$staging/${HANDOFF_NAME}"
   run_root install -m 0755 "${BUILD_DIR}/gateway-bin"/gateway-* "$staging/gateway-bin/"
   if [[ -f sidecar/curl_cffi_sidecar.py ]]; then
     run_root install -m 0755 sidecar/curl_cffi_sidecar.py "$staging/sidecar/"
     run_root install -m 0644 sidecar/requirements.txt "$staging/sidecar/"
+  fi
+  if [[ -d super-instruct ]]; then
+    run_root cp -a super-instruct/. "$staging/super-instruct/"
+    run_root chmod -R u=rwX,g=rX,o= "$staging/super-instruct"
   fi
   commit_id="$(git rev-parse HEAD 2>/dev/null || echo source)"
   built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -2155,6 +2159,7 @@ WorkingDirectory=${DATA_DIR}
 Environment="CODEX_POOL_DATABASE=${DATABASE_PATH}"
 Environment="CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS}"
 Environment="CODEX_POOL_DATA_DIR=${DATA_DIR%/}/data"
+Environment="CODEX_POOL_SUPER_INSTRUCT_DIR=${APP_DIR%/}/releases/%i/super-instruct/codex-skills"
 LoadCredential=master.key:${DATA_DIR%/}/data/keys/master.key
 LoadCredential=identity.key:${DATA_DIR%/}/data/keys/identity.key
 LoadCredential=diagnostic-alias.key:${DATA_DIR%/}/data/keys/diagnostic-alias.key
@@ -2797,7 +2802,7 @@ WARP:          ${warp_summary}
 Admin token:   ${admin_token_summary}
 
 Manual run:
-  CODEX_POOL_DATABASE=${DATABASE_PATH} CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS} CODEX_POOL_LISTEN_ADDR=${LISTEN_ADDR}${manual_admin_env} ${BIN_DIR}/${APP_NAME} --config ${CONFIG_FILE}${reauth_manual}
+  CODEX_POOL_DATABASE=${DATABASE_PATH} CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS} CODEX_POOL_LISTEN_ADDR=${LISTEN_ADDR} CODEX_POOL_SUPER_INSTRUCT_DIR=${APP_DIR%/}/current/super-instruct/codex-skills${manual_admin_env} ${BIN_DIR}/${APP_NAME} --config ${CONFIG_FILE}${reauth_manual}
 
 Useful service commands:
   systemctl status ${HANDOFF_SERVICE_NAME}.service

@@ -929,16 +929,22 @@ var errInvalidGroupPolicy = errors.New("account pool groups cannot contain user 
 
 func applyGroupFieldsFromBody(g *storage.Group, body io.Reader) error {
 	var req struct {
-		SystemPrompt                  *string   `json:"system_prompt"`
-		PromptMode                    *string   `json:"prompt_mode"`
-		SystemPromptApplyToCompaction *bool     `json:"system_prompt_apply_to_compaction"`
-		ModelInstructionsEnabled      *bool     `json:"model_instructions_enabled"`
-		ModelInstructionsFiles        []string  `json:"model_instructions_files"`
-		ForceModel                    *string   `json:"force_model"`
-		ForceEffort                   *string   `json:"force_effort"`
-		DefaultEgressID               *string   `json:"default_egress_id"`
-		EgressIDs                     *[]string `json:"egress_ids"`
-		Virtual2MEnabled              *bool     `json:"virtual_2m_enabled"`
+		SystemPrompt                        *string                       `json:"system_prompt"`
+		PromptMode                          *string                       `json:"prompt_mode"`
+		SystemPromptApplyToCompaction       *bool                         `json:"system_prompt_apply_to_compaction"`
+		ModelInstructionsEnabled            *bool                         `json:"model_instructions_enabled"`
+		ModelInstructionsFiles              []string                      `json:"model_instructions_files"`
+		SuperInstructEnabled                *bool                         `json:"super_instruct_enabled"`
+		SuperInstructSkillIDs               []string                      `json:"super_instruct_skill_ids"`
+		SuperInstructProfiles               storage.SuperInstructProfiles `json:"super_instruct_profiles"`
+		SuperInstructResponseRewriteEnabled *bool                         `json:"super_instruct_response_rewrite_enabled"`
+		SuperInstructMemoryEnabled          *bool                         `json:"super_instruct_memory_enabled"`
+		SuperInstructMonitorEnabled         *bool                         `json:"super_instruct_monitor_enabled"`
+		ForceModel                          *string                       `json:"force_model"`
+		ForceEffort                         *string                       `json:"force_effort"`
+		DefaultEgressID                     *string                       `json:"default_egress_id"`
+		EgressIDs                           *[]string                     `json:"egress_ids"`
+		Virtual2MEnabled                    *bool                         `json:"virtual_2m_enabled"`
 	}
 	if err := decodeJSONRequestBody(body, &req, adminJSONBodyLimit); err != nil {
 		return err
@@ -946,10 +952,16 @@ func applyGroupFieldsFromBody(g *storage.Group, body io.Reader) error {
 	if (req.SystemPrompt != nil && strings.TrimSpace(*req.SystemPrompt) != "") ||
 		(req.ModelInstructionsEnabled != nil && *req.ModelInstructionsEnabled) ||
 		(req.ModelInstructionsFiles != nil && len(req.ModelInstructionsFiles) > 0) ||
+		(req.SuperInstructEnabled != nil && *req.SuperInstructEnabled) ||
+		(req.SuperInstructSkillIDs != nil && len(req.SuperInstructSkillIDs) > 0) ||
+		(req.SuperInstructProfiles != nil && len(req.SuperInstructProfiles) > 0) ||
+		(req.SuperInstructResponseRewriteEnabled != nil && *req.SuperInstructResponseRewriteEnabled) ||
+		(req.SuperInstructMemoryEnabled != nil && *req.SuperInstructMemoryEnabled) ||
+		(req.SuperInstructMonitorEnabled != nil && *req.SuperInstructMonitorEnabled) ||
 		(req.ForceModel != nil && strings.TrimSpace(*req.ForceModel) != "") ||
 		(req.ForceEffort != nil && strings.TrimSpace(*req.ForceEffort) != "") ||
 		(req.Virtual2MEnabled != nil && *req.Virtual2MEnabled) {
-		return fmt.Errorf("%w: configure prompts, instructions, model, and effort on a user group", errInvalidGroupPolicy)
+		return fmt.Errorf("%w: configure prompts, instructions, Super-Instruct, model, and effort on a user group", errInvalidGroupPolicy)
 	}
 	if req.SystemPrompt != nil {
 		g.SystemPrompt = *req.SystemPrompt

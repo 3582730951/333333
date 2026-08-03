@@ -49,6 +49,10 @@ func (s *Server) adminUserGroups(w http.ResponseWriter, r *http.Request) {
 			writePoolCodeError(w, http.StatusUnprocessableEntity, "invalid_model_instruction_policy", err.Error())
 			return
 		}
+		if err := s.validateUserGroupSuperInstructConfig(r, &req); err != nil {
+			writePoolCodeError(w, http.StatusUnprocessableEntity, "invalid_super_instruct_policy", err.Error())
+			return
+		}
 		req.ID = "ug_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 		if err := s.store.CreateUserGroupDefinition(r.Context(), req); err != nil {
 			writeError(w, http.StatusUnprocessableEntity, err)
@@ -134,6 +138,10 @@ func (s *Server) adminUserGroupsItem(w http.ResponseWriter, r *http.Request, id 
 		}
 		if err := normalizeUserGroupInstructionConfig(&req); err != nil {
 			writePoolCodeError(w, http.StatusUnprocessableEntity, "invalid_model_instruction_policy", err.Error())
+			return
+		}
+		if err := s.validateUserGroupSuperInstructConfig(r, &req); err != nil {
+			writePoolCodeError(w, http.StatusUnprocessableEntity, "invalid_super_instruct_policy", err.Error())
 			return
 		}
 		if err := s.store.ReplaceUserGroupDefinition(r.Context(), req); err != nil {

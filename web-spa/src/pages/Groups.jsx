@@ -16,7 +16,7 @@ const TARGET_ACCOUNT_GROUP = 'account_pool_group';
 const TARGET_PROVIDER = 'model_provider';
 const EFFORTS = ['', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 const INSTRUCTION_FAMILIES = [
-  { key: 'gpt', label: 'GPT / Codex', help: '用于 GPT 与 Codex 模型；Responses 入口写入 model instructions。' },
+  { key: 'gpt', label: 'GPT / ChatGPT / Codex', help: '用于 GPT、ChatGPT 与 Codex 模型；Responses 入口写入 model instructions。' },
   { key: 'claude', label: 'Claude', help: '用于原生 Claude、Claude Code，以及 Kiro / Antigravity 中的 Claude 模型。' },
   { key: 'gemini', label: 'Gemini', help: '用于 Antigravity 等目标中的 Gemini 模型，并进入其 systemInstruction。' },
 ];
@@ -61,6 +61,47 @@ function modelsByFamily(models) {
 function groupEgressIDs(group) {
   if (Array.isArray(group?.egress_ids)) return uniqueStrings(group.egress_ids);
   return group?.default_egress_id ? [group.default_egress_id] : [];
+}
+
+function blankSuperInstructProfiles() {
+  return Object.fromEntries(INSTRUCTION_FAMILIES.map(({ key }) => [key, {
+    enabled: false,
+    skill_ids: [],
+    response_rewrite_enabled: false,
+    memory_enabled: false,
+    monitor_enabled: false,
+  }]));
+}
+
+function normalizedSuperInstructProfiles(row) {
+  const configured = row?.super_instruct_profiles && typeof row.super_instruct_profiles === 'object'
+    ? row.super_instruct_profiles
+    : null;
+  const hasProfiles = configured && Object.keys(configured).length > 0;
+  return Object.fromEntries(INSTRUCTION_FAMILIES.map(({ key }) => {
+    const profile = hasProfiles ? configured[key] : null;
+    return [key, {
+      enabled: hasProfiles ? Boolean(profile?.enabled) : Boolean(row?.super_instruct_enabled),
+      skill_ids: hasProfiles ? uniqueStrings(profile?.skill_ids) : uniqueStrings(row?.super_instruct_skill_ids),
+      response_rewrite_enabled: hasProfiles ? Boolean(profile?.response_rewrite_enabled) : Boolean(row?.super_instruct_response_rewrite_enabled),
+      memory_enabled: hasProfiles ? Boolean(profile?.memory_enabled) : Boolean(row?.super_instruct_memory_enabled),
+      monitor_enabled: hasProfiles ? Boolean(profile?.monitor_enabled) : Boolean(row?.super_instruct_monitor_enabled),
+    }];
+  }));
+}
+
+function superInstructProfileEnabled(profile) {
+  return Boolean(profile?.enabled || profile?.response_rewrite_enabled || profile?.memory_enabled || profile?.monitor_enabled);
+}
+
+function superInstructAnyEnabled(row) {
+  if (row?.super_instruct_profiles && Object.keys(row.super_instruct_profiles).length > 0) {
+    return Object.values(row.super_instruct_profiles).some(superInstructProfileEnabled);
+  }
+  return Boolean(row?.super_instruct_enabled
+    || row?.super_instruct_response_rewrite_enabled
+    || row?.super_instruct_memory_enabled
+    || row?.super_instruct_monitor_enabled);
 }
 
 function egressOptions(profiles) {
@@ -128,6 +169,12 @@ function blankUserGroup() {
     model_instructions_enabled: false,
     model_instructions_files: [],
     model_instruction_profiles: Object.fromEntries(INSTRUCTION_FAMILIES.map(({ key }) => [key, { enabled: false, files: [] }])),
+    super_instruct_enabled: false,
+    super_instruct_skill_ids: [],
+    super_instruct_profiles: blankSuperInstructProfiles(),
+    super_instruct_response_rewrite_enabled: false,
+    super_instruct_memory_enabled: false,
+    super_instruct_monitor_enabled: false,
     force_model: '',
     force_effort: '',
     block_claude_target_groups: [],
@@ -161,6 +208,12 @@ function userGroupDraft(row) {
     target_keys: (row.targets || []).map(targetKey),
     model_instructions_files: uniqueStrings(row.model_instructions_files),
     model_instruction_profiles: normalizedInstructionProfiles(row),
+    super_instruct_enabled: Boolean(row.super_instruct_enabled),
+    super_instruct_skill_ids: uniqueStrings(row.super_instruct_skill_ids),
+    super_instruct_profiles: normalizedSuperInstructProfiles(row),
+    super_instruct_response_rewrite_enabled: Boolean(row.super_instruct_response_rewrite_enabled),
+    super_instruct_memory_enabled: Boolean(row.super_instruct_memory_enabled),
+    super_instruct_monitor_enabled: Boolean(row.super_instruct_monitor_enabled),
     block_claude_target_groups: uniqueStrings(row.block_claude_target_groups),
     block_gpt_target_groups: uniqueStrings(row.block_gpt_target_groups),
     traffic_fallback_groups: Object.fromEntries(FALLBACK_FAMILIES.map(({ key }) => [
@@ -192,6 +245,16 @@ function normalizedUserGroupPayload(draft, providers = []) {
   }]));
   const enabledProfiles = Object.values(profiles).filter((profile) => profile.enabled);
   const legacyFiles = uniqueStrings(enabledProfiles.flatMap((profile) => profile.files));
+  const superProfiles = Object.fromEntries(INSTRUCTION_FAMILIES.map(({ key }) => {
+    const profile = draft.super_instruct_profiles?.[key] || {};
+    return [key, {
+      enabled: Boolean(profile.enabled),
+      skill_ids: uniqueStrings(profile.skill_ids),
+      response_rewrite_enabled: Boolean(profile.response_rewrite_enabled),
+      memory_enabled: Boolean(profile.memory_enabled),
+      monitor_enabled: Boolean(profile.monitor_enabled),
+    }];
+  }));
   const trafficFallbackGroups = Object.fromEntries(FALLBACK_FAMILIES.map(({ key }) => [
     key,
     uniqueStrings(draft.traffic_fallback_groups?.[key]),
@@ -215,6 +278,12 @@ function normalizedUserGroupPayload(draft, providers = []) {
     model_instructions_enabled: enabledProfiles.length > 0,
     model_instructions_files: legacyFiles,
     model_instruction_profiles: profiles,
+    super_instruct_enabled: false,
+    super_instruct_skill_ids: [],
+    super_instruct_profiles: superProfiles,
+    super_instruct_response_rewrite_enabled: false,
+    super_instruct_memory_enabled: false,
+    super_instruct_monitor_enabled: false,
     force_model: String(draft.force_model || '').trim(),
     force_effort: String(draft.force_effort || '').trim(),
     block_claude_target_groups: uniqueStrings(draft.block_claude_target_groups)
@@ -634,6 +703,9 @@ function UserGroupEditor({
   userGroups,
   providers,
   instructionFiles,
+  superSkills,
+  superSkillsLoading,
+  superSkillsError,
   models,
   modelsError,
   catalogLoading,
@@ -682,6 +754,13 @@ function UserGroupEditor({
     model_instruction_profiles: {
       ...current.model_instruction_profiles,
       [family]: { ...current.model_instruction_profiles?.[family], ...patchValue },
+    },
+  }));
+  const updateSuperInstructProfile = (family, patchValue) => setDraft((current) => ({
+    ...current,
+    super_instruct_profiles: {
+      ...current.super_instruct_profiles,
+      [family]: { ...current.super_instruct_profiles?.[family], ...patchValue },
     },
   }));
   const setTrafficFallbackGroups = (traffic_fallback_groups) => setDraft((current) => ({
@@ -818,6 +897,62 @@ function UserGroupEditor({
           })}
         </div>
       </Card>
+      <Card title="Super-Instruct 热插拔模块" className="pool-card">
+        <Banner
+          type="info"
+          title="按模型家族启用 Super-Instruct"
+          description="默认关闭。GPT/ChatGPT/Codex、Claude、Gemini 可以分别启用指令文件系统、响应改写、Memory、Monitor；指令目录仍从 super-instruct/codex-skills 热加载。"
+        />
+        {superSkillsError ? (
+          <Banner type="warning" title="Super-Instruct 技能目录加载失败" description="未开启的分组不受影响；开启前请确认服务端资源目录存在。" />
+        ) : null}
+        <div className="pool-instruction-profiles">
+          {INSTRUCTION_FAMILIES.map((family) => {
+            const profile = draft.super_instruct_profiles?.[family.key] || { enabled: false, skill_ids: [], response_rewrite_enabled: false, memory_enabled: false, monitor_enabled: false };
+            return (
+              <div className="pool-instruction-profile" key={`super:${family.key}`}>
+                <div className="pool-instruction-profile__label">
+                  <strong>{family.label}</strong>
+                  <span className="pool-field__help">{family.help}</span>
+                </div>
+                <div className="pool-user-group-grid">
+                  <label className="pool-inline-switch">
+                    <Switch checked={Boolean(profile.enabled)} onChange={(enabled) => updateSuperInstructProfile(family.key, { enabled })} />
+                    <span>指令文件系统</span>
+                  </label>
+                  <label className="pool-inline-switch">
+                    <Switch checked={Boolean(profile.response_rewrite_enabled)} onChange={(response_rewrite_enabled) => updateSuperInstructProfile(family.key, { response_rewrite_enabled })} />
+                    <span>响应改写</span>
+                  </label>
+                  <label className="pool-inline-switch">
+                    <Switch checked={Boolean(profile.memory_enabled)} onChange={(memory_enabled) => updateSuperInstructProfile(family.key, { memory_enabled })} />
+                    <span>Memory</span>
+                  </label>
+                  <label className="pool-inline-switch">
+                    <Switch checked={Boolean(profile.monitor_enabled)} onChange={(monitor_enabled) => updateSuperInstructProfile(family.key, { monitor_enabled })} />
+                    <span>Monitor</span>
+                  </label>
+                </div>
+                <Select
+                  multiple
+                  filter
+                  value={profile.skill_ids}
+                  onChange={(skill_ids) => updateSuperInstructProfile(family.key, { skill_ids })}
+                  optionList={(superSkills || []).map((skill) => ({
+                    label: skill.description ? `${skill.id} · ${skill.description}` : skill.id,
+                    value: skill.id,
+                    disabled: Boolean(skill.error),
+                  }))}
+                  placeholder={profile.enabled ? '留空 = 此模型家族使用全部当前技能' : '指令文件系统关闭'}
+                  disabled={!profile.enabled || (superSkillsLoading && !(superSkills || []).length)}
+                  style={{ width: '100%' }}
+                />
+              </div>
+            );
+          })}
+        </div>
+        <div className="pool-field__help">已迁移 {superSkills?.length || 0} 个技能；每个模型家族留空技能列表时会热加载全部当前可用技能。</div>
+      </Card>
       <ModelRoutingEditor draft={draft} setDraft={setDraft} targetOptions={selectedTargetOptions} providers={providers} />
       <Card title="最终路由摘要" className="pool-card pool-routing-summary">
         {payload.targets.length ? (
@@ -862,6 +997,7 @@ export default function Groups() {
   // erase valid account groups or providers from the user-group target picker.
   const fetchGroups = useCallback(async ({ signal }) => rowsOf(await get('/admin/groups', undefined, { signal }), ['groups']), []);
   const fetchInstructions = useCallback(async ({ signal }) => rowsOf(await get('/admin/model-instructions', undefined, { signal }), ['files']), []);
+  const fetchSuperSkills = useCallback(async ({ signal }) => rowsOf(await get('/admin/super-instruct/skills', undefined, { signal }), ['skills']), []);
   const fetchEgresses = useCallback(async ({ signal }) => rowsOf(await get('/admin/egress-profiles', undefined, { signal }), ['profiles', 'egress_profiles']), []);
   const fetchUserGroups = useCallback(async ({ signal }) => rowsOf(await get('/admin/user-groups', undefined, { signal }), ['user_groups']), []);
   const fetchProviders = useCallback(async ({ signal }) => rowsOf(await get('/admin/providers', undefined, { signal }), ['providers']), []);
@@ -869,14 +1005,16 @@ export default function Groups() {
 
   const groupsResource = useAsyncResource(fetchGroups, [fetchGroups], { initialData: [] });
   const instructionsResource = useAsyncResource(fetchInstructions, [fetchInstructions], { initialData: [] });
+  const superSkillsResource = useAsyncResource(fetchSuperSkills, [fetchSuperSkills], { initialData: [] });
   const egressesResource = useAsyncResource(fetchEgresses, [fetchEgresses], { initialData: [] });
   const userGroupsResource = useAsyncResource(fetchUserGroups, [fetchUserGroups], { initialData: [] });
   const providersResource = useAsyncResource(fetchProviders, [fetchProviders], { initialData: [] });
   const modelsResource = useAsyncResource(fetchModels, [fetchModels], { initialData: [] });
-  const resources = [groupsResource, instructionsResource, egressesResource, userGroupsResource, providersResource, modelsResource];
+  const resources = [groupsResource, instructionsResource, superSkillsResource, egressesResource, userGroupsResource, providersResource, modelsResource];
   const data = {
     groups: groupsResource.data || [],
     instructions: instructionsResource.data || [],
+    superSkills: superSkillsResource.data || [],
     egresses: egressesResource.data || [],
     userGroups: userGroupsResource.data || [],
     providers: providersResource.data || [],
@@ -891,6 +1029,7 @@ export default function Groups() {
     await Promise.allSettled([
       groupsResource.reload(),
       instructionsResource.reload(),
+      superSkillsResource.reload(),
       egressesResource.reload(),
       userGroupsResource.reload(),
       providersResource.reload(),
@@ -899,6 +1038,7 @@ export default function Groups() {
   }, [
     groupsResource.reload,
     instructionsResource.reload,
+    superSkillsResource.reload,
     egressesResource.reload,
     userGroupsResource.reload,
     providersResource.reload,
@@ -909,9 +1049,10 @@ export default function Groups() {
       groupsResource.reload(),
       providersResource.reload(),
       instructionsResource.reload(),
+      superSkillsResource.reload(),
       modelsResource.reload(),
     ]);
-  }, [groupsResource.reload, providersResource.reload, instructionsResource.reload, modelsResource.reload]);
+  }, [groupsResource.reload, providersResource.reload, instructionsResource.reload, superSkillsResource.reload, modelsResource.reload]);
   const openUserGroupEditor = useCallback((editor) => {
     setUserEditor(editor);
     refreshUserGroupCatalog();
@@ -920,7 +1061,7 @@ export default function Groups() {
     setAccountEditor(editor);
     void egressesResource.reload();
   }, [egressesResource.reload]);
-  const targetCatalogLoading = groupsResource.loading || providersResource.loading || instructionsResource.loading || modelsResource.loading;
+  const targetCatalogLoading = groupsResource.loading || providersResource.loading || instructionsResource.loading || superSkillsResource.loading || modelsResource.loading;
   const targetCatalogError = groupsResource.error || providersResource.error || instructionsResource.error;
 
   const { run: saveAccountGroup, running: savingAccountGroup } = useAsyncAction(async (values) => {
@@ -1043,6 +1184,20 @@ export default function Groups() {
         ...INSTRUCTION_FAMILIES.filter(({ key }) => row.model_instruction_profiles?.[key]?.enabled).map(({ label }) => `${label} 指令`),
         !row.model_instruction_profiles && row.model_instructions_enabled ? `兼容指令 ${row.model_instructions_files?.length || 0}` : '',
         row.system_prompt_apply_to_compaction ? '压缩时应用' : '',
+        ...INSTRUCTION_FAMILIES.flatMap(({ key, label }) => {
+          const profile = row.super_instruct_profiles?.[key];
+          if (!superInstructProfileEnabled(profile)) return [];
+          const enabled = [];
+          if (profile.enabled) enabled.push('指令');
+          if (profile.response_rewrite_enabled) enabled.push('改写');
+          if (profile.memory_enabled) enabled.push('Memory');
+          if (profile.monitor_enabled) enabled.push('Monitor');
+          return [`SI ${label} ${enabled.join('/')}`];
+        }),
+        !row.super_instruct_profiles && row.super_instruct_enabled ? `Super-Instruct ${row.super_instruct_skill_ids?.length ? row.super_instruct_skill_ids.length : '全部'}` : '',
+        !row.super_instruct_profiles && row.super_instruct_response_rewrite_enabled ? 'SI 响应改写' : '',
+        !row.super_instruct_profiles && row.super_instruct_memory_enabled ? 'SI Memory' : '',
+        !row.super_instruct_profiles && row.super_instruct_monitor_enabled ? 'SI Monitor' : '',
         row.block_claude_target_groups?.length ? `Claude 跳过 ${row.block_claude_target_groups.length} 组` : '',
         row.block_gpt_target_groups?.length ? `GPT 跳过 ${row.block_gpt_target_groups.length} 组` : '',
         FALLBACK_FAMILIES.reduce((count, { key }) => count + (row.traffic_fallback_groups?.[key]?.length || 0), 0)
@@ -1077,6 +1232,7 @@ export default function Groups() {
     { label: '混合目标', value: data.userGroups.filter((row) => new Set((row.targets || []).map((target) => canonicalTarget(target).kind)).size > 1).length },
     { label: '模型分层', value: data.userGroups.filter((row) => row.model_routing?.length).length, tone: 'success' },
     { label: '流量兜底', value: data.userGroups.filter((row) => FALLBACK_FAMILIES.some(({ key }) => row.traffic_fallback_groups?.[key]?.length)).length, tone: 'success' },
+    { label: 'Super-Instruct', value: data.userGroups.filter((row) => superInstructAnyEnabled(row)).length, tone: 'success' },
   ];
 
   return (
@@ -1126,6 +1282,9 @@ export default function Groups() {
             userGroups={data.userGroups}
             providers={data.providers}
             instructionFiles={data.instructions}
+            superSkills={data.superSkills}
+            superSkillsLoading={superSkillsResource.loading}
+            superSkillsError={superSkillsResource.error}
             models={data.models}
             modelsError={modelsResource.error}
             catalogLoading={targetCatalogLoading}

@@ -39,6 +39,7 @@ import (
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/streamrewrite"
+	"codex-account-pool/internal/superinstruct"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
 	upstreamrules "codex-account-pool/internal/upstream_error_rules"
@@ -145,6 +146,10 @@ type Server struct {
 	upstreamRulesMu       sync.RWMutex
 	upstreamRulesCache    []storage.UpstreamErrorRule
 	upstreamRulesCachedAt time.Time
+	superMemory           *superinstruct.MemoryKernel
+	superMonitor          *superinstruct.MonitorPanel
+	publicChatLimiterMu   sync.Mutex
+	publicChatLimiter     map[string]publicChatRateWindow
 
 	claudeCacheFlightsMu sync.Mutex
 	claudeCacheFlights   map[string]chan struct{}
@@ -237,6 +242,9 @@ func NewServer(dep Dependencies) *Server {
 		codexSessionGates:   map[string]*codexSessionGate{},
 		codexResetLocks:     map[string]*sync.Mutex{},
 		diagnosticJobWake:   make(chan struct{}, 1),
+		superMemory:         superinstruct.NewMemoryKernel(filepath.Join(dep.Config.DataDir, "super-instruct-memory.json")),
+		superMonitor:        superinstruct.NewMonitorPanel(),
+		publicChatLimiter:   map[string]publicChatRateWindow{},
 	}
 	if dep.Store != nil {
 		connector := dep.TeamLifecycleConnector
@@ -405,6 +413,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/auth/me", s.handleAuthMe)
 	s.mux.HandleFunc("/client/errors", s.handleClientError)
 
+	// Public no-login browser chat. Administrators create a link and bind it to a
+	// user/account-pool group; visitors only need the /chat/<slug> URL.
+	s.mux.HandleFunc("/chat", s.publicChatPage)
+	s.mux.HandleFunc("/chat/", s.publicChatPage)
+	s.mux.HandleFunc("/public-chat/", s.publicChatAPI)
+
 	// Automation-only account pool import. Requires a dedicated poolimp_ key and never
 	// exposes listing/export/inference/admin surfaces.
 	s.mux.HandleFunc("/api/account-pool/import", s.accountPoolImport)
@@ -487,6 +501,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/groups", s.adminGroups)
 	s.mux.HandleFunc("/admin/groups/", s.adminGroupAction)
 	s.mux.HandleFunc("/admin/model-instructions", s.adminModelInstructions)
+	s.mux.HandleFunc("/admin/super-instruct/skills", s.adminSuperInstructSkills)
+	s.mux.HandleFunc("/admin/super-instruct/memory", s.adminSuperInstructMemory)
+	s.mux.HandleFunc("/admin/super-instruct/monitor", s.adminSuperInstructMonitor)
+	s.mux.HandleFunc("/admin/public-chat/links", s.adminPublicChatLinks)
+	s.mux.HandleFunc("/admin/public-chat/links/", s.adminPublicChatLinkAction)
 	s.mux.HandleFunc("/admin/tenants", s.adminTenants)
 	s.mux.HandleFunc("/admin/users", s.adminUsers)
 	s.mux.HandleFunc("/admin/users/", s.adminUserAction)
@@ -870,6 +889,12 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	}
 	if pol.ForceModel != "" {
 		raw = setForcedModel(raw, pol.ForceModel)
+	}
+	if wrapped, wrappedReq, finish, enabled := s.maybeSuperInstructResponsePipeline(w, r, raw, modelWithMeta(raw, bodyMetaForView(capturedMeta, originalRaw, raw))); enabled {
+		w = wrapped
+		r = wrappedReq
+		defer finish()
+		r = r.WithContext(withSchedulerWait(r.Context(), w, streamRequestWithMeta(raw, capturedMeta), schedulerWaitProtocol(r.URL.Path)))
 	}
 	requestPolicy := requestUserGroupPolicy(r.Context())
 	if prompt.ShouldRewrite(requestPolicy.SystemPrompt, compactionRequestWithMeta(r.URL.Path, raw, bodyMetaForView(capturedMeta, originalRaw, raw)), requestPolicy.SystemPromptApplyToCompaction) {

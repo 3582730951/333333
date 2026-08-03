@@ -115,6 +115,116 @@ func TestUserGroupModelInstructionsFilesBecomeResponsesInstructions(t *testing.T
 	}
 }
 
+func TestSuperInstructSkillsBecomeResponsesInstructions(t *testing.T) {
+	dir := t.TempDir()
+	writeAPISuperSkill(t, dir, "anti-debug", `---
+name: anti-debug
+description: Anti debug workflow
+---
+# Anti Debug
+ANTI DEBUG DIRECTIVE`)
+	writeAPISuperSkill(t, dir, "rei-fallback", `---
+name: rei-fallback
+description: Fallback workflow
+---
+# Rei
+REI DIRECTIVE MUST NOT LOAD`)
+	t.Setenv("CODEX_POOL_SUPER_INSTRUCT_DIR", dir)
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_super_instr","status":"completed","output_text":"ok"}`))
+	})
+	routeKey := createTestAPIKeyForUserGroup(t, h, "super-codex-team", map[string]interface{}{
+		"super_instruct_enabled":   true,
+		"super_instruct_skill_ids": []string{"anti-debug"},
+	})
+	acc := h.importAccount(t, "super-instr", "up-super-instr", "access-super-instr")
+	if code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+acc+"/group", `{"group":"super-codex-team"}`); code != http.StatusOK {
+		t.Fatalf("assign group = %d: %s", code, raw)
+	}
+	setTestCapability(t, h, acc, "gpt", 272000)
+
+	req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt","instructions":"downstream should be replaced","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer "+routeKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("responses status = %d", resp.StatusCode)
+	}
+	reqs := h.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("requests = %d", len(reqs))
+	}
+	var upstream map[string]interface{}
+	if err := json.Unmarshal([]byte(reqs[0].Body), &upstream); err != nil {
+		t.Fatalf("upstream json: %v\n%s", err, reqs[0].Body)
+	}
+	instructions, _ := upstream["instructions"].(string)
+	for _, want := range []string{"Super-Instruct Codex 5.6", "ANTI DEBUG DIRECTIVE"} {
+		if !strings.Contains(instructions, want) {
+			t.Fatalf("instructions missing %q:\n%s", want, instructions)
+		}
+	}
+	for _, forbidden := range []string{"downstream should be replaced", "REI DIRECTIVE MUST NOT LOAD"} {
+		if strings.Contains(instructions, forbidden) {
+			t.Fatalf("instructions contains forbidden %q:\n%s", forbidden, instructions)
+		}
+	}
+}
+
+func TestSuperInstructProfilesSelectSkillsByModelFamily(t *testing.T) {
+	dir := t.TempDir()
+	writeAPISuperSkill(t, dir, "gpt-skill", `---
+name: gpt-skill
+description: GPT workflow
+---
+# GPT
+GPT ONLY DIRECTIVE`)
+	writeAPISuperSkill(t, dir, "claude-skill", `---
+name: claude-skill
+description: Claude workflow
+---
+# Claude
+CLAUDE ONLY DIRECTIVE`)
+	t.Setenv("CODEX_POOL_SUPER_INSTRUCT_DIR", dir)
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	group := storage.Group{
+		Name: "super-profile-team",
+		SuperInstructProfiles: storage.SuperInstructProfiles{
+			storage.ModelInstructionFamilyGPT:    {Enabled: true, SkillIDs: []string{"gpt-skill"}},
+			storage.ModelInstructionFamilyClaude: {Enabled: true, SkillIDs: []string{"claude-skill"}},
+		},
+	}
+	gptCompiled, _, err := h.app.compileGroupModelInstructionsForModel(t.Context(), group, "chatgpt-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gptCompiled, "GPT ONLY DIRECTIVE") || strings.Contains(gptCompiled, "CLAUDE ONLY DIRECTIVE") {
+		t.Fatalf("gpt compiled profile mismatch:\n%s", gptCompiled)
+	}
+	claudeCompiled, _, err := h.app.compileGroupModelInstructionsForModel(t.Context(), group, "claude-sonnet-4.6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(claudeCompiled, "CLAUDE ONLY DIRECTIVE") || strings.Contains(claudeCompiled, "GPT ONLY DIRECTIVE") {
+		t.Fatalf("claude compiled profile mismatch:\n%s", claudeCompiled)
+	}
+	geminiCompiled, _, err := h.app.compileGroupModelInstructionsForModel(t.Context(), group, "gemini-3.2-pro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(geminiCompiled) != "" {
+		t.Fatalf("gemini should be disabled without a profile, got:\n%s", geminiCompiled)
+	}
+}
+
 func TestModelInstructionProfilesSelectFilesByModelFamily(t *testing.T) {
 	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
 	for name, content := range map[string]string{

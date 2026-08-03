@@ -11,8 +11,9 @@ cd "$ROOT"
   # release verification deterministic before the final commit is assembled.
   git ls-files --others --exclude-standard
 } | awk '
-  /^(cmd|internal|services|sidecar|scripts|deploy|web-spa\/src|web-spa\/scripts|workers\/node-registrar\/src)\// &&
-  /\.(go|py|sh|js|jsx|ts|tsx|css|json|jsonc|mjs|sql)$/ { print }
+  /^super-instruct\/LICENSE$/ { print; next }
+  /^(cmd|internal|services|sidecar|scripts|deploy|web-spa\/src|web-spa\/scripts|workers\/node-registrar\/src|super-instruct)\// &&
+  /\.(go|py|sh|js|jsx|ts|tsx|css|json|jsonc|mjs|sql|md|txt)$/ { print }
 ' | LC_ALL=C sort -u | while IFS= read -r candidate; do
   # `git ls-files --cached` still reports paths deleted in an uncommitted
   # release worktree. A release manifest describes files that actually ship,

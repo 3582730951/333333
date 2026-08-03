@@ -17,6 +17,7 @@ import (
 
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/superinstruct"
 	"github.com/tidwall/sjson"
 )
 
@@ -152,16 +153,34 @@ func userGroupPolicyAsAccountGroup(group storage.UserGroup) storage.Group {
 		profiles[family] = profile
 	}
 	return storage.Group{
-		Name:                          group.ID,
-		SystemPrompt:                  group.SystemPrompt,
-		PromptMode:                    group.PromptMode,
-		SystemPromptApplyToCompaction: group.SystemPromptApplyToCompaction,
-		ModelInstructionsEnabled:      group.ModelInstructionsEnabled,
-		ModelInstructionsFiles:        append([]string(nil), group.ModelInstructionsFiles...),
-		ModelInstructionProfiles:      profiles,
-		ForceModel:                    group.ForceModel,
-		ForceEffort:                   group.ForceEffort,
+		Name:                                group.ID,
+		SystemPrompt:                        group.SystemPrompt,
+		PromptMode:                          group.PromptMode,
+		SystemPromptApplyToCompaction:       group.SystemPromptApplyToCompaction,
+		ModelInstructionsEnabled:            group.ModelInstructionsEnabled,
+		ModelInstructionsFiles:              append([]string(nil), group.ModelInstructionsFiles...),
+		ModelInstructionProfiles:            profiles,
+		SuperInstructEnabled:                group.SuperInstructEnabled,
+		SuperInstructSkillIDs:               append([]string(nil), group.SuperInstructSkillIDs...),
+		SuperInstructProfiles:               cloneSuperInstructProfiles(group.SuperInstructProfiles),
+		SuperInstructResponseRewriteEnabled: group.SuperInstructResponseRewriteEnabled,
+		SuperInstructMemoryEnabled:          group.SuperInstructMemoryEnabled,
+		SuperInstructMonitorEnabled:         group.SuperInstructMonitorEnabled,
+		ForceModel:                          group.ForceModel,
+		ForceEffort:                         group.ForceEffort,
 	}
+}
+
+func cloneSuperInstructProfiles(profiles storage.SuperInstructProfiles) storage.SuperInstructProfiles {
+	if len(profiles) == 0 {
+		return nil
+	}
+	out := make(storage.SuperInstructProfiles, len(profiles))
+	for family, profile := range profiles {
+		profile.SkillIDs = append([]string(nil), profile.SkillIDs...)
+		out[family] = profile
+	}
+	return out
 }
 
 func modelInstructionFamily(model string) string {
@@ -193,6 +212,28 @@ func modelInstructionPolicyForModel(group storage.Group, model string) (bool, []
 		return false, nil, family
 	}
 	return profile.Enabled, append([]string(nil), profile.Files...), family
+}
+
+func superInstructPolicyForModel(group storage.Group, model string) (storage.SuperInstructProfile, string) {
+	if len(group.SuperInstructProfiles) == 0 {
+		return storage.SuperInstructProfile{
+			Enabled:                group.SuperInstructEnabled,
+			SkillIDs:               append([]string(nil), group.SuperInstructSkillIDs...),
+			ResponseRewriteEnabled: group.SuperInstructResponseRewriteEnabled,
+			MemoryEnabled:          group.SuperInstructMemoryEnabled,
+			MonitorEnabled:         group.SuperInstructMonitorEnabled,
+		}, "legacy"
+	}
+	family := modelInstructionFamily(model)
+	if family == "" {
+		return storage.SuperInstructProfile{}, ""
+	}
+	profile, ok := group.SuperInstructProfiles[family]
+	if !ok {
+		return storage.SuperInstructProfile{}, family
+	}
+	profile.SkillIDs = append([]string(nil), profile.SkillIDs...)
+	return profile, family
 }
 
 func normalizeUserGroupInstructionConfig(group *storage.UserGroup) error {
@@ -243,18 +284,52 @@ func requestUserGroupPolicy(ctx context.Context) storage.Group {
 }
 
 func (s *Server) compileGroupModelInstructions(ctx context.Context, group storage.Group) (string, string, error) {
-	_ = ctx
-	return s.compileModelInstructionFiles(group.Name, group.ModelInstructionsEnabled, group.ModelInstructionsFiles)
+	compiled, _, err := s.compileModelInstructionFiles(group.Name, group.ModelInstructionsEnabled, group.ModelInstructionsFiles)
+	if err != nil {
+		return "", "", err
+	}
+	superCompiled, _, err := s.compileGroupSuperInstruct(ctx, group)
+	if err != nil {
+		return "", "", err
+	}
+	combined := joinInstructionParts(compiled, superCompiled)
+	if strings.TrimSpace(combined) == "" {
+		return "", "", nil
+	}
+	sum := sha256.Sum256([]byte(combined))
+	return combined, hex.EncodeToString(sum[:]), nil
 }
 
 func (s *Server) compileGroupModelInstructionsForModel(ctx context.Context, group storage.Group, model string) (string, string, error) {
-	_ = ctx
 	enabled, files, family := modelInstructionPolicyForModel(group, model)
 	name := group.Name
 	if family != "" && family != "legacy" {
 		name += "/" + family
 	}
-	return s.compileModelInstructionFiles(name, enabled, files)
+	compiled, _, err := s.compileModelInstructionFiles(name, enabled, files)
+	if err != nil {
+		return "", "", err
+	}
+	superCompiled, _, err := s.compileGroupSuperInstructForModel(ctx, group, model)
+	if err != nil {
+		return "", "", err
+	}
+	combined := joinInstructionParts(compiled, superCompiled)
+	if strings.TrimSpace(combined) == "" {
+		return "", "", nil
+	}
+	sum := sha256.Sum256([]byte(combined))
+	return combined, hex.EncodeToString(sum[:]), nil
+}
+
+func joinInstructionParts(parts ...string) string {
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return strings.Join(out, "\n\n")
 }
 
 func (s *Server) compileModelInstructionFiles(groupName string, enabled bool, files []string) (string, string, error) {
@@ -282,6 +357,68 @@ func (s *Server) compileModelInstructionFiles(groupName string, enabled bool, fi
 		parts = append(parts, content)
 	}
 	compiled := strings.Join(parts, "\n\n")
+	sum := sha256.Sum256([]byte(compiled))
+	return compiled, hex.EncodeToString(sum[:]), nil
+}
+
+func (s *Server) superInstructLibrary() superinstruct.Library {
+	return superinstruct.New("")
+}
+
+func (s *Server) compileGroupSuperInstruct(ctx context.Context, group storage.Group) (string, string, error) {
+	if len(group.SuperInstructProfiles) > 0 {
+		families := make([]string, 0, len(group.SuperInstructProfiles))
+		for family := range group.SuperInstructProfiles {
+			families = append(families, family)
+		}
+		sort.Strings(families)
+		parts := make([]string, 0, len(families))
+		for _, family := range families {
+			profile := group.SuperInstructProfiles[family]
+			if !profile.Enabled {
+				continue
+			}
+			compiled, _, err := s.superInstructLibrary().Compile(ctx, profile.SkillIDs)
+			if err != nil {
+				return "", "", err
+			}
+			if strings.TrimSpace(compiled) != "" {
+				parts = append(parts, "## Super-Instruct profile: "+family+"\n\n"+strings.TrimSpace(compiled))
+			}
+		}
+		combined := joinInstructionParts(parts...)
+		if strings.TrimSpace(combined) == "" {
+			return "", "", nil
+		}
+		sum := sha256.Sum256([]byte(combined))
+		return combined, hex.EncodeToString(sum[:]), nil
+	}
+	if !group.SuperInstructEnabled {
+		return "", "", nil
+	}
+	compiled, _, err := s.superInstructLibrary().Compile(ctx, group.SuperInstructSkillIDs)
+	if err != nil {
+		return "", "", err
+	}
+	if strings.TrimSpace(compiled) == "" {
+		return "", "", nil
+	}
+	sum := sha256.Sum256([]byte(compiled))
+	return compiled, hex.EncodeToString(sum[:]), nil
+}
+
+func (s *Server) compileGroupSuperInstructForModel(ctx context.Context, group storage.Group, model string) (string, string, error) {
+	profile, _ := superInstructPolicyForModel(group, model)
+	if !profile.Enabled {
+		return "", "", nil
+	}
+	compiled, _, err := s.superInstructLibrary().Compile(ctx, profile.SkillIDs)
+	if err != nil {
+		return "", "", err
+	}
+	if strings.TrimSpace(compiled) == "" {
+		return "", "", nil
+	}
 	sum := sha256.Sum256([]byte(compiled))
 	return compiled, hex.EncodeToString(sum[:]), nil
 }
@@ -354,6 +491,40 @@ func (s *Server) codexGroupInstructionPolicyRevision(group storage.Group) string
 	for _, name := range group.ModelInstructionsFiles {
 		parts = append(parts, strings.TrimSpace(name))
 	}
+	if group.SuperInstructEnabled {
+		parts = append(parts, "super_instruct_enabled")
+	} else {
+		parts = append(parts, "super_instruct_disabled")
+	}
+	for _, id := range group.SuperInstructSkillIDs {
+		parts = append(parts, "super_skill:"+strings.TrimSpace(id))
+	}
+	superFamilies := make([]string, 0, len(group.SuperInstructProfiles))
+	for family := range group.SuperInstructProfiles {
+		superFamilies = append(superFamilies, family)
+	}
+	sort.Strings(superFamilies)
+	for _, family := range superFamilies {
+		profile := group.SuperInstructProfiles[family]
+		parts = append(parts, "super_profile:"+family)
+		if profile.Enabled {
+			parts = append(parts, "instructions_enabled")
+		} else {
+			parts = append(parts, "instructions_disabled")
+		}
+		if profile.ResponseRewriteEnabled {
+			parts = append(parts, "rewrite_enabled")
+		}
+		if profile.MemoryEnabled {
+			parts = append(parts, "memory_enabled")
+		}
+		if profile.MonitorEnabled {
+			parts = append(parts, "monitor_enabled")
+		}
+		for _, id := range profile.SkillIDs {
+			parts = append(parts, "super_profile_skill:"+strings.TrimSpace(id))
+		}
+	}
 	families := make([]string, 0, len(group.ModelInstructionProfiles))
 	for family := range group.ModelInstructionProfiles {
 		families = append(families, family)
@@ -379,7 +550,9 @@ func (s *Server) codexGroupInstructionPolicyRevision(group storage.Group) string
 // a legacy tree with no row is migrated through a tree-level storage CAS before its
 // first continuation is sent upstream.
 func (s *Server) codexInstructionPlan(ctx context.Context, group storage.Group, mapping *codexSessionMapping, strict bool, model string) (*CodexInstructionPlan, error) {
-	enabled, _, _ := modelInstructionPolicyForModel(group, model)
+	modelInstructionsEnabled, _, _ := modelInstructionPolicyForModel(group, model)
+	superPolicy, _ := superInstructPolicyForModel(group, model)
+	enabled := modelInstructionsEnabled || superPolicy.Enabled
 	if !strict {
 		instructions, err := s.compileCodexInstructionSnapshot(ctx, group, model)
 		if err != nil {

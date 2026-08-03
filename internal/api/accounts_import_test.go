@@ -81,6 +81,70 @@ func TestNormalizeImportedSessionCookie(t *testing.T) {
 	}
 }
 
+func TestImportRawChatGPTSessionAutomaticallyStoresSessionToken(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":[]}`)
+	})
+	accessToken := externalSessionJWTForTest(
+		t,
+		"user-auto-session",
+		"workspace-auto-session",
+		time.Now().Add(time.Hour).Unix(),
+	)
+	const sessionToken = "automatic-session-secret"
+	payload := map[string]interface{}{
+		"label": "raw-web-session",
+		"auth_json": map[string]interface{}{
+			"user":         map[string]interface{}{"id": "user-auto-session", "email": "auto@example.internal"},
+			"account":      map[string]interface{}{"id": "workspace-auto-session", "planType": "team"},
+			"accessToken":  accessToken,
+			"sessionToken": sessionToken,
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/import-auth-json", string(body))
+	if code != http.StatusOK {
+		t.Fatalf("raw Web session import = %d: %s", code, raw)
+	}
+	var imported struct {
+		ID             string   `json:"id"`
+		CredentialMode string   `json:"credential_mode"`
+		Warnings       []string `json:"warnings"`
+	}
+	if err := json.Unmarshal(raw, &imported); err != nil {
+		t.Fatalf("decode import: %v (%s)", err, raw)
+	}
+	if imported.ID == "" || imported.CredentialMode != authparse.CredentialModeChatGPTAuthTokens {
+		t.Fatalf("raw Web session result = %+v", imported)
+	}
+	if !strings.Contains(strings.Join(imported.Warnings, " "), "renewal will use the encrypted session cookie") {
+		t.Fatalf("raw Web session warnings = %v", imported.Warnings)
+	}
+	if strings.Contains(string(raw), accessToken) || strings.Contains(string(raw), sessionToken) {
+		t.Fatalf("raw Web session response leaked a credential: %s", raw)
+	}
+	storedToken, err := h.store.GetToken(context.Background(), imported.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedToken.AccessToken != accessToken || storedToken.RefreshToken != "" ||
+		storedToken.AuthMethod != "access_token" ||
+		storedToken.CredentialMode != authparse.CredentialModeChatGPTAuthTokens {
+		t.Fatalf("stored raw Web session credentials = %+v", storedToken)
+	}
+	storedCookie, err := h.store.GetSessionCookie(context.Background(), imported.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedCookie != "__Secure-next-auth.session-token="+sessionToken {
+		t.Fatalf("stored raw Web session cookie = %q", storedCookie)
+	}
+}
+
 func TestImportedChatGPTWebSessionUsesRealBearerAndUpdatesOnReimport(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

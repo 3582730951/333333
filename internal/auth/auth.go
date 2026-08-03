@@ -100,6 +100,13 @@ func ParseAuthJSON(raw []byte) (ParsedAuth, error) {
 	out.IDTokenRaw = extractIDTokenRaw(firstPresent(root["id_token"], root["idToken"]))
 	out.Provider = importedProvider(root)
 	out.SessionCookie = stringFieldAny(root, "cookie_header", "cookieHeader", "session_cookie", "sessionCookie", "cookie")
+	if webSession && strings.TrimSpace(out.SessionCookie) == "" {
+		// The raw /api/auth/session response names the encrypted browser
+		// session value sessionToken. Treat it as a cookie candidate only when
+		// the same document is already recognized as a ChatGPT Web session;
+		// explicit cookie fields above retain precedence.
+		out.SessionCookie = stringFieldAny(root, "sessionToken", "session_token")
+	}
 	fillChatGPTWebSessionMetadata(&out, root)
 	if tokens, ok := root["tokens"].(map[string]interface{}); ok {
 		if out.AccessToken == "" {

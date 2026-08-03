@@ -1,0 +1,170 @@
+{
+  "auth_metadata": [
+    {
+      "declared_provider": "codex",
+      "effective_provider": "codex",
+      "auth_method": "access_token",
+      "credential_mode": "chatgpt_auth_tokens",
+      "billing_mode": "subscription",
+      "credential_present": "true",
+      "expires_at": "1786601934",
+      "last_refresh": "1785739658"
+    }
+  ],
+  "quota_evidence": [
+    {
+      "provider": "codex",
+      "limiter_type": "5h_polled",
+      "source": "5h_polled",
+      "used_percent": "0",
+      "status": "allowed_warning",
+      "reset_at": "1788332263"
+    },
+    {
+      "provider": "codex",
+      "limiter_type": "codex_reset_credits",
+      "source": "usage_fallback",
+      "used_percent": "'-1",
+      "status": "ok",
+      "reset_at": "0"
+    }
+  ],
+  "upstream_attempts": [
+    {
+      "state": "attempted",
+      "status_code": "0",
+      "created_at": "1785739885"
+    },
+    {
+      "state": "transport_attempted",
+      "status_code": "0",
+      "created_at": "1785739885"
+    },
+    {
+      "state": "response_headers",
+      "status_code": "401",
+      "created_at": "1785739886"
+    }
+  ],
+  "account_state": [
+    {
+      "status": "active",
+      "plan_type": "free",
+      "quarantine_until": "0",
+      "cooldown_until": "1785740186",
+      "recheck_pending": "true"
+    }
+  ],
+  "audit_findings": [
+    {
+      "action": "health_test",
+      "state": "auth_expired",
+      "reason": "http_401",
+      "detail": "http=401 alive=false probe_scope=model_request model_checked=true model=gpt-5.6-sol body={\"detail\":\"Unauthorized\"}"
+    },
+    {
+      "action": "codex_mapped_session_rotation",
+      "state": "requested",
+      "reason": "http_401",
+      "detail": "main_cli_new_upstream_uuid"
+    },
+    {
+      "action": "codex_scheduler_wait",
+      "state": "queued",
+      "reason": "recheck",
+      "detail": "model=\"gpt-5.5\" waited_ms=15134"
+    },
+    {
+      "action": "codex_scheduler_wait",
+      "state": "queued",
+      "reason": "recheck",
+      "detail": "model=\"gpt-5.4-mini\" waited_ms=15157"
+    },
+    {
+      "action": "health_test",
+      "state": "auth_expired",
+      "reason": "http_401",
+      "detail": "http=401 alive=false probe_scope=model_request model_checked=true model=gpt-5.6-sol body={\"detail\":\"Unauthorized\"}"
+    },
+    {
+      "action": "health_test",
+      "state": "auth_expired",
+      "reason": "http_401",
+      "detail": "http=401 alive=false probe_scope=model_request model_checked=true model=gpt-5.6-sol body={\"detail\":\"Unauthorized\"}"
+    },
+    {
+      "action": "health_test",
+      "state": "auth_expired",
+      "reason": "http_401",
+      "detail": "http=401 alive=false probe_scope=model_request model_checked=true model=gpt-5.5 body={\"detail\":\"Unauthorized\"}"
+    },
+    {
+      "action": "codex_scheduler_wait",
+      "state": "queued",
+      "reason": "recheck",
+      "detail": "model=\"gpt-5.5\" waited_ms=15076"
+    }
+  ],
+  "http_routes": [
+    {
+      "method": "POST",
+      "route": "admin.accounts.import-auth-json",
+      "status": "200",
+      "duration_ms": "2"
+    },
+    {
+      "method": "POST",
+      "route": "admin.accounts.*",
+      "status": "200",
+      "duration_ms": "884"
+    },
+    {
+      "method": "GET",
+      "route": "v1.models",
+      "status": "200",
+      "duration_ms": "0"
+    },
+    {
+      "method": "POST",
+      "route": "v1.responses",
+      "status": "200",
+      "duration_ms": "120000"
+    },
+    {
+      "method": "POST",
+      "route": "v1.responses",
+      "status": "200",
+      "duration_ms": "33542"
+    },
+    {
+      "method": "POST",
+      "route": "admin.accounts.*",
+      "status": "200",
+      "duration_ms": "1709"
+    },
+    {
+      "method": "POST",
+      "route": "admin.accounts.*",
+      "status": "200",
+      "duration_ms": "536"
+    },
+    {
+      "method": "POST",
+      "route": "admin.accounts.*",
+      "status": "200",
+      "duration_ms": "597"
+    },
+    {
+      "method": "POST",
+      "route": "v1.responses",
+      "status": "200",
+      "duration_ms": "44182"
+    },
+    {
+      "method": "POST",
+      "route": "admin.diagnostics.jobs",
+      "status": "202",
+      "duration_ms": "8"
+    }
+  ]
+}

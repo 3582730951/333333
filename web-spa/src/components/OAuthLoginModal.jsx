@@ -446,7 +446,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
             />
           </Form.Slot>
           <Text type="tertiary" as="p" style={{ marginTop: 6 }}>
-            提供后会加密保存，并在 access token 过期时重新读取 /api/auth/session；留空则需要到期前重新导入。
+            完整 Web session JSON 内含 sessionToken 时会自动识别；这里可手动覆盖。保存后会加密存储，并在 access token 过期时重新读取 /api/auth/session。
           </Text>
         </div>
         {manualResult ? (

@@ -20,7 +20,16 @@ func TestUserGroupCRUD(t *testing.T) {
 			ModelInstructionFamilyGPT:    {Enabled: true, Files: []string{"gpt.md"}},
 			ModelInstructionFamilyClaude: {Files: []string{"claude.md"}},
 		},
-		ForceModel: "", ForceEffort: "",
+		SuperInstructEnabled:  true,
+		SuperInstructSkillIDs: []string{"anti-debug", "anti-debug", "reverse-engineering"},
+		SuperInstructProfiles: SuperInstructProfiles{
+			"chatgpt":                    {Enabled: true, SkillIDs: []string{"anti-debug", "anti-debug"}, ResponseRewriteEnabled: true},
+			ModelInstructionFamilyClaude: {MemoryEnabled: true, MonitorEnabled: true},
+		},
+		SuperInstructResponseRewriteEnabled: true,
+		SuperInstructMemoryEnabled:          true,
+		SuperInstructMonitorEnabled:         true,
+		ForceModel:                          "", ForceEffort: "",
 		BlockClaudeTargetGroups: []string{"claude-pool"},
 		BlockGPTTargetGroups:    []string{"gpt-pool"},
 	}
@@ -38,6 +47,18 @@ func TestUserGroupCRUD(t *testing.T) {
 	}
 	if profile := got.ModelInstructionProfiles[ModelInstructionFamilyGPT]; !profile.Enabled || len(profile.Files) != 1 || profile.Files[0] != "gpt.md" {
 		t.Errorf("model instruction profiles not persisted: %+v", got.ModelInstructionProfiles)
+	}
+	if !got.SuperInstructEnabled || !reflect.DeepEqual(got.SuperInstructSkillIDs, []string{"anti-debug", "reverse-engineering"}) {
+		t.Errorf("super instruct policy not persisted/normalized: enabled=%v ids=%v", got.SuperInstructEnabled, got.SuperInstructSkillIDs)
+	}
+	if !got.SuperInstructResponseRewriteEnabled || !got.SuperInstructMemoryEnabled || !got.SuperInstructMonitorEnabled {
+		t.Errorf("super instruct response policy not persisted: rewrite=%v memory=%v monitor=%v", got.SuperInstructResponseRewriteEnabled, got.SuperInstructMemoryEnabled, got.SuperInstructMonitorEnabled)
+	}
+	if profile := got.SuperInstructProfiles[ModelInstructionFamilyGPT]; !profile.Enabled || !profile.ResponseRewriteEnabled || !reflect.DeepEqual(profile.SkillIDs, []string{"anti-debug"}) {
+		t.Errorf("gpt super instruct profile not normalized/persisted: %+v", profile)
+	}
+	if profile := got.SuperInstructProfiles[ModelInstructionFamilyClaude]; !profile.MemoryEnabled || !profile.MonitorEnabled {
+		t.Errorf("claude super instruct profile not persisted: %+v", profile)
 	}
 	if !reflect.DeepEqual(got.BlockClaudeTargetGroups, []string{"claude-pool"}) ||
 		!reflect.DeepEqual(got.BlockGPTTargetGroups, []string{"gpt-pool"}) {

@@ -96,9 +96,6 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if s.goalContinuityEnabled(r.Context()) {
-		w.Header().Set("X-MiCliProxy-Context-Engine", "v2; build=goal-continuity-v2")
-	}
 	r = r.WithContext(withDownstreamKey(r.Context(), pol))
 	r = r.WithContext(withDownstreamClientScope(r.Context(), pol.KeyHash, r))
 	r = r.WithContext(withGoalIdentityAliases(r.Context(), goalAliases(r, raw, "claude")))
@@ -109,16 +106,22 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if pol.ForceEffort != "" {
 		raw = applyForcedThinkingClaude(raw, pol.ForceEffort)
 	}
+	if wrapped, wrappedReq, finish, enabled := s.maybeSuperInstructResponsePipeline(w, r, raw, routing.Model(raw)); enabled {
+		w = wrapped
+		r = wrappedReq
+		defer finish()
+	}
+	if s.goalContinuityEnabled(r.Context()) {
+		w.Header().Set("X-MiCliProxy-Context-Engine", "v2; build=goal-continuity-v2")
+	}
 	requestPolicy := requestUserGroupPolicy(r.Context())
 	policyPrompt := strings.TrimSpace(requestPolicy.SystemPrompt)
-	if enabled, _, _ := modelInstructionPolicyForModel(requestPolicy, routing.Model(raw)); enabled {
-		compiled, _, compileErr := s.compileGroupModelInstructionsForModel(r.Context(), requestPolicy, routing.Model(raw))
-		if compileErr != nil {
-			writeCodexInstructionConfigurationError(w, compileErr)
-			return
-		}
-		policyPrompt = strings.TrimSpace(strings.Join([]string{policyPrompt, compiled}, "\n\n"))
+	compiled, _, compileErr := s.compileGroupModelInstructionsForModel(r.Context(), requestPolicy, routing.Model(raw))
+	if compileErr != nil {
+		writeCodexInstructionConfigurationError(w, compileErr)
+		return
 	}
+	policyPrompt = joinInstructionParts(policyPrompt, compiled)
 	if prompt.ShouldRewrite(policyPrompt, routing.IsCompaction(path, raw), requestPolicy.SystemPromptApplyToCompaction) {
 		raw, _, err = prompt.InjectAnthropicSystemPrompt(raw, policyPrompt)
 		if err != nil {

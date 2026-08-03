@@ -80,6 +80,7 @@ COPY services/codex_register/protocol_register.py \
      services/codex_register/phone_verify.py \
      /usr/local/lib/codex-pool/releases/docker/registrar-python/
 COPY config.example.json /etc/codex-pool/config.json
+COPY super-instruct /usr/local/lib/codex-pool/releases/docker/super-instruct
 COPY deploy/docker-entrypoint.sh /usr/local/bin/codex-pool-entrypoint
 RUN PYTHONDONTWRITEBYTECODE=1 \
       /usr/local/lib/codex-pool/releases/docker/registrar-python-venv/bin/python -c \
@@ -90,11 +91,13 @@ RUN PYTHONDONTWRITEBYTECODE=1 \
     chown -R root:codex-pool \
       /usr/local/lib/codex-pool/releases/docker/registrar-node \
       /usr/local/lib/codex-pool/releases/docker/registrar-python \
-      /usr/local/lib/codex-pool/releases/docker/registrar-python-venv && \
+      /usr/local/lib/codex-pool/releases/docker/registrar-python-venv \
+      /usr/local/lib/codex-pool/releases/docker/super-instruct && \
     chmod -R u=rwX,g=rX,o= \
       /usr/local/lib/codex-pool/releases/docker/registrar-node \
       /usr/local/lib/codex-pool/releases/docker/registrar-python \
-      /usr/local/lib/codex-pool/releases/docker/registrar-python-venv && \
+      /usr/local/lib/codex-pool/releases/docker/registrar-python-venv \
+      /usr/local/lib/codex-pool/releases/docker/super-instruct && \
     chmod 0755 /usr/local/bin/codex-pool-entrypoint
 
 USER codex-pool
@@ -105,6 +108,7 @@ ENV CODEX_REG_NODE_DIR=/usr/local/lib/codex-pool/releases/docker/registrar-node
 ENV CODEX_REG_PYTHON=/usr/local/lib/codex-pool/releases/docker/registrar-python-venv/bin/python
 ENV CODEX_REG_PROTOCOL_SCRIPT=/usr/local/lib/codex-pool/releases/docker/registrar-python/protocol_register.py
 ENV CODEX_REG_SCRIPT=/usr/local/lib/codex-pool/releases/docker/registrar-python/browser_register.py
+ENV CODEX_POOL_SUPER_INSTRUCT_DIR=/usr/local/lib/codex-pool/releases/docker/super-instruct/codex-skills
 ENV CODEX_REG_V3_SCRIPT=/usr/local/lib/codex-pool/releases/docker/registrar-python/reg_v3.py
 ENV CODEX_REG_CHROME=/usr/bin/chromium
 ENV CHROME_PATH=/usr/bin/chromium

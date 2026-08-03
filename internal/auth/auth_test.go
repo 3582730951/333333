@@ -68,6 +68,67 @@ func TestParseChatGPTWebSessionBuildsUsableExternalCredentials(t *testing.T) {
 	}
 }
 
+func TestParseChatGPTWebSessionExtractsSessionTokenAliases(t *testing.T) {
+	accessToken := codexJWTForTest(t, map[string]interface{}{
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"https://api.openai.com/auth": map[string]interface{}{
+			"chatgpt_user_id":    "user-session-token",
+			"chatgpt_account_id": "workspace-session-token",
+		},
+	})
+	base := func() map[string]interface{} {
+		return map[string]interface{}{
+			"accessToken": accessToken,
+			"account":     map[string]interface{}{"id": "workspace-session-token"},
+			"user":        map[string]interface{}{"id": "user-session-token"},
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(map[string]interface{})
+		want   string
+	}{
+		{
+			name: "camel case",
+			mutate: func(root map[string]interface{}) {
+				root["sessionToken"] = "camel-session-token"
+			},
+			want: "camel-session-token",
+		},
+		{
+			name: "snake case",
+			mutate: func(root map[string]interface{}) {
+				root["session_token"] = "snake-session-token"
+			},
+			want: "snake-session-token",
+		},
+		{
+			name: "explicit cookie wins",
+			mutate: func(root map[string]interface{}) {
+				root["sessionToken"] = "fallback-session-token"
+				root["session_cookie"] = "explicit-session-cookie"
+			},
+			want: "explicit-session-cookie",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := base()
+			tc.mutate(payload)
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := ParseAuthJSON(raw)
+			if err != nil {
+				t.Fatalf("parse Web session: %v", err)
+			}
+			if parsed.SessionCookie != tc.want {
+				t.Fatalf("session cookie = %q, want %q", parsed.SessionCookie, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseCPAExternalCredentialsReplacesInvalidPlaceholder(t *testing.T) {
 	expiresAt := time.Now().Add(30 * time.Minute).Unix()
 	lastRefresh := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)

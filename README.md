@@ -137,11 +137,13 @@ curl -sS http://127.0.0.1:8787/admin/accounts/import-auth-json \
   "user": {"id": "user-...", "email": "name@example.com"},
   "account": {"id": "workspace-...", "planType": "pro"},
   "expires": "2026-07-28T00:00:00Z",
-  "accessToken": "eyJ..."
+  "accessToken": "eyJ...",
+  "sessionToken": "<encrypted-session-token>"
 }
 ```
 
 缺少真实 `id_token` 时，导入器会生成仅承载 claims 的三段兼容 JWT；它不会被当作上游凭据。导入前会验证真实 `accessToken` 的 JWT 结构、`exp` 和 workspace ID，避免“能入池、调用才 401/403”。Web session 通常没有 `refresh_token`；可在请求外层同时传入 `"session_cookie":"完整 Cookie 头或 session-token 值"`，服务端会加密保存并在 bearer 失效后重新读取 `/api/auth/session`。未提供 Cookie 时必须在 access token 到期前重新导入。
+原始 Web session 响应中的 `sessionToken` / `session_token` 会自动作为加密 session cookie 导入；请求外层显式提供的 `session_cookie` 优先。
 
 探测模型：
 

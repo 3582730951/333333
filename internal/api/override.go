@@ -51,6 +51,7 @@ const (
 	ctxKeyBillingHold
 	ctxKeyUsageDiagnostics
 	ctxKeyModelDiagnostics
+	ctxKeyPublicChatPolicy
 )
 
 type modelDiagnostics struct{ Requested, Resolved, Source string }
@@ -60,6 +61,15 @@ func withInternal(ctx context.Context) context.Context {
 }
 
 func isInternalCall(ctx context.Context) bool { v, _ := ctx.Value(ctxKeyInternal).(bool); return v }
+
+func withPublicChatPolicy(ctx context.Context, pol downstreamPolicy) context.Context {
+	return context.WithValue(ctx, ctxKeyPublicChatPolicy, pol)
+}
+
+func publicChatPolicyFromContext(ctx context.Context) (downstreamPolicy, bool) {
+	pol, ok := ctx.Value(ctxKeyPublicChatPolicy).(downstreamPolicy)
+	return pol, ok
+}
 
 func withDownstreamKey(ctx context.Context, pol downstreamPolicy) context.Context {
 	if pol.KeyHash == "" && pol.UserID == "" {
@@ -166,6 +176,29 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 	// Relay-internal calls (the moderation model call) bypass downstream-key enforcement.
 	if isInternalCall(ctx) {
 		return downstreamPolicy{Group: s.cfg.DefaultGroup, ProviderHint: "auto", Authed: true}, true
+	}
+	if pol, ok := publicChatPolicyFromContext(ctx); ok {
+		if strings.TrimSpace(pol.Group) == "" {
+			pol.Group = s.cfg.DefaultGroup
+		}
+		if strings.TrimSpace(pol.ProviderHint) == "" {
+			pol.ProviderHint = "auto"
+		}
+		if strings.TrimSpace(pol.UserGroupID) != "" && (strings.TrimSpace(pol.ForceModel) == "" || strings.TrimSpace(pol.ForceEffort) == "") {
+			if ug, ok, ugErr := s.store.GetUserGroup(ctx, pol.UserGroupID); ugErr == nil && ok {
+				if strings.TrimSpace(pol.ForceModel) == "" {
+					pol.ForceModel = strings.TrimSpace(ug.ForceModel)
+					if pol.ForceModel != "" {
+						pol.ModelOverrideSource = "user_group"
+					}
+				}
+				if strings.TrimSpace(pol.ForceEffort) == "" {
+					pol.ForceEffort = strings.TrimSpace(ug.ForceEffort)
+				}
+			}
+		}
+		pol.Authed = true
+		return pol, true
 	}
 	pol := downstreamPolicy{Group: s.cfg.DefaultGroup, ProviderHint: "auto"}
 	plain := downstreamBearer(r)

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/secretbox"
+	"codex-account-pool/internal/superinstruct"
 	"codex-account-pool/internal/supervisor"
 
 	"github.com/google/uuid"
@@ -139,7 +140,13 @@ type Group struct {
 	ModelInstructionsFiles        []string `json:"model_instructions_files,omitempty"`
 	// ModelInstructionProfiles is populated only when a UserGroup policy is carried
 	// through the request context. Account-pool groups do not persist or execute it.
-	ModelInstructionProfiles ModelInstructionProfiles `json:"model_instruction_profiles,omitempty"`
+	ModelInstructionProfiles            ModelInstructionProfiles `json:"model_instruction_profiles,omitempty"`
+	SuperInstructEnabled                bool                     `json:"super_instruct_enabled"`
+	SuperInstructSkillIDs               []string                 `json:"super_instruct_skill_ids,omitempty"`
+	SuperInstructProfiles               SuperInstructProfiles    `json:"super_instruct_profiles,omitempty"`
+	SuperInstructResponseRewriteEnabled bool                     `json:"super_instruct_response_rewrite_enabled"`
+	SuperInstructMemoryEnabled          bool                     `json:"super_instruct_memory_enabled"`
+	SuperInstructMonitorEnabled         bool                     `json:"super_instruct_monitor_enabled"`
 	// Legacy policy fields are retained for one compatibility cycle only. Runtime
 	// request policy comes exclusively from UserGroup and new account-pool group
 	// writes reject non-empty policy values.
@@ -173,6 +180,20 @@ type ModelInstructionProfile struct {
 // Once any profile exists, unlisted families are intentionally disabled.
 type ModelInstructionProfiles map[string]ModelInstructionProfile
 
+type SuperInstructProfile struct {
+	Enabled                bool     `json:"enabled"`
+	SkillIDs               []string `json:"skill_ids,omitempty"`
+	ResponseRewriteEnabled bool     `json:"response_rewrite_enabled"`
+	MemoryEnabled          bool     `json:"memory_enabled"`
+	MonitorEnabled         bool     `json:"monitor_enabled"`
+}
+
+// SuperInstructProfiles stores per-model-family Super-Instruct policy. Empty
+// means legacy global fields remain authoritative. Once any profile exists,
+// unlisted or disabled families do not load Super-Instruct instructions or
+// response submodules.
+type SuperInstructProfiles map[string]SuperInstructProfile
+
 // TrafficFallbackGroups is the ordered set of user groups that may receive
 // replay-safe traffic after every compatible target in the current user group
 // has been exhausted. Order is significant and is preserved per model family.
@@ -203,16 +224,22 @@ type GroupAccountCounts struct {
 // A user group can fan out to multiple targets (base groups, relays, kiro, antigravity)
 // via UserGroupTarget rows, enabling affinity-spread and session-sticky multi-target routing.
 type UserGroup struct {
-	ID                            string                   `json:"id"`
-	Name                          string                   `json:"name"`
-	SystemPrompt                  string                   `json:"system_prompt"`
-	PromptMode                    string                   `json:"prompt_mode"`
-	SystemPromptApplyToCompaction bool                     `json:"system_prompt_apply_to_compaction"`
-	ModelInstructionsEnabled      bool                     `json:"model_instructions_enabled"`
-	ModelInstructionsFiles        []string                 `json:"model_instructions_files,omitempty"`
-	ModelInstructionProfiles      ModelInstructionProfiles `json:"model_instruction_profiles,omitempty"`
-	ForceModel                    string                   `json:"force_model"`
-	ForceEffort                   string                   `json:"force_effort"`
+	ID                                  string                   `json:"id"`
+	Name                                string                   `json:"name"`
+	SystemPrompt                        string                   `json:"system_prompt"`
+	PromptMode                          string                   `json:"prompt_mode"`
+	SystemPromptApplyToCompaction       bool                     `json:"system_prompt_apply_to_compaction"`
+	ModelInstructionsEnabled            bool                     `json:"model_instructions_enabled"`
+	ModelInstructionsFiles              []string                 `json:"model_instructions_files,omitempty"`
+	ModelInstructionProfiles            ModelInstructionProfiles `json:"model_instruction_profiles,omitempty"`
+	SuperInstructEnabled                bool                     `json:"super_instruct_enabled"`
+	SuperInstructSkillIDs               []string                 `json:"super_instruct_skill_ids,omitempty"`
+	SuperInstructProfiles               SuperInstructProfiles    `json:"super_instruct_profiles,omitempty"`
+	SuperInstructResponseRewriteEnabled bool                     `json:"super_instruct_response_rewrite_enabled"`
+	SuperInstructMemoryEnabled          bool                     `json:"super_instruct_memory_enabled"`
+	SuperInstructMonitorEnabled         bool                     `json:"super_instruct_monitor_enabled"`
+	ForceModel                          string                   `json:"force_model"`
+	ForceEffort                         string                   `json:"force_effort"`
 	// BlockClaudeTargetGroups and BlockGPTTargetGroups are user-group routing
 	// policy. Each value names an account-pool target selected by this user
 	// group; the underlying account-pool group itself remains unchanged and may
@@ -389,6 +416,74 @@ func decodeModelInstructionProfiles(raw string) ModelInstructionProfiles {
 		return nil
 	}
 	normalized, err := normalizeModelInstructionProfiles(profiles)
+	if err != nil {
+		return nil
+	}
+	return normalized
+}
+
+func normalizeSuperInstructProfileFamily(family string) string {
+	switch strings.ToLower(strings.TrimSpace(family)) {
+	case ModelInstructionFamilyGPT, "chatgpt", "codex", "openai":
+		return ModelInstructionFamilyGPT
+	case ModelInstructionFamilyClaude, "anthropic":
+		return ModelInstructionFamilyClaude
+	case ModelInstructionFamilyGemini, "google":
+		return ModelInstructionFamilyGemini
+	default:
+		return ""
+	}
+}
+
+func normalizeSuperInstructProfiles(profiles SuperInstructProfiles) (SuperInstructProfiles, error) {
+	if len(profiles) == 0 {
+		return nil, nil
+	}
+	out := make(SuperInstructProfiles, len(profiles))
+	for rawFamily, profile := range profiles {
+		family := normalizeSuperInstructProfileFamily(rawFamily)
+		if family == "" {
+			return nil, fmt.Errorf("unsupported Super-Instruct profile family %q", rawFamily)
+		}
+		ids, err := superinstruct.NormalizeSkillIDs(profile.SkillIDs)
+		if err != nil {
+			return nil, fmt.Errorf("Super-Instruct profile %q: %w", family, err)
+		}
+		if _, duplicate := out[family]; duplicate {
+			return nil, fmt.Errorf("duplicate Super-Instruct profile family %q", family)
+		}
+		out[family] = SuperInstructProfile{
+			Enabled:                profile.Enabled,
+			SkillIDs:               ids,
+			ResponseRewriteEnabled: profile.ResponseRewriteEnabled,
+			MemoryEnabled:          profile.MemoryEnabled,
+			MonitorEnabled:         profile.MonitorEnabled,
+		}
+	}
+	return out, nil
+}
+
+func encodeSuperInstructProfiles(profiles SuperInstructProfiles) string {
+	if len(profiles) == 0 {
+		return "{}"
+	}
+	normalized, err := normalizeSuperInstructProfiles(profiles)
+	if err != nil || len(normalized) == 0 {
+		return "{}"
+	}
+	raw, err := json.Marshal(normalized)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+func decodeSuperInstructProfiles(raw string) SuperInstructProfiles {
+	var profiles SuperInstructProfiles
+	if err := json.Unmarshal([]byte(raw), &profiles); err != nil || len(profiles) == 0 {
+		return nil
+	}
+	normalized, err := normalizeSuperInstructProfiles(profiles)
 	if err != nil {
 		return nil
 	}
@@ -2833,6 +2928,12 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
   model_instructions_enabled INTEGER NOT NULL DEFAULT 0,
   model_instructions_files TEXT NOT NULL DEFAULT '[]',
   model_instruction_profiles TEXT NOT NULL DEFAULT '{}',
+  super_instruct_enabled INTEGER NOT NULL DEFAULT 0,
+  super_instruct_skill_ids TEXT NOT NULL DEFAULT '[]',
+  super_instruct_profiles TEXT NOT NULL DEFAULT '{}',
+  super_instruct_response_rewrite_enabled INTEGER NOT NULL DEFAULT 0,
+  super_instruct_memory_enabled INTEGER NOT NULL DEFAULT 0,
+  super_instruct_monitor_enabled INTEGER NOT NULL DEFAULT 0,
   force_model TEXT NOT NULL DEFAULT '',
   force_effort TEXT NOT NULL DEFAULT '',
   block_claude_target_groups TEXT NOT NULL DEFAULT '[]',
@@ -2869,6 +2970,12 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
 		`CREATE INDEX IF NOT EXISTS idx_user_group_target_bindings_updated ON user_group_target_bindings(updated_at)`,
 		`ALTER TABLE user_groups ADD COLUMN model_routing_json TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE user_groups ADD COLUMN model_instruction_profiles TEXT NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE user_groups ADD COLUMN super_instruct_enabled INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE user_groups ADD COLUMN super_instruct_skill_ids TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE user_groups ADD COLUMN super_instruct_profiles TEXT NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE user_groups ADD COLUMN super_instruct_response_rewrite_enabled INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE user_groups ADD COLUMN super_instruct_memory_enabled INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE user_groups ADD COLUMN super_instruct_monitor_enabled INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE user_groups ADD COLUMN block_claude_target_groups TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE user_groups ADD COLUMN block_gpt_target_groups TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE user_groups ADD COLUMN traffic_fallback_groups_json TEXT NOT NULL DEFAULT '{}'`,
@@ -2893,6 +3000,26 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 )`,
 		`CREATE INDEX IF NOT EXISTS idx_antigravity_cache_expires ON antigravity_cache_entries(expires_at)`,
+		// Public no-login browser chat links. Kept in the additive migration surface
+		// so PostgreSQL's immutable base schema checksum does not change.
+		`CREATE TABLE IF NOT EXISTS public_chat_links(
+  id TEXT PRIMARY KEY,
+  slug TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 0,
+  route_type TEXT NOT NULL DEFAULT 'user_group',
+  user_group_id TEXT NOT NULL DEFAULT '',
+  group_name TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT 'gpt-5.6-sol',
+  title TEXT NOT NULL DEFAULT '',
+  welcome_message TEXT NOT NULL DEFAULT '',
+  max_history_messages INTEGER NOT NULL DEFAULT 24,
+  rate_limit_per_minute INTEGER NOT NULL DEFAULT 30,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_public_chat_links_slug ON public_chat_links(slug)`,
+		`CREATE INDEX IF NOT EXISTS idx_public_chat_links_enabled ON public_chat_links(enabled, updated_at)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
@@ -3147,9 +3274,19 @@ func (s *Store) CreateGroup(ctx context.Context, g Group) error {
 	if strings.TrimSpace(g.PromptMode) == "" {
 		g.PromptMode = "prepend"
 	}
+	ids, err := superinstruct.NormalizeSkillIDs(g.SuperInstructSkillIDs)
+	if err != nil {
+		return err
+	}
+	g.SuperInstructSkillIDs = ids
+	superProfiles, err := normalizeSuperInstructProfiles(g.SuperInstructProfiles)
+	if err != nil {
+		return err
+	}
+	g.SuperInstructProfiles = superProfiles
 	now := Now()
 	egressJSON := prepareGroupEgress(&g)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO groups(name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, model_instructions_enabled, model_instructions_files, force_model, force_effort, default_egress_id, egress_ids, created_at, updated_at)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO groups(name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, model_instructions_enabled, model_instructions_files, force_model, force_effort, default_egress_id, egress_ids, created_at, updated_at)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.Virtual2MEnabled), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, g.DefaultEgressID, egressJSON, now, now)
 	return err
@@ -3268,17 +3405,23 @@ func (s *Store) DeleteGroup(ctx context.Context, name string) error {
 
 // ── UserGroup CRUD ──────────────────────────────────────────────────────────
 
-const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at`
+const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at`
 
 func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
 	var g UserGroup
-	var apply, miEnabled int
-	var filesJSON, profilesJSON, blockClaudeJSON, blockGPTJSON, fallbackGroupsJSON, fallbackMappingsJSON, routingJSON string
-	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &g.ForceModel, &g.ForceEffort, &blockClaudeJSON, &blockGPTJSON, &fallbackGroupsJSON, &fallbackMappingsJSON, &routingJSON, &g.CreatedAt, &g.UpdatedAt)
+	var apply, miEnabled, superEnabled, superResponseRewriteEnabled, superMemoryEnabled, superMonitorEnabled int
+	var filesJSON, profilesJSON, superSkillIDsJSON, superProfilesJSON, blockClaudeJSON, blockGPTJSON, fallbackGroupsJSON, fallbackMappingsJSON, routingJSON string
+	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &superEnabled, &superSkillIDsJSON, &superProfilesJSON, &superResponseRewriteEnabled, &superMemoryEnabled, &superMonitorEnabled, &g.ForceModel, &g.ForceEffort, &blockClaudeJSON, &blockGPTJSON, &fallbackGroupsJSON, &fallbackMappingsJSON, &routingJSON, &g.CreatedAt, &g.UpdatedAt)
 	g.SystemPromptApplyToCompaction = apply != 0
 	g.ModelInstructionsEnabled = miEnabled != 0
 	g.ModelInstructionsFiles = decodeStringList(filesJSON)
 	g.ModelInstructionProfiles = decodeModelInstructionProfiles(profilesJSON)
+	g.SuperInstructEnabled = superEnabled != 0
+	g.SuperInstructSkillIDs = decodeStringList(superSkillIDsJSON)
+	g.SuperInstructProfiles = decodeSuperInstructProfiles(superProfilesJSON)
+	g.SuperInstructResponseRewriteEnabled = superResponseRewriteEnabled != 0
+	g.SuperInstructMemoryEnabled = superMemoryEnabled != 0
+	g.SuperInstructMonitorEnabled = superMonitorEnabled != 0
 	g.BlockClaudeTargetGroups = decodeStringList(blockClaudeJSON)
 	g.BlockGPTTargetGroups = decodeStringList(blockGPTJSON)
 	if err == nil {
@@ -3430,15 +3573,20 @@ func (s *Store) CreateUserGroup(ctx context.Context, g UserGroup) error {
 	if strings.TrimSpace(g.PromptMode) == "" {
 		g.PromptMode = "prepend"
 	}
+	ids, err := superinstruct.NormalizeSkillIDs(g.SuperInstructSkillIDs)
+	if err != nil {
+		return err
+	}
+	g.SuperInstructSkillIDs = ids
 	now := Now()
 	if g.CreatedAt == 0 {
 		g.CreatedAt = now
 	}
 	g.UpdatedAt = now
 	routingJSON := encodeModelRouting(g.ModelRouting)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO NOTHING`,
-		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), routingJSON, g.CreatedAt, g.UpdatedAt)
+		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), routingJSON, g.CreatedAt, g.UpdatedAt)
 	return err
 }
 
@@ -3851,6 +3999,14 @@ func (s *Store) normalizeUserGroupDefinition(ctx context.Context, tx *sql.Tx, g 
 		return UserGroup{}, err
 	}
 	g.ModelInstructionProfiles = profiles
+	g.SuperInstructSkillIDs, err = superinstruct.NormalizeSkillIDs(g.SuperInstructSkillIDs)
+	if err != nil {
+		return UserGroup{}, err
+	}
+	g.SuperInstructProfiles, err = normalizeSuperInstructProfiles(g.SuperInstructProfiles)
+	if err != nil {
+		return UserGroup{}, err
+	}
 	targets, err := normalizeTargetRefs(g.Targets)
 	if err != nil {
 		return UserGroup{}, err
@@ -3942,8 +4098,8 @@ func (s *Store) CreateUserGroupDefinition(ctx context.Context, g UserGroup) erro
 		g.CreatedAt = now
 	}
 	g.UpdatedAt = now
-	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt); err != nil {
 		return err
 	}
 	if err := insertUserGroupTargets(ctx, tx, g, now); err != nil {
@@ -3965,8 +4121,8 @@ func (s *Store) ReplaceUserGroupDefinition(ctx context.Context, g UserGroup) err
 		return err
 	}
 	now := Now()
-	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, updated_at=? WHERE id=?`,
-		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), now, g.ID)
+	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, super_instruct_enabled=?, super_instruct_skill_ids=?, super_instruct_profiles=?, super_instruct_response_rewrite_enabled=?, super_instruct_memory_enabled=?, super_instruct_monitor_enabled=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, updated_at=? WHERE id=?`,
+		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), now, g.ID)
 	if err != nil {
 		return err
 	}
@@ -3986,8 +4142,18 @@ func (s *Store) UpdateUserGroup(ctx context.Context, g UserGroup) error {
 	if strings.TrimSpace(g.PromptMode) == "" {
 		g.PromptMode = "prepend"
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, updated_at=? WHERE id=?`,
-		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), Now(), g.ID)
+	ids, err := superinstruct.NormalizeSkillIDs(g.SuperInstructSkillIDs)
+	if err != nil {
+		return err
+	}
+	g.SuperInstructSkillIDs = ids
+	superProfiles, err := normalizeSuperInstructProfiles(g.SuperInstructProfiles)
+	if err != nil {
+		return err
+	}
+	g.SuperInstructProfiles = superProfiles
+	_, err = s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, super_instruct_enabled=?, super_instruct_skill_ids=?, super_instruct_profiles=?, super_instruct_response_rewrite_enabled=?, super_instruct_memory_enabled=?, super_instruct_monitor_enabled=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, updated_at=? WHERE id=?`,
+		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), Now(), g.ID)
 	return err
 }
 

@@ -58,6 +58,15 @@ func TestMultiGroupCRUDAndReassign(t *testing.T) {
 	if code, body := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"team-a","force_model":"gpt-5","force_effort":"high"}`); code != http.StatusUnprocessableEntity || !strings.Contains(string(body), "invalid_group_policy") {
 		t.Fatalf("create group with user policy = %d: %s", code, body)
 	}
+	if code, body := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"team-a","super_instruct_enabled":true}`); code != http.StatusUnprocessableEntity || !strings.Contains(string(body), "invalid_group_policy") {
+		t.Fatalf("create group with super instruct policy = %d: %s", code, body)
+	}
+	if code, body := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"team-a","super_instruct_memory_enabled":true}`); code != http.StatusUnprocessableEntity || !strings.Contains(string(body), "invalid_group_policy") {
+		t.Fatalf("create group with super instruct memory policy = %d: %s", code, body)
+	}
+	if code, body := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"team-a","super_instruct_profiles":{"gpt":{"enabled":true}}}`); code != http.StatusUnprocessableEntity || !strings.Contains(string(body), "invalid_group_policy") {
+		t.Fatalf("create group with super instruct profiles = %d: %s", code, body)
+	}
 	if code, body := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"team-a","egress_ids":[]}`); code != http.StatusOK {
 		t.Fatalf("create group = %d: %s", code, body)
 	}

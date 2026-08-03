@@ -91,6 +91,7 @@ func newHarness(t *testing.T, upstreamHandler http.HandlerFunc) *testHarness {
 	cfg.OpenAIAPIUpstreamBaseURL = up.URL + "/v1"
 	cfg.ClaudeUpstreamBaseURL = up.URL
 	cfg.DatabasePath = filepath.Join(t.TempDir(), "unused.sqlite3")
+	cfg.DataDir = filepath.Join(t.TempDir(), "data")
 	cfg.StickyWaitMillis = 1
 	// The production default is now the in-process TLS fingerprinter
 	// (EgressFingerprintEngine="inprocess"), which dials a REAL TLS connection and

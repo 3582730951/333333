@@ -3,9 +3,12 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/superinstruct"
 )
 
 func TestAdminUserGroupsCreatePersistsBaseAndRelayTargets(t *testing.T) {
@@ -58,6 +61,82 @@ func TestAdminUserGroupsCreatePersistsBaseAndRelayTargets(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("list response did not hydrate targets: %+v", groups)
+	}
+}
+
+func TestAdminSuperInstructSkillsAndUserGroupPolicy(t *testing.T) {
+	dir := t.TempDir()
+	writeAPISuperSkill(t, dir, "anti-debug", `---
+name: anti-debug
+description: Anti debug workflow
+---
+# Anti Debug
+ANTI DEBUG DIRECTIVE`)
+	writeAPISuperSkill(t, dir, "reverse-engineering", `---
+name: reverse-engineering
+description: Reverse workflow
+---
+# Reverse
+REVERSE DIRECTIVE`)
+	t.Setenv(superinstruct.EnvDir, dir)
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	code, raw := grpReq(t, h, http.MethodGet, "/admin/super-instruct/skills", "")
+	if code != http.StatusOK {
+		t.Fatalf("GET super instruct skills = %d: %s", code, raw)
+	}
+	var catalog struct {
+		Directory string                `json:"directory"`
+		Skills    []superinstruct.Skill `json:"skills"`
+	}
+	if err := json.Unmarshal(raw, &catalog); err != nil {
+		t.Fatalf("decode skills: %v (%s)", err, raw)
+	}
+	if catalog.Directory != dir || len(catalog.Skills) != 2 || catalog.Skills[0].ID != "anti-debug" {
+		t.Fatalf("unexpected catalog: %+v", catalog)
+	}
+
+	code, raw = grpReq(t, h, http.MethodPost, "/admin/user-groups", `{
+		"name":"super-team",
+		"super_instruct_enabled":true,
+		"super_instruct_skill_ids":["anti-debug","anti-debug"],
+		"super_instruct_profiles":{
+			"chatgpt":{"enabled":true,"skill_ids":["anti-debug","anti-debug"],"response_rewrite_enabled":true},
+			"claude":{"monitor_enabled":true}
+		},
+		"super_instruct_response_rewrite_enabled":true,
+		"super_instruct_memory_enabled":true,
+		"super_instruct_monitor_enabled":true,
+		"targets":[{"kind":"account_pool_group","id":"cyber"}]
+	}`)
+	if code != http.StatusCreated {
+		t.Fatalf("POST super user group = %d: %s", code, raw)
+	}
+	var created storage.UserGroup
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatal(err)
+	}
+	if !created.SuperInstructEnabled || len(created.SuperInstructSkillIDs) != 1 || created.SuperInstructSkillIDs[0] != "anti-debug" {
+		t.Fatalf("super instruct policy not round-tripped: %+v", created)
+	}
+	if !created.SuperInstructResponseRewriteEnabled || !created.SuperInstructMemoryEnabled || !created.SuperInstructMonitorEnabled {
+		t.Fatalf("super instruct response submodules not round-tripped: %+v", created)
+	}
+	if profile := created.SuperInstructProfiles[storage.ModelInstructionFamilyGPT]; !profile.Enabled || !profile.ResponseRewriteEnabled || len(profile.SkillIDs) != 1 || profile.SkillIDs[0] != "anti-debug" {
+		t.Fatalf("gpt super instruct profile not round-tripped: %+v", created.SuperInstructProfiles)
+	}
+	if profile := created.SuperInstructProfiles[storage.ModelInstructionFamilyClaude]; !profile.MonitorEnabled {
+		t.Fatalf("claude super instruct profile not round-tripped: %+v", created.SuperInstructProfiles)
+	}
+
+	code, raw = grpReq(t, h, http.MethodPost, "/admin/user-groups", `{
+		"name":"missing-super-skill",
+		"super_instruct_enabled":true,
+		"super_instruct_skill_ids":["missing"],
+		"targets":[{"kind":"account_pool_group","id":"cyber"}]
+	}`)
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("POST missing super skill = %d, want 422: %s", code, raw)
 	}
 }
 
@@ -137,5 +216,16 @@ func TestAdminUserGroupsRejectsIncompleteTrafficFallback(t *testing.T) {
 	}`)
 	if code != http.StatusUnprocessableEntity {
 		t.Fatalf("POST incomplete traffic fallback = %d, want 422: %s", code, raw)
+	}
+}
+
+func writeAPISuperSkill(t *testing.T, root, id, content string) {
+	t.Helper()
+	dir := filepath.Join(root, id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
