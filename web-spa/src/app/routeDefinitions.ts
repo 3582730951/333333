@@ -7,7 +7,6 @@ export const adminRoutes = [
   { path: '/providers', role: 'admin', navGroup: 'access', titleKey: 'nav.providers', descriptionKey: 'page.providers.desc', lazyLoader: () => import('../pages/Providers.jsx') },
   { path: '/models', role: 'admin', navGroup: 'access', titleKey: 'nav.models', descriptionKey: 'page.models.desc', lazyLoader: () => import('../pages/Models.tsx') },
   { path: '/public-chat', role: 'admin', navGroup: 'access', navHidden: true, titleKey: 'nav.public_chat', descriptionKey: 'page.public_chat.desc', lazyLoader: () => import('../pages/PublicChat.jsx') },
-  { path: '/super-instruct', role: 'admin', navGroup: 'access', navHidden: true, titleKey: 'nav.super_instruct', descriptionKey: 'page.super_instruct.desc', lazyLoader: () => import('../pages/SuperInstruct.jsx') },
   { path: '/egress', role: 'admin', navGroup: 'access', titleKey: 'nav.egress', descriptionKey: 'page.egress.desc', lazyLoader: () => import('../pages/Egress.jsx'), prefetch: 'idle' },
   { path: '/upstream-error-rules', role: 'admin', navGroup: 'access', titleKey: 'nav.upstream_error_rules', descriptionKey: 'page.upstream.desc', lazyLoader: () => import('../pages/UpstreamErrorRules.jsx') },
   { path: '/registration', role: 'admin', navGroup: 'automation', titleKey: 'nav.auto_register', descriptionKey: 'page.registration.desc', lazyLoader: () => import('../pages/Registration.tsx'), prefetch: 'idle' },
@@ -53,6 +52,7 @@ export const legacyRedirects = [
   { path: '/settings/models/antigravity', to: '/settings/ai/antigravity' },
   { path: '/settings/models/codex', to: '/settings/ai/codex' },
   { path: '/settings/models/claude-code', to: '/settings/ai/claude-code' },
+  { path: '/super-instruct', to: '/groups' },
 ] as const;
 
 export const settingsSections = [

@@ -3,7 +3,7 @@ import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router'
 import { useIsFetching } from '@tanstack/react-query';
 import * as PoolUI from './components/pool/index.jsx';
 import {
-  IconChevronDown, IconExit, IconFile, IconGlobe, IconHistogram, IconHome, IconKey, IconLanguage,
+  IconChevronDown, IconExit, IconGlobe, IconHistogram, IconHome, IconKey, IconLanguage,
   IconList, IconMoon, IconPulse, IconSetting, IconSun, IconUser, IconUserGroup,
 } from './components/pool/icons.jsx';
 import AppErrorBoundary, { isChunkLoadError, notifyChunkUpdateAvailable, reportClientError } from './components/AppErrorBoundary.jsx';
@@ -109,7 +109,6 @@ function adminNavigation() {
   const overview = adminRoutes.find((route) => route.path === '/');
   const items: any[] = overview ? [{ itemKey: '/', text: t(overview.titleKey), icon: <IconHome /> }] : [];
   items.push({ itemKey: '/public-chat', text: t('nav.public_chat'), icon: <IconGlobe /> });
-  items.push({ itemKey: '/super-instruct', text: t('nav.super_instruct'), icon: <IconFile /> });
   for (const group of ADMIN_GROUPS) {
     const Icon = group.icon;
     const children = adminRoutes

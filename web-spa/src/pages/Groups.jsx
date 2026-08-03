@@ -73,6 +73,20 @@ function blankSuperInstructProfiles() {
   }]));
 }
 
+function setSuperInstructProfilesEnabled(profiles, enabled) {
+  const source = profiles && typeof profiles === 'object' ? profiles : {};
+  return Object.fromEntries(INSTRUCTION_FAMILIES.map(({ key }) => {
+    const profile = source[key] || {};
+    return [key, {
+      enabled: Boolean(enabled),
+      skill_ids: uniqueStrings(profile.skill_ids),
+      response_rewrite_enabled: Boolean(enabled),
+      memory_enabled: Boolean(enabled),
+      monitor_enabled: Boolean(enabled),
+    }];
+  }));
+}
+
 function normalizedSuperInstructProfiles(row) {
   const configured = row?.super_instruct_profiles && typeof row.super_instruct_profiles === 'object'
     ? row.super_instruct_profiles
@@ -1084,6 +1098,19 @@ export default function Groups() {
     } catch (saveError) { showErrorToast(saveError); }
   });
 
+  const { run: toggleSuperInstruct, isRunning: isTogglingSuperInstruct } = useKeyedAsyncAction(async (id, row, enabled) => {
+    try {
+      const draft = userGroupDraft(row);
+      draft.super_instruct_profiles = setSuperInstructProfilesEnabled(draft.super_instruct_profiles, enabled);
+      const payload = normalizedUserGroupPayload(draft, data.providers);
+      await put(`/admin/user-groups/${encodeURIComponent(id)}`, payload);
+      Toast.success(`Super-Instruct 已${enabled ? '开启' : '关闭'}`);
+      void load();
+    } catch (saveError) {
+      showErrorToast(saveError);
+    }
+  });
+
   const { run: removeAccountGroup, running: removingAccountGroup, isRunning: isRemovingAccountGroup } = useKeyedAsyncAction(async (name) => {
     try {
       await del(`/admin/groups/${encodeURIComponent(name)}`);
@@ -1178,6 +1205,23 @@ export default function Groups() {
     },
     { title: '模型规则', dataIndex: 'model_routing', width: 110, render: (rules) => <Tag color={rules?.length ? 'green' : 'grey'}>{rules?.length || 0} 条</Tag> },
     {
+      title: 'Super-Instruct', key: 'super_instruct_toggle', width: 160,
+      render: (_, row) => {
+        const enabled = superInstructAnyEnabled(row);
+        const busy = savingUserGroup || removingUserGroup || isTogglingSuperInstruct(row.id);
+        return (
+          <label className="pool-inline-switch pool-user-group-super-switch" title="按用户分组开启或关闭 Super-Instruct 全套能力">
+            <Switch
+              checked={enabled}
+              disabled={busy}
+              onChange={(next) => toggleSuperInstruct(row.id, row, next)}
+            />
+            <span>{enabled ? '已开启' : '默认关闭'}</span>
+          </label>
+        );
+      },
+    },
+    {
       title: '策略', key: 'policy', width: 210,
       render: (_, row) => <TagList items={[
         row.system_prompt ? '系统提示词' : '',
@@ -1263,6 +1307,7 @@ export default function Groups() {
           </div>
         </TabPane>
         <TabPane key="user" tab="用户分组" itemKey="user">
+          <Banner type="info" title="Super-Instruct 按用户分组开关" description="列表中的 Super-Instruct 开关默认关闭；开启后为该用户分组启用 GPT/ChatGPT/Codex、Claude、Gemini 的指令文件系统、响应改写、Memory 和 Monitor。需要细分模型家族或技能时，使用“编辑完整策略”。" />
           <div className="pool-resource-split pool-group-resource-split">
             <ResourceTable error={userGroupsResource.error} onRetry={userGroupsResource.reload} loading={userGroupsResource.loading} lastRefresh={userGroupsResource.lastRefresh} dataSource={data.userGroups} columns={userColumns} rowKey="id" pagination={false} density="compact" layout="fit" scroll={false} rowHeight={68} emptyTitle="暂无用户分组" emptyDescription="创建后可混合选择账号池分组与模型提供商，并按模型设置优先层级。" skeletonRows={5} />
             {!userGroupsResource.error || userGroupsResource.lastRefresh ? <MetricRail items={userMetrics} /> : null}
