@@ -275,7 +275,7 @@ func isSupervisorRecoverCall(call *ast.CallExpr, allowPackageLocalSupervisorCall
 		return false
 	}
 	if pkg == "supervisor" || pkg == "" && allowPackageLocalSupervisorCalls {
-		return name == "Recover" || name == "RecoverWithLogf"
+		return name == "Recover" || name == "RecoverEvent" || name == "RecoverWithLogf" || name == "RecoverCallback"
 	}
 	return false
 }

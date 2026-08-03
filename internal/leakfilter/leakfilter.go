@@ -347,6 +347,7 @@ type ResponsesContextErrorKind string
 const (
 	ResponsesContextErrorNone                     ResponsesContextErrorKind = ""
 	ResponsesContextErrorOrphanedToolOutput       ResponsesContextErrorKind = "orphaned_tool_output"
+	ResponsesContextErrorEncryptedFunctionOutput  ResponsesContextErrorKind = "encrypted_function_output"
 	ResponsesContextErrorPreviousResponseNotFound ResponsesContextErrorKind = "previous_response_not_found"
 )
 
@@ -408,6 +409,16 @@ func ParseCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 	contextError := ResponsesContextErrorNone
 	if requestError == ResponsesRequestErrorNone {
 		contextError = DetectResponsesContextError(status, data)
+		if status == 0 {
+			// Some Codex SSE transports omit the redundant HTTP status from an
+			// event:error/response.failed body. Promote only the exact encrypted
+			// function-output signature; ordinary statusless client errors and the
+			// broader context classifiers must remain pass-through.
+			if detected := DetectResponsesContextError(http.StatusBadRequest, data); detected == ResponsesContextErrorEncryptedFunctionOutput {
+				status = http.StatusBadRequest
+				contextError = detected
+			}
+		}
 	}
 	statusRetryable := status == http.StatusUnauthorized || status == http.StatusForbidden ||
 		status == http.StatusRequestTimeout || status == http.StatusTooManyRequests ||
@@ -541,6 +552,9 @@ func responsesContextErrorInStructuredError(raw []byte, depth int, remaining *in
 		if isMissingPairedToolOutputMessage(message) {
 			return ResponsesContextErrorOrphanedToolOutput
 		}
+		if isEncryptedFunctionOutputMessage(message) {
+			return ResponsesContextErrorEncryptedFunctionOutput
+		}
 	}
 	if depth == 2 {
 		return ResponsesContextErrorNone
@@ -641,6 +655,12 @@ func isMissingPairedToolOutputMessage(message string) bool {
 		}
 	}
 	return false
+}
+
+func isEncryptedFunctionOutputMessage(message string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(message), " "))
+	return normalized == "encrypted function output content could not be decrypted or decoded." ||
+		normalized == "encrypted function output content could not be decrypted or decoded"
 }
 
 func IsRetryableCodexFailureFrame(frame []byte) bool {

@@ -181,6 +181,24 @@ func TestDiagnosticJobV3StableAliasesDLPAndRangeDownload(t *testing.T) {
 	}
 }
 
+func TestDiagnosticDLPAllowsPublicSupportRequestID(t *testing.T) {
+	for _, value := range []string{
+		"REQ-89C6735FD8ABC561",
+		"request_id=REQ-89C6735FD8ABC561",
+		"REQ-ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+	} {
+		if diagnosticContainsUnsafeRequestID(value) {
+			t.Fatalf("public or stable request ID was rejected: %q", value)
+		}
+	}
+	if !diagnosticContainsUnsafeRequestID("request_id=req_011CdWLhB6LpPonmxYYxwQdD") {
+		t.Fatal("upstream request ID bypassed DLP validation")
+	}
+	if diagnosticDLPMatch("request_id=REQ-89C6735FD8ABC561") {
+		t.Fatal("public support request ID triggered another DLP rule")
+	}
+}
+
 func TestLegacyDiagnosticExportReturnsAsyncLocationWithoutPrematureDownload(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
 	request, _ := http.NewRequest(http.MethodGet, h.pool.URL+"/admin/export/logs", nil)

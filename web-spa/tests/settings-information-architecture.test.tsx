@@ -1,7 +1,11 @@
 import React from 'react';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import { filterConfigCategories, SettingsCategorySection, SettingsDisclosure } from '../src/pages/SettingsV2';
+import {
+  changedRegistrarProviders, filterConfigCategories, registrarProviderPayload, SettingsCategorySection, SettingsDisclosure,
+} from '../src/pages/SettingsV2';
+import { formatSavedDiffValue } from '../src/components/SettingsTabShell.jsx';
+import { TabPane, Tabs } from '../src/components/pool/Tabs.jsx';
 import type { ConfigField } from '../src/features/settings/model/settings';
 
 function field(overrides: Partial<ConfigField>): ConfigField {
@@ -84,5 +88,39 @@ describe('settings information architecture', () => {
     expect(screen.queryByRole('textbox', { name: 'Worker API URL' })).not.toBeInTheDocument();
     fireEvent.click(trigger);
     expect(screen.getByRole('textbox', { name: 'Worker API URL' })).toHaveValue('https://mail.example.test');
+  });
+
+  it('submits only registrar providers whose form values changed', () => {
+    const baseline = registrarProviderPayload({});
+    const next = registrarProviderPayload({ smsactivate_enabled: true, smsactivate_api_key: 'new-key' });
+
+    expect(changedRegistrarProviders(next, baseline).map((provider) => `${provider.type}/${provider.key}`))
+      .toEqual(['sms/smsactivate']);
+  });
+
+  it('redacts flat and nested credentials from saved diffs', () => {
+    expect(formatSavedDiffValue('proxyPassword', 'top-secret')).toBe('"••••"');
+    const nested = formatSavedDiffValue('provider', { service: 'dr', auth_token: 'nested-secret' });
+    expect(nested).toContain('dr');
+    expect(nested).toContain('••••');
+    expect(nested).not.toContain('nested-secret');
+  });
+
+  it('preserves visited settings panels while switching tabs', () => {
+    function PersistentTabs() {
+      const [active, setActive] = React.useState('registrar');
+      return (
+        <Tabs keepMounted activeKey={active} onChange={setActive}>
+          <TabPane itemKey="registrar" tab="注册器"><input aria-label="代理 Host" defaultValue="old.proxy" /></TabPane>
+          <TabPane itemKey="logging" tab="日志"><div>日志内容</div></TabPane>
+        </Tabs>
+      );
+    }
+
+    render(<PersistentTabs />);
+    fireEvent.change(screen.getByRole('textbox', { name: '代理 Host' }), { target: { value: 'edited.proxy' } });
+    fireEvent.click(screen.getByRole('tab', { name: '日志' }));
+    fireEvent.click(screen.getByRole('tab', { name: '注册器' }));
+    expect(screen.getByRole('textbox', { name: '代理 Host' })).toHaveValue('edited.proxy');
   });
 });

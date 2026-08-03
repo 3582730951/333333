@@ -110,12 +110,10 @@ func TestRunSafeDiskCleanupCreatesGoalStorageHeadroomBeforeHardLimit(t *testing.
 		t.Fatal(err)
 	}
 	snap := DiskGuardSnapshot{GoalStorageTargetBytes: target, GoalStorageReserveBytes: reserve}
-	remaining := used
-	for i := 0; i < 8 && remaining > target; i++ {
-		s.runSafeDiskCleanup(ctx, &snap)
-		if err = store.DB().QueryRowContext(ctx, `SELECT COALESCE(SUM(storage_bytes),0) FROM goal_session`).Scan(&remaining); err != nil {
-			t.Fatal(err)
-		}
+	s.runSafeDiskCleanup(ctx, &snap)
+	var remaining int64
+	if err = store.DB().QueryRowContext(ctx, `SELECT COALESCE(SUM(storage_bytes),0) FROM goal_session`).Scan(&remaining); err != nil {
+		t.Fatal(err)
 	}
 	if snap.GoalBytesReclaimed <= 0 || remaining >= used {
 		t.Fatalf("cleanup reclaimed=%d storage before/after=%d/%d", snap.GoalBytesReclaimed, used, remaining)

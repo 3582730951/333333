@@ -19,6 +19,14 @@ export const settingsSaveResponseSchema = z.object({
   saved: z.array(settingsDiffSchema).optional(),
 }).passthrough().transform((value) => ({ ...value, saved: value.saved ?? [] }));
 
+const registrarProviderSaveResponseSchema = z.object({
+  saved: z.union([z.array(settingsDiffSchema), z.number().int().nonnegative()]).optional(),
+  registrar_saved: z.boolean().optional(),
+  settings_saved: z.array(settingsDiffSchema).optional(),
+  reload_ok: z.boolean().optional(),
+  warning: z.string().optional(),
+}).passthrough();
+
 const logRecordCountsSchema = z.object({
   audit_log: z.coerce.number().int().nonnegative(),
   cf_events: z.coerce.number().int().nonnegative(),
@@ -253,12 +261,16 @@ export async function fetchRegistrarSettings(signal?: AbortSignal): Promise<Regi
     ? parseApiResponse(providersResponseSchema, providersResult.value) as ProviderSetting[]
     : [];
   const metaKeys = new Set(['defaults', 'registrar_error', 'defaults_error']);
-  const cfg = Object.fromEntries(Object.entries(section).filter(([key]) => !metaKeys.has(key)));
+  const cfg = Object.fromEntries(Object.entries(section).filter(([key]) => !metaKeys.has(key) && !key.endsWith('_configured')));
+  for (const [key, value] of Object.entries(section)) {
+    if (key.endsWith('_configured')) cfg[key] = value;
+  }
   return {
     cfg,
-    smsProviders: providers.filter((provider) => provider.type === 'sms' && ['smsbower', 'herosms'].includes(provider.key)),
+    smsProviders: providers.filter((provider) => provider.type === 'sms'
+      && ['smsbower', 'herosms', 'smsactivate', 'smspool'].includes(provider.key)),
     mailboxProviders: providers.filter((provider) => provider.type === 'mailbox'
-      && ['tempmail', 'cloudflare', 'imap'].includes(provider.key)),
+      && ['tempmail', 'mailtm', 'mailgw', 'cloudflare', 'imap'].includes(provider.key)),
     captchaProviders: providers.filter((provider) => provider.type === 'captcha'
       && ['yescaptcha', '2captcha'].includes(provider.key)),
     emailProviders: providers.filter((provider) => provider.type === 'email'
@@ -313,7 +325,21 @@ export async function applySettingsTemplate(templateId: string): Promise<Setting
 }
 
 export async function saveRegistrarSettings(input: RegistrarSaveInput): Promise<SettingsSaveResponse> {
-  if (input.providers.length) await post('/admin/register/providers', { providers: input.providers });
+  if (!input.providers.length) {
+    return saveSettingsPatches([{ section: 'registrar', mode: 'replace', values: input.values }]);
+  }
+  const response = parseApiResponse(registrarProviderSaveResponseSchema, await post('/admin/register/providers', {
+    providers: input.providers,
+    registrar: input.values,
+    registrar_mode: 'replace',
+  }));
+  if (response.registrar_saved === true) {
+    return {
+      saved: response.settings_saved ?? (Array.isArray(response.saved) ? response.saved : []),
+      reloadOk: response.reload_ok,
+      warning: response.warning,
+    };
+  }
   return saveSettingsPatches([{ section: 'registrar', mode: 'replace', values: input.values }]);
 }
 

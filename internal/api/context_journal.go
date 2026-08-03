@@ -168,12 +168,13 @@ func degradedResponsesReplayForContextError(body []byte, contextError leakfilter
 	// succeeds (a paired call+output already in the input is left untouched).
 	if input, ok := root["input"].([]interface{}); ok {
 		fixed, n := neutralizeOrphanedToolOutputs(input)
-		if contextError == leakfilter.ResponsesContextErrorOrphanedToolOutput {
+		if contextError == leakfilter.ResponsesContextErrorOrphanedToolOutput ||
+			contextError == leakfilter.ResponsesContextErrorEncryptedFunctionOutput {
 			// The upstream explicitly rejected a tool output. Even if the current
 			// payload contains a superficially paired call, that pair was not valid in
 			// upstream context. Remove completed calls and preserve their results as
 			// user context so retrying cannot execute the tools a second time.
-			fixed, n = neutralizeCompletedToolExchanges(input)
+			fixed, n = neutralizeCompletedToolExchanges(input, contextError == leakfilter.ResponsesContextErrorEncryptedFunctionOutput)
 		}
 		if n > 0 {
 			root["input"] = fixed
@@ -187,10 +188,10 @@ func degradedResponsesReplayForContextError(body []byte, contextError leakfilter
 }
 
 // neutralizeCompletedToolExchanges is the stronger fallback used only after an exact
-// missing-tool-call response. Every client-managed tool output becomes user context,
-// and a matching call in the same input is removed with it. Calls without an output
-// remain untouched because they may still require execution.
-func neutralizeCompletedToolExchanges(input []interface{}) ([]interface{}, int) {
+// rejected-tool-output response. Every client-managed tool output becomes user
+// context, and a matching call in the same input is removed with it. Calls without an
+// output remain untouched because they may still require execution.
+func neutralizeCompletedToolExchanges(input []interface{}, discardEncryptedContent bool) ([]interface{}, int) {
 	completed := map[string]bool{}
 	for _, it := range input {
 		m, ok := it.(map[string]interface{})
@@ -223,6 +224,15 @@ func neutralizeCompletedToolExchanges(input []interface{}) ([]interface{}, int) 
 		}
 		outputKind := toolOutputPairKind(m)
 		if outputKind != "" && outputKind != "tool_search_server" {
+			if discardEncryptedContent {
+				clean := make(map[string]interface{}, len(m))
+				for key, value := range m {
+					if key != "encrypted_content" {
+						clean[key] = value
+					}
+				}
+				m = clean
+			}
 			out = append(out, orphanedToolOutputAsUserMessage(m))
 			converted++
 			continue
@@ -453,11 +463,30 @@ func responsesHasUnpairedToolOutput(body []byte, contextError leakfilter.Respons
 		return bodyHasClientToolResult(body)
 	}
 	input, _ := root["input"].([]interface{})
-	if contextError == leakfilter.ResponsesContextErrorOrphanedToolOutput {
+	if contextError == leakfilter.ResponsesContextErrorOrphanedToolOutput ||
+		contextError == leakfilter.ResponsesContextErrorEncryptedFunctionOutput {
 		return bodyHasClientToolResult(body)
 	}
 	_, unpaired := neutralizeOrphanedToolOutputs(input)
 	return unpaired > 0
+}
+
+func responsesHasEncryptedToolOutput(body []byte) bool {
+	root, err := decodeContextJSONMap(body)
+	if err != nil {
+		return false
+	}
+	input, _ := root["input"].([]interface{})
+	for _, raw := range input {
+		item, ok := raw.(map[string]interface{})
+		if !ok || toolOutputPairKind(item) == "" {
+			continue
+		}
+		if encrypted, present := item["encrypted_content"]; present && encrypted != nil && strings.TrimSpace(streamString(encrypted)) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeContextJSONMap(raw []byte) (map[string]interface{}, error) {

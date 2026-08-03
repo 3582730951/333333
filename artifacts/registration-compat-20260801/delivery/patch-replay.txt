@@ -1,6 +1,0 @@
-COMMANDS:
-  git apply --check --whitespace=nowarn registration-compat.patch
-  git apply --whitespace=nowarn registration-compat.patch
-current_tree_sha256=2cd5d217302cc286e7eec412df3042d8cd7a5942878399e0b12d36c5fd755692 files=91
-patched_tree_sha256=2cd5d217302cc286e7eec412df3042d8cd7a5942878399e0b12d36c5fd755692 files=91
-EXIT_STATUS: 0

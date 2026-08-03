@@ -123,7 +123,7 @@ func (s *Store) ListEmailAccounts(ctx context.Context, page, pageSize int, searc
 	}
 	defer rows.Close()
 
-	var out []EmailAccount
+	out := make([]EmailAccount, 0)
 	for rows.Next() {
 		var a EmailAccount
 		if err := rows.Scan(&a.ID, &a.Email, &a.Password, &a.ClientID, &a.RefreshToken,

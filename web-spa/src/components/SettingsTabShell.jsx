@@ -34,6 +34,38 @@ function SettingsErrorBanner({ title, section, errors }) {
   );
 }
 
+const SENSITIVE_DIFF_PART = /(?:^|_)(?:api_key|password|passwd|secret|token|authorization|credential|private_key|client_id|username|email|otp_url)(?:_|$)/;
+
+function isSensitiveDiffKey(key) {
+  const normalized = String(key || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_');
+  return SENSITIVE_DIFF_PART.test(normalized);
+}
+
+function redactDiffValue(value, key, depth = 0) {
+  if (isSensitiveDiffKey(key)) return value == null || value === '' ? '(未设置)' : '••••';
+  if (depth >= 4) return '[…]';
+  if (Array.isArray(value)) return value.map((item) => redactDiffValue(item, '', depth + 1));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([childKey, childValue]) => (
+      [childKey, redactDiffValue(childValue, childKey, depth + 1)]
+    )));
+  }
+  return value;
+}
+
+export function formatSavedDiffValue(key, value) {
+  try {
+    const encoded = JSON.stringify(redactDiffValue(value, key));
+    if (encoded === undefined) return 'null';
+    return encoded.length > 240 ? `${encoded.slice(0, 237)}…` : encoded;
+  } catch {
+    return '"[unavailable]"';
+  }
+}
+
 function SavedDiffPanel({ diffs, onUndo, undoLoading = false, onClose }) {
   if (!diffs || diffs.length === 0) return null;
   const actions = [
@@ -48,7 +80,7 @@ function SavedDiffPanel({ diffs, onUndo, undoLoading = false, onClose }) {
         <div style={{ maxHeight: 120, overflow: 'auto', fontSize: 12, fontFamily: 'monospace', lineHeight: 1.6 }}>
           {diffs.map((d, i) => (
             <div key={i}>
-              [{d.section}] <b>{d.key}</b>: {JSON.stringify(d.old_value)} → {JSON.stringify(d.new_value)}
+              [{d.section}] <b>{d.key}</b>: {formatSavedDiffValue(d.key, d.old_value)} → {formatSavedDiffValue(d.key, d.new_value)}
             </div>
           ))}
         </div>

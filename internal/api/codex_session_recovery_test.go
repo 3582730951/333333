@@ -316,3 +316,212 @@ func TestCodexSessionMappingRepairsStreamedPreviousResponseNotFound(t *testing.T
 		t.Fatalf("expected one fresh-root streamed repair, calls=%d payloads=%v", len(got), got)
 	}
 }
+
+func TestCodexSessionMappingRepairsEncryptedFunctionOutputBeforeCommit(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		stream bool
+	}{
+		{name: "http_400"},
+		{name: "early_sse", stream: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			type upstreamCall struct {
+				body, session, thread, turnState, auth string
+			}
+			var mu sync.Mutex
+			var calls []upstreamCall
+			h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				mu.Lock()
+				calls = append(calls, upstreamCall{
+					body: string(raw), session: r.Header.Get("Session-Id"), thread: r.Header.Get("Thread-Id"),
+					turnState: r.Header.Get("X-Codex-Turn-State"), auth: r.Header.Get("Authorization"),
+				})
+				call := len(calls)
+				mu.Unlock()
+
+				switch call {
+				case 1:
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("X-Codex-Turn-State", "encrypted-root-state")
+					_, _ = io.WriteString(w, `{"id":"resp-encrypted-root","object":"response","model":"gpt-5.6-sol","status":"completed","output":[{"type":"function_call","call_id":"call-encrypted","name":"read_file","arguments":"{}"}]}`)
+				case 2:
+					if test.stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "event: error\n"+
+							`data: {"type":"error","error":{"type":"invalid_request_error","message":"Encrypted function output content could not be decrypted or decoded."}}`+"\n\n")
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","message":"Encrypted function output content could not be decrypted or decoded."}}`)
+				case 3:
+					payload := string(raw)
+					invalid := strings.Contains(payload, "previous_response_id") ||
+						r.Header.Get("X-Codex-Turn-State") != "" ||
+						strings.Contains(payload, `"type":"function_call"`) ||
+						strings.Contains(payload, "function_call_output") ||
+						strings.Contains(payload, "encrypted_content") ||
+						strings.Contains(payload, "opaque-invalid") ||
+						!strings.Contains(payload, "start durable encrypted task") ||
+						!strings.Contains(payload, "preserve recovered result")
+					if invalid {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusBadRequest)
+						_, _ = io.WriteString(w, `{"error":{"message":"invalid encrypted-output recovery"}}`)
+						return
+					}
+					if test.stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "event: response.completed\n"+
+							`data: {"type":"response.completed","response":{"id":"resp-encrypted-recovered","object":"response","model":"gpt-5.6-sol","status":"completed","output":[]}}`+"\n\n"+
+							"data: [DONE]\n\n")
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"resp-encrypted-recovered","object":"response","model":"gpt-5.6-sol","status":"completed","output":[]}`)
+				default:
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			})
+			enableCodexSessionMappingForTest(h)
+			h.importAccount(t, "encrypted-recovery", "upstream-encrypted-recovery", "access-encrypted-recovery")
+
+			post := func(body, state string) (int, http.Header, string) {
+				t.Helper()
+				req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Thread-Id", "encrypted-recovery-root")
+				req.Header.Set("Session-Id", "encrypted-recovery-root")
+				if state != "" {
+					req.Header.Set("X-Codex-Turn-State", state)
+				}
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer resp.Body.Close()
+				payload, _ := io.ReadAll(resp.Body)
+				return resp.StatusCode, resp.Header.Clone(), string(payload)
+			}
+
+			if status, _, body := post(`{"model":"gpt-5.6-sol","input":[{"role":"user","content":"start durable encrypted task"}]}`, ""); status != http.StatusOK || !strings.Contains(body, "resp-encrypted-root") {
+				t.Fatalf("root status=%d body=%s", status, body)
+			}
+			streamField := ""
+			if test.stream {
+				streamField = `"stream":true,`
+			}
+			status, headers, body := post(`{"model":"gpt-5.6-sol",`+streamField+`"previous_response_id":"resp-encrypted-root","input":[{"type":"function_call_output","call_id":"call-encrypted","output":"preserve recovered result","encrypted_content":"opaque-invalid"}]}`, "encrypted-root-state")
+			if status != http.StatusOK || headers.Get("X-MiCliProxy-Context-Status") != "degraded" ||
+				!strings.Contains(body, "resp-encrypted-recovered") || strings.Contains(body, "Encrypted function output") {
+				t.Fatalf("encrypted recovery status=%d context=%q body=%s", status, headers.Get("X-MiCliProxy-Context-Status"), body)
+			}
+			mu.Lock()
+			got := append([]upstreamCall(nil), calls...)
+			mu.Unlock()
+			if len(got) != 3 || got[0].auth != got[1].auth || got[1].auth != got[2].auth ||
+				got[1].session == "" || got[1].session == got[2].session || got[2].session != got[2].thread {
+				t.Fatalf("expected one same-account fresh-epoch retry: %+v", got)
+			}
+		})
+	}
+}
+
+func TestCodexSessionMappingRetiresLateEncryptedFunctionOutputAndRepairsNextTurn(t *testing.T) {
+	type upstreamCall struct {
+		body, session string
+	}
+	var mu sync.Mutex
+	var calls []upstreamCall
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		calls = append(calls, upstreamCall{body: string(raw), session: r.Header.Get("Session-Id")})
+		call := len(calls)
+		mu.Unlock()
+		switch call {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Codex-Turn-State", "late-encrypted-state")
+			_, _ = io.WriteString(w, `{"id":"resp-late-encrypted-root","object":"response","model":"gpt-5.6-sol","status":"completed","output":[{"type":"function_call","call_id":"call-late-encrypted","name":"read_file","arguments":"{}"}]}`)
+		case 2:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: response.created\n"+
+				`data: {"type":"response.created","response":{"id":"resp-late-encrypted-root","object":"response","status":"in_progress"}}`+"\n\n"+
+				"event: response.output_text.delta\n"+
+				`data: {"type":"response.output_text.delta","delta":"visible partial"}`+"\n\n"+
+				"event: response.failed\n"+
+				`data: {"type":"response.failed","status":400,"response":{"id":"resp-late-encrypted-root","object":"response","status":"failed","error":{"type":"invalid_request_error","message":"Encrypted function output content could not be decrypted or decoded."}}}`+"\n\n"+
+				"data: [DONE]\n\n")
+		case 3:
+			payload := string(raw)
+			if strings.Contains(payload, "previous_response_id") || strings.Contains(payload, "function_call_output") ||
+				strings.Contains(payload, `"type":"function_call"`) ||
+				strings.Contains(payload, "encrypted_content") || strings.Contains(payload, "opaque-late-invalid") ||
+				!strings.Contains(payload, "late recovered result") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `{"error":{"message":"invalid late encrypted recovery"}}`)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: response.completed\n"+
+				`data: {"type":"response.completed","response":{"id":"resp-late-encrypted-recovered","object":"response","model":"gpt-5.6-sol","status":"completed","output":[]}}`+"\n\n"+
+				"data: [DONE]\n\n")
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	enableCodexSessionMappingForTest(h)
+	h.importAccount(t, "late-encrypted", "upstream-late-encrypted", "access-late-encrypted")
+
+	post := func(body, state string) (int, http.Header, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Thread-Id", "late-encrypted-root")
+		req.Header.Set("Session-Id", "late-encrypted-root")
+		if state != "" {
+			req.Header.Set("X-Codex-Turn-State", state)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		payload, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header.Clone(), string(payload)
+	}
+
+	if status, _, body := post(`{"model":"gpt-5.6-sol","input":[{"role":"user","content":"late encrypted root"}]}`, ""); status != http.StatusOK || !strings.Contains(body, "resp-late-encrypted-root") {
+		t.Fatalf("root status=%d body=%s", status, body)
+	}
+	failedRequest := `{"model":"gpt-5.6-sol","stream":true,"previous_response_id":"resp-late-encrypted-root","input":[{"type":"function_call_output","call_id":"call-late-encrypted","output":"late recovered result","encrypted_content":"opaque-late-invalid"}]}`
+	status, _, body := post(failedRequest, "late-encrypted-state")
+	if status != http.StatusOK || !strings.Contains(body, "visible partial") || !strings.Contains(body, "response.failed") || strings.Contains(body, "Encrypted function output") {
+		t.Fatalf("late failure status=%d body=%s", status, body)
+	}
+	namespace := codexNativeNamespaceForTest(t, "", "late-encrypted-root")
+	rows, err := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "response", Value: "resp-late-encrypted-root"})
+	if err != nil || len(rows) != 1 || rows[0].State != "retired" {
+		t.Fatalf("late encrypted epoch was not retired: rows=%+v err=%v", rows, err)
+	}
+	status, headers, body := post(failedRequest, "late-encrypted-state")
+	if status != http.StatusOK || headers.Get("X-MiCliProxy-Context-Status") != "degraded" || !strings.Contains(body, "resp-late-encrypted-recovered") {
+		t.Fatalf("next-turn recovery status=%d context=%q body=%s", status, headers.Get("X-MiCliProxy-Context-Status"), body)
+	}
+	mu.Lock()
+	got := append([]upstreamCall(nil), calls...)
+	mu.Unlock()
+	if len(got) != 3 || got[1].session == got[2].session {
+		t.Fatalf("late failure was replayed or epoch was reused: %+v", got)
+	}
+}

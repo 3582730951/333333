@@ -130,6 +130,9 @@ func schedulerWaitTerminal(ctx context.Context, _ string) bool {
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if state.closed {
+		return true
+	}
 	if !state.committed {
 		return false
 	}
@@ -151,6 +154,44 @@ func schedulerWaitTerminal(ctx context.Context, _ string) bool {
 	data, _ := json.Marshal(map[string]interface{}{"type": "error", "error": map[string]interface{}{"type": "api_error", "message": publicRetryMessage}})
 	if state.protocol == "openai" {
 		data, _ = json.Marshal(map[string]interface{}{"error": map[string]interface{}{"type": "server_error", "message": publicRetryMessage}})
+	}
+	_, _ = fmt.Fprintf(state.w, "event: error\ndata: %s\n\n", data)
+	if state.protocol == "openai" {
+		_, _ = state.w.Write([]byte("data: [DONE]\n\n"))
+	}
+	if f, ok := state.w.(http.Flusher); ok {
+		f.Flush()
+	}
+	state.closed = true
+	return true
+}
+
+// schedulerWaitContextLengthTerminal is the only pre-content typed failure that may
+// cross an already committed scheduler keepalive. Its caller supplies a locally
+// constructed context-limit message and metadata; arbitrary upstream errors must keep
+// using schedulerWaitTerminal so credentials and provider details cannot leak.
+func schedulerWaitContextLengthTerminal(ctx context.Context, message string, trailers map[string]string) bool {
+	state, _ := ctx.Value(schedulerWaitKey{}).(*schedulerWaitState)
+	if state == nil {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.closed {
+		return true
+	}
+	if !state.committed {
+		return false
+	}
+	for name, value := range trailers {
+		state.w.Header().Set(http.TrailerPrefix+name, value)
+	}
+	errorPayload := map[string]interface{}{
+		"type": "invalid_request_error", "code": "context_length_exceeded", "message": message,
+	}
+	data, _ := json.Marshal(map[string]interface{}{"type": "error", "error": errorPayload})
+	if state.protocol == "openai" {
+		data, _ = json.Marshal(map[string]interface{}{"error": errorPayload})
 	}
 	_, _ = fmt.Fprintf(state.w, "event: error\ndata: %s\n\n", data)
 	if state.protocol == "openai" {

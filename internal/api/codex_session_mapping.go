@@ -556,7 +556,20 @@ func (s *Server) recoverCodexSessionMapping(ctx context.Context, r *http.Request
 			mode = "rotated"
 		}
 	}
+	if contextError == leakfilter.ResponsesContextErrorEncryptedFunctionOutput {
+		// Even a lossless durable replay can contain the exact completed tool
+		// exchange whose encrypted payload the upstream rejected. Preserve its
+		// readable result as inert user context and remove the unusable ciphertext
+		// before installing the fresh CPA epoch.
+		retry.Raw = degradedResponsesReplayForContextError(retry.Raw, contextError)
+		retry.Header = stripCodexServerStateHeaders(retry.Header)
+		mode = "degraded"
+	}
 	if mode == "rebuilt" {
+		if responsesHasUnpairedToolOutput(retry.Raw, leakfilter.ResponsesContextErrorNone) {
+			return codexContextMigration{}, false, errCodexToolContextUnrecoverable
+		}
+	} else if contextError == leakfilter.ResponsesContextErrorEncryptedFunctionOutput {
 		if responsesHasUnpairedToolOutput(retry.Raw, leakfilter.ResponsesContextErrorNone) {
 			return codexContextMigration{}, false, errCodexToolContextUnrecoverable
 		}

@@ -65,6 +65,22 @@ type ContextLengthError struct {
 	EffectiveLimit int64
 	ContextMode    string
 	Compaction     bool
+	// NativeCompactionClient identifies the downstream client that owns the
+	// lossless conversation state. Empty and "claude_code" retain the Anthropic
+	// Messages contract; "codex" is assigned by the Responses-to-Kiro bridge so a
+	// mid-conversation Kiro rejection asks Codex—not Claude Code—to compact.
+	NativeCompactionClient string
+	// KiroSummaryFallbackAttempted is set only after a genuine Claude Code
+	// compaction request has already reached the bounded Kiro summary fallback.
+	// Ordinary turns deliberately leave this false so the native client gets the
+	// first opportunity to compact its own lossless conversation state.
+	KiroSummaryFallbackAttempted bool
+	KiroSummaryFallbackPasses    int
+	// UpstreamRejected distinguishes an observed Kiro rejection from the local
+	// planner proving that EstimatedInput exceeds EffectiveLimit. Kiro does not
+	// report its effective token boundary, so those values must not be presented
+	// as a mathematically false comparison.
+	UpstreamRejected bool
 }
 
 func (e *ContextLengthError) Error() string {
@@ -72,18 +88,47 @@ func (e *ContextLengthError) Error() string {
 	if requested == "" {
 		requested = e.KiroModel
 	}
-	// Claude Code recognizes this exact leading phrase and token-count grammar.
-	// Keeping the numbers before model versions is important: its parser extracts
-	// the first "N tokens > M" pair and uses the gap to remove old conversation
-	// groups before retrying compaction automatically.
-	detail := fmt.Sprintf("%s: %d tokens > %d; requested_model=%s kiro_model=%s", claudeCodePromptTooLongPrefix, e.EstimatedInput, e.EffectiveLimit, requested, e.KiroModel)
-	if e.Compaction {
-		return detail + "; Claude Code should automatically retry compaction with older conversation groups removed"
+	detail := ""
+	if e.UpstreamRejected && (e.EffectiveLimit <= 0 || e.EstimatedInput <= e.EffectiveLimit) {
+		// Keep Claude Code's automatic-compaction grammar, but compare against an
+		// explicitly labelled retry target derived from the observed rejection. A
+		// 20% reduction is deliberately conservative when Kiro's tokenizer/limit is
+		// unavailable and remains mathematically true.
+		retryTarget := e.SuggestedRetryLimit()
+		detail = fmt.Sprintf("%s: %d tokens > %d; retry_target=%d; configured_window=%d; upstream rejected the request without reporting its effective limit; requested_model=%s kiro_model=%s", claudeCodePromptTooLongPrefix, e.EstimatedInput, retryTarget, retryTarget, e.EffectiveLimit, requested, e.KiroModel)
+	} else {
+		// Claude Code recognizes this leading phrase and token-count grammar. Use
+		// the comparison only when the local planner has actually proved it true.
+		detail = fmt.Sprintf("%s: %d tokens > %d; requested_model=%s kiro_model=%s", claudeCodePromptTooLongPrefix, e.EstimatedInput, e.EffectiveLimit, requested, e.KiroModel)
 	}
-	return detail + "; Claude Code should automatically compact the conversation and retry"
+	nativeClient := "Claude Code"
+	if strings.EqualFold(strings.TrimSpace(e.NativeCompactionClient), "codex") {
+		nativeClient = "Codex"
+	}
+	if e.Compaction {
+		if e.KiroSummaryFallbackAttempted {
+			return detail + "; " + nativeClient + " native compaction ran first and the bounded Kiro summary fallback was exhausted"
+		}
+		return detail + "; " + nativeClient + " should automatically retry compaction with older conversation groups removed"
+	}
+	return detail + "; " + nativeClient + " should automatically compact the conversation and retry"
 }
 
 func (e *ContextLengthError) Unwrap() error { return ErrContextTooLong }
+
+func (e *ContextLengthError) SuggestedRetryLimit() int64 {
+	if !e.UpstreamRejected || (e.EffectiveLimit > 0 && e.EstimatedInput > e.EffectiveLimit) {
+		return e.EffectiveLimit
+	}
+	if e.EstimatedInput <= 1 {
+		return 0
+	}
+	target := (e.EstimatedInput * 4) / 5
+	if target >= e.EstimatedInput {
+		target = e.EstimatedInput - 1
+	}
+	return target
+}
 
 type Conversion struct {
 	Body                   []byte
@@ -95,19 +140,26 @@ type Conversion struct {
 	// InputTokens remains as a compatibility alias for callers that only need a
 	// local estimate (notably the MCP web-search bridge). It must never be reported
 	// as upstream metering.
-	InputTokens            int64
-	WebSearch              *WebSearchRequest
-	CompatibilityLosses    []string
-	ThinkingEnabled        bool
-	ThinkingEffort         string
-	MaxOutputTokens        int64
-	ContextWindow          int64
-	ContextMode            string
-	Compaction             bool
-	OriginalInputTokens    int64
-	HistoryMessagesDropped int
-	CachePointCount        int
-	CachePointBreakpoints  []KiroCachePointBreakpoint
+	InputTokens         int64
+	WebSearch           *WebSearchRequest
+	CompatibilityLosses []string
+	ThinkingEnabled     bool
+	ThinkingEffort      string
+	MaxOutputTokens     int64
+	ContextWindow       int64
+	ContextMode         string
+	Compaction          bool
+	// SummaryFallbackEligible is an API-layer control bit. Conversion itself never
+	// drops history or starts model calls; the API sets this only for the first
+	// genuine Claude Code compaction attempt and clears it before the bounded Kiro
+	// summary replay.
+	SummaryFallbackEligible  bool
+	SummaryFallbackAttempted bool
+	SummaryFallbackPasses    int
+	OriginalInputTokens      int64
+	HistoryMessagesDropped   int
+	CachePointCount          int
+	CachePointBreakpoints    []KiroCachePointBreakpoint
 }
 
 type KiroCachePointBreakpoint struct {
@@ -244,7 +296,13 @@ func IsClaudeCodeCompactionRequest(raw []byte) bool {
 	if !hasSystemMarker && !(hasInstructionMarker && hasReminderMarker) {
 		return false
 	}
-	var req anthropicRequest
+	// Decode only the fields used for recognition. In particular, do not retain a
+	// potentially very large tool catalogue merely to decide whether this is the
+	// client's dedicated summarizer call.
+	var req struct {
+		System   json.RawMessage    `json:"system"`
+		Messages []anthropicMessage `json:"messages"`
+	}
 	if decodeUseNumber(raw, &req) != nil {
 		return false
 	}

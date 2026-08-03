@@ -979,10 +979,13 @@ func TestSettingsCenterRegistrarReplaceDeletesOmittedAndBlankKeys(t *testing.T) 
 		t.Fatalf("registrar replace status = %d: %s", status, body)
 	}
 	cfg := nodeRegistrarConfig(t, h)
-	for _, deleted := range []string{"heroSmsApiKey", "proxyHost", "custom"} {
+	for _, deleted := range []string{"proxyHost", "custom"} {
 		if _, ok := cfg[deleted]; ok {
 			t.Fatalf("registrar replace did not delete %s: %#v", deleted, cfg)
 		}
+	}
+	if cfg["heroSmsApiKey"] != "old-key" {
+		t.Fatalf("registrar replace did not preserve blank write-only credential: %#v", cfg)
 	}
 	if cfg["proxyPort"] != float64(3010) {
 		t.Fatalf("proxyPort = %#v, want 3010", cfg["proxyPort"])

@@ -1,8 +1,0 @@
-{
-  "listen_addr": "127.0.0.1:19081",
-  "database_path": "/tmp/codex-pool-diagnostic-smoke/pool.sqlite3",
-  "data_dir": "/tmp/codex-pool-diagnostic-smoke/data",
-  "admin_token": "diagnostic-smoke-token",
-  "identity_secret": "diagnostic-smoke-identity",
-  "model_probe_interval_hours": 0
-}

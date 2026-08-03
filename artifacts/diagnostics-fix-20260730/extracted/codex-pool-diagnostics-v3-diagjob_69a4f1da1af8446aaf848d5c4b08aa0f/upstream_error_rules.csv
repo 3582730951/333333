@@ -1,1 +1,0 @@
-id,name,enabled,priority,providers,entrypoints,model_patterns,status_codes,body_keywords,match_mode,account_action,downstream_action,response_status,custom_message,cooldown_seconds,prefer_retry_after,idle_seconds,idle_ping_seconds,skip_log,description,created_at,updated_at

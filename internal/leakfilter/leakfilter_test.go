@@ -323,6 +323,34 @@ func TestRetryableCodexFailureFrameAcceptsOrphanedToolOutputStatus(t *testing.T)
 	}
 }
 
+func TestRetryableCodexFailureFrameAcceptsEncryptedFunctionOutputStatus(t *testing.T) {
+	frame := []byte("event: error\n" +
+		`data: {"type":"error","error":{"type":"invalid_request_error","message":"Encrypted function output content could not be decrypted or decoded."},"status":400}` + "\n\n")
+	failure, ok := ParseRetryableCodexFailureFrame(frame)
+	if !ok || failure.StatusCode != http.StatusBadRequest || failure.ContextError != ResponsesContextErrorEncryptedFunctionOutput {
+		t.Fatalf("encrypted function output failure = %+v ok=%v", failure, ok)
+	}
+}
+
+func TestRetryableCodexFailureFrameAcceptsStatuslessEncryptedFunctionOutput(t *testing.T) {
+	for _, frame := range [][]byte{
+		[]byte("event: error\n" +
+			`data: {"type":"error","error":{"type":"invalid_request_error","message":"Encrypted function output content could not be decrypted or decoded."}}` + "\n\n"),
+		[]byte("event: response.failed\n" +
+			`data: {"type":"response.failed","response":{"status":"failed","error":{"type":"invalid_request_error","message":"Encrypted function output content could not be decrypted or decoded."}}}` + "\n\n"),
+	} {
+		failure, ok := ParseRetryableCodexFailureFrame(frame)
+		if !ok || failure.StatusCode != http.StatusBadRequest || failure.ContextError != ResponsesContextErrorEncryptedFunctionOutput {
+			t.Fatalf("statusless encrypted function output failure = %+v ok=%v frame=%s", failure, ok, frame)
+		}
+	}
+	nearMatch := []byte("event: error\n" +
+		`data: {"type":"error","error":{"type":"invalid_request_error","message":"Encrypted function output content could not be decrypted or decoded while parsing."}}` + "\n\n")
+	if failure, ok := ParseCodexFailureFrame(nearMatch); !ok || failure.StatusCode != 0 || failure.ContextError != ResponsesContextErrorNone || failure.BuiltinRetryable {
+		t.Fatalf("statusless near-match was promoted: %+v ok=%v", failure, ok)
+	}
+}
+
 func TestRetryableCodexFailureFrameAcceptsWrappedOrphanStatusAndStatusCode(t *testing.T) {
 	inner := `{"error":{"type":"invalid_request_error","message":"No tool call found for function call output with call_id call_wrapped."}}`
 	for _, tc := range []struct {
@@ -429,6 +457,35 @@ func TestOrphanedToolOutputErrorRecognizesObservedProxyWrapper(t *testing.T) {
 	body := []byte(`{"error":{"message":"{\n\"type\": \"error\",\n\"error\": {\n\"type\": \"invalid_request_error\",\n\"message\": \"No tool call found for custom tool call output with call_id call_LhyrFDALDxT1GOWETYWfgfRz.\",\n\"param\": \"input\"\n},\n\"status\": 400\n}"},"status":400,"type":"error"}`)
 	if !IsOrphanedToolCallOutputError(http.StatusBadRequest, body) {
 		t.Fatalf("observed nested proxy error was not recognized: %s", body)
+	}
+}
+
+func TestEncryptedFunctionOutputErrorRecognizesOnlyExactStructuredMessage(t *testing.T) {
+	direct := []byte(`{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"Encrypted function output content could not be decrypted or decoded."}}`)
+	if got := DetectResponsesContextError(http.StatusBadRequest, direct); got != ResponsesContextErrorEncryptedFunctionOutput {
+		t.Fatalf("encrypted function output error kind = %q", got)
+	}
+
+	inner, _ := json.Marshal(map[string]interface{}{
+		"error": map[string]interface{}{"message": "Encrypted function output content could not be decrypted or decoded."},
+	})
+	wrapped, _ := json.Marshal(map[string]interface{}{
+		"error": map[string]interface{}{"message": string(inner)},
+	})
+	if got := DetectResponsesContextError(http.StatusBadRequest, wrapped); got != ResponsesContextErrorEncryptedFunctionOutput {
+		t.Fatalf("wrapped encrypted function output error kind = %q", got)
+	}
+
+	for _, body := range [][]byte{
+		[]byte(`{"error":{"message":"Encrypted reasoning content could not be decrypted or decoded."}}`),
+		[]byte(`{"error":{"message":"Encrypted function output content could not be decrypted or decoded while parsing."}}`),
+	} {
+		if got := DetectResponsesContextError(http.StatusBadRequest, body); got != ResponsesContextErrorNone {
+			t.Fatalf("near-match error was classified as %q: %s", got, body)
+		}
+	}
+	if got := DetectResponsesContextError(http.StatusServiceUnavailable, direct); got != ResponsesContextErrorNone {
+		t.Fatalf("non-400 encrypted function output error was classified as %q", got)
 	}
 }
 

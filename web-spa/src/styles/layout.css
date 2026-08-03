@@ -522,14 +522,16 @@
 
 .pool-settings-shell > .pool-toolbar:first-child {
   position: sticky;
-  top: 66px;
+  top: 68px;
   z-index: 20;
-  padding: 8px 0;
-  border: 0;
-  border-bottom: 1px solid var(--pool-border);
-  border-radius: 0;
-  background: var(--pool-bg-elevated);
-  box-shadow: none;
+  margin-bottom: 14px;
+  padding: 10px;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-material-strong);
+  box-shadow: var(--pool-shadow-panel);
+  backdrop-filter: var(--pool-material-blur);
+  -webkit-backdrop-filter: var(--pool-material-blur);
 }
 
 .pool-instruction-files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 16px; }
@@ -547,7 +549,12 @@
   .pool-boot-shell { grid-template-columns: 1fr; }
   .pool-boot-sidebar { display: none; }
   .pool-boot-main > .pool-route-fallback { padding: 18px 12px; }
-  .pool-settings-shell > .pool-toolbar:first-child { top: 58px; }
+  .pool-settings-shell > .pool-toolbar:first-child {
+    top: 60px;
+    margin-bottom: 12px;
+    padding: 8px;
+    border-radius: 14px;
+  }
 }
 
 @media (max-width: 640px) {

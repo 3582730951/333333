@@ -212,6 +212,11 @@ func (s *Server) adminCodexReauthOAuthStart(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	authURL, err := desc.buildAuthorizeURLWithOptions(challenge, state, oauthAuthorizeOptions{AllowedWorkspaceID: targetWorkspaceID})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("invalid OAuth provider configuration: %w", err))
+		return
+	}
 	sid, err := randomToken(18)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -222,7 +227,7 @@ func (s *Server) adminCodexReauthOAuthStart(w http.ResponseWriter, r *http.Reque
 		"session_id":          sid,
 		"provider":            desc.provider,
 		"target_workspace_id": targetWorkspaceID,
-		"auth_url":            desc.authorizeURLWithOptions(challenge, state, oauthAuthorizeOptions{AllowedWorkspaceID: targetWorkspaceID}),
+		"auth_url":            authURL,
 		"expires_in":          int(s.oauth.ttl.Seconds()),
 	})
 }

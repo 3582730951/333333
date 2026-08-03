@@ -77,7 +77,10 @@ func ModuleFailedWithUptime(name string, err error, uptime time.Duration) {
 	}
 	event := Event{
 		Type:         "failed",
+		Severity:     "error",
 		Module:       normalizeOptions(Options{Name: name}).Name,
+		Operation:    "module_run",
+		ErrorClass:   errorClass(err),
 		Message:      message,
 		UptimeMillis: uptime.Milliseconds(),
 	}

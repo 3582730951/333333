@@ -15,6 +15,14 @@ function getInitialValues(initValues) {
   return initValues && typeof initValues === 'object' ? { ...initValues } : {};
 }
 
+function initialValuesKey(initValues) {
+  try {
+    return JSON.stringify(initValues && typeof initValues === 'object' ? initValues : {});
+  } catch {
+    return null;
+  }
+}
+
 function validateField(value, rules = []) {
   for (const rule of rules) {
     if (rule?.required && (value === undefined || value === null || value === '')) {
@@ -66,6 +74,7 @@ function useField(field, rules, externalValue, externalOnChange, initValue) {
     if (externalOnChange) externalOnChange(next);
     if (form && field) {
       form.setValues((current) => ({ ...current, [field]: next }));
+      form.notifyValueChange?.(field, next);
       if (form.errors[field]) {
         const message = validateField(next, rules);
         form.setErrors((current) => ({ ...current, [field]: message }));
@@ -179,6 +188,185 @@ function normalizeOptions(optionList = []) {
     if (item && typeof item === 'object') return item;
     return { label: String(item), value: item };
   });
+}
+
+function SearchableSingleSelect({ controlId, options, current, setCurrent, placeholder, className, style, emptyContent, disabled, ariaLabel }) {
+  const [query, setQuery] = useState('');
+  const [open, setOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const searchRef = useRef(null);
+  const optionRefs = useRef(new Map());
+  const currentKey = current === undefined || current === null ? '' : String(current);
+  const valueMap = new Map(options.map((option) => [String(option.value), option.value]));
+  const labelMap = new Map(options.map((option) => [String(option.value), option.label]));
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const filteredOptions = normalizedQuery
+    ? options.filter((option) => `${String(option.label ?? '')} ${String(option.value ?? '')}`.toLocaleLowerCase().includes(normalizedQuery))
+    : options;
+  const enabledIndices = filteredOptions.reduce((indices, option, index) => {
+    if (!option.disabled) indices.push(index);
+    return indices;
+  }, []);
+  const enabledIndexKey = enabledIndices.join(',');
+  const listboxId = `${controlId}-listbox`;
+  const activeOptionId = filteredOptions[activeIndex] ? `${controlId}-option-${activeIndex}` : undefined;
+  const hasDisplayedValue = currentKey !== '' || (!placeholder && labelMap.has(currentKey));
+
+  useEffect(() => {
+    setActiveIndex(enabledIndices.length ? enabledIndices[0] : 0);
+  }, [filteredOptions.length, normalizedQuery, enabledIndexKey]);
+
+  useEffect(() => {
+    if (!open || !filteredOptions[activeIndex]) return;
+    optionRefs.current.get(String(filteredOptions[activeIndex].value))?.scrollIntoView?.({ block: 'nearest' });
+  }, [activeIndex, filteredOptions, open]);
+
+  const resetActiveOption = (fromEnd = false) => {
+    const selectedIndex = filteredOptions.findIndex((option) => !option.disabled && String(option.value) === currentKey);
+    if (selectedIndex >= 0) {
+      setActiveIndex(selectedIndex);
+      return;
+    }
+    if (enabledIndices.length) setActiveIndex(fromEnd ? enabledIndices[enabledIndices.length - 1] : enabledIndices[0]);
+  };
+
+  const closeOptions = () => {
+    setOpen(false);
+    setQuery('');
+    setActiveIndex(0);
+  };
+
+  const selectOption = (option) => {
+    if (!option || option.disabled || disabled) return;
+    const key = String(option.value);
+    setCurrent(valueMap.has(key) ? valueMap.get(key) : option.value);
+    closeOptions();
+  };
+
+  const handleOptionKeys = (event) => {
+    if (event.key === 'Escape') {
+      closeOptions();
+      return;
+    }
+    if (!enabledIndices.length) return;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      const delta = event.key === 'ArrowDown' ? 1 : -1;
+      setActiveIndex((index) => {
+        const position = enabledIndices.indexOf(index);
+        const currentPosition = position < 0 ? (delta > 0 ? -1 : 0) : position;
+        return enabledIndices[(currentPosition + delta + enabledIndices.length) % enabledIndices.length];
+      });
+      return;
+    }
+    if (event.key === 'Home' || event.key === 'End') {
+      event.preventDefault();
+      setActiveIndex(event.key === 'Home' ? enabledIndices[0] : enabledIndices[enabledIndices.length - 1]);
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      selectOption(filteredOptions[activeIndex]);
+    }
+  };
+
+  return (
+    <PopoverPrimitive.Root open={open} onOpenChange={(nextOpen) => {
+      if (disabled) return;
+      if (nextOpen) {
+        setOpen(true);
+        resetActiveOption();
+      } else closeOptions();
+    }}>
+      <PopoverPrimitive.Trigger asChild>
+        <button
+          type="button"
+          id={controlId}
+          className={cx('pool-multi-select pool-single-select', className)}
+          style={style}
+          role="combobox"
+          aria-haspopup="listbox"
+          aria-expanded={open}
+          aria-controls={listboxId}
+          aria-activedescendant={open ? activeOptionId : undefined}
+          aria-disabled={disabled || undefined}
+          aria-label={ariaLabel || placeholder || '选项'}
+          disabled={disabled}
+          onKeyDown={(event) => {
+            if (disabled) return;
+            if (event.key === 'Enter' || event.key === ' ' || event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+              event.preventDefault();
+              resetActiveOption(event.key === 'ArrowUp');
+              setOpen(true);
+            }
+          }}
+        >
+          <span className={cx('pool-single-select__value', hasDisplayedValue ? '' : 'pool-multi-select__placeholder')}>
+            {hasDisplayedValue ? labelMap.get(currentKey) ?? currentKey : placeholder || '请选择'}
+          </span>
+          <span className="pool-multi-select__chevron" aria-hidden="true">⌄</span>
+        </button>
+      </PopoverPrimitive.Trigger>
+      <PopoverPrimitive.Content
+        className="pool-multi-select__content"
+        align="start"
+        sideOffset={4}
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          requestBrowserAnimationFrame(() => searchRef.current?.focus());
+        }}
+      >
+        <input
+          ref={searchRef}
+          className="pool-input pool-multi-select__search"
+          type="search"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={handleOptionKeys}
+          role="combobox"
+          aria-label={placeholder || `${ariaLabel || '选项'}搜索`}
+          aria-autocomplete="list"
+          aria-expanded={open}
+          aria-controls={listboxId}
+          aria-activedescendant={activeOptionId}
+          autoComplete="off"
+          spellCheck={false}
+          placeholder={placeholder || '搜索...'}
+        />
+        <div
+          id={listboxId}
+          className="pool-multi-select__options"
+          role="listbox"
+        >
+          {filteredOptions.length ? filteredOptions.map((option, index) => {
+            const key = String(option.value);
+            const selected = key === currentKey;
+            return (
+              <button
+                type="button"
+                key={option.key || key}
+                id={`${controlId}-option-${index}`}
+                ref={(node) => {
+                  if (node) optionRefs.current.set(key, node);
+                  else optionRefs.current.delete(key);
+                }}
+                className={cx('pool-multi-select__option', selected ? 'is-selected' : '', index === activeIndex ? 'is-active' : '')}
+                role="option"
+                aria-selected={selected}
+                tabIndex={-1}
+                disabled={option.disabled}
+                onPointerMove={() => { if (!option.disabled) setActiveIndex(index); }}
+                onClick={() => selectOption(option)}
+              >
+                <span className="pool-single-select__option-label">{option.label}</span>
+                <span className="pool-multi-select__check" aria-hidden="true">{selected ? '✓' : ''}</span>
+              </button>
+            );
+          }) : <div className="pool-multi-select__empty" role="status">{emptyContent || '暂无选项'}</div>}
+        </div>
+      </PopoverPrimitive.Content>
+    </PopoverPrimitive.Root>
+  );
 }
 
 function MultiSelectControl({ controlId, options, current, setCurrent, placeholder, className, style, filter, emptyContent, maxTagCount, disabled, ariaLabel }) {
@@ -387,6 +575,24 @@ export function SelectInput({ field, label, help, rules, value, onChange, option
     if (!field && !label) return control;
     return <FieldShell field={field} label={label} help={help} rules={rules} controlId={controlId}>{control}</FieldShell>;
   }
+  if (filter) {
+    const control = (
+      <SearchableSingleSelect
+        controlId={controlId}
+        options={options}
+        current={current}
+        setCurrent={setCurrent}
+        placeholder={placeholder}
+        className={className}
+        style={style}
+        emptyContent={emptyContent}
+        disabled={props.disabled}
+        ariaLabel={props['aria-label'] || label}
+      />
+    );
+    if (!field && !label) return control;
+    return <FieldShell field={field} label={label} help={help} rules={rules} controlId={controlId}>{control}</FieldShell>;
+  }
   const valueMap = new Map(options.map((option) => [String(option.value), option.value]));
   const select = (
     <select
@@ -426,7 +632,10 @@ export function Toggle({ field, label, help, value, checked, onChange, disabled,
   const current = checked !== undefined ? checked : value !== undefined ? value : !!form?.values?.[field];
   const setCurrent = (next) => {
     onChange?.(next);
-    if (form && field) form.setValues((values) => ({ ...values, [field]: next }));
+    if (form && field) {
+      form.setValues((values) => ({ ...values, [field]: next }));
+      form.notifyValueChange?.(field, next);
+    }
   };
   const control = (
     <SwitchPrimitive.Root
@@ -448,6 +657,7 @@ export function Form({
   children,
   initValues,
   onSubmit,
+  onValueChange,
   getFormApi,
   labelPosition = 'top',
   labelWidth,
@@ -458,11 +668,12 @@ export function Form({
   const [values, setValues] = useState(() => getInitialValues(initValues));
   const [errors, setErrors] = useState({});
   const fieldsRef = useRef(new Map());
+  const initKey = initialValuesKey(initValues);
 
   useEffect(() => {
     setValues(getInitialValues(initValues));
     setErrors({});
-  }, [initValues]);
+  }, [initKey]);
 
   const api = useMemo(() => ({
     getValues: () => ({ ...values }),
@@ -515,13 +726,17 @@ export function Form({
   const context = useMemo(() => ({
     values,
     setValues,
+    notifyValueChange: (field, value) => onValueChange?.(
+      { ...values, [field]: value },
+      { [field]: value },
+    ),
     errors,
     setErrors,
     labelPosition,
     register: (field, rules) => {
       if (field) fieldsRef.current.set(field, rules || []);
     },
-  }), [errors, labelPosition, values]);
+  }), [errors, labelPosition, onValueChange, values]);
 
   const registerFields = (node) => {
     React.Children.forEach(node, (child) => {

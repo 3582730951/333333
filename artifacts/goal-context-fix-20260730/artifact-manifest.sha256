@@ -1,6 +1,0 @@
-40877c9b567cff91245c8d79f2807c63be208493792f8643dbfa3bf2b62b1419  artifacts/goal-context-fix-20260730/baseline/original.tar.gz
-7ef47d841c800706f7eec6909a3219fac908f96faceb594392c68eed69043b56  artifacts/goal-context-fix-20260730/modified/workspace-source.tar.gz
-049050ae0f4d4f2b2b687b68146b41cc47f51f0b25aa6f90f190b1cd93daa70d  artifacts/goal-context-fix-20260730/patch/goal-context-fix.patch
-56c1d1698db2d1a667a00a31583409f3697fa7ac46dde658a543cf6e2f5e3b1f  artifacts/goal-context-fix-20260730/setup-pool-codex.sh
-ed93b6179b605ab5a4af828e63f77342326100a7a5a1e373c996a97892be6f6a  artifacts/goal-context-fix-20260730/verification.md
-12293afe40558e488ac8f0c41738a1034c0318dfe6a7e352a7daec687594e4be  artifacts/goal-context-fix-20260730/rollback.sh

@@ -75,6 +75,7 @@ export default function EmailPool() {
   const accounts = data.accounts || [];
   const total = data.total || 0;
   const counts = data.counts || {};
+  const hasLoadedData = Boolean(lastRefresh);
 
   const { run: doImport, running: importing } = useAsyncAction(async () => {
     try {
@@ -226,6 +227,7 @@ export default function EmailPool() {
     <MobileResourceCell
       selectable
       selected={meta.selected}
+      selectLabel={`${t('email_pool.email')}: ${account.email}`}
       onSelect={() => meta.toggleSelected(!meta.selected)}
       title={(
         <TextClamp
@@ -313,7 +315,7 @@ export default function EmailPool() {
           ) : null}
         </div>
       )}
-      summary={<MetricRail items={metrics} className="pool-email-metrics" />}
+      summary={hasLoadedData ? <MetricRail items={metrics} className="pool-email-metrics" /> : null}
     >
       <ResourceTable
         error={loadError}
@@ -333,6 +335,9 @@ export default function EmailPool() {
         rowSelection={{
           selectedRowKeys: selected,
           onChange: (keys: string[]) => setSelectedIds(new Set(keys)),
+          getCheckboxProps: (account: EmailAccount) => ({
+            'aria-label': `${t('email_pool.email')}: ${account.email}`,
+          }),
         }}
         minScrollX={1156}
         safeActionWidth={156}

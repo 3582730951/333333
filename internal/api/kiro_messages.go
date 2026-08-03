@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/bodysource"
@@ -32,11 +33,85 @@ import (
 
 func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, raw []byte, model string, affinity routing.AffinityKey, lease scheduler.Lease, _ bool, _ map[string]bool) attemptOutcome {
 	defer lease.Release()
-	converted, err := s.convertKiroRequest(r.Context(), raw, affinity, lease)
-	if err != nil {
-		writeKiroError(w, r, http.StatusBadRequest, err)
-		return outcomeDone
+	// Request bodies are immutable after capture. Keep the original slice for goal
+	// continuity without duplicating multi-hundred-thousand-token compaction bodies;
+	// fallback replaces the local raw variable with a newly allocated reduce body.
+	originalRaw := raw
+	streamRequest := isStreamRequest(originalRaw)
+	nativeCompaction := kirowire.IsClaudeCodeCompactionRequest(originalRaw)
+	if nativeCompaction {
+		w.Header().Set("X-MiCliProxy-Compaction-Order", "claude_code_native,kiro_summary")
 	}
+
+	// A local context proof can start the Kiro map/reduce before the ordinary Kiro
+	// request is opened. Start the heartbeat early for a genuine streaming Claude
+	// Code compaction so those internal stages do not create a new idle window.
+	stopKeepaliveRun := func() {}
+	keepaliveActive := false
+	trailersDeclared := false
+	startKeepalive := func() {
+		if keepaliveActive || !streamRequest {
+			return
+		}
+		if !trailersDeclared {
+			declareKiroTrailers(w)
+			trailersDeclared = true
+		}
+		stopKeepaliveRun = startSchedulerWaitKeepalive(r.Context(), s.streamKeepAliveInterval(r.Context()))
+		keepaliveActive = true
+	}
+	stopKeepalive := func() {
+		if !keepaliveActive {
+			return
+		}
+		stopKeepaliveRun()
+		stopKeepaliveRun = func() {}
+		keepaliveActive = false
+	}
+	if nativeCompaction {
+		startKeepalive()
+	}
+	defer func() { stopKeepalive() }()
+
+	converted, err := s.convertKiroRequest(r.Context(), raw, affinity, lease)
+	fallbackPasses := 0
+	applySummaryFallback := func(contextErr *kirowire.ContextLengthError) error {
+		recoveredRaw, recovered, stages, fallbackErr := s.prepareKiroSummaryFallback(r, originalRaw, affinity, lease, contextErr)
+		if fallbackErr != nil {
+			fallbackPasses = stages
+			recordKiroSummaryFallbackFailure(r, stages, fallbackErr)
+			return fallbackErr
+		}
+		raw = recoveredRaw
+		converted = recovered
+		fallbackPasses = stages
+		// Header maps must not be mutated concurrently with a heartbeat write.
+		// Pause synchronously, publish both ordinary headers and declared trailers,
+		// then let the caller restart the heartbeat for the final Kiro request.
+		stopKeepalive()
+		observeKiroSummaryFallbackMetadata(w, stages, streamRequest)
+		return nil
+	}
+	if err != nil {
+		var contextErr *kirowire.ContextLengthError
+		if nativeCompaction && errors.As(err, &contextErr) {
+			if fallbackErr := applySummaryFallback(contextErr); fallbackErr == nil {
+				err = nil
+			} else {
+				stopKeepalive()
+				writeKiroError(w, r, http.StatusBadRequest, annotateKiroSummaryFallbackFailure(contextErr, fallbackPasses))
+				return outcomeDone
+			}
+		} else {
+			stopKeepalive()
+			writeKiroError(w, r, http.StatusBadRequest, err)
+			return outcomeDone
+		}
+	}
+	converted.SummaryFallbackEligible = converted.Compaction && fallbackPasses == 0
+	converted.SummaryFallbackAttempted = fallbackPasses > 0
+	converted.SummaryFallbackPasses = fallbackPasses
+	stopKeepalive()
 	setKiroQualityHeaders(w, converted)
 	resolvedModel := firstNonEmpty(converted.Model, lease.ResolvedModel, model)
 	// A streaming Kiro attempt has a silent pre-first-token window (cache-singleflight
@@ -47,18 +122,17 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 	// then bridge the window with SSE keepalive comments. stopKeepalive is synchronous, so
 	// no comment can trail the first real emitted frame. WebSearch buffers internally and
 	// takes its own branch, so it is left untouched.
-	stopKeepalive := func() {}
-	if converted.WebSearch == nil && isStreamRequest(raw) {
-		declareKiroTrailers(w)
-		stopKeepalive = startSchedulerWaitKeepalive(r.Context(), s.streamKeepAliveInterval(r.Context()))
+	if converted.WebSearch == nil && streamRequest {
+		startKeepalive()
 	}
-	defer stopKeepalive()
-	releaseFlight, waitedForFlight := func() (func(), bool) {
+	releaseFlightRaw, waitedForFlight := func() (func(), bool) {
 		if converted.WebSearch != nil {
 			return func() {}, false
 		}
 		return s.enterKiroCacheSingleflight(r.Context(), raw, affinity, lease, resolvedModel, converted.CachePointCount)
 	}()
+	var releaseFlightOnce sync.Once
+	releaseFlight := func() { releaseFlightOnce.Do(releaseFlightRaw) }
 	defer releaseFlight()
 	id := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	if converted.WebSearch != nil {
@@ -73,8 +147,8 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 		s.recordKiroUsage(r, lease.Account.ID, affinity, lease.RouteEpoch, data.Model, *data, storage.KiroRuntimeCapability{})
 		displayModel := downstreamKiroModel(r.Context(), data.Model)
 		goalResponse := kirowire.AnthropicJSON(*data, displayModel, id)
-		s.persistKiroGoalContinuity(r.Context(), r, raw, goalResponse)
-		if isStreamRequest(raw) {
+		s.persistKiroGoalContinuity(r.Context(), r, originalRaw, goalResponse)
+		if streamRequest {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
 			_, _ = w.Write(kirowire.AnthropicSSE(*data, displayModel, id))
@@ -87,59 +161,126 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 		_, _ = w.Write(goalResponse)
 		return outcomeDone
 	}
-	if isStreamRequest(raw) {
+	if streamRequest {
 		response, endpointHash, outcome := s.openKiroAttempt(w, r, &converted, lease)
+		if response == nil && outcome == outcomeKiroSummaryFallback {
+			releaseFlight()
+			requested := requestedClaudeModelFromContext(r.Context())
+			contextErr := &kirowire.ContextLengthError{
+				RequestedModel: firstNonEmpty(requested.RequestedModel, converted.Model),
+				KiroModel:      converted.Model, EstimatedInput: converted.EstimatedInputTokens,
+				EffectiveLimit: converted.ContextWindow, ContextMode: converted.ContextMode,
+				Compaction: true, UpstreamRejected: true,
+			}
+			if fallbackErr := applySummaryFallback(contextErr); fallbackErr != nil {
+				stopKeepalive()
+				writeKiroError(w, r, http.StatusBadRequest, annotateKiroSummaryFallbackFailure(contextErr, fallbackPasses))
+				return outcomeDone
+			}
+			converted.SummaryFallbackEligible = false
+			converted.SummaryFallbackAttempted = true
+			converted.SummaryFallbackPasses = fallbackPasses
+			setKiroQualityHeaders(w, converted)
+			resolvedModel = firstNonEmpty(converted.Model, lease.ResolvedModel, model)
+			startKeepalive()
+			response, endpointHash, outcome = s.openKiroAttempt(w, r, &converted, lease)
+		}
 		releaseFlight()
-		// Stop the keepalive synchronously before any emitter write. The emitter writes
-		// straight to w, bypassing schedulerWaitState's mutex, so a trailing keepalive
-		// tick must be guaranteed gone before the first real frame (success or error).
-		stopKeepalive()
 		if response == nil {
+			stopKeepalive()
 			return outcome
 		}
-		defer response.Body.Close()
-		emitter := newKiroAnthropicEmitter(w, func(metering kirowire.KiroMetering, actualModel string) {
-			usageSource := metering.UsageSource()
-			if usageSource == kirowire.UsageSourceUnreported {
-				usageSource = kirowire.UsageSourceEstimated
+		for {
+			// Stop the keepalive synchronously before any emitter write. The emitter
+			// writes straight to w, bypassing schedulerWaitState's mutex, so a trailing
+			// keepalive tick must be guaranteed gone before the first real frame.
+			stopKeepalive()
+			emitter := newKiroAnthropicEmitter(w, func(metering kirowire.KiroMetering, actualModel string) {
+				usageSource := metering.UsageSource()
+				if usageSource == kirowire.UsageSourceUnreported {
+					usageSource = kirowire.UsageSourceEstimated
+				}
+				setKiroHeaders(w, actualModel, converted.CompatibilityLosses, usageSource)
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("Cache-Control", "no-cache")
+			}, resolvedModel, id)
+			emitter.displayModel = downstreamKiroModel(r.Context(), resolvedModel)
+			emitter.estimatedInputTokens = converted.EstimatedInputTokens
+			data, streamErr := streamKiroResponseWithContext(r.Context(), response.Body, converted.ToolNameMap, emitter, s.responseBodyCaptureOptions(r.Context()))
+			_ = response.Body.Close()
+			finalizeKiroUsage(&data, converted)
+			data.Model = firstNonEmpty(data.Model, resolvedModel)
+			if data.UsageSource == "" {
+				data.UsageSource = data.Metering.UsageSource()
 			}
-			setKiroHeaders(w, actualModel, converted.CompatibilityLosses, usageSource)
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-		}, resolvedModel, id)
-		emitter.displayModel = downstreamKiroModel(r.Context(), resolvedModel)
-		emitter.estimatedInputTokens = converted.EstimatedInputTokens
-		data, streamErr := streamKiroResponseWithContext(r.Context(), response.Body, converted.ToolNameMap, emitter, s.responseBodyCaptureOptions(r.Context()))
-		finalizeKiroUsage(&data, converted)
-		data.Model = firstNonEmpty(data.Model, resolvedModel)
-		if data.UsageSource == "" {
-			data.UsageSource = data.Metering.UsageSource()
-		}
-		data.ToolDescriptionHashes = converted.ToolDescriptionHashes
-		s.persistKiroResolvedBinding(r.Context(), affinity, lease, data.Model)
-		data.SingleflightWaited = waitedForFlight
-		data.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, data.CompatibilityLosses)
-		if streamErr != nil {
-			if emitter.started {
-				capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, data)
-				setKiroTrailers(w, data.Model, data.CompatibilityLosses, data.UsageSource)
-				s.recordKiroUsage(r, lease.Account.ID, affinity, lease.RouteEpoch, data.Model, data, capabilityState)
-				emitter.fail(kiroErrorCode(streamErr), streamErr)
-				s.markGoalStreamRetryable(r.Context(), r, "kiro", raw, "upstream_stream_error")
-			} else {
-				writeKiroError(w, r, http.StatusBadGateway, normalizeKiroContextError(r.Context(), streamErr, converted))
+			data.ToolDescriptionHashes = converted.ToolDescriptionHashes
+			s.persistKiroResolvedBinding(r.Context(), affinity, lease, data.Model)
+			data.SingleflightWaited = waitedForFlight
+			data.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, data.CompatibilityLosses)
+			if streamErr != nil {
+				normalized := normalizeKiroContextError(r.Context(), streamErr, converted)
+				var contextErr *kirowire.ContextLengthError
+				if !emitter.started && converted.SummaryFallbackEligible && errors.As(normalized, &contextErr) {
+					startKeepalive()
+					if fallbackErr := applySummaryFallback(contextErr); fallbackErr != nil {
+						stopKeepalive()
+						writeKiroError(w, r, http.StatusBadRequest, annotateKiroSummaryFallbackFailure(contextErr, fallbackPasses))
+						return outcomeDone
+					}
+					converted.SummaryFallbackEligible = false
+					converted.SummaryFallbackAttempted = true
+					converted.SummaryFallbackPasses = fallbackPasses
+					setKiroQualityHeaders(w, converted)
+					resolvedModel = firstNonEmpty(converted.Model, lease.ResolvedModel, model)
+					startKeepalive()
+					response, endpointHash, outcome = s.openKiroAttempt(w, r, &converted, lease)
+					if response == nil {
+						stopKeepalive()
+						return outcome
+					}
+					continue
+				}
+				if emitter.started {
+					capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, data)
+					setKiroTrailers(w, data.Model, data.CompatibilityLosses, data.UsageSource)
+					s.recordKiroUsage(r, lease.Account.ID, affinity, lease.RouteEpoch, data.Model, data, capabilityState)
+					emitter.fail(kiroErrorCode(streamErr), streamErr)
+					s.markGoalStreamRetryable(r.Context(), r, "kiro", originalRaw, "upstream_stream_error")
+				} else {
+					writeKiroError(w, r, http.StatusBadGateway, normalized)
+				}
+				return outcomeDone
 			}
+			capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, data)
+			emitter.finish(data)
+			setKiroTrailers(w, data.Model, data.CompatibilityLosses, data.UsageSource)
+			s.recordKiroUsage(r, lease.Account.ID, affinity, lease.RouteEpoch, data.Model, data, capabilityState)
+			s.persistKiroGoalContinuity(r.Context(), r, originalRaw, kirowire.AnthropicJSON(data, downstreamKiroModel(r.Context(), data.Model), id))
 			return outcomeDone
 		}
-		capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, data)
-		emitter.finish(data)
-		setKiroTrailers(w, data.Model, data.CompatibilityLosses, data.UsageSource)
-		s.recordKiroUsage(r, lease.Account.ID, affinity, lease.RouteEpoch, data.Model, data, capabilityState)
-		s.persistKiroGoalContinuity(r.Context(), r, raw, kirowire.AnthropicJSON(data, downstreamKiroModel(r.Context(), data.Model), id))
-		return outcomeDone
 	}
 
 	data, endpointHash, outcome := s.doKiroAttemptOnResponse(w, r, &converted, lease, releaseFlight)
+	if data == nil && outcome == outcomeKiroSummaryFallback {
+		releaseFlight()
+		requested := requestedClaudeModelFromContext(r.Context())
+		contextErr := &kirowire.ContextLengthError{
+			RequestedModel: firstNonEmpty(requested.RequestedModel, converted.Model),
+			KiroModel:      converted.Model, EstimatedInput: converted.EstimatedInputTokens,
+			EffectiveLimit: converted.ContextWindow, ContextMode: converted.ContextMode,
+			Compaction: true, UpstreamRejected: true,
+		}
+		if fallbackErr := applySummaryFallback(contextErr); fallbackErr != nil {
+			writeKiroError(w, r, http.StatusBadRequest, annotateKiroSummaryFallbackFailure(contextErr, fallbackPasses))
+			return outcomeDone
+		}
+		converted.SummaryFallbackEligible = false
+		converted.SummaryFallbackAttempted = true
+		converted.SummaryFallbackPasses = fallbackPasses
+		setKiroQualityHeaders(w, converted)
+		resolvedModel = firstNonEmpty(converted.Model, lease.ResolvedModel, model)
+		data, endpointHash, outcome = s.doKiroAttemptOnResponse(w, r, &converted, lease, nil)
+	}
 	if data == nil {
 		return outcome
 	}
@@ -152,7 +293,7 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 	setKiroHeaders(w, data.Model, data.CompatibilityLosses, data.UsageSource)
 	s.recordKiroUsage(r, lease.Account.ID, affinity, lease.RouteEpoch, data.Model, *data, capabilityState)
 	goalResponse := kirowire.AnthropicJSON(*data, downstreamKiroModel(r.Context(), data.Model), id)
-	s.persistKiroGoalContinuity(r.Context(), r, raw, goalResponse)
+	s.persistKiroGoalContinuity(r.Context(), r, originalRaw, goalResponse)
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(goalResponse)
 	return outcomeDone
@@ -394,6 +535,9 @@ func (s *Server) convertKiroRequest(ctx context.Context, raw []byte, affinity ro
 		}
 	}
 	contextWindow := capability.KiroEffectiveContextWindow(capabilityModel, effectiveContextMode, measuredWindow)
+	if catalogModelFound && catalogModel.MaxInputTokens > 0 && catalogModel.MaxInputTokens < contextWindow {
+		contextWindow = catalogModel.MaxInputTokens
+	}
 	cachePointsEnabled := strings.EqualFold(strings.TrimSpace(kiroCfg.KiroCacheMode), "auto")
 	if cachePointsEnabled {
 		capabilityState, capabilityErr := s.store.GetKiroRuntimeCapability(ctx, lease.Account.ID, endpointHash, capabilityModel)
@@ -464,7 +608,11 @@ func (s *Server) doKiroAttemptOnResponse(w http.ResponseWriter, r *http.Request,
 	}
 	response.Body.Close()
 	if err != nil {
-		writeKiroError(w, r, http.StatusBadGateway, normalizeKiroContextError(r.Context(), err, *converted))
+		normalized := normalizeKiroContextError(r.Context(), err, *converted)
+		if converted.SummaryFallbackEligible && errors.Is(normalized, kirowire.ErrContextTooLong) {
+			return nil, endpointHash, outcomeKiroSummaryFallback
+		}
+		writeKiroError(w, r, http.StatusBadGateway, normalized)
 		return nil, endpointHash, outcomeDone
 	}
 	finalizeKiroUsage(&data, *converted)
@@ -521,6 +669,7 @@ func normalizeKiroContextError(ctx context.Context, err error, converted kirowir
 		RequestedModel: firstNonEmpty(requested.RequestedModel, converted.Model),
 		KiroModel:      converted.Model, EstimatedInput: converted.EstimatedInputTokens,
 		EffectiveLimit: converted.ContextWindow, ContextMode: converted.ContextMode, Compaction: converted.Compaction,
+		UpstreamRejected: true, KiroSummaryFallbackAttempted: converted.SummaryFallbackAttempted,
 	}
 }
 
@@ -641,13 +790,19 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 
 		if kirowire.ContentLengthExceeded(rawError) {
 			// Preserve the exact downstream prompt and requested output budget.
-			// Claude Code owns compaction and can resubmit after receiving this
-			// structured context signal; silently dropping history is irreversible.
+			// Ordinary turns first return the structured signal that activates the
+			// native Claude Code compactor. A genuine compaction retry may enter the
+			// one bounded Kiro map/reduce fallback, but only before any model content
+			// has been emitted and never by silently dropping history.
+			if converted.SummaryFallbackEligible {
+				return nil, endpointHash, outcomeKiroSummaryFallback
+			}
 			requested := requestedClaudeModelFromContext(r.Context())
 			writeKiroError(w, r, http.StatusBadRequest, &kirowire.ContextLengthError{
 				RequestedModel: firstNonEmpty(requested.RequestedModel, converted.Model),
 				KiroModel:      converted.Model, EstimatedInput: converted.EstimatedInputTokens,
 				EffectiveLimit: converted.ContextWindow, ContextMode: converted.ContextMode, Compaction: converted.Compaction,
+				UpstreamRejected: true, KiroSummaryFallbackAttempted: converted.SummaryFallbackAttempted,
 			})
 			return nil, endpointHash, outcomeDone
 		}
@@ -918,6 +1073,15 @@ func declareKiroTrailers(w http.ResponseWriter) {
 	w.Header().Add("Trailer", "X-Pool-Resolved-Model")
 	w.Header().Add("Trailer", "X-Pool-Kiro-Compatibility")
 	w.Header().Add("Trailer", "X-Pool-Usage-Source")
+	for _, name := range []string{
+		"X-MiCliProxy-Context-Status", "X-MiCliProxy-Context-Limit",
+		"X-MiCliProxy-Context-Limit-Source", "X-MiCliProxy-Context-Retry-Target",
+		"X-MiCliProxy-Context-Estimated-Input", "X-MiCliProxy-Kiro-Model",
+		"X-MiCliProxy-Auto-Compact", "X-MiCliProxy-Compaction-Stage",
+		"X-MiCliProxy-Compaction-Order", "X-MiCliProxy-Kiro-Summary-Passes",
+	} {
+		w.Header().Add("Trailer", name)
+	}
 }
 
 func setKiroTrailers(w http.ResponseWriter, model string, losses []string, usageSource string) {
@@ -951,29 +1115,80 @@ func mergeCompatibilityLosses(sets ...[]string) []string {
 }
 
 func writeKiroError(w http.ResponseWriter, r *http.Request, status int, err error) {
+	var contextErr *kirowire.ContextLengthError
+	if errors.As(err, &contextErr) {
+		contextErr = kiroContextErrorForRequest(r, contextErr)
+		message := contextErr.Error()
+		metadata := kiroContextErrorMetadata(contextErr)
+		if schedulerWaitContextLengthTerminal(r.Context(), message, metadata) {
+			return
+		}
+		for name, value := range metadata {
+			w.Header().Set(name, value)
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]any{"type": "error", "error": map[string]any{
+			"message": message, "type": "invalid_request_error", "code": "context_length_exceeded",
+		}})
+		return
+	}
 	if schedulerWaitTerminal(r.Context(), err.Error()) {
 		return
 	}
 	code := kiroErrorCode(err)
-	var contextErr *kirowire.ContextLengthError
-	if errors.As(err, &contextErr) {
-		contextStatus := "compact_required"
-		if contextErr.Compaction {
-			contextStatus = "compact_failed"
-		}
-		w.Header().Set("X-MiCliProxy-Context-Status", contextStatus)
-		w.Header().Set("X-MiCliProxy-Context-Limit", fmt.Sprintf("%d", contextErr.EffectiveLimit))
-		w.Header().Set("X-MiCliProxy-Context-Estimated-Input", fmt.Sprintf("%d", contextErr.EstimatedInput))
-		w.Header().Set("X-MiCliProxy-Kiro-Model", contextErr.KiroModel)
-		w.Header().Set("X-MiCliProxy-Auto-Compact", "client_retry")
-		writeJSON(w, http.StatusBadRequest, map[string]any{"type": "error", "error": map[string]any{
-			"message": err.Error(), "type": "invalid_request_error", "code": "context_length_exceeded",
-		}})
-		return
-	}
 	writeJSON(w, status, map[string]any{"error": map[string]any{
 		"message": err.Error(), "type": "codex_pool_error", "code": code,
 	}})
+}
+
+func kiroContextErrorForRequest(r *http.Request, contextErr *kirowire.ContextLengthError) *kirowire.ContextLengthError {
+	if contextErr == nil || r == nil || r.URL == nil || r.URL.Path != "/v1/responses" {
+		return contextErr
+	}
+	model := firstNonEmpty(contextErr.RequestedModel, contextErr.KiroModel)
+	if !capability.KiroSupportsGPTModel(model) && !capability.KiroSupportsGPTModel(contextErr.KiroModel) {
+		return contextErr
+	}
+	copy := *contextErr
+	copy.NativeCompactionClient = "codex"
+	return &copy
+}
+
+func kiroContextErrorMetadata(contextErr *kirowire.ContextLengthError) map[string]string {
+	contextStatus := "compact_required"
+	if contextErr.Compaction {
+		contextStatus = "compact_failed"
+	}
+	limitSource := "local_planner"
+	if contextErr.UpstreamRejected {
+		limitSource = "upstream_unreported"
+	}
+	autoCompact := "client_retry"
+	compactionStage := "claude_code_native"
+	compactionOrder := "claude_code_native,kiro_summary"
+	if strings.EqualFold(strings.TrimSpace(contextErr.NativeCompactionClient), "codex") {
+		compactionStage = "codex_native"
+		compactionOrder = "codex_native,kiro_retry"
+	}
+	if contextErr.KiroSummaryFallbackAttempted {
+		autoCompact = "kiro_summary_failed"
+		compactionStage = "kiro_summary_fallback"
+		compactionOrder = "claude_code_native,kiro_summary"
+	}
+	metadata := map[string]string{
+		"X-MiCliProxy-Context-Status":          contextStatus,
+		"X-MiCliProxy-Context-Limit":           fmt.Sprintf("%d", contextErr.EffectiveLimit),
+		"X-MiCliProxy-Context-Limit-Source":    limitSource,
+		"X-MiCliProxy-Context-Retry-Target":    fmt.Sprintf("%d", contextErr.SuggestedRetryLimit()),
+		"X-MiCliProxy-Context-Estimated-Input": fmt.Sprintf("%d", contextErr.EstimatedInput),
+		"X-MiCliProxy-Kiro-Model":              contextErr.KiroModel,
+		"X-MiCliProxy-Auto-Compact":            autoCompact,
+		"X-MiCliProxy-Compaction-Stage":        compactionStage,
+		"X-MiCliProxy-Compaction-Order":        compactionOrder,
+	}
+	if contextErr.KiroSummaryFallbackAttempted {
+		metadata["X-MiCliProxy-Kiro-Summary-Passes"] = fmt.Sprintf("%d", contextErr.KiroSummaryFallbackPasses)
+	}
+	return metadata
 }
 
 func kiroAccessTokenExpired(body []byte) bool {

@@ -43,9 +43,9 @@ func TestGenericHTTPAdapterKeepsConcurrentMailboxStateIsolated(t *testing.T) {
 			"method": "POST", "path": "/create",
 			"extract": map[string]interface{}{"email": "email", "account_id": "account_id"},
 		},
-		"list_emails": map[string]interface{}{"method": "GET", "path": "/mail/{account_id}"},
-		"response_list_path":  "messages",
-		"response_id_field":   "id",
+		"list_emails":          map[string]interface{}{"method": "GET", "path": "/mail/{account_id}"},
+		"response_list_path":   "messages",
+		"response_id_field":    "id",
 		"response_body_fields": "body",
 	}
 	adapter, err := NewGenericHTTPAdapter(

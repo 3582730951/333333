@@ -123,6 +123,12 @@ async function mockBackend(page: Page, role: Role, state: FixtureState = 'ready'
     if (state === 'interactive' && request.method() === 'POST' && url.pathname === '/admin/api-keys') {
       return route.fulfill({ json: { key: 'cap_e2e_new_secret' } });
     }
+    if (state === 'interactive' && request.method() === 'POST' && url.pathname === '/admin/oauth/start') {
+      return route.fulfill({ json: {
+        session_id: 'oauth-e2e-session', provider: 'codex',
+        auth_url: 'https://identity.example.test/oauth?state=oauth-e2e-state', expires_in: 900,
+      } });
+    }
     if (state === 'interactive' && request.method() === 'GET' && url.pathname === '/admin/register/readiness') {
       return route.fulfill({ json: { ready: false, blockers: ['auto-refill 策略未启用'], providers: { sms: 1, mailbox: 1, email_otp: 1, captcha: 0 }, pool: { active: 3, target: 5, deficit: 2 } } });
     }
@@ -324,6 +330,24 @@ test('submit, success, download, batch selection, and confirmation remain usable
   await batchPage.close();
 });
 
+test('OAuth link generation and clipboard copy work in a real browser', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'http://127.0.0.1:5188' });
+  await mockBackend(page, 'admin', 'interactive');
+  await page.goto('/console/accounts');
+  await expect(page.locator('[data-page-ready="true"]')).toBeVisible();
+  await page.getByRole('button', { name: '添加账号', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: '添加账号' });
+  const startRequest = page.waitForRequest((request) => request.method() === 'POST' && new URL(request.url()).pathname === '/admin/oauth/start');
+  await dialog.getByRole('button', { name: '生成授权链接' }).click();
+  expect((await startRequest).postDataJSON()).toEqual({ provider: 'chatgpt', group_name: '' });
+
+  const authURL = 'https://identity.example.test/oauth?state=oauth-e2e-state';
+  await expect(dialog.getByRole('textbox', { name: '授权链接' })).toHaveValue(authURL);
+  await dialog.getByRole('button', { name: '复制授权链接' }).click();
+  await expect(dialog.getByRole('button', { name: '授权链接已复制' })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(authURL);
+});
+
 test('account import provider marks stay bounded and model donut has one readable center label', async ({ browser }) => {
   const accountPage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   await mockBackend(accountPage, 'admin', 'interactive');
@@ -415,7 +439,8 @@ test('registration saves manual country strategy before starting a job', async (
   await expect(startButton).toBeEnabled();
 
   await page.getByLabel('国家策略').selectOption('manual');
-  await page.getByLabel('指定国家').selectOption('US');
+  await page.getByLabel('指定国家').click();
+  await page.getByRole('option', { name: /美国.*United States/ }).click();
   const strategyRequest = page.waitForRequest((request) => request.method() === 'POST' && new URL(request.url()).pathname === '/admin/settings-center');
   const startRequest = page.waitForRequest((request) => request.method() === 'POST' && new URL(request.url()).pathname === '/admin/register/batch');
   await startButton.click();

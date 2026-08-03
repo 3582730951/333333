@@ -928,6 +928,9 @@ func (s *Server) adminUsers(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		if items == nil {
+			items = []storage.User{}
+		}
 		writeJSON(w, http.StatusOK, items)
 	case http.MethodPost:
 		var req struct {

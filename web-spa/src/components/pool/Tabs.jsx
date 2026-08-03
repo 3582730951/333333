@@ -5,11 +5,26 @@ function cx(...parts) {
   return parts.filter(Boolean).join(' ');
 }
 
-export function TabPane() {
+/**
+ * @param {{ itemKey: string, tab: React.ReactNode, children?: React.ReactNode }} _props
+ */
+export function TabPane(_props) {
   return null;
 }
 
-export function Tabs({ children, activeKey, defaultActiveKey, onChange, tabPosition, className, style }) {
+/**
+ * @param {{
+ *   children: React.ReactNode,
+ *   activeKey?: string,
+ *   defaultActiveKey?: string,
+ *   onChange?: (value: string) => void,
+ *   tabPosition?: 'left' | 'top',
+ *   className?: string,
+ *   style?: React.CSSProperties,
+ *   keepMounted?: boolean,
+ * }} props
+ */
+export function Tabs({ children, activeKey, defaultActiveKey, onChange, tabPosition, className, style, keepMounted = false }) {
   const panes = React.Children.toArray(children).filter(Boolean);
   const first = panes[0]?.props?.itemKey;
   const value = activeKey ?? defaultActiveKey ?? first;
@@ -30,7 +45,7 @@ export function Tabs({ children, activeKey, defaultActiveKey, onChange, tabPosit
       </TabsPrimitive.List>
       <div className="pool-tabs-panels">
         {panes.map((pane) => (
-          <TabsPrimitive.Content key={pane.props.itemKey} value={pane.props.itemKey}>
+          <TabsPrimitive.Content key={pane.props.itemKey} value={pane.props.itemKey} forceMount={keepMounted || undefined}>
             {pane.props.children}
           </TabsPrimitive.Content>
         ))}

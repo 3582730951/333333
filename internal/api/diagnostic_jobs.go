@@ -799,7 +799,8 @@ func diagnosticDLPMatch(value string) bool {
 
 func diagnosticContainsUnsafeRequestID(value string) bool {
 	for _, candidate := range diagnosticRequestIDRE.FindAllString(value, -1) {
-		if !diagnosticStableAliasRE.MatchString(strings.ToUpper(candidate)) {
+		upper := strings.ToUpper(candidate)
+		if !diagnosticPublicRequestIDRE.MatchString(upper) && !diagnosticStableAliasRE.MatchString(upper) {
 			return true
 		}
 	}

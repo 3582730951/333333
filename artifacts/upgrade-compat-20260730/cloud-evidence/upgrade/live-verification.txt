@@ -1,5 +1,0 @@
-ready={"checks":{"storage":true},"deployment_state":"active","fencing_token":3,"inflight":0,"ok":true,"ready":true,"release_id":"new-goal-context-fix","started_at":"2026-07-30T19:36:50.647202023Z","worker_socket":""}
-config_sha256=cde01a26751948a159065d1a5d288e24f5d25d95ec4912ed78b281be406c5a57
-database_sha256_after_start=6f6b04ed3e72f13c2b7c0427883b3ce423d2c470ab4658694c4fabfbc6b8970e
-new_pid=378697
-codex_setup_sha256=d877a6eb3d4c585c198c7efaaac102cb9684fe3f53516cf5eebffae97f9c2b4e

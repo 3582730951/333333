@@ -51,6 +51,19 @@ func TestProbeModelCodexUsesConfiguredChatGPTModel(t *testing.T) {
 	}
 }
 
+func TestKiroCatalogCapabilitiesPreserveLiveGPTInputLimit(t *testing.T) {
+	caps := kiroCatalogCapabilities("kiro-account", []storage.KiroModelDescriptor{{
+		PublicID: "gpt-5.6-sol", UpstreamID: "gpt-5.6-sol",
+		MaxInputTokens: 272000, Complete: true,
+	}})
+	if len(caps) != 1 {
+		t.Fatalf("capabilities = %+v, want one row", caps)
+	}
+	if caps[0].NativeContextWindow != 272000 || caps[0].NativeMaxContextWindow != 272000 {
+		t.Fatalf("Kiro live limit was overwritten by Codex contract: %+v", caps[0])
+	}
+}
+
 func apiTestStore(t *testing.T) *storage.Store {
 	t.Helper()
 	store, err := storage.Open(filepath.Join(t.TempDir(), "pool.sqlite3"))

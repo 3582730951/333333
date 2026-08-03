@@ -1,13 +1,31 @@
 package api
 
 import (
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 )
 
 // admin_users_test.go covers P4 admin user management: an admin can create users,
 // change role/status, reset passwords, and delete users (but not lock themselves
 // out), and the registration toggle gates self-registration.
+func TestAdminUsersEmptyListIsJSONArray(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {})
+	resp, err := http.Get(h.pool.URL + "/admin/users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(raw)) != "[]" {
+		t.Fatalf("empty users response status=%d body=%s, want []", resp.StatusCode, raw)
+	}
+}
+
 func TestAdminUserManagementAndRegistrationToggle(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	admin := jarClient(t)

@@ -17,6 +17,34 @@ import { openExternalURL } from '../lib/browserNavigation.js';
 
 const { Text } = Typography;
 
+export function normalizeOAuthStartResult(result) {
+  if (!result || typeof result !== 'object') {
+    throw new Error('服务未返回有效的授权会话');
+  }
+  const sessionId = String(result.session_id ?? result.loginId ?? '').trim();
+  const authUrl = String(result.auth_url ?? result.authUrl ?? '').trim();
+  if (!sessionId) {
+    throw new Error('服务未返回授权会话编号，请重试');
+  }
+  if (!authUrl) {
+    throw new Error('服务未返回授权链接，请重试');
+  }
+  let parsed;
+  try {
+    parsed = new URL(authUrl);
+  } catch {
+    throw new Error('服务返回的授权链接格式有误');
+  }
+  if ((parsed.protocol !== 'https:' && parsed.protocol !== 'http:') || !parsed.hostname) {
+    throw new Error('服务返回的授权链接协议有误');
+  }
+  const rawExpires = Number(result.expires_in ?? result.expiresIn);
+  const expiresIn = Number.isFinite(rawExpires) && rawExpires > 0
+    ? Math.min(Math.floor(rawExpires), 86_400)
+    : 900;
+  return { sessionId, authUrl: parsed.toString(), expiresIn };
+}
+
 // OAuthLoginModal - 新版账号导入弹窗，支持：
 // 1. ChatGPT/Codex OAuth 授权登录
 // 2. Claude OAuth 授权登录
@@ -146,11 +174,12 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const { run: handleGenerate, running: generating } = useAsyncAction(async () => {
     const actionEpoch = actionEpochRef.current;
     try {
-	      const result = await oauthStart(tab, groupName);
+      const result = await oauthStart(tab, groupName);
       if (actionEpoch !== actionEpochRef.current) return;
-      setSessionId(result.session_id || result.loginId || '');
-      setAuthUrl(result.auth_url || result.authUrl || '');
-      setCountdown(result.expires_in || 900);
+      const generated = normalizeOAuthStartResult(result);
+      setSessionId(generated.sessionId);
+      setAuthUrl(generated.authUrl);
+      setCountdown(generated.expiresIn);
       Toast.info('登录链接已生成，请在浏览器中完成授权');
     } catch (e) {
       if (actionEpoch !== actionEpochRef.current) return;

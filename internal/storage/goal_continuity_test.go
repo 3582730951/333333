@@ -758,6 +758,73 @@ func TestEnforceGoalStorageBudgetPreservesLiveRun(t *testing.T) {
 	}
 }
 
+func TestEnforceGoalStorageBudgetPrioritizesTerminalGoals(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	goals := map[string]GoalSession{}
+	for index, state := range []string{"retryable", "ready", "failed", "completed"} {
+		turn := goalTurnForTest("priority-"+state, "priority-response-"+state, strings.Repeat(state, 256), "output")
+		turn.DownstreamKeyHash = fmt.Sprintf("priority-key-%d", index)
+		turn.WorkspaceHash = fmt.Sprintf("priority-workspace-%d", index)
+		turn.InitialGoalHash = fmt.Sprintf("priority-goal-%d", index)
+		goal, commitErr := store.CommitGoalTurn(ctx, turn)
+		if commitErr != nil {
+			t.Fatal(commitErr)
+		}
+		if _, updateErr := store.DB().ExecContext(ctx, `UPDATE goal_session SET state=?,updated_at=? WHERE id=?`, state, Now()-100+int64(index), goal.ID); updateErr != nil {
+			t.Fatal(updateErr)
+		}
+		goals[state] = goal
+	}
+	step, err := store.EnforceGoalStorageBudgetStep(ctx, 1)
+	if err != nil || !step.Progressed {
+		t.Fatalf("terminal-priority reclaim step=%+v err=%v", step, err)
+	}
+	for state, goal := range goals {
+		var current string
+		if err := store.DB().QueryRowContext(ctx, `SELECT state FROM goal_session WHERE id=?`, goal.ID).Scan(&current); err != nil {
+			t.Fatal(err)
+		}
+		want := state
+		if state == "completed" {
+			want = goalReclaimingState
+		}
+		if current != want {
+			t.Fatalf("goal %s state=%q, want %q", state, current, want)
+		}
+	}
+}
+
+func TestEnforceGoalStorageBudgetStepReportsNoProgressWhenAllGoalsAreLive(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	goal, err := store.CommitGoalTurn(ctx, goalTurnForTest("no-progress-live", "no-progress-response", strings.Repeat("live", 1024), "output"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireGoalRun(ctx, goal.ID, "no-progress-owner", "running", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	step, err := store.EnforceGoalStorageBudgetStep(ctx, 1)
+	if err != nil || step.Progressed || step.BytesFreed != 0 || step.Goals != 0 {
+		t.Fatalf("all-live reclaim step=%+v err=%v", step, err)
+	}
+}
+
 func TestEnforceGoalStorageBudgetPreservesAwaitingToolSessionWithoutRun(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenInMemory()

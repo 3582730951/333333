@@ -87,6 +87,7 @@ describe('API contracts', () => {
     expect(parseApiResponse(usersResponseSchema, {
       rows: [{ id: 'user-1', email: 'user@example.com', role: 'user', status: 'active' }],
     })).toHaveLength(1);
+    expect(parseApiResponse(usersResponseSchema, null)).toEqual([]);
     expect(parseApiResponse(keysResponseSchema, { keys: [{ hash: 'hash-1', enabled: true }] }))
       .toEqual([{ hash: 'hash-1', enabled: true }]);
   });
@@ -146,6 +147,12 @@ describe('API contracts', () => {
       }],
       total: 1, page: 3, pageSize: 10, counts: { ready: 1 },
     });
+    expect(parseApiResponse(emailPoolResponseSchema, {
+      accounts: null, total: 0, page: 1, pageSize: 50, counts: null,
+    })).toEqual({ accounts: [], total: 0, page: 1, pageSize: 50, counts: {} });
+    expect(parseApiResponse(emailPoolResponseSchema, {
+      accounts: null, items: [{ id: 'mail-mixed', email: 'mixed@example.test' }], total: 1,
+    })).toMatchObject({ accounts: [{ id: 'mail-mixed', email: 'mixed@example.test' }], total: 1 });
   });
 
   it('rejects malformed email pool and error payloads', () => {

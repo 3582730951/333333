@@ -28,6 +28,7 @@ import (
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/console"
 	"codex-account-pool/internal/identity"
+	"codex-account-pool/internal/incident"
 	"codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/prompt"
@@ -51,6 +52,7 @@ import (
 type Dependencies struct {
 	Config            config.Config
 	Store             *storage.Store
+	IncidentReporter  *incident.Reporter
 	Scheduler         *scheduler.Scheduler
 	Upstream          *upstream.Client
 	Planner           *virtual.Planner
@@ -66,10 +68,11 @@ type Dependencies struct {
 }
 
 type Server struct {
-	cfg       config.Config
-	store     *storage.Store
-	scheduler *scheduler.Scheduler
-	upstream  *upstream.Client
+	cfg              config.Config
+	store            *storage.Store
+	incidentReporter *incident.Reporter
+	scheduler        *scheduler.Scheduler
+	upstream         *upstream.Client
 	// upstreamDo is the single Codex/Responses call boundary. Production binds it
 	// to upstream.Client.Do during construction; focused fault-injection tests replace
 	// it to verify that a broken transport contract cannot panic an HTTP/WS request.
@@ -199,15 +202,16 @@ func NewServer(dep Dependencies) *Server {
 	requestBodyBudget.SetDiskReserver(bodyDiskReserver)
 	responseBodyBudget.SetDiskReserver(bodyDiskReserver)
 	s := &Server{
-		cfg:        dep.Config,
-		store:      dep.Store,
-		scheduler:  dep.Scheduler,
-		upstream:   dep.Upstream,
-		planner:    dep.Planner,
-		warp:       dep.Warp,
-		solver:     dep.Solver,
-		mux:        http.NewServeMux(),
-		bodyBudget: requestBodyBudget, requestBodyBudget: requestBodyBudget, responseBodyBudget: responseBodyBudget,
+		cfg:              dep.Config,
+		store:            dep.Store,
+		incidentReporter: dep.IncidentReporter,
+		scheduler:        dep.Scheduler,
+		upstream:         dep.Upstream,
+		planner:          dep.Planner,
+		warp:             dep.Warp,
+		solver:           dep.Solver,
+		mux:              http.NewServeMux(),
+		bodyBudget:       requestBodyBudget, requestBodyBudget: requestBodyBudget, responseBodyBudget: responseBodyBudget,
 		bodyDiskReserver: bodyDiskReserver,
 		oauth:            newOAuthStore(oauthSessionTTL),
 		login:            newLoginThrottle(),
@@ -894,6 +898,14 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// request shaping, and the CPA window-generation increment after terminal
 	// success, so the three cannot disagree.
 	isCompact := compactionRequestWithMeta(path, raw, bodyMetaForView(capturedMeta, originalRaw, raw))
+	if isCompact {
+		// Codex compaction stays on the native Responses path; Kiro GPT spillover is
+		// bypassed below. Make that ordering observable for both the legacy compact
+		// endpoint and RemoteCompactionV2's terminal compaction_trigger form.
+		w.Header().Set("X-MiCliProxy-Auto-Compact", "codex_native")
+		w.Header().Set("X-MiCliProxy-Compaction-Stage", "codex_native")
+		w.Header().Set("X-MiCliProxy-Compaction-Order", "codex_native")
+	}
 	affinityGroup := pol.Group
 	if affinityGroup == "" {
 		affinityGroup = s.cfg.DefaultGroup
@@ -1108,7 +1120,14 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		// following request so the client does not need to manually restart its
 		// task. The legacy fresh-root reset remains only when no checkpoint exists.
 		if mappingErr != nil && s.codexCPAStrict(r.Context()) && errors.Is(mappingErr, storage.ErrCodexSessionEpochRetired) {
-			if migration, recovered, recoveryErr := s.recoverCodexSessionMapping(r.Context(), r, raw, r.Header, pol, codexMapping, leakfilter.ResponsesContextErrorPreviousResponseNotFound, "retired_upstream_context"); recovered {
+			retiredContextError := leakfilter.ResponsesContextErrorPreviousResponseNotFound
+			if responsesHasEncryptedToolOutput(raw) {
+				// Encrypted tool output is scoped to the retired upstream epoch and
+				// cannot safely cross into its replacement even when the retirement
+				// was observed after downstream SSE bytes had already committed.
+				retiredContextError = leakfilter.ResponsesContextErrorEncryptedFunctionOutput
+			}
+			if migration, recovered, recoveryErr := s.recoverCodexSessionMapping(r.Context(), r, raw, r.Header, pol, codexMapping, retiredContextError, "retired_upstream_context"); recovered {
 				raw = migration.Retry.Raw
 				r = r.Clone(r.Context())
 				r.Header = migration.Retry.Header
@@ -1394,10 +1413,11 @@ func (s *Server) codexFailoverAttempts(ctx context.Context, movable bool, group,
 type attemptOutcome int
 
 const (
-	outcomeDone            attemptOutcome = iota // request finished (success, or terminal error already written)
-	outcomeRetry                                 // recoverable error on a self-contained request — retry on a fresh account
-	outcomeModelRetry                            // account-scoped model_not_found — retry, then require manual fallback
-	outcomeContextRecovery                       // strict CPA needs a fresh, durable replay epoch
+	outcomeDone                attemptOutcome = iota // request finished (success, or terminal error already written)
+	outcomeRetry                                     // recoverable error on a self-contained request — retry on a fresh account
+	outcomeModelRetry                                // account-scoped model_not_found — retry, then require manual fallback
+	outcomeContextRecovery                           // strict CPA needs a fresh, durable replay epoch
+	outcomeKiroSummaryFallback                       // genuine Claude Code compaction needs the bounded Kiro last-stage fallback
 )
 
 type codexRetryRequest struct {
@@ -1953,24 +1973,31 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		// bytes are committed. That preserves long-running work across an
 		// upstream context loss (notably the ultra path) rather than surfacing a
 		// permanent previous_response_not_found.
-		if contextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
+		if contextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound ||
+			contextError == leakfilter.ResponsesContextErrorEncryptedFunctionOutput {
 			if explicitRuleAction {
-				if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
-					!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
-					log.Printf("[CODEX-SESSION-MAPPING] upstream context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
+				if contextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
+					if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
+						!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
+						log.Printf("[CODEX-SESSION-MAPPING] upstream context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
+					}
 				}
 			} else if mapping := codexSessionMappingFromContext(r.Context()); strictNativeCPA && mapping != nil && mapping.enabled && mapping.binding != nil {
+				recoveryReason := "previous_response_not_found"
+				if contextError == leakfilter.ResponsesContextErrorEncryptedFunctionOutput {
+					recoveryReason = "encrypted_function_output"
+				}
 				_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_recovering")
 				return codexAttemptResult{
 					Outcome:              outcomeContextRecovery,
 					RecoveryContextError: contextError,
-					RecoveryReason:       "previous_response_not_found",
+					RecoveryReason:       recoveryReason,
 					RecoveryStatus:       status,
 					RecoveryHeader:       header.Clone(),
 					RecoveryBody:         append([]byte(nil), body...),
 				}, true
 			}
-			if !explicitRuleAction {
+			if contextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound && !explicitRuleAction {
 				if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
 					!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
 					log.Printf("[CODEX-SESSION-MAPPING] upstream context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
@@ -2481,22 +2508,29 @@ codexSuccess:
 					}
 				}
 				if streamFailure.ContextError != leakfilter.ResponsesContextErrorNone && !explicitRuleAction {
-					if streamFailure.ContextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
+					if streamFailure.ContextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound ||
+						streamFailure.ContextError == leakfilter.ResponsesContextErrorEncryptedFunctionOutput {
 						if mapping := codexSessionMappingFromContext(r.Context()); strictNativeCPA && mapping != nil && mapping.enabled && mapping.binding != nil {
+							recoveryReason := "previous_response_not_found"
+							if streamFailure.ContextError == leakfilter.ResponsesContextErrorEncryptedFunctionOutput {
+								recoveryReason = "encrypted_function_output"
+							}
 							_ = resp.Body.Close()
 							_ = s.settleBillingHold(r.Context(), holdID, "stream_context_error_recovering")
 							return codexAttemptResult{
 								Outcome:              outcomeContextRecovery,
 								RecoveryContextError: streamFailure.ContextError,
-								RecoveryReason:       "previous_response_not_found",
+								RecoveryReason:       recoveryReason,
 								RecoveryStatus:       failureStatus,
 								RecoveryHeader:       failureHeader.Clone(),
 								RecoveryBody:         append([]byte(nil), failureBody...),
 							}
 						}
-						if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
-							!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
-							log.Printf("[CODEX-SESSION-MAPPING] streamed context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
+						if streamFailure.ContextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
+							if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
+								!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
+								log.Printf("[CODEX-SESSION-MAPPING] streamed context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
+							}
 						}
 					}
 					// Preserve native context-loss handling by default, but do not let it
@@ -2801,11 +2835,16 @@ codexSuccess:
 			})
 		}
 		// Strict CPA relays terminal SSE failures immediately rather than holding
-		// them in the legacy early-retry probe. Preserve the same epoch rule here:
-		// only an upstream-confirmed missing previous response retires the whole
-		// tree; a missing tool output remains an ordinary visible client error.
-		if streamRecorder.terminalContextError() == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
-			if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
+		// them in the legacy early-retry probe. Once bytes are committed we cannot
+		// replay in place, so retire an upstream-confirmed dead response chain and
+		// let the next request rebuild it from the durable checkpoint.
+		if contextError := streamRecorder.terminalContextError(); contextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound ||
+			contextError == leakfilter.ResponsesContextErrorEncryptedFunctionOutput {
+			reason := "upstream_context_invalid"
+			if contextError == leakfilter.ResponsesContextErrorEncryptedFunctionOutput {
+				reason = "encrypted_function_output_invalid"
+			}
+			if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), reason); err != nil &&
 				!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
 				log.Printf("[CODEX-SESSION-MAPPING] streamed context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
 			}

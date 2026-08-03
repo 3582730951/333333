@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -101,6 +102,43 @@ func TestEmailPoolAcceptsStructuredLegacyImportAndQueryAliases(t *testing.T) {
 	code, raw = grpReq(t, h, http.MethodGet, "/admin/register/providers/options", "")
 	if code != http.StatusOK || !strings.Contains(string(raw), `"value":"email_pool"`) {
 		t.Fatalf("email pool was not hot-wired into provider options: code=%d body=%s", code, raw)
+	}
+}
+
+func TestEmailPoolEmptyListReturnsArray(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	code, raw := grpReq(t, h, http.MethodGet, "/admin/email-pool", "")
+	if code != http.StatusOK || !strings.Contains(string(raw), `"accounts":[]`) || strings.Contains(string(raw), `"accounts":null`) {
+		t.Fatalf("empty email pool response=%d: %s", code, raw)
+	}
+}
+
+func TestEmailPoolOmittedOrAllStatusPreservesLegacyUnfilteredList(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	for index, status := range []string{"idle", "in_use", "used", "error"} {
+		if err := h.store.InsertEmailAccount(ctx, storage.EmailAccount{
+			ID: fmt.Sprintf("compat-email-%d", index), Email: fmt.Sprintf("compat-%d@example.test", index),
+			Status: status,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{"/admin/email-pool", "/admin/email-pool?status=all", "/admin/email-pool?state=any"} {
+		code, raw := grpReq(t, h, http.MethodGet, path, "")
+		if code != http.StatusOK {
+			t.Fatalf("unfiltered list %s=%d: %s", path, code, raw)
+		}
+		var response struct {
+			Accounts []map[string]interface{} `json:"accounts"`
+			Total    int                      `json:"total"`
+		}
+		if err := json.Unmarshal(raw, &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Total != 4 || len(response.Accounts) != 4 {
+			t.Fatalf("unfiltered list %s narrowed rows: %s", path, raw)
+		}
 	}
 }
 

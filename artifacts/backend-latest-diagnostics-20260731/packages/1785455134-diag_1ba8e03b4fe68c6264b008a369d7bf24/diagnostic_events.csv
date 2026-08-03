@@ -1,2 +1,0 @@
-event_code,created_at,event_type,severity,entity_type,entity_alias,detail_json,diagnostic_gap
-EVT-RA3GFIOYX2OARH25WTLBRBCEJM,1785447422,storage_gc,warning,diagnostic_job,JOB-FKHLOJUTCG2W4HLBEDX5HTNOQM,"{""reason"":""retention_or_cancellation"",""resource_type"":""diagnostic_artifact""}",true

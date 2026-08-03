@@ -1,4 +1,0 @@
-已备份原有配置 -> /root/autodl-tmp/cpupg-20260730/codex-client-home/.codex/config.toml.bak.20260731034012.378997
-已写入 /root/autodl-tmp/cpupg-20260730/codex-client-home/.codex/config.toml
-已配置 Goal、模型、推理强度、沙箱审批、URL 与 API key
-model=gpt-5.6-sol

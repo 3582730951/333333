@@ -1,4 +1,0 @@
-998c8ddfdea53e7e96428bf85973797969de15b4933612a90015591590c96803  artifacts/upgrade-compat-20260730/source-old-to-new.patch
-ace7cbc3ecfb3105e592f0832d711f75500bb6d03197b232b445e30b83700511  artifacts/upgrade-compat-20260730/cpupg-evidence-20260730.tar.gz
-fea6d7ba68e67cea6dfb87377cb527ae01cc26b081c682e5e18dddaf708134ef  artifacts/upgrade-compat-20260730/verification-record.md
-ab2d2de61103d0eea0e6a3727fa5e84b394aa738a32b85eaebb20d74b46d2471  artifacts/upgrade-compat-20260730/rollback-no-systemd.sh

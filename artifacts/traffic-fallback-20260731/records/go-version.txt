@@ -1,1 +1,0 @@
-go version go1.25.12 linux/amd64

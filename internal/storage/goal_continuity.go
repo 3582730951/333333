@@ -884,7 +884,7 @@ func (s *Store) markNextBudgetGoalReclaiming(ctx context.Context, tx *sql.Tx, no
 WHERE s.state<>'reclaiming'
   AND s.state IN ('ready','retryable','completed','failed')
   AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=s.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)
-ORDER BY CASE s.state WHEN 'retryable' THEN 0 WHEN 'ready' THEN 1 WHEN 'completed' THEN 2 ELSE 3 END,
+ORDER BY CASE s.state WHEN 'completed' THEN 0 WHEN 'failed' THEN 1 WHEN 'ready' THEN 2 ELSE 3 END,
          s.updated_at ASC,s.id ASC LIMIT 1`, now).Scan(&goalID, &storageBytes, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
@@ -1073,9 +1073,9 @@ func (s *Store) reclaimGoalIDTableStep(ctx context.Context, tx *sql.Tx, goalID, 
 // Large v2 payloads live in fixed-size goal_payload_chunk rows, so both the row
 // count and ciphertext bytes removed by a transaction have hard upper bounds.
 // The parent is deleted only after every cascading child table is empty.
-func (s *Store) reclaimGoalStep(ctx context.Context, tx *sql.Tx, goalID string, now int64) (int64, int64, error) {
+func (s *Store) reclaimGoalStep(ctx context.Context, tx *sql.Tx, goalID string, now int64) (int64, int64, bool, error) {
 	if progressed, freed, err := s.reclaimGoalChunkStep(ctx, tx, goalID); progressed || err != nil {
-		return freed, 0, err
+		return freed, 0, progressed, err
 	}
 	for _, phase := range []struct {
 		table, idColumn string
@@ -1087,15 +1087,15 @@ func (s *Store) reclaimGoalStep(ctx context.Context, tx *sql.Tx, goalID string, 
 		{table: "goal_run", idColumn: "id"},
 	} {
 		if progressed, freed, err := s.reclaimGoalIDTableStep(ctx, tx, goalID, phase.table, phase.idColumn, phase.payload); progressed || err != nil {
-			return freed, 0, err
+			return freed, 0, progressed, err
 		}
 	}
 	var remainingStorage int64
 	if err := tx.QueryRowContext(ctx, `SELECT storage_bytes FROM goal_session WHERE id=? AND state='reclaiming'`, goalID).Scan(&remainingStorage); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return 0, 0, nil
+			return 0, 0, false, nil
 		}
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	result, err := tx.ExecContext(ctx, `DELETE FROM goal_session
 WHERE id=? AND state='reclaiming'
@@ -1106,13 +1106,19 @@ WHERE id=? AND state='reclaiming'
   AND NOT EXISTS (SELECT 1 FROM goal_run WHERE goal_id=goal_session.id)
   AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=goal_session.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)`, goalID, now)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	deleted, err := result.RowsAffected()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
-	return remainingStorage, deleted, nil
+	return remainingStorage, deleted, deleted > 0, nil
+}
+
+type GoalStorageReclaimStep struct {
+	BytesFreed int64
+	Goals      int64
+	Progressed bool
 }
 
 // EnforceGoalStorageBudget converges databases created by older releases to the
@@ -1121,49 +1127,66 @@ WHERE id=? AND state='reclaiming'
 // oversized until every retained goal expires. Live runs are protected by the same
 // lease predicate used on the foreground commit path.
 func (s *Store) EnforceGoalStorageBudget(ctx context.Context, maxBytes int64) (int64, int64, error) {
+	step, err := s.EnforceGoalStorageBudgetStep(ctx, maxBytes)
+	return step.BytesFreed, step.Goals, err
+}
+
+// EnforceGoalStorageBudgetStep exposes whether a bounded transaction advanced a
+// reclaiming goal even when it removed metadata rather than payload bytes. The disk
+// guard uses this signal to stop immediately when every over-budget goal is live.
+func (s *Store) EnforceGoalStorageBudgetStep(ctx context.Context, maxBytes int64) (GoalStorageReclaimStep, error) {
 	if maxBytes <= 0 {
-		return 0, 0, nil
+		return GoalStorageReclaimStep{}, nil
 	}
 	now := Now()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, 0, err
+		return GoalStorageReclaimStep{}, err
 	}
 	defer tx.Rollback()
 	goalID, err := s.findReclaimingGoal(ctx, tx, now)
 	if err != nil {
-		return 0, 0, err
+		return GoalStorageReclaimStep{}, err
 	}
 	if goalID == "" {
 		var used int64
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(storage_bytes),0) FROM goal_session`).Scan(&used); err != nil {
-			return 0, 0, err
+			return GoalStorageReclaimStep{}, err
 		}
 		if used <= maxBytes {
-			return 0, 0, nil
+			return GoalStorageReclaimStep{}, nil
 		}
 		goalID, err = s.markNextBudgetGoalReclaiming(ctx, tx, now)
 		if err != nil {
-			return 0, 0, err
+			return GoalStorageReclaimStep{}, err
 		}
 		if goalID == "" {
-			return 0, 0, nil
+			return GoalStorageReclaimStep{}, nil
 		}
 	}
-	freed, deleted, err := s.reclaimGoalStep(ctx, tx, goalID, now)
+	freed, deleted, progressed, err := s.reclaimGoalStep(ctx, tx, goalID, now)
 	if err != nil {
-		return freed, deleted, err
+		return GoalStorageReclaimStep{BytesFreed: freed, Goals: deleted, Progressed: progressed}, err
 	}
 	if deleted > 0 {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO audit_log(account_id,account_label,action,state,reason,detail,created_at) VALUES('', '', ?, ?, ?, ?, ?)`,
 			"goal_storage_reclaimed", "completed", "storage_budget_maintenance", fmt.Sprintf("goal=%s goals=%d bytes=%d max_bytes=%d", goalID, deleted, freed, maxBytes), now); err != nil {
-			return freed, deleted, err
+			return GoalStorageReclaimStep{BytesFreed: freed, Goals: deleted, Progressed: progressed}, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return freed, deleted, err
+		return GoalStorageReclaimStep{BytesFreed: freed, Goals: deleted, Progressed: progressed}, err
 	}
-	return freed, deleted, nil
+	return GoalStorageReclaimStep{BytesFreed: freed, Goals: deleted, Progressed: progressed}, nil
+}
+
+// GoalStorageBytes returns the transaction-writer view used by the hard budget
+// check. Maintenance uses it between bounded reclaim steps so it can stop as soon
+// as reserve headroom is restored without relying on a potentially stale replica.
+func (s *Store) GoalStorageBytes(ctx context.Context) (int64, error) {
+	var used int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(storage_bytes),0) FROM goal_session`).Scan(&used)
+	return used, err
 }
 
 type goalReplaySegment struct {
@@ -1880,7 +1903,7 @@ func (s *Store) DeleteGoalSafely(ctx context.Context, goalID string) error {
 			return ErrGoalActiveCannotBePurged
 		}
 	}
-	_, deleted, err := s.reclaimGoalStep(ctx, tx, goalID, now)
+	_, deleted, _, err := s.reclaimGoalStep(ctx, tx, goalID, now)
 	if err != nil {
 		return err
 	}
@@ -1918,7 +1941,7 @@ func (s *Store) CleanupGoalContinuity(ctx context.Context) (int64, error) {
 			return 0, nil
 		}
 	}
-	_, deleted, err := s.reclaimGoalStep(ctx, tx, goalID, now)
+	_, deleted, _, err := s.reclaimGoalStep(ctx, tx, goalID, now)
 	if err != nil {
 		return 0, err
 	}

@@ -1,9 +1,0 @@
-group_name,instructions_enabled,instruction_file_count,policy_revision_hmac_prefix,updated_at
-antigravity,false,0,27dc8a6353826f25,1785407093
-claude,false,0,ec6aff28f6885c33,1785406950
-cyber,false,0,386da66cd4193820,1785406765
-gpt-plus-备用2(可破甲),false,0,1d3f97230b884b06,1785407064
-gpt-plus-正常(备用1),false,0,819152e02d62e089,1785407068
-gpt-pro,false,0,00ec786eff6ac6d7,1785407074
-gpt-team,false,0,eb301cf19acfb65e,1785407508
-kiro,false,0,6a536b2236b8d833,1785407099

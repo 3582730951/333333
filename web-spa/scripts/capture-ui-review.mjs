@@ -422,7 +422,12 @@ async function handleAPI(req) {
   if (p === '/admin/settings') return req.respond(json({ conversation_isolation: true, claude_cache_control_inject: true, require_downstream_key: true }));
   if (p === '/admin/settings-center') return req.respond(json({
     config: { values: { require_downstream_key: true, web_search_enabled: true, claude_cache_ttl: '1h' } },
-    registrar: { values: { default_register_method: 'protocol', registration_concurrency: 2 } },
+    registrar: {
+      default_register_method: 'protocol_v2', registration_concurrency: 2,
+      phoneCountryCode: 'BR', proxyHost: 'proxy.example.test', proxyPort: 3010,
+      proxyUsername: '', proxyUsername_configured: true,
+      proxyPassword: '', proxyPassword_configured: true,
+    },
     automation: { policy: { enabled: true, type: 'refill', config: { target: 8, threshold: 2 } } },
     logging: { values: {} },
     memory: { values: {} },
@@ -433,7 +438,13 @@ async function handleAPI(req) {
   if (p === '/admin/user-groups') return req.respond(json([{ id: 'ug_fixture', name: 'Fixture users', targets: [{ kind: 'account_pool_group', id: 'cyber' }] }]));
   if (p === '/admin/api-keys') return req.respond(json({ keys: fixtures.apiKeys }));
   if (p === '/admin/users') return req.respond(json({ users: fixtures.users }));
-  if (p === '/admin/providers' || p === '/admin/register/providers') return req.respond(json({ providers: [{ id: 'openai', name: 'OpenAI', base_url: 'https://api.openai.com/v1', enabled: true, auto_discover_models: true, models: ['gpt-5.5', 'gpt-5.4'] }] }));
+  if (p === '/admin/providers') return req.respond(json({ providers: [{ id: 'openai', name: 'OpenAI', base_url: 'https://api.openai.com/v1', enabled: true, auto_discover_models: true, models: ['gpt-5.5', 'gpt-5.4'] }] }));
+  if (p === '/admin/register/providers') return req.respond(json({ providers: [
+    { type: 'sms', key: 'smsactivate', display_name: 'SMS-Activate', enabled: true, priority: 20, config: { api_key: '', api_key_configured: true, service: 'dr', max_price: '0.50' } },
+    { type: 'mailbox', key: 'imap', display_name: 'IMAP', enabled: true, priority: 10, config: { host: 'imap.example.test', port: '993', email: '', email_configured: true, password: '', password_configured: true, use_tls: true } },
+    { type: 'captcha', key: 'yescaptcha', display_name: 'YesCaptcha', enabled: true, priority: 10, config: { api_key: '', api_key_configured: true } },
+    { type: 'email', key: 'hotmail_otp', display_name: 'Hotmail OTP', enabled: true, priority: 10, config: { base_email: '', base_email_configured: true, otp_url: '', otp_url_configured: true, auth_token: '', auth_token_configured: true } },
+  ] }));
   if (p === '/admin/register/providers/options') return req.respond(json({ sms: ['smsbower', 'herosms'], mailbox: ['cloudflare'], captcha: ['capsolver'] }));
   if (p === '/admin/egress-profiles') return req.respond(json({ profiles: [{ id: 'egress_direct', name: 'Direct', type: 'direct', region: 'us-east', health: 'ok', latency_millis: 42, stream_capable: true }] }));
   if (p === '/admin/egress-pools') return req.respond(json({ pools: [{ id: 'pool_registration', name: 'Registration Pool', purpose: 'registration', members: ['egress_direct'] }, { id: 'pool_runtime', name: 'Runtime Pool', purpose: 'runtime', members: ['egress_direct'] }] }));
@@ -1027,7 +1038,8 @@ async function waitForText(page, text, timeout = 45000) {
 
 async function captureState(page, dir, filename, states, covered, extra = {}) {
   const file = path.join(dir, filename);
-  await screenshotDocument(page, file, { segments: false });
+  const { fullDocument = false, ...details } = extra;
+  await screenshotDocument(page, file, { segments: fullDocument });
   const metrics = await pageMetrics(page);
   let issue = '';
   try {
@@ -1036,7 +1048,7 @@ async function captureState(page, dir, filename, states, covered, extra = {}) {
     issue = error.message;
   }
   states.forEach((state) => covered.add(state));
-  log('state_capture', { states, file: path.relative(workspaceRoot, file), metrics, issue, ...extra });
+  log('state_capture', { states, file: path.relative(workspaceRoot, file), metrics, issue, ...details });
   if (issue && !recordOnly) throw new Error(issue);
 }
 
@@ -1085,6 +1097,37 @@ async function captureStates(browser, baseURL) {
   await accounts.waitForFunction(() => document.body.innerText.includes('已选'), { timeout: 45000 });
   await captureState(accounts, dir, 'accounts-bulk-selected.png', ['selected', 'bulk-selected'], covered);
   await accounts.close();
+
+  for (const [name, viewport, theme] of [
+    ['settings-registrar-desktop.png', { name: '1440x900', width: 1440, height: 900 }, 'light'],
+    ['settings-registrar-mobile.png', { name: '390x844', width: 390, height: 844, mobile: true }, 'dark'],
+  ]) {
+    const settings = await preparePage(browser, baseURL, 'admin', viewport, theme);
+    await gotoApp(settings, baseURL, '/settings-v2');
+    await clickButtonByText(settings, '注册器凭据');
+    await waitForText(settings, '接码平台');
+    await captureState(settings, dir, name, ['settings-registrar'], covered, { fullDocument: true, theme, viewport: viewport.name });
+    for (const section of [
+      { title: '接码平台', content: 'SMS-Activate', slug: 'sms' },
+      { title: '验证码求解器', content: 'YesCaptcha', slug: 'captcha' },
+      { title: 'Hotmail OTP', content: '基础邮箱', slug: 'hotmail' },
+      { title: '邮箱提供商', content: 'Cloudflare / MoeMail', slug: 'mailbox' },
+    ]) {
+      await clickButtonByText(settings, section.title);
+      await waitForText(settings, section.content);
+      await captureState(
+        settings,
+        dir,
+        name.replace('.png', `-${section.slug}.png`),
+        [`settings-registrar-${section.slug}`],
+        covered,
+        { fullDocument: true, theme, viewport: viewport.name },
+      );
+      await clickButtonByText(settings, section.title);
+      await settings.waitForFunction((text) => !document.body.innerText.includes(text), { timeout: 15000 }, section.content);
+    }
+    await settings.close();
+  }
 
   const page = await preparePage(browser, baseURL, 'admin', { name: '1440x900', width: 1440, height: 900 }, 'light');
   await gotoApp(page, baseURL, '/usage');

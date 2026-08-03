@@ -187,9 +187,9 @@ func isGPT56Model(model string) bool {
 	return ok && strings.HasPrefix(canonical, "gpt-5.6-")
 }
 
-// ApplyGPT56ContextContract normalizes stale discovery metadata before it is
-// persisted or rendered. Some upstream catalogs inherit an older client bundle's
-// 272K value even though the pool product contract is 372K.
+// ApplyGPT56ContextContract normalizes Codex/ChatGPT discovery metadata before it
+// is persisted or rendered. It must not be applied to Kiro live-catalog rows:
+// Kiro is a different transport and its account-scoped limit is authoritative.
 func ApplyGPT56ContextContract(cap storage.ModelCapability) storage.ModelCapability {
 	if !isGPT56Model(cap.ModelSlug) {
 		return cap

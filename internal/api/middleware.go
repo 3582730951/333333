@@ -116,15 +116,50 @@ func (r *responseRecorder) Unwrap() http.ResponseWriter {
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	requestID := newRequestID()
-	w.Header().Set(requestIDHeader, requestID)
-	setSecurityHeaders(w, r)
-
 	rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
 	requestBytes := r.ContentLength
 	metricRoute := s.httpMetrics.begin(r.URL.Path)
+	_, routePattern := s.mux.Handler(r)
+	routeName := diagnosticHTTPRouteName(routePattern)
+	panicRecovered := false
+	// Install the containment boundary before admission, body capture, scheduling,
+	// or routing. The former late boundary left middleware panics to net/http,
+	// which closed the connection before the diagnostic callback could run.
 	defer func() {
-		s.httpMetrics.finish(metricRoute, rec.status, requestBytes, rec.bytes, time.Since(start))
+		if value := recover(); value != nil {
+			panicRecovered = true
+			committedBeforePanic := rec.wrote || rec.hijacked
+			log.Printf("[PANIC] request_id=%s method=%s path=%s remote=%s panic=%v",
+				requestID, r.Method, r.URL.Path, r.RemoteAddr, value)
+			if !rec.wrote && !rec.hijacked {
+				writePublicServiceUnavailable(rec)
+			}
+			panicContext := fmt.Sprintf("%s %s request_id=%s remote=%s panic=%v",
+				r.Method, r.URL.Path, requestID, r.RemoteAddr, value)
+			supervisor.LogPanicEvent(supervisor.Event{
+				Module: "http-request", Operation: "serve_http", RequestID: requestID,
+				Route: routeName, Status: rec.status, Recovered: true,
+				ResponseCommitted: committedBeforePanic,
+				Message:           "module panic: " + panicContext, Panic: panicContext,
+			}, value)
+		}
+		duration := time.Since(start)
+		s.httpMetrics.finish(metricRoute, rec.status, requestBytes, rec.bytes, duration)
+		s.recordHTTPRequest(requestID, r.Method, routeName, rec.status, requestBytes, rec.bytes, duration)
+		if rec.status >= http.StatusInternalServerError && !panicRecovered {
+			log.Printf("[HTTP-ERROR] request_id=%s status=%d method=%s path=%s bytes=%d duration=%s",
+				requestID, rec.status, r.Method, r.URL.Path, rec.bytes, duration.Round(time.Millisecond))
+			supervisor.Report(supervisor.Event{
+				Type: "http_error", Severity: "error", Module: "http-request",
+				Operation: "serve_http", ErrorClass: "http_status_5xx",
+				RequestID: requestID, Route: routeName, Status: rec.status,
+				Recovered: true, ResponseCommitted: rec.wrote || rec.hijacked,
+				Message: "HTTP request completed with a server error",
+			})
+		}
 	}()
+	w.Header().Set(requestIDHeader, requestID)
+	setSecurityHeaders(w, r)
 	if s.rejectForStoragePressure(r) {
 		writePublicServiceUnavailable(rec)
 		return
@@ -190,23 +225,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx = contextWithUsageEventID(ctx, newRequestID())
 	ctx = contextWithRuntimeSettingsCache(ctx)
 	r = r.WithContext(ctx)
-	defer func() {
-		if v := recover(); v != nil {
-			log.Printf("[PANIC] request_id=%s method=%s path=%s remote=%s panic=%v",
-				requestID, r.Method, r.URL.Path, r.RemoteAddr, v)
-			supervisor.LogPanic("http-request", fmt.Sprintf("%s %s request_id=%s remote=%s panic=%v",
-				r.Method, r.URL.Path, requestID, r.RemoteAddr, v))
-			if !rec.wrote && !rec.hijacked {
-				writePublicServiceUnavailable(rec)
-			}
-			return
-		}
-		if rec.status >= http.StatusInternalServerError {
-			log.Printf("[HTTP-ERROR] request_id=%s status=%d method=%s path=%s bytes=%d duration=%s",
-				requestID, rec.status, r.Method, r.URL.Path, rec.bytes, time.Since(start).Round(time.Millisecond))
-		}
-	}()
 	s.mux.ServeHTTP(rec, r)
+}
+
+// diagnosticHTTPRouteName turns a repository-owned ServeMux pattern into a
+// stable diagnostic label. Dynamic URL components never enter the runtime ring.
+func diagnosticHTTPRouteName(pattern string) string {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" || pattern == "/" {
+		return "root"
+	}
+	wildcard := strings.HasSuffix(pattern, "/")
+	name := strings.Trim(strings.ReplaceAll(pattern, "/", "."), ".")
+	if wildcard {
+		name += ".*"
+	}
+	return name
 }
 
 func (s *Server) rejectForStoragePressure(r *http.Request) bool {

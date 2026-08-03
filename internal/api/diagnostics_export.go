@@ -163,6 +163,7 @@ func diagnosticFileOrder() []string {
 		"diagnostic_summary.json",
 		"runtime_storage.json",
 		"diagnostic_events.csv",
+		"http_requests.csv",
 		"route_attempts.csv",
 		"provider_attempts.csv",
 		"account_auth_metadata.csv",
@@ -395,8 +396,10 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 	addCSV("account_lifecycle_status.csv", []string{"account_code", "validity_status", "subscription_tier", "subscription_expires_at", "last_health_check_at", "last_token_refresh_at", "health_check_fail_count", "summary_json", "created_at", "updated_at"}, lifecycleStatusRows(lifecycleStatuses, codebook))
 	addCSV("codex_reauth_config.csv", []string{"account_code", "login_email_present", "password_configured", "otp_url_configured", "target_workspace_id", "auto_enabled", "last_status", "last_error", "created_at", "updated_at"}, codexReauthConfigRows(reauthConfigs, codebook))
 	addCSV("codex_reauth_jobs.csv", []string{"id", "account_code", "status", "reason", "last_error", "created_at", "updated_at", "started_at", "finished_at"}, codexReauthJobRows(reauthJobs, codebook))
+	httpRequests := s.diagnosticHTTPRequests()
 	routeAttempts := s.diagnosticRouteAttempts()
 	providerAttempts := s.diagnosticProviderAttempts()
+	addCSV("http_requests.csv", []string{"request_id", "method", "route", "status", "request_bytes", "response_bytes", "duration_ms", "created_at"}, httpRequestRows(httpRequests))
 	addCSV("route_attempts.csv", []string{"request_id", "tier", "target", "selection_type", "status_class", "fallback_target", "created_at"}, routeAttemptRows(routeAttempts))
 	addCSV("provider_attempts.csv", []string{"request_id", "account_code", "provider", "phase", "status", "error_class", "body_hash", "retry_after", "created_at"}, providerAttemptRows(providerAttempts, codebook))
 	addCSV("accounts_snapshot.csv", []string{"account_code", "group_name", "declared_provider", "effective_provider", "status", "plan_type", "is_fedramp", "ignore_rate_limit_controls", "quarantine_until", "quarantine_reason", "created_at", "updated_at", "primary_egress_id", "standby_egress_ids", "sidecar_egress_id", "cooldown_until", "recheck_pending"}, accountSnapshotRows(accounts, tokensByID, bindings, codebook))
@@ -533,6 +536,11 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 		providerAttemptTimes = append(providerAttemptTimes, row.CreatedAt)
 	}
 	addRange("provider_attempts.csv", providerAttemptTimes)
+	httpRequestTimes := make([]int64, 0, len(httpRequests))
+	for _, row := range httpRequests {
+		httpRequestTimes = append(httpRequestTimes, row.CreatedAt)
+	}
+	addRange("http_requests.csv", httpRequestTimes)
 	egressTimes := make([]int64, 0, len(egressProfiles))
 	for _, row := range egressProfiles {
 		egressTimes = append(egressTimes, row.CreatedAt)
@@ -551,6 +559,7 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 		"table_time_ranges_scope": "source_snapshot",
 		"account_redaction":       "all entity identifiers use type-isolated stable HMAC aliases; no reverse map or alias key is included",
 		"account_code_format":     "ACC-Base32(HMAC-SHA256(alias_key,domain||entity_type||raw_id)[:16])",
+		"public_request_ids":      "server-generated REQ- plus 16 hexadecimal request IDs are retained for support correlation; upstream request IDs remain aliased",
 	}
 	if err := addJSON("manifest.json", manifest); err != nil {
 		return err
@@ -987,6 +996,9 @@ func diagnosticExportEntityAlias(codebook diagnosticCodebook, entityType, value 
 		return ""
 	}
 	upper := strings.ToUpper(value)
+	if entityType == "request" && diagnosticPublicRequestIDRE.MatchString(upper) {
+		return upper
+	}
 	if diagnosticEntityAliasRE.MatchString(upper) {
 		return upper
 	}
@@ -1058,8 +1070,8 @@ func sanitizeDiagnosticEventValue(field string, value interface{}, codebook diag
 
 func diagnosticEventTypedStringField(field string) bool {
 	switch field {
-	case "action", "component", "error_code", "level", "mode", "operation", "phase",
-		"previous_level", "reason", "resource_type", "result", "role", "source", "state", "status":
+	case "action", "component", "delivery", "error_class", "error_code", "fingerprint", "level", "mode", "operation", "phase",
+		"previous_level", "reason", "resource_type", "result", "role", "route", "source", "state", "status":
 		return true
 	default:
 		return false
@@ -1288,6 +1300,7 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	addCSV("codex_instruction_snapshots.csv", []string{"tree_hmac_prefix", "revision_hmac_prefix", "created_at", "updated_at", "expires_at"}, nil)
 	addCSV("codex_upstream_attempts.csv", []string{"tree_hmac_prefix", "account_code", "egress_id", "epoch", "state", "status_code", "created_at"}, nil)
 	addCSV("codex_upstream_attempts_daily.csv", []string{"day_start", "account_code", "egress_id", "state", "status_code", "attempt_count", "first_created_at", "last_created_at"}, nil)
+	addCSV("http_requests.csv", []string{"request_id", "method", "route", "status", "request_bytes", "response_bytes", "duration_ms", "created_at"}, nil)
 	addCSV("route_attempts.csv", []string{"request_id", "tier", "target", "selection_type", "status_class", "fallback_target", "created_at"}, nil)
 	addCSV("provider_attempts.csv", []string{"request_id", "account_code", "provider", "phase", "status", "error_class", "body_hash", "retry_after", "created_at"}, nil)
 	addCSV("diagnostic_events.csv", []string{"event_code", "created_at", "event_type", "severity", "entity_type", "entity_alias", "detail_json", "diagnostic_gap"}, nil)
@@ -1328,6 +1341,7 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 		"row_counts":                         rowCounts,
 		"account_redaction":                  "all entity identifiers use type-isolated stable HMAC aliases; no reverse map or alias key is included",
 		"account_code_format":                "ACC-Base32(HMAC-SHA256(alias_key,domain||entity_type||raw_id)[:16])",
+		"public_request_ids":                 "server-generated REQ- plus 16 hexadecimal request IDs are retained for support correlation; upstream request IDs remain aliased",
 	}
 	rawManifest, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -1920,6 +1934,9 @@ func (b diagnosticCodebook) sanitize(text string) string {
 		return diagnosticAlias(b.aliasKey, "TOKEN", "credential", value)
 	})
 	text = diagnosticRequestIDRE.ReplaceAllStringFunc(text, func(value string) string {
+		if diagnosticPublicRequestIDRE.MatchString(value) {
+			return strings.ToUpper(value)
+		}
 		if diagnosticStableAliasRE.MatchString(strings.ToUpper(value)) {
 			return value
 		}
@@ -2063,18 +2080,19 @@ func diagnosticContainsHighEntropy(value string) bool {
 }
 
 var (
-	diagnosticPrivateKeyRE   = regexp.MustCompile(`(?is)-----BEGIN[ A-Z0-9_-]{0,40}PRIVATE KEY-----.*?-----END[ A-Z0-9_-]{0,40}PRIVATE KEY-----`)
-	diagnosticBearerRE       = regexp.MustCompile(`(?i)\bBearer[ \t]+[A-Za-z0-9._~+/=-]{8,}`)
-	diagnosticJWTRE          = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
-	diagnosticSecretPrefixRE = regexp.MustCompile(`(?i)\b(?:sk|rk|ghp|github_pat|xox[baprs]|ya29|AIza)[_-][A-Za-z0-9._~+/=-]{12,}`)
-	diagnosticRequestIDRE    = regexp.MustCompile(`(?i)\breq[_-][A-Za-z0-9][A-Za-z0-9_-]{11,}\b`)
-	diagnosticEmailRE        = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
-	diagnosticURLRE          = regexp.MustCompile(`(?i)\b(?:https?|socks5h?)://[^\s,"'<>]+`)
-	diagnosticIPv4RE         = regexp.MustCompile(`\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`)
-	diagnosticWindowsPathRE  = regexp.MustCompile(`(?i)\b[A-Z]:\\(?:[^\\\s,"'<>]+\\)*[^\\\s,"'<>]*`)
-	diagnosticUnixPathRE     = regexp.MustCompile(`(?:^|[\s="'(])(/[A-Za-z0-9._~+-]+(?:/[A-Za-z0-9._~+:-]+)+)`)
-	diagnosticHighEntropyRE  = regexp.MustCompile(`[A-Za-z0-9_+/=-]{40,}`)
-	diagnosticStableAliasRE  = regexp.MustCompile(`^(?:ACC|EGR|GRP|USR|KEY|REQ|SES|TSK|HST|JOB|ENT|EVT|EMAIL|URL|IP|PATH|TOKEN|TEXT|FIELD)-[A-Z2-7]{26}$`)
+	diagnosticPrivateKeyRE      = regexp.MustCompile(`(?is)-----BEGIN[ A-Z0-9_-]{0,40}PRIVATE KEY-----.*?-----END[ A-Z0-9_-]{0,40}PRIVATE KEY-----`)
+	diagnosticBearerRE          = regexp.MustCompile(`(?i)\bBearer[ \t]+[A-Za-z0-9._~+/=-]{8,}`)
+	diagnosticJWTRE             = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
+	diagnosticSecretPrefixRE    = regexp.MustCompile(`(?i)\b(?:sk|rk|ghp|github_pat|xox[baprs]|ya29|AIza)[_-][A-Za-z0-9._~+/=-]{12,}`)
+	diagnosticRequestIDRE       = regexp.MustCompile(`(?i)\breq[_-][A-Za-z0-9][A-Za-z0-9_-]{11,}\b`)
+	diagnosticPublicRequestIDRE = regexp.MustCompile(`(?i)^REQ-[A-F0-9]{16}$`)
+	diagnosticEmailRE           = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
+	diagnosticURLRE             = regexp.MustCompile(`(?i)\b(?:https?|socks5h?)://[^\s,"'<>]+`)
+	diagnosticIPv4RE            = regexp.MustCompile(`\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`)
+	diagnosticWindowsPathRE     = regexp.MustCompile(`(?i)\b[A-Z]:\\(?:[^\\\s,"'<>]+\\)*[^\\\s,"'<>]*`)
+	diagnosticUnixPathRE        = regexp.MustCompile(`(?:^|[\s="'(])(/[A-Za-z0-9._~+-]+(?:/[A-Za-z0-9._~+:-]+)+)`)
+	diagnosticHighEntropyRE     = regexp.MustCompile(`[A-Za-z0-9_+/=-]{40,}`)
+	diagnosticStableAliasRE     = regexp.MustCompile(`^(?:ACC|EGR|GRP|USR|KEY|REQ|SES|TSK|HST|JOB|ENT|EVT|EMAIL|URL|IP|PATH|TOKEN|TEXT|FIELD)-[A-Z2-7]{26}$`)
 )
 
 func diagnosticSafeCSVCell(value string) string {

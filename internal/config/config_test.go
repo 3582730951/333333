@@ -24,6 +24,28 @@ func TestLoadMigratesLegacyClaudeOAuthTokenURL(t *testing.T) {
 	}
 }
 
+func TestOAuthDefaultsAvailableWithoutLoad(t *testing.T) {
+	cfg := Default()
+	for name, value := range map[string]string{
+		"codex auth URL":           cfg.CodexOAuthAuthURL,
+		"codex token URL":          cfg.CodexOAuthTokenURL,
+		"codex client ID":          cfg.CodexOAuthClientID,
+		"codex redirect URI":       cfg.CodexOAuthRedirectURI,
+		"claude auth URL":          cfg.ClaudeOAuthAuthURL,
+		"claude token URL":         cfg.ClaudeOAuthTokenURL,
+		"claude client ID":         cfg.ClaudeOAuthClientID,
+		"claude redirect URI":      cfg.ClaudeOAuthRedirectURI,
+		"antigravity auth URL":     cfg.AntigravityOAuthAuthURL,
+		"antigravity token URL":    cfg.AntigravityOAuthTokenURL,
+		"antigravity client ID":    cfg.AntigravityOAuthClientID,
+		"antigravity redirect URI": cfg.AntigravityOAuthRedirectURI,
+	} {
+		if strings.TrimSpace(value) == "" {
+			t.Errorf("Default() left %s empty", name)
+		}
+	}
+}
+
 func TestBodyResourceDefaults(t *testing.T) {
 	cfg := Default()
 	if cfg.MaxBodyBytes != 1<<30 || cfg.BodyMemoryThresholdBytes != 8<<20 || cfg.BodySpoolMaxBytes != 32<<30 || cfg.BodyDiskReserveBytes != 0 {

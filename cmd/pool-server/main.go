@@ -26,6 +26,7 @@ import (
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/datadir"
 	"codex-account-pool/internal/identity"
+	"codex-account-pool/internal/incident"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/secretbox"
 	"codex-account-pool/internal/storage"
@@ -80,6 +81,23 @@ func run() int {
 		log.Printf("persistent data preflight: %v", err)
 		return 1
 	}
+	// Install the exception callback as soon as the private data layout exists.
+	// Storage is deliberately nil until Init completes: startup failures are
+	// fsynced to the fallback journal and replayed by the next healthy process.
+	incidentReporter, err := incident.Open(filepath.Join(layout.Journal, "exception-events"), nil)
+	if err != nil {
+		log.Printf("initialize exception diagnostics: %v", err)
+		return 1
+	}
+	incidentCallback, err := supervisor.RegisterEventCallback(incidentReporter.CallbackOptions("durable-diagnostic-events"))
+	if err != nil {
+		log.Printf("register exception diagnostics callback: %v", err)
+		return 1
+	}
+	defer incidentCallback.Unregister()
+	reportStartupFailure := func(operation string, startupErr error) {
+		supervisor.ReportError("process-startup", operation, startupErr)
+	}
 	cfg.DataDir = layout.Root
 	cfg.BodySpoolDir = layout.Spool
 	cfg.DiagnosticsDir = layout.Diagnostics
@@ -87,6 +105,7 @@ func run() int {
 		cfg.UsageJournalDir = filepath.Join(layout.Journal, journalOwnerDirectory(cfg.NodeID, os.Getenv("CODEX_POOL_INSTANCE_ID")))
 		if err := datadir.EnsureDirectory(cfg.UsageJournalDir); err != nil {
 			log.Printf("usage journal preflight: %v", err)
+			reportStartupFailure("usage_journal_preflight", err)
 			return 1
 		}
 	} else {
@@ -104,16 +123,19 @@ func run() int {
 	masterKey, err := loadRuntimeKey(cfg.MasterKeyFile, explicitMasterKey)
 	if err != nil {
 		log.Printf("load storage master key: %v", err)
+		reportStartupFailure("load_storage_master_key", err)
 		return 1
 	}
 	cfg.RuntimeIdentityKey, err = loadRuntimeKey(cfg.IdentityKeyFile, explicitIdentityKey)
 	if err != nil {
 		log.Printf("load stable identity key: %v", err)
+		reportStartupFailure("load_identity_key", err)
 		return 1
 	}
 	cfg.RuntimeDiagnosticAliasKey, err = loadRuntimeKey(cfg.DiagnosticAliasKeyFile, explicitDiagnosticAliasKey)
 	if err != nil {
 		log.Printf("load diagnostic alias key: %v", err)
+		reportStartupFailure("load_diagnostic_alias_key", err)
 		return 1
 	}
 	// Advisory only: surface fingerprint version-override combinations that risk looking
@@ -137,15 +159,24 @@ func run() int {
 	store, err := storage.OpenWithConfig(cfg)
 	if err != nil {
 		log.Printf("open storage: %v", err)
+		reportStartupFailure("open_storage", err)
 		return 1
 	}
 	defer store.Close()
 
 	if err := store.Init(ctx); err != nil {
 		log.Printf("init storage: %v", err)
+		reportStartupFailure("init_storage", err)
 		return 1
 	}
 	log.Printf("startup: storage initialized in %s", time.Since(storageInitStarted).Round(time.Millisecond))
+	incidentReporter.SetStore(store)
+	if replayed, replayErr := incidentReporter.Replay(ctx); replayErr != nil && !errors.Is(replayErr, incident.ErrPrimaryUnavailable) {
+		log.Printf("replay exception diagnostics: %v", replayErr)
+		supervisor.ReportError("exception-reporter", "startup_replay", replayErr)
+	} else if replayed > 0 {
+		log.Printf("startup: replayed %d durable exception event(s)", replayed)
+	}
 	// Keep the former host/config-derived key readable for exactly this migration
 	// window. Every value is then rewritten with the independent persistent master.
 	legacyStorageKey := secretbox.DeriveKey(identity.ResolveSecret([]byte(cfg.IdentitySecret)))
@@ -155,14 +186,17 @@ func run() int {
 	}
 	if err := store.SetTokenMasterKey(masterKey, legacyKeys...); err != nil {
 		log.Printf("[SECURITY] configure storage encryption: %v", err)
+		reportStartupFailure("configure_storage_encryption", err)
 		return 1
 	}
 	if err := store.ValidateEncryptionSentinel(ctx); err != nil {
 		log.Printf("[SECURITY] encryption sentinel: %v", err)
+		reportStartupFailure("validate_encryption_sentinel", err)
 		return 1
 	}
 	if n, err := store.EncryptExistingTokens(ctx); err != nil {
 		log.Printf("[SECURITY] encrypt existing tokens at rest: %v", err)
+		reportStartupFailure("encrypt_existing_tokens", err)
 		return 1
 	} else if n > 0 {
 		log.Printf("[SECURITY] encrypted %d plaintext account token row(s) at rest", n)
@@ -170,6 +204,7 @@ func run() int {
 	store.EnableStrictEncryption()
 	if err := store.CryptoError(); err != nil {
 		log.Printf("[SECURITY] credential validation: %v", err)
+		reportStartupFailure("validate_credentials", err)
 		return 1
 	}
 	up := upstream.NewClient(cfg)
@@ -185,11 +220,13 @@ func run() int {
 	leaseCoordinator, err := scheduler.NewLeaseCoordinator(cfg)
 	if err != nil {
 		log.Printf("init lease coordinator: %v", err)
+		reportStartupFailure("init_lease_coordinator", err)
 		return 1
 	}
 	app := api.NewServer(api.Dependencies{
 		Config:            cfg,
 		Store:             store,
+		IncidentReporter:  incidentReporter,
 		Scheduler:         scheduler.NewWithLeaseCoordinator(store, cfg, leaseCoordinator),
 		Upstream:          up,
 		Planner:           virtual.NewPlanner(store, cfg),
@@ -263,6 +300,7 @@ func run() int {
 	roleController, err := newWorkerRoleController(store, deployment, deploymentRole, unixSocket, roleOwner, startActive)
 	if err != nil {
 		log.Printf("deployment role: %v", err)
+		reportStartupFailure("init_worker_role", err)
 		return 1
 	}
 	httpServer := &http.Server{
@@ -277,6 +315,7 @@ func run() int {
 	serveErr := make(chan error, 1)
 	deployment.standbyReady.Store(true)
 	serveHTTPServerAsync(serveErr, func() error { return serveHTTPServerOn(httpServer, unixSocket) })
+	supervisor.Go(ctx, "exception-journal-replay", incidentReporter.Run)
 	supervisor.Go(ctx, "worker-role", roleController.Run)
 
 	stop := make(chan os.Signal, 1)

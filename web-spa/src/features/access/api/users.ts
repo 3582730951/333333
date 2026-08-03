@@ -13,6 +13,7 @@ const userSchema = z.object({
 }).passthrough();
 
 export const usersResponseSchema = z.union([
+  z.null().transform(() => []),
   z.array(userSchema),
   z.object({ users: z.array(userSchema).optional(), rows: z.array(userSchema).optional() })
     .passthrough()

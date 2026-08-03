@@ -37,7 +37,7 @@ func NewMailTMProvider(name, apiURL, domain string, httpClient *http.Client) *Ma
 	}
 	return &MailTMProvider{
 		name: strings.TrimSpace(name), apiURL: apiURL,
-		domain: strings.TrimSpace(strings.TrimPrefix(domain, "@")),
+		domain:     strings.TrimSpace(strings.TrimPrefix(domain, "@")),
 		httpClient: newGuardedMailboxHTTPClient(httpClient, apiURL),
 	}
 }

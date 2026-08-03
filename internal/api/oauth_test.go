@@ -250,6 +250,118 @@ func TestOAuthProviderDescriptors(t *testing.T) {
 	}
 }
 
+func TestOAuthAuthorizeURLPreservesConfiguredQueryAndRejectsInvalidEndpoints(t *testing.T) {
+	desc := oauthProviderDesc{
+		provider:    "codex",
+		authURL:     "https://identity.example.test/authorize?tenant=school",
+		tokenURL:    "https://identity.example.test/token",
+		clientID:    "client",
+		redirectURI: "http://localhost:1455/auth/callback",
+		scope:       "openid profile",
+	}
+	raw, err := desc.buildAuthorizeURLWithOptions("CHALLENGE", "STATE", oauthAuthorizeOptions{})
+	if err != nil {
+		t.Fatalf("buildAuthorizeURLWithOptions: %v", err)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := u.Query().Get("tenant"); got != "school" {
+		t.Fatalf("configured query was lost: tenant=%q URL=%q", got, raw)
+	}
+	if got := u.Query().Get("state"); got != "STATE" {
+		t.Fatalf("generated state=%q, want STATE", got)
+	}
+	if strings.Count(raw, "?") != 1 {
+		t.Fatalf("authorize URL contains a malformed second query delimiter: %q", raw)
+	}
+
+	for name, mutate := range map[string]func(*oauthProviderDesc){
+		"missing authorization endpoint":   func(d *oauthProviderDesc) { d.authURL = "" },
+		"relative authorization endpoint":  func(d *oauthProviderDesc) { d.authURL = "/oauth/authorize" },
+		"unsupported authorization scheme": func(d *oauthProviderDesc) { d.authURL = "file:///tmp/authorize" },
+		"authorization fragment":           func(d *oauthProviderDesc) { d.authURL += "#fragment" },
+		"invalid token endpoint":           func(d *oauthProviderDesc) { d.tokenURL = "/oauth/token" },
+		"missing client id":                func(d *oauthProviderDesc) { d.clientID = "" },
+		"invalid redirect URI":             func(d *oauthProviderDesc) { d.redirectURI = "localhost/callback" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := desc
+			mutate(&invalid)
+			if _, err := invalid.buildAuthorizeURLWithOptions("CHALLENGE", "STATE", oauthAuthorizeOptions{}); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestAdminOAuthStartContractForEveryProvider(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	for _, tc := range []struct {
+		requestProvider string
+		canonical       string
+		wantPKCE        bool
+	}{
+		{requestProvider: "chatgpt", canonical: "codex", wantPKCE: true},
+		{requestProvider: "claude", canonical: "claude", wantPKCE: true},
+		{requestProvider: "antigravity", canonical: "antigravity", wantPKCE: false},
+	} {
+		t.Run(tc.requestProvider, func(t *testing.T) {
+			payload, _ := json.Marshal(map[string]string{"provider": tc.requestProvider})
+			resp, err := http.Post(h.pool.URL+"/admin/oauth/start", "application/json", strings.NewReader(string(payload)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			var result struct {
+				SessionID string `json:"session_id"`
+				Provider  string `json:"provider"`
+				AuthURL   string `json:"auth_url"`
+				ExpiresIn int    `json:"expires_in"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusOK || result.SessionID == "" || result.Provider != tc.canonical || result.ExpiresIn <= 0 {
+				t.Fatalf("start contract status=%d response=%+v", resp.StatusCode, result)
+			}
+			auth, err := url.Parse(result.AuthURL)
+			if err != nil || (auth.Scheme != "https" && auth.Scheme != "http") || auth.Host == "" {
+				t.Fatalf("unusable auth_url=%q err=%v", result.AuthURL, err)
+			}
+			pending, ok := h.app.oauth.get(result.SessionID)
+			if !ok || pending.provider != tc.canonical || pending.state == "" {
+				t.Fatalf("pending session missing/mismatched: ok=%v pending=%+v", ok, pending)
+			}
+			if got := auth.Query().Get("state"); got != pending.state {
+				t.Fatalf("URL state=%q pending state=%q", got, pending.state)
+			}
+			hasPKCE := auth.Query().Get("code_challenge") != ""
+			if hasPKCE != tc.wantPKCE {
+				t.Fatalf("PKCE presence=%v, want %v URL=%q", hasPKCE, tc.wantPKCE, result.AuthURL)
+			}
+		})
+	}
+}
+
+func TestAdminOAuthStartDoesNotPersistSessionForInvalidProviderConfiguration(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	h.app.cfg.CodexOAuthAuthURL = "/relative/authorize"
+	req := httptest.NewRequest(http.MethodPost, "/admin/oauth/start", strings.NewReader(`{"provider":"codex"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.app.adminOAuthStart(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	h.app.oauth.mu.Lock()
+	defer h.app.oauth.mu.Unlock()
+	if len(h.app.oauth.m) != 0 {
+		t.Fatalf("invalid generated link left %d pending sessions", len(h.app.oauth.m))
+	}
+}
+
 type oauthRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn oauthRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

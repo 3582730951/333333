@@ -1763,27 +1763,94 @@ type providerInput struct {
 	Config      map[string]interface{} `json:"config"`
 }
 
-// createProvider accepts EITHER a bulk save {providers:[...], defaults:{...}} (the
-// Provider config page's "save all") or a single provider {type,key,...}. Both upsert by
-// (provider_type, provider_key) so re-saving updates in place instead of erroring on the
-// UNIQUE constraint, then reload the live Manager so the change takes effect immediately.
+type providerBulkInput struct {
+	Providers     []providerInput        `json:"providers"`
+	Defaults      map[string]interface{} `json:"defaults"`
+	Registrar     map[string]interface{} `json:"registrar"`
+	RegistrarMode string                 `json:"registrar_mode"`
+}
+
+type registrarBatchPatch struct {
+	Provided bool
+	Values   map[string]interface{}
+	Mode     string
+}
+
+type providerBatchSaveResult struct {
+	RegistrarSaved bool
+	SettingsSaved  []settingsCenterDiff
+}
+
+type providerWriteError struct {
+	ProviderType string
+	ProviderKey  string
+	cause        error
+}
+
+func (e *providerWriteError) Error() string { return "provider settings write failed" }
+func (e *providerWriteError) Unwrap() error { return e.cause }
+
+const providerReloadWarning = "Settings were saved, but the registration runtime could not reload them; the previous active configuration remains in use."
+
+// createProvider accepts EITHER a bulk save
+// {providers:[...], defaults:{...}, registrar:{...}, registrar_mode:"merge|replace"}
+// or a single provider {type,key,...}. The registrar fields are optional, preserving the
+// old request contract. When present, provider rows, defaults, and node registrar config
+// are committed together before the live Manager is reloaded.
 func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	var bulk struct {
-		Providers []providerInput        `json:"providers"`
-		Defaults  map[string]interface{} `json:"defaults"`
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
 	}
-	_ = json.Unmarshal(raw, &bulk)
-	if len(bulk.Providers) > 0 || len(bulk.Defaults) > 0 {
+	_, hasProviders := envelope["providers"]
+	_, hasDefaults := envelope["defaults"]
+	registrarRaw, hasRegistrar := envelope["registrar"]
+	_, hasRegistrarMode := envelope["registrar_mode"]
+	if hasProviders || hasDefaults || hasRegistrar || hasRegistrarMode {
+		var bulk providerBulkInput
+		if err := json.Unmarshal(raw, &bulk); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		registrarPatch := registrarBatchPatch{
+			Provided: hasRegistrar,
+			Values:   bulk.Registrar,
+			Mode:     strings.ToLower(strings.TrimSpace(bulk.RegistrarMode)),
+		}
+		if hasRegistrar {
+			if strings.TrimSpace(string(registrarRaw)) == "null" {
+				writeError(w, http.StatusBadRequest, errors.New("registrar must be an object"))
+				return
+			}
+			if registrarPatch.Values == nil {
+				registrarPatch.Values = map[string]interface{}{}
+			}
+		}
+		if !hasRegistrar && registrarPatch.Mode != "" {
+			writeError(w, http.StatusBadRequest, errors.New("registrar_mode requires registrar"))
+			return
+		}
+		if hasRegistrar {
+			if _, nestedDefaults := registrarPatch.Values["defaults"]; nestedDefaults {
+				writeError(w, http.StatusBadRequest, errors.New("registrar defaults must use the top-level defaults field"))
+				return
+			}
+			if _, err := applyRegistrarConfigPatch(map[string]interface{}{}, registrarPatch.Values, registrarPatch.Mode); err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+		}
 		providers := make([]providerInput, 0, len(bulk.Providers))
 		for i, p := range bulk.Providers {
 			normalized, err := normalizeProviderInput(p)
 			if err != nil {
-				writeError(w, http.StatusBadRequest, fmt.Errorf("providers[%d]: %w", i, err))
+				writeProviderScopedError(w, http.StatusBadRequest, "invalid_provider", "Provider type/key is invalid.", normalized.Type, normalized.Key, i)
 				return
 			}
 			providers = append(providers, normalized)
@@ -1797,15 +1864,27 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 			}
 			defaults = normalized
 		}
-		if err := h.saveProviderBatch(r.Context(), providers, defaults); err != nil {
+		result, err := h.saveProviderBatch(r.Context(), providers, defaults, registrarPatch)
+		if err != nil {
+			var providerErr *providerWriteError
+			if errors.As(err, &providerErr) {
+				writeProviderScopedError(w, http.StatusServiceUnavailable, "provider_save_failed", "Provider settings could not be saved.", providerErr.ProviderType, providerErr.ProviderKey, -1)
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		if err := h.ReloadProviders(r.Context()); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+		reloadOK, warning := h.reloadProvidersAfterCommittedSave(r.Context())
+		response := map[string]interface{}{
+			"saved":           len(providers),
+			"registrar_saved": result.RegistrarSaved,
+			"settings_saved":  result.SettingsSaved,
+			"reload_ok":       reloadOK,
 		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{"saved": len(providers)})
+		if warning != "" {
+			response["warning"] = warning
+		}
+		writeJSON(w, http.StatusOK, response)
 		return
 	}
 
@@ -1816,19 +1895,25 @@ func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	normalized, err := normalizeProviderInput(p)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeProviderScopedError(w, http.StatusBadRequest, "invalid_provider", "Provider type/key is invalid.", normalized.Type, normalized.Key, -1)
 		return
 	}
 	id, err := h.upsertProvider(r.Context(), normalized)
 	if err != nil {
+		var providerErr *providerWriteError
+		if errors.As(err, &providerErr) {
+			writeProviderScopedError(w, http.StatusServiceUnavailable, "provider_save_failed", "Provider settings could not be saved.", providerErr.ProviderType, providerErr.ProviderKey, -1)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := h.ReloadProviders(r.Context()); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	reloadOK, warning := h.reloadProvidersAfterCommittedSave(r.Context())
+	response := map[string]interface{}{"id": id, "reload_ok": reloadOK}
+	if warning != "" {
+		response["warning"] = warning
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+	writeJSON(w, http.StatusOK, response)
 }
 
 type sqlReadWriter interface {
@@ -1838,6 +1923,46 @@ type sqlReadWriter interface {
 
 type sqlExecutor interface {
 	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+}
+
+func writeProviderScopedError(w http.ResponseWriter, status int, code, message, providerType, providerKey string, index int) {
+	errorType := "invalid_request_error"
+	if status >= http.StatusInternalServerError {
+		status = http.StatusServiceUnavailable
+		errorType = "server_error"
+	}
+	providerType = strings.TrimSpace(providerType)
+	providerKey = strings.TrimSpace(providerKey)
+	if len(providerType) > 128 {
+		providerType = providerType[:128]
+	}
+	if len(providerKey) > 128 {
+		providerKey = providerKey[:128]
+	}
+	errorBody := map[string]interface{}{
+		"message":       message,
+		"type":          errorType,
+		"code":          code,
+		"request_id":    publicRequestID(w),
+		"provider_type": providerType,
+		"provider_key":  providerKey,
+	}
+	if index >= 0 {
+		errorBody["provider_index"] = index
+	}
+	resetPublicErrorHeaders(w)
+	writeJSON(w, status, map[string]interface{}{"error": errorBody})
+}
+
+func (h *Handler) reloadProvidersAfterCommittedSave(ctx context.Context) (bool, string) {
+	if err := h.ReloadProviders(ctx); err != nil {
+		// Do not include the underlying error in the response: provider loader errors can
+		// describe credential storage internals. The committed DB state remains valid and
+		// the old pipeline is left active because ReloadProviders swaps only on success.
+		log.Printf("[REGISTRATION] committed provider settings reload failed: class=%T", err)
+		return false, providerReloadWarning
+	}
+	return true, ""
 }
 
 func normalizeProviderInput(p providerInput) (providerInput, error) {
@@ -1866,10 +1991,14 @@ func normalizeProviderInput(p providerInput) (providerInput, error) {
 	return p, nil
 }
 
-func (h *Handler) saveProviderBatch(ctx context.Context, providers []providerInput, defaults map[string]interface{}) error {
+func (h *Handler) saveProviderBatch(ctx context.Context, providers []providerInput, defaults map[string]interface{}, registrar registrarBatchPatch) (providerBatchSaveResult, error) {
+	result := providerBatchSaveResult{
+		RegistrarSaved: registrar.Provided,
+		SettingsSaved:  []settingsCenterDiff{},
+	}
 	tx, err := h.store.DB().BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return result, err
 	}
 	committed := false
 	defer func() {
@@ -1877,25 +2006,72 @@ func (h *Handler) saveProviderBatch(ctx context.Context, providers []providerInp
 			_ = tx.Rollback()
 		}
 	}()
+	var registrarJSON string
+	if registrar.Provided {
+		old, err := loadNodeRegistrarConfigWithExecutor(ctx, tx)
+		if err != nil {
+			return result, err
+		}
+		next, err := applyRegistrarConfigPatch(old, registrar.Values, registrar.Mode)
+		if err != nil {
+			return result, err
+		}
+		raw, err := json.Marshal(next)
+		if err != nil {
+			return result, err
+		}
+		registrarJSON = string(raw)
+		result.SettingsSaved = registrarDiffs(old, next)
+	}
 	for _, p := range providers {
 		if _, err := h.upsertProviderWithExecutor(ctx, tx, p); err != nil {
-			return err
+			return result, &providerWriteError{ProviderType: p.Type, ProviderKey: p.Key, cause: err}
 		}
 	}
 	if len(defaults) > 0 {
 		if err := h.saveDefaultsWithExecutor(ctx, tx, defaults); err != nil {
-			return err
+			return result, err
+		}
+	}
+	if registrar.Provided {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO settings(key, value, updated_at) VALUES('node_registrar_config', ?, ?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+			registrarJSON, storage.Now()); err != nil {
+			return result, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return err
+		return result, err
 	}
 	committed = true
-	if len(defaults) > 0 {
+	if len(defaults) > 0 || registrar.Provided {
 		// The transaction wrote the settings table directly; refresh the snapshot.
 		h.store.InvalidateSettingsCache()
 	}
-	return nil
+	return result, nil
+}
+
+func loadNodeRegistrarConfigWithExecutor(ctx context.Context, exec sqlReadWriter) (map[string]interface{}, error) {
+	var raw string
+	err := exec.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='node_registrar_config'`).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return map[string]interface{}{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(raw) == "" {
+		return map[string]interface{}{}, nil
+	}
+	cfg := map[string]interface{}{}
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return nil, errors.New("stored node registrar configuration is invalid")
+	}
+	if cfg == nil {
+		cfg = map[string]interface{}{}
+	}
+	return cfg, nil
 }
 
 // upsertProvider inserts or updates a provider row keyed by (provider_type, provider_key)
@@ -1907,7 +2083,11 @@ func (h *Handler) upsertProvider(ctx context.Context, p providerInput) (string, 
 	if err != nil {
 		return "", err
 	}
-	return h.upsertProviderWithExecutor(ctx, h.store.DB(), normalized)
+	id, err := h.upsertProviderWithExecutor(ctx, h.store.DB(), normalized)
+	if err != nil {
+		return "", &providerWriteError{ProviderType: normalized.Type, ProviderKey: normalized.Key, cause: err}
+	}
+	return id, nil
 }
 
 func (h *Handler) upsertProviderWithExecutor(ctx context.Context, exec sqlReadWriter, p providerInput) (string, error) {
@@ -1922,10 +2102,11 @@ func (h *Handler) upsertProviderWithExecutor(ctx context.Context, exec sqlReadWr
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
-	publicConfig, incomingSecrets, err := storage.SplitProviderConfig(cfg)
+	incomingPublicConfig, incomingSecrets, err := storage.SplitProviderConfig(cfg)
 	if err != nil {
 		return "", err
 	}
+	publicConfig := map[string]interface{}{}
 	existingSecrets := map[string]string{}
 	if existingID != "" {
 		existingSecrets, err = h.store.OpenProviderAuthJSON(p.Type, p.Key, existingAuth)
@@ -1937,9 +2118,12 @@ func (h *Handler) upsertProviderWithExecutor(ctx context.Context, exec sqlReadWr
 			if err := json.Unmarshal([]byte(existingCfg), &old); err != nil {
 				return "", err
 			}
-			_, legacySecrets, err := storage.SplitProviderConfig(old)
+			oldPublicConfig, legacySecrets, err := storage.SplitProviderConfig(old)
 			if err != nil {
 				return "", err
+			}
+			for field, value := range oldPublicConfig {
+				publicConfig[field] = value
 			}
 			for field, value := range legacySecrets {
 				if strings.TrimSpace(value) != "" {
@@ -1947,6 +2131,12 @@ func (h *Handler) upsertProviderWithExecutor(ctx context.Context, exec sqlReadWr
 				}
 			}
 		}
+	}
+	// Preserve public fields unknown to this client (for example fields introduced by a
+	// newer server or plugin), while letting every explicitly supplied field overwrite
+	// the stored value, including an explicit blank.
+	for field, value := range incomingPublicConfig {
+		publicConfig[field] = value
 	}
 	for field, value := range incomingSecrets {
 		if strings.TrimSpace(value) != "" {
@@ -1998,19 +2188,25 @@ func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	normalized, err := normalizeProviderInput(p)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeProviderScopedError(w, http.StatusBadRequest, "invalid_provider", "Provider type/key is invalid.", normalized.Type, normalized.Key, -1)
 		return
 	}
 	id, err := h.upsertProvider(r.Context(), normalized)
 	if err != nil {
+		var providerErr *providerWriteError
+		if errors.As(err, &providerErr) {
+			writeProviderScopedError(w, http.StatusServiceUnavailable, "provider_save_failed", "Provider settings could not be saved.", providerErr.ProviderType, providerErr.ProviderKey, -1)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := h.ReloadProviders(r.Context()); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	reloadOK, warning := h.reloadProvidersAfterCommittedSave(r.Context())
+	response := map[string]interface{}{"id": id, "reload_ok": reloadOK}
+	if warning != "" {
+		response["warning"] = warning
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) deleteProvider(w http.ResponseWriter, r *http.Request) {

@@ -133,6 +133,7 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	}
 	h.app.recordRouteAttempt("req-diagnostic", 2, "account_pool_group:cyber", "fair", "upstream_503", "account_pool_group:standby")
 	h.app.recordProviderAttempt("req-diagnostic", account.ID, "antigravity", "inference", http.StatusServiceUnavailable, "transient_resource_exhausted", "sha256:0123456789abcdef", "2")
+	h.app.recordHTTPRequest("REQ-89C6735FD8ABC561", http.MethodGet, "admin.email-pool", http.StatusOK, 0, 84, 12*time.Millisecond)
 	h.app.recordBodyStorageRejection(&bodysource.BodyStorageError{Class: bodysource.BodyStorageDiskReserve, Cause: bodysource.ErrDiskReserve})
 	h.app.recordBodyStorageRejection(&bodysource.BodyStorageError{Class: bodysource.BodyStorageLocalCapacity, Cause: bodysource.ErrSpoolBudget})
 
@@ -142,6 +143,7 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		"manifest.json",
 		"diagnostic_summary.json",
 		"runtime_storage.json",
+		"http_requests.csv",
 		"route_attempts.csv",
 		"provider_attempts.csv",
 		"account_auth_metadata.csv",
@@ -279,6 +281,12 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	for _, want := range []string{"request_id,account_code,provider,phase,status,error_class,body_hash,retry_after,created_at", "req-diagnostic", accountAlias, "antigravity", "transient_resource_exhausted", "sha256:0123456789abcdef"} {
 		if !strings.Contains(providerCSV, want) {
 			t.Fatalf("provider_attempts.csv missing %q:\n%s", want, providerCSV)
+		}
+	}
+	httpCSV := files["http_requests.csv"]
+	for _, want := range []string{"request_id,method,route,status,request_bytes,response_bytes,duration_ms,created_at", "REQ-89C6735FD8ABC561", "admin.email-pool", ",200,0,84,12,"} {
+		if !strings.Contains(httpCSV, want) {
+			t.Fatalf("http_requests.csv missing %q:\n%s", want, httpCSV)
 		}
 	}
 	usageCSV := files["usage_records.csv"]
@@ -428,6 +436,10 @@ func TestDiagnosticSanitizerPreservesSchemaAndEnumText(t *testing.T) {
 	upstreamRequestID := "req_011CdWLhB6LpPonmxYYxwQdD"
 	if got := codebook.sanitize(`request_id="` + upstreamRequestID + `"`); !strings.Contains(got, "REQ-") || strings.Contains(got, upstreamRequestID) {
 		t.Fatalf("upstream request id was not aliased: %q", got)
+	}
+	publicRequestID := "REQ-89C6735FD8ABC561"
+	if got := codebook.sanitize(`request_id="` + publicRequestID + `"`); !strings.Contains(got, publicRequestID) {
+		t.Fatalf("public support request id was not retained: %q", got)
 	}
 }
 

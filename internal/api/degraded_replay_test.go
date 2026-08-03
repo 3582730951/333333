@@ -85,6 +85,51 @@ func TestContextErrorReplayNeutralizesCompletedPairedToolExchange(t *testing.T) 
 	}
 }
 
+func TestEncryptedFunctionOutputReplayNeutralizesCompletedPairedExchange(t *testing.T) {
+	body := []byte(`{"model":"gpt","previous_response_id":"resp_encrypted","input":[
+	  {"type":"function_call","call_id":"call_done","name":"read_file","arguments":"{}"},
+	  {"type":"function_call_output","call_id":"call_done","output":{"text":"preserve decrypted result","n":900719925474099312345},"encrypted_content":"opaque-invalid"},
+	  {"type":"custom_tool_call","call_id":"call_pending","name":"next_tool","input":"{}"}
+	]}`)
+	degraded := degradedResponsesReplayForContextError(body, leakfilter.ResponsesContextErrorEncryptedFunctionOutput)
+	root, err := decodeContextJSONMap(degraded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := root["previous_response_id"]; ok {
+		t.Fatalf("encrypted-output replay retained previous_response_id: %s", degraded)
+	}
+	pending := false
+	for _, raw := range root["input"].([]interface{}) {
+		item, _ := raw.(map[string]interface{})
+		if streamString(item["call_id"]) == "call_done" && (isToolCallItemType(streamString(item["type"])) || isToolOutputItemType(streamString(item["type"]))) {
+			t.Fatalf("rejected encrypted tool exchange remained executable: %v", item)
+		}
+		if streamString(item["call_id"]) == "call_pending" && isToolCallItemType(streamString(item["type"])) {
+			pending = true
+		}
+	}
+	text := string(degraded)
+	if !pending || !strings.Contains(text, "preserve decrypted result") || !strings.Contains(text, "900719925474099312345") || strings.Contains(text, "opaque-invalid") || strings.Contains(text, "encrypted_content") {
+		t.Fatalf("encrypted-output replay lost pending work or completed result: %s", degraded)
+	}
+}
+
+func TestResponsesHasEncryptedToolOutputIsNarrow(t *testing.T) {
+	if !responsesHasEncryptedToolOutput([]byte(`{"input":[{"type":"function_call_output","call_id":"call_1","output":"ok","encrypted_content":"opaque"}]}`)) {
+		t.Fatal("encrypted function output was not detected")
+	}
+	for _, body := range [][]byte{
+		[]byte(`{"input":[{"type":"reasoning","encrypted_content":"valid-reasoning"}]}`),
+		[]byte(`{"input":[{"type":"function_call_output","output":"ok"}]}`),
+		[]byte(`not-json`),
+	} {
+		if responsesHasEncryptedToolOutput(body) {
+			t.Fatalf("non-function encryption was classified as rejected tool output: %s", body)
+		}
+	}
+}
+
 func TestNeutralizeOrphanedToolOutputsUsesStablePairingRules(t *testing.T) {
 	var root map[string]interface{}
 	raw := []byte(`{"input":[

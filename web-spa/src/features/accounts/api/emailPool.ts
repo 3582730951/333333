@@ -231,7 +231,8 @@ export function normalizeEmailPoolResponse(value: unknown): unknown {
   }
   if (!isRecord(value)) return value;
 
-  const directRows = firstDefined(value, ['accounts', 'email_accounts', 'emailAccounts', 'rows', 'items', 'list']);
+  const rowKeys = ['accounts', 'email_accounts', 'emailAccounts', 'rows', 'items', 'list'];
+  const directRows = rowKeys.map((key) => value[key]).find(Array.isArray);
   if (Array.isArray(directRows)) {
     const pagination = isRecord(value.pagination) ? value.pagination : {};
     return {
@@ -258,6 +259,19 @@ export function normalizeEmailPoolResponse(value: unknown): unknown {
         counts: normalized.counts ?? normalizeLegacyEmailCounts(firstDefined(value, ['counts', 'status_counts', 'statusCounts'])),
       };
     }
+  }
+
+  // Go encodes a nil slice as null. Empty pools from older/current backends are
+  // a known successful response, not a malformed contract. Prefer any concrete
+  // row alias or nested page above so a mixed-version wrapper cannot hide data.
+  if (rowKeys.some((key) => value[key] === null)) {
+    return {
+      accounts: [],
+      total: firstDefined(value, ['total', 'count']) ?? 0,
+      page: firstDefined(value, ['page', 'current_page', 'currentPage']) ?? 1,
+      pageSize: firstDefined(value, ['pageSize', 'page_size', 'limit']) ?? 1,
+      counts: normalizeLegacyEmailCounts(firstDefined(value, ['counts', 'status_counts', 'statusCounts'])) ?? {},
+    };
   }
   return value;
 }

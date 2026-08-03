@@ -875,16 +875,132 @@ func TestKiroContentLengthErrorPreservesOutputAndRequestsClientCompaction(t *tes
 		!bytes.Contains(responseBody, []byte(`"code":"context_length_exceeded"`)) {
 		t.Fatalf("status=%d requests=%d body=%s", response.StatusCode, len(bodies), responseBody)
 	}
+	if bytes.Contains(responseBody, []byte("tokens > 1000000")) ||
+		!bytes.Contains(responseBody, []byte("without reporting its effective limit")) ||
+		response.Header.Get("X-MiCliProxy-Context-Limit-Source") != "upstream_unreported" ||
+		response.Header.Get("X-MiCliProxy-Context-Retry-Target") == "" {
+		t.Fatalf("upstream rejection fabricated a context comparison: headers=%v body=%s", response.Header, responseBody)
+	}
 	if !bytes.Contains(bodies[0], []byte(`"max_tokens":64000`)) ||
 		!bytes.Contains(bodies[0], []byte("preserve this request")) ||
 		response.Header.Get("X-MiCliProxy-Context-Status") != "compact_required" ||
-		response.Header.Get("X-MiCliProxy-Auto-Compact") != "client_retry" {
+		response.Header.Get("X-MiCliProxy-Auto-Compact") != "client_retry" ||
+		response.Header.Get("X-MiCliProxy-Compaction-Stage") != "claude_code_native" ||
+		response.Header.Get("X-MiCliProxy-Compaction-Order") != "claude_code_native,kiro_summary" {
 		t.Fatalf("context signal changed the request or lost diagnostics: headers=%v body=%s", response.Header, bodies[0])
 	}
 	endpointHash, _ := kirowire.EndpointHash(kiroMock.URL, "us-east-1", []string{kiroMock.URL})
 	state, stateErr := h.store.GetKiroRuntimeCapability(context.Background(), account.ID, endpointHash, "claude-sonnet-4.6")
 	if stateErr != nil || state.CachePointState == "unsupported" {
 		t.Fatalf("content error poisoned cachePoint state: state=%+v err=%v", state, stateErr)
+	}
+}
+
+func TestKiroClaudeCodeCompactionFallsBackToBoundedSummaryAfterUpstreamReject(t *testing.T) {
+	var bodies [][]byte
+	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/getUsageLimits":
+			_, _ = w.Write([]byte(`{"subscriptionTitle":"KIRO PRO"}`))
+		case "/generateAssistantResponse":
+			body, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, append([]byte(nil), body...))
+			if !bytes.Contains(body, []byte("sequential transcript fragment")) && !bytes.Contains(body, []byte("ordered intermediate summaries")) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}`))
+				return
+			}
+			content := "map-summary-preserves-UPSTREAM_REJECT_HISTORY"
+			if bytes.Contains(body, []byte("ordered intermediate summaries")) {
+				content = "final-summary-after-kiro-fallback"
+			}
+			w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"content":"`+content+`"}`)))
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "metadataEvent"}, []byte(`{"tokenUsage":{"uncachedInputTokens":120,"outputTokens":20,"totalTokens":140}}`)))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kiroMock.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	_ = importKiroEndpointForTest(t, h, kiroMock.URL, "native-first-summary-key")
+	compactPayload, _ := json.Marshal(map[string]any{
+		"model":  "claude-sonnet-4-6",
+		"system": "You are a helpful AI assistant tasked with summarizing conversations.",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "UPSTREAM_REJECT_HISTORY with exact decision 42"},
+			map[string]any{"role": "assistant", "content": "prior answer"},
+			map[string]any{"role": "user", "content": "Your task is to create a detailed summary of the conversation so far.\n\nREMINDER: Do NOT call any tools. Respond with plain text only"},
+		},
+	})
+	request, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", bytes.NewReader(compactPayload))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Pool-Provider", "kiro")
+	request.Header.Set("X-Claude-Code-Session-Id", "native-first-summary")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || len(bodies) != 3 || !bytes.Contains(responseBody, []byte("final-summary-after-kiro-fallback")) {
+		t.Fatalf("status=%d requests=%d headers=%v body=%s", response.StatusCode, len(bodies), response.Header, responseBody)
+	}
+	if response.Header.Get("X-MiCliProxy-Auto-Compact") != "kiro_summary_fallback" ||
+		response.Header.Get("X-MiCliProxy-Context-Status") != "compacted" ||
+		response.Header.Get("X-MiCliProxy-Kiro-Summary-Passes") != "1" ||
+		response.Header.Get("X-MiCliProxy-Compaction-Order") != "claude_code_native,kiro_summary" {
+		t.Fatalf("fallback metadata=%v", response.Header)
+	}
+	if !bytes.Contains(bodies[0], []byte("UPSTREAM_REJECT_HISTORY")) ||
+		!bytes.Contains(bodies[1], []byte("sequential transcript fragment")) ||
+		!bytes.Contains(bodies[1], []byte(`"max_tokens":8192`)) ||
+		bytes.Contains(bodies[1], []byte(`"cachePoint"`)) ||
+		!bytes.Contains(bodies[2], []byte("ordered intermediate summaries")) ||
+		bytes.Contains(bodies[2], []byte("UPSTREAM_REJECT_HISTORY with exact decision 42")) {
+		t.Fatalf("fallback order or reduction changed: requests=%q", bodies)
+	}
+}
+
+func TestKiroClaudeCodeCompactionFallbackFailureIsBoundedAndTyped(t *testing.T) {
+	requests := 0
+	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/getUsageLimits":
+			_, _ = w.Write([]byte(`{"subscriptionTitle":"KIRO PRO"}`))
+		case "/generateAssistantResponse":
+			requests++
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kiroMock.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	_ = importKiroEndpointForTest(t, h, kiroMock.URL, "summary-bound-key")
+	payload := `{"model":"claude-sonnet-4-6","system":"You are a helpful AI assistant tasked with summarizing conversations.","messages":[{"role":"user","content":"history that reaches native compaction first"},{"role":"user","content":"Your task is to create a detailed summary of the conversation so far. REMINDER: Do NOT call any tools. Respond with plain text only"}]}`
+	request, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", strings.NewReader(payload))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Pool-Provider", "kiro")
+	request.Header.Set("X-Claude-Code-Session-Id", "summary-bound")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest || requests != 2 ||
+		response.Header.Get("X-MiCliProxy-Auto-Compact") != "kiro_summary_failed" ||
+		response.Header.Get("X-MiCliProxy-Compaction-Stage") != "kiro_summary_fallback" ||
+		response.Header.Get("X-MiCliProxy-Kiro-Summary-Passes") != "1" ||
+		!bytes.Contains(body, []byte(`"code":"context_length_exceeded"`)) ||
+		!bytes.Contains(body, []byte("Claude Code native compaction ran first")) ||
+		!bytes.Contains(body, []byte("bounded Kiro summary fallback was exhausted")) {
+		t.Fatalf("status=%d requests=%d headers=%v body=%s", response.StatusCode, requests, response.Header, body)
 	}
 }
 
@@ -1053,19 +1169,14 @@ func TestKiroCatalogOpusClaudeCodeCompactionUsesExtendedWindow(t *testing.T) {
 	}
 	overflowHistory := strings.Repeat("overflow-context-", 280_000)
 	overflowResponse, overflowBody := request("claude-opus-4-8[1m]", overflowHistory, compactSystem, compactInstruction+"\n\nREMINDER: Do NOT call any tools. Respond with plain text only.", "compact-over-1m")
-	var overflowEnvelope struct {
-		Type  string `json:"type"`
-		Error struct {
-			Message string `json:"message"`
-			Type    string `json:"type"`
-			Code    string `json:"code"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(overflowBody, &overflowEnvelope); err != nil {
-		t.Fatalf("decode overflow compaction response: %v body=%s", err, overflowBody)
-	}
-	if overflowResponse.StatusCode != http.StatusBadRequest || overflowResponse.Header.Get("X-MiCliProxy-Context-Status") != "compact_failed" || overflowResponse.Header.Get("X-MiCliProxy-Auto-Compact") != "client_retry" || overflowEnvelope.Type != "error" || overflowEnvelope.Error.Type != "invalid_request_error" || overflowEnvelope.Error.Code != "context_length_exceeded" || !strings.HasPrefix(overflowEnvelope.Error.Message, "Prompt is too long:") || !strings.Contains(overflowEnvelope.Error.Message, "tokens > 1000000") || !strings.Contains(overflowEnvelope.Error.Message, "automatically retry compaction") || strings.Contains(overflowEnvelope.Error.Message, "请运行 /compact") {
-		t.Fatalf("overflow compaction did not request Claude Code partial retry: status=%d headers=%v body=%s", overflowResponse.StatusCode, overflowResponse.Header, overflowBody)
+	if overflowResponse.StatusCode != http.StatusOK ||
+		overflowResponse.Header.Get("X-MiCliProxy-Context-Status") != "compacted" ||
+		overflowResponse.Header.Get("X-MiCliProxy-Auto-Compact") != "kiro_summary_fallback" ||
+		overflowResponse.Header.Get("X-MiCliProxy-Compaction-Stage") != "kiro_summary_fallback" ||
+		overflowResponse.Header.Get("X-MiCliProxy-Compaction-Order") != "claude_code_native,kiro_summary" ||
+		overflowResponse.Header.Get("X-MiCliProxy-Kiro-Summary-Passes") == "" ||
+		!bytes.Contains(overflowBody, []byte("compact summary")) {
+		t.Fatalf("overflow compaction did not complete through Kiro summary fallback: status=%d headers=%v body=%s", overflowResponse.StatusCode, overflowResponse.Header, overflowBody)
 	}
 	caps, err := h.store.ListCapabilities(context.Background(), account.ID)
 	if err != nil {

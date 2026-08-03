@@ -39,7 +39,7 @@ func (s *Server) adminEmailPoolList(w http.ResponseWriter, r *http.Request) {
 		r.URL.Query().Get("search"), r.URL.Query().Get("q"),
 		r.URL.Query().Get("query"), r.URL.Query().Get("email"),
 	))
-	status := normalizeEmailPoolStatus(firstNonEmpty(r.URL.Query().Get("status"), r.URL.Query().Get("state")))
+	status := normalizeEmailPoolStatusFilter(firstNonEmpty(r.URL.Query().Get("status"), r.URL.Query().Get("state")))
 
 	if page < 1 {
 		page = 1

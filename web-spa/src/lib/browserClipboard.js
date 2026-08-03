@@ -1,16 +1,19 @@
 export async function writeClipboard(text) {
   const value = String(text ?? '');
+  if (!value) return false;
+
+  // Test the capability instead of window.isSecureContext. Managed WebViews
+  // and reverse-proxied deployments can expose a working Clipboard API while
+  // reporting an unexpected secure-context value.
   const hasClipboardAPI = typeof navigator !== 'undefined'
-    && typeof window !== 'undefined'
-    && window.isSecureContext
     && typeof navigator.clipboard?.writeText === 'function';
 
   // Calling writeText before the first await retains the click's user
-  // activation. Plain HTTP deployments take the synchronous textarea path.
+  // activation. Browsers that hide or reject the API take the textarea path.
   if (hasClipboardAPI) {
     try {
-    await navigator.clipboard.writeText(value);
-    return true;
+      await navigator.clipboard.writeText(value);
+      return true;
     } catch {
       // Browser permission policies can reject Clipboard even in a secure
       // context; keep the legacy path for managed/embedded browsers.
@@ -29,7 +32,10 @@ function writeWithTextareaFallback(value) {
     textArea = document.createElement('textarea');
     textArea.value = value;
     textArea.setAttribute('readonly', '');
-    textArea.style.cssText = 'position:fixed;left:0;top:0;width:1px;height:1px;padding:0;border:0;opacity:0';
+    textArea.setAttribute('aria-hidden', 'true');
+    // A 16px font avoids iOS zoom; fixed positioning and near-transparent
+    // rendering keep selection available without moving the page.
+    textArea.style.cssText = 'position:fixed;left:0;top:0;width:1px;height:1px;padding:0;border:0;opacity:0.01;font-size:16px;pointer-events:none';
     document.body.appendChild(textArea);
     textArea.focus();
     textArea.select();

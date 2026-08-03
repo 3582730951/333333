@@ -645,11 +645,92 @@ const REGISTRAR_META_KEYS = new Set(['defaults', 'registrar_error', 'defaults_er
 const EMPTY_REGISTRAR: RegistrarSettings = {
   cfg: {}, smsProviders: [], mailboxProviders: [], captchaProviders: [], emailProviders: [], registrarErrors: {},
 };
+const PROVIDER_SECRET_KEY = /(?:^|_)(?:api_key|admin_token|auth_token|password|email|base_email|otp_url|client_id|client_secret)$/i;
+const REGISTRAR_SECRET_KEYS = new Set(['proxyUsername', 'proxyPassword']);
+
+export function registrarProviderPayload(values: SettingsValues): ProviderSetting[] {
+  const providers: ProviderSetting[] = SMS_PROVIDER_CARDS.map((card) => ({
+    type: 'sms',
+    key: card.key,
+    display_name: card.name,
+    enabled: values[`${card.key}_enabled`] === true,
+    priority: Number(values[`${card.key}_priority`]) || 0,
+    config: {
+      api_key: values[`${card.key}_api_key`] || '',
+      service: values[`${card.key}_service`] || 'dr',
+      max_price: values[`${card.key}_max_price`] || '',
+    },
+  }));
+  providers.push(...MAILBOX_PROVIDER_CARDS.map((card) => ({
+    type: 'mailbox',
+    key: card.key,
+    display_name: card.name,
+    enabled: values[`${card.key}_enabled`] === true,
+    priority: Number(values[`${card.key}_priority`]) || 0,
+    config: card.key === 'cloudflare' ? {
+      api_url: values.cloudflare_api_url || '',
+      admin_token: values.cloudflare_admin_token || '',
+      domain: values.cloudflare_domain || '',
+    } : card.key === 'imap' ? {
+      host: values.imap_host || '',
+      port: String(Number(values.imap_port) || 993),
+      email: values.imap_email || '',
+      password: values.imap_password || '',
+      use_tls: values.imap_tls !== false,
+    } : {},
+  })));
+  providers.push(...CAPTCHA_PROVIDER_CARDS.map((card) => ({
+    type: 'captcha',
+    key: card.key,
+    display_name: card.name,
+    enabled: values[`${card.key}_enabled`] === true,
+    priority: Number(values[`${card.key}_priority`]) || 0,
+    config: { api_key: values[`${card.key}_api_key`] || '' },
+  })));
+  providers.push({
+    type: 'email',
+    key: 'hotmail_otp',
+    display_name: 'Hotmail OTP',
+    enabled: values.hotmail_otp_enabled === true,
+    priority: Number(values.hotmail_otp_priority) || 0,
+    config: {
+      base_email: values.hotmail_base_email || '',
+      otp_url: values.hotmail_otp_url || '',
+      auth_token: values.hotmail_otp_auth_token || '',
+    },
+  });
+  return providers;
+}
+
+function providerIdentity(provider: ProviderSetting) {
+  return `${provider.type}\u0000${provider.key}`;
+}
+
+export function changedRegistrarProviders(next: ProviderSetting[], baseline: ProviderSetting[]) {
+  const previous = new Map(baseline.map((provider) => [providerIdentity(provider), provider]));
+  return next.filter((provider) => JSON.stringify(provider) !== JSON.stringify(previous.get(providerIdentity(provider))));
+}
+
+function providerSecretsChanged(next: ProviderSetting[], baseline: ProviderSetting[]) {
+  const previous = new Map(baseline.map((provider) => [providerIdentity(provider), provider]));
+  return next.some((provider) => {
+    const oldConfig = previous.get(providerIdentity(provider))?.config || {};
+    return Object.entries(provider.config || {}).some(([key, value]) => (
+      PROVIDER_SECRET_KEY.test(key)
+      && String(value ?? '').trim() !== ''
+      && value !== oldConfig[key]
+    ));
+  });
+}
+
+function registrarSecretsChanged(next: SettingsValues, baseline: SettingsValues) {
+  return [...REGISTRAR_SECRET_KEYS].some((key) => next[key] !== baseline[key]);
+}
 
 function registrarConfigOnly(section: SettingsValues | undefined): SettingsValues {
   const out: SettingsValues = {};
   Object.entries(section || {}).forEach(([key, value]) => {
-    if (!REGISTRAR_META_KEYS.has(key)) out[key] = value;
+    if (!REGISTRAR_META_KEYS.has(key) && !key.endsWith('_configured')) out[key] = value;
   });
   return out;
 }
@@ -657,6 +738,7 @@ function registrarConfigOnly(section: SettingsValues | undefined): SettingsValue
 function RegistrarTab() {
   const [diffs, setDiffs] = useState<SettingsDiff[] | null>(null);
   const [prevSnapshot, setPrevSnapshot] = useState<{ oldSnap: SettingsValues; oldProviders: ProviderSetting[] } | null>(null);
+  const [dirty, setDirty] = useState(false);
 
   const {
     data: registrar = EMPTY_REGISTRAR,
@@ -668,6 +750,16 @@ function RegistrarTab() {
   const saveMutation = useSaveRegistrarMutation();
   const undoMutation = useSaveRegistrarMutation();
 
+  useEffect(() => {
+    if (!dirty) return undefined;
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warnBeforeUnload);
+    return () => window.removeEventListener('beforeunload', warnBeforeUnload);
+  }, [dirty]);
+
   const cfg = registrar.cfg || {};
   const smsProviders = registrar.smsProviders || [];
   const mailboxProviders = registrar.mailboxProviders || [];
@@ -676,7 +768,7 @@ function RegistrarTab() {
   const registrarErrors = registrar.registrarErrors || {};
 
   const save = async (values: SettingsValues) => {
-    const oldSnap = { ...cfg };
+    const oldSnap = registrarConfigOnly(cfg);
     try {
       const out: SettingsValues = {};
       if (typeof values.advancedJSON === 'string' && values.advancedJSON.trim()) {
@@ -698,55 +790,30 @@ function RegistrarTab() {
       }
       if (out.heroSmsCountry !== undefined && out.heroSmsCountry !== '') out.heroSmsCountry = Number(out.heroSmsCountry);
       if (out.proxyPort !== undefined && out.proxyPort !== '') out.proxyPort = Number(out.proxyPort);
-      const providers: ProviderSetting[] = SMS_PROVIDER_CARDS.map((card) => ({
-        type: 'sms',
-        key: card.key,
-        display_name: card.name,
-        enabled: values[`${card.key}_enabled`] === true,
-        priority: Number(values[`${card.key}_priority`]) || 0,
-        config: {
-          api_key: values[`${card.key}_api_key`] || '',
-          service: values[`${card.key}_service`] || 'dr',
-          max_price: values[`${card.key}_max_price`] || '',
-        },
-      }));
-      providers.push(...MAILBOX_PROVIDER_CARDS.map((card) => ({
-        type: 'mailbox',
-        key: card.key,
-        display_name: card.name,
-        enabled: values[`${card.key}_enabled`] === true,
-        priority: Number(values[`${card.key}_priority`]) || 0,
-        config: card.key === 'cloudflare' ? {
-          api_url: values.cloudflare_api_url || '',
-          admin_token: values.cloudflare_admin_token || '',
-          domain: values.cloudflare_domain || '',
-        } : card.key === 'imap' ? {
-          host: values.imap_host || '',
-          port: String(Number(values.imap_port) || 993),
-          email: values.imap_email || '',
-          password: values.imap_password || '',
-          use_tls: values.imap_tls !== false,
-        } : {},
-      })));
-      providers.push(...CAPTCHA_PROVIDER_CARDS.map((card) => ({
-        type: 'captcha', key: card.key, display_name: card.name,
-        enabled: values[`${card.key}_enabled`] === true,
-        priority: Number(values[`${card.key}_priority`]) || 0,
-        config: { api_key: values[`${card.key}_api_key`] || '' },
-      })));
-      providers.push({
-        type: 'email', key: 'hotmail_otp', display_name: 'Hotmail OTP',
-        enabled: values.hotmail_otp_enabled === true,
-        priority: Number(values.hotmail_otp_priority) || 0,
-        config: {
-          base_email: values.hotmail_base_email || '',
-          otp_url: values.hotmail_otp_url || '',
-          auth_token: values.hotmail_otp_auth_token || '',
-        },
-      });
+      const nextProviders = registrarProviderPayload(values);
+      const baselineProviders = registrarProviderPayload(known);
+      const providers = changedRegistrarProviders(nextProviders, baselineProviders);
       const r = await saveMutation.mutateAsync({ providers, values: out });
-      setDiffs(r?.saved || [{ section: 'registrar', key: 'sms_providers', old_value: 'saved', new_value: 'saved' }]);
-      setPrevSnapshot({ oldSnap, oldProviders: [...smsProviders, ...mailboxProviders, ...captchaProviders, ...emailProviders] });
+      const savedDiffs = [...(r?.saved || [])];
+      if (providers.length) {
+        savedDiffs.push({ section: 'registrar', key: 'providers', old_value: 0, new_value: providers.length });
+      }
+      setDiffs(savedDiffs);
+      const containsSecretChange = providerSecretsChanged(providers, baselineProviders)
+        || registrarSecretsChanged(out, oldSnap);
+      if (containsSecretChange) {
+        setPrevSnapshot(null);
+      } else {
+        const changedKeys = new Set(providers.map(providerIdentity));
+        setPrevSnapshot({
+          oldSnap,
+          oldProviders: baselineProviders.filter((provider) => changedKeys.has(providerIdentity(provider))),
+        });
+      }
+      setDirty(false);
+      if (r?.warning || r?.reloadOk === false) {
+        Toast.warning(r.warning || '配置已保存，但运行时刷新失败；服务仍使用上一份有效配置。');
+      }
       Toast.success('注册器凭据已保存');
     } catch (e) { showErrorToast(e); }
   };
@@ -756,7 +823,7 @@ function RegistrarTab() {
     try {
       const providers = Array.isArray(prevSnapshot.oldProviders)
         ? prevSnapshot.oldProviders.map((row) => ({
-            type: 'sms',
+            type: row.type,
             key: row.key,
             display_name: row.display_name || row.key,
             enabled: row.enabled !== false,
@@ -768,6 +835,7 @@ function RegistrarTab() {
       Toast.success('已撤销');
       setDiffs(null);
       setPrevSnapshot(null);
+      setDirty(false);
     } catch (e) { showErrorToast(e); }
   };
   const saving = saveMutation.isPending;
@@ -815,7 +883,7 @@ function RegistrarTab() {
   });
   if (Array.isArray(known.mailDomains)) known.mailDomains = known.mailDomains.join(', ');
   const extra: SettingsValues = {};
-  Object.keys(cfg).forEach((k) => { if (!KNOWN.includes(k)) extra[k] = cfg[k]; });
+  Object.keys(cfg).forEach((k) => { if (!KNOWN.includes(k) && !k.endsWith('_configured')) extra[k] = cfg[k]; });
   known.advancedJSON = Object.keys(extra).length ? JSON.stringify(extra, null, 2) : '';
   const smsEnabled = SMS_PROVIDER_CARDS.filter((card) => known[`${card.key}_enabled`] === true).length;
   const captchaEnabled = CAPTCHA_PROVIDER_CARDS.filter((card) => known[`${card.key}_enabled`] === true).length;
@@ -828,7 +896,7 @@ function RegistrarTab() {
       error={error}
       onRetry={load}
       diffs={diffs}
-      onUndo={undo}
+      onUndo={prevSnapshot ? undo : undefined}
       undoLoading={undoing}
       onClearDiffs={() => setDiffs(null)}
       settingsErrorTitle="注册器配置读取异常"
@@ -836,7 +904,12 @@ function RegistrarTab() {
     >
       <Banner type="info" closeIcon={null} style={{ marginBottom: 12 }}
         description="邮箱和接码配置会直接保存到注册流水线实际使用的 provider_settings；住宅代理区域需与手机号国家匹配。" />
-      <Form key={settingsFormKey('registrar', known)} onSubmit={save} initValues={known} labelPosition="top" className="pool-registrar-form">
+      {dirty ? (
+        <Banner type="warning" closeIcon={null} style={{ marginBottom: 12 }}
+          title="有未保存的更改"
+          description="保存后才会应用到注册流水线；为防止误丢失，保存前已暂停重新加载。" />
+      ) : null}
+      <Form key={settingsFormKey('registrar', known)} onSubmit={save} onValueChange={() => setDirty(true)} initValues={known} labelPosition="top" className="pool-registrar-form">
         <SettingsDisclosure
           title="接码平台"
           subtitle={`已启用 ${smsEnabled} / ${SMS_PROVIDER_CARDS.length}`}
@@ -925,16 +998,18 @@ function RegistrarTab() {
             <Form.Input field="phoneCountryCode" label="手机号国家码" style={{ width: 140 }} placeholder="BR" />
             <Form.Input field="proxyHost" label="住宅代理 Host" style={{ width: 220 }} placeholder="us2.cliproxy.io" />
             <Form.Input field="proxyPort" label="代理端口" style={{ width: 120 }} placeholder="3010" />
-            <Form.Input field="proxyUsername" label="代理用户名" style={{ width: 320 }} placeholder="...-region-BR-sid-xxxx-t-5" />
-            <Form.Input field="proxyPassword" label="代理密码" mode="password" style={{ width: 220 }} />
+            <Form.Input field="proxyUsername" label="代理用户名" style={{ width: 320 }}
+              placeholder={cfg.proxyUsername_configured ? '已加密配置；留空保留' : '...-region-BR-sid-xxxx-t-5'} />
+            <Form.Input field="proxyPassword" label="代理密码" mode="password" style={{ width: 220 }}
+              placeholder={cfg.proxyPassword_configured ? '已加密配置；留空保留' : '输入代理密码'} />
             <Form.TextArea field="advancedJSON" label="高级：其它键 (JSON)" className="pool-registrar-advanced" style={{ width: '100%' }} autosize
               placeholder='{ "heroSmsCountryTopN": 10 }' />
           </div>
         </SettingsDisclosure>
 
         <div className="pool-registrar-actions">
-          <Button htmlType="submit" theme="solid" icon={<IconSave />} loading={saving}>保存凭据</Button>
-          <Button onClick={load}>重新加载</Button>
+          <Button htmlType="submit" theme="solid" icon={<IconSave />} loading={saving} disabled={!dirty}>保存凭据</Button>
+          <Button onClick={load} disabled={dirty}>重新加载</Button>
         </div>
       </Form>
     </SettingsTabShell>
@@ -1186,7 +1261,7 @@ export default function SettingsV2() {
       {tabNeedsSharedOptions(activeTab) ? (
         <LoadErrorBanner error={sharedOptionsError || sharedOptions.error} onRetry={reloadSharedOptions} title={t('settings.shared_options_failed')} />
       ) : null}
-      <Tabs className="pool-settings-tabs" activeKey={activeTab} onChange={setTab} tabPosition="left" style={{ minHeight: 500 }}>
+      <Tabs keepMounted className="pool-settings-tabs" activeKey={activeTab} onChange={setTab} tabPosition="left" style={{ minHeight: 500 }}>
         <TabPane tab={t('settings.general_tab')} itemKey="config">
           {tabContent('config', <ConfigTab />)}
         </TabPane>

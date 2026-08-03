@@ -11,6 +11,21 @@ import (
 	"codex-account-pool/internal/secretbox"
 )
 
+func TestEmailPoolEmptyListIsJSONSafe(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err = store.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rows, total, err := store.ListEmailAccounts(context.Background(), 1, 50, "", "")
+	if err != nil || rows == nil || len(rows) != 0 || total != 0 {
+		t.Fatalf("empty email pool rows=%#v total=%d err=%v", rows, total, err)
+	}
+}
+
 func TestEmailPoolMigratesLegacyMissingColumns(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "pool.sqlite3"))
 	if err != nil {

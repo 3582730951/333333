@@ -4,7 +4,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "[1/5] gofmt"
-test -z "$(gofmt -l .)"
+GO_SOURCE_ROOTS=(cmd internal tools services workers)
+mapfile -d '' -t go_files < <(find "${GO_SOURCE_ROOTS[@]}" -type f -name '*.go' -print0)
+unformatted="$(gofmt -l "${go_files[@]}")"
+if [[ -n "$unformatted" ]]; then
+  printf 'unformatted current-source files:\n%s\n' "$unformatted" >&2
+  exit 1
+fi
 
 echo "[2/5] go test"
 go test ./...

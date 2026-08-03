@@ -376,21 +376,11 @@ func (s *Server) planRegistrarPatch(ctx context.Context, plan *settingsCenterWri
 		return nil
 	}
 	old := cloneSettingsMap(state.registrarCfg)
-	if p.Mode == "replace" {
-		state.registrarCfg = map[string]interface{}{}
-	} else if p.Mode != "" && p.Mode != "merge" {
-		return fmt.Errorf("unknown registrar patch mode %q", p.Mode)
+	next, err := applyRegistrarConfigPatch(old, configBody, p.Mode)
+	if err != nil {
+		return err
 	}
-	for k, v := range configBody {
-		if isRegistrarMetaKey(k) {
-			return fmt.Errorf("registrar key %q is read-only metadata", k)
-		}
-		if shouldClearRegistrarValue(v) {
-			delete(state.registrarCfg, k)
-			continue
-		}
-		state.registrarCfg[k] = v
-	}
+	state.registrarCfg = next
 	raw, err := json.Marshal(state.registrarCfg)
 	if err != nil {
 		return err
@@ -581,6 +571,7 @@ func (s *Server) settingsCenterRegistrar(ctx context.Context) map[string]interfa
 		out = map[string]interface{}{}
 		registrarError = err.Error()
 	}
+	out = publicRegistrarConfig(out)
 	out["registrar_error"] = registrarError
 	defaultsError := ""
 	// Add defaults for known fields
@@ -645,17 +636,34 @@ func (s *Server) validateRegistrarPatch(p settingsCenterPatch) error {
 		if isRegistrarMetaKey(k) {
 			return fmt.Errorf("registrar key %q is read-only metadata", k)
 		}
+		if isRegistrarSecretKey(k) && v != nil {
+			if _, ok := v.(string); !ok {
+				return fmt.Errorf("registrar secret %q must be a string", k)
+			}
+		}
 	}
 	return nil
+}
+
+func isRegistrarSecretKey(key string) bool {
+	normalized := strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(strings.TrimSpace(key)))
+	for _, suffix := range []string{"apikey", "password", "token", "secret", "username"} {
+		if strings.HasSuffix(normalized, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func isRegistrarMetaKey(key string) bool {
 	switch key {
 	case "registrar_error", "defaults_error":
 		return true
-	default:
-		return false
 	}
+	if base, ok := strings.CutSuffix(key, "_configured"); ok && isRegistrarSecretKey(base) {
+		return true
+	}
+	return false
 }
 
 func shouldClearRegistrarValue(v interface{}) bool {
@@ -666,6 +674,75 @@ func shouldClearRegistrarValue(v interface{}) bool {
 		return true
 	}
 	return false
+}
+
+// applyRegistrarConfigPatch is shared by settings-center and the atomic provider save
+// endpoint. Secret fields deliberately use write-only semantics: blank, null, or omitted
+// values preserve the stored credential even in replace mode. A future explicit-clear
+// protocol can opt into deletion without making an empty password input destructive.
+func applyRegistrarConfigPatch(old, patch map[string]interface{}, mode string) (map[string]interface{}, error) {
+	if mode == "" {
+		mode = "merge"
+	}
+	if mode != "merge" && mode != "replace" {
+		return nil, fmt.Errorf("unknown registrar patch mode %q", mode)
+	}
+	next := map[string]interface{}{}
+	if mode == "merge" {
+		next = cloneSettingsMap(old)
+	} else {
+		for key, value := range old {
+			if isRegistrarSecretKey(key) && !shouldClearRegistrarValue(value) {
+				next[key] = value
+			}
+		}
+	}
+	for key, value := range patch {
+		if isRegistrarMetaKey(key) {
+			return nil, fmt.Errorf("registrar key %q is read-only metadata", key)
+		}
+		if isRegistrarSecretKey(key) {
+			if value != nil {
+				if _, ok := value.(string); !ok {
+					return nil, fmt.Errorf("registrar secret %q must be a string", key)
+				}
+			}
+			if shouldClearRegistrarValue(value) {
+				continue
+			}
+			next[key] = value
+			continue
+		}
+		if shouldClearRegistrarValue(value) {
+			delete(next, key)
+			continue
+		}
+		next[key] = value
+	}
+	return next, nil
+}
+
+func registrarSecretMetadata(value interface{}, exists bool) map[string]interface{} {
+	configured := exists && !shouldClearRegistrarValue(value)
+	masked := ""
+	if configured {
+		masked = "••••"
+	}
+	return map[string]interface{}{"configured": configured, "masked": masked}
+}
+
+func publicRegistrarConfig(cfg map[string]interface{}) map[string]interface{} {
+	out := cloneSettingsMap(cfg)
+	for key, value := range cfg {
+		if !isRegistrarSecretKey(key) {
+			continue
+		}
+		out[key] = ""
+		if !shouldClearRegistrarValue(value) {
+			out[key+"_configured"] = true
+		}
+	}
+	return out
 }
 
 func registrarDiffs(old, next map[string]interface{}) []settingsCenterDiff {
@@ -684,6 +761,10 @@ func registrarDiffs(old, next map[string]interface{}) []settingsCenterDiff {
 		nextValue, nextOK := next[k]
 		if oldOK == nextOK && reflect.DeepEqual(oldValue, nextValue) {
 			continue
+		}
+		if isRegistrarSecretKey(k) {
+			oldValue = registrarSecretMetadata(oldValue, oldOK)
+			nextValue = registrarSecretMetadata(nextValue, nextOK)
 		}
 		var newValue interface{}
 		if nextOK {

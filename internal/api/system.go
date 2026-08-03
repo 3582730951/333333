@@ -32,19 +32,21 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 	dataDir := filepath.Dir(s.cfg.DatabasePath)
 	payload := struct {
 		sysmetrics.Metrics
-		Admission         interface{}                `json:"admission"`
-		Scheduler         interface{}                `json:"scheduler"`
-		BodyStorage       bodysource.BudgetSnapshot  `json:"body_storage"`
-		UsageJournal      map[string]interface{}     `json:"usage_journal"`
-		HTTP              httpRequestMetricsSnapshot `json:"http"`
-		RoutingAudit      map[string]interface{}     `json:"routing_audit"`
-		ContextRebuilt    uint64                     `json:"context_rebuilt"`
-		ContextDegraded   uint64                     `json:"context_degraded"`
-		CodexSessionMap   map[string]interface{}     `json:"codex_session_mapping"`
-		Sidecar           interface{}                `json:"sidecar,omitempty"`
-		DiskGuard         DiskGuardSnapshot          `json:"disk_guard"`
-		SupervisorEvents  []supervisor.Event         `json:"supervisor_events"`
-		SupervisorModules []supervisor.ModuleState   `json:"supervisor_modules"`
+		Admission          interface{}                `json:"admission"`
+		Scheduler          interface{}                `json:"scheduler"`
+		BodyStorage        bodysource.BudgetSnapshot  `json:"body_storage"`
+		UsageJournal       map[string]interface{}     `json:"usage_journal"`
+		HTTP               httpRequestMetricsSnapshot `json:"http"`
+		RoutingAudit       map[string]interface{}     `json:"routing_audit"`
+		ContextRebuilt     uint64                     `json:"context_rebuilt"`
+		ContextDegraded    uint64                     `json:"context_degraded"`
+		CodexSessionMap    map[string]interface{}     `json:"codex_session_mapping"`
+		Sidecar            interface{}                `json:"sidecar,omitempty"`
+		DiskGuard          DiskGuardSnapshot          `json:"disk_guard"`
+		SupervisorEvents   []supervisor.Event         `json:"supervisor_events"`
+		SupervisorModules  []supervisor.ModuleState   `json:"supervisor_modules"`
+		ExceptionCallbacks []supervisor.CallbackState `json:"exception_callbacks"`
+		ExceptionJournal   interface{}                `json:"exception_journal"`
 	}{
 		Metrics:        sysmetrics.Collect(dataDir),
 		Admission:      s.scheduler.AdmissionSnapshot(),
@@ -54,11 +56,18 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 		HTTP:           s.httpMetrics.snapshot(),
 		RoutingAudit:   s.routingAuditDiagnostics(),
 		ContextRebuilt: atomic.LoadUint64(&s.contextRebuilt), ContextDegraded: atomic.LoadUint64(&s.contextDegraded),
-		CodexSessionMap:   s.codexSessionMappingStats(r.Context()),
-		Sidecar:           s.sidecarMetrics(r.Context()),
-		DiskGuard:         s.diskGuardSnapshot(),
-		SupervisorEvents:  supervisor.RecentEvents(),
-		SupervisorModules: supervisor.ModuleStates(),
+		CodexSessionMap:    s.codexSessionMappingStats(r.Context()),
+		Sidecar:            s.sidecarMetrics(r.Context()),
+		DiskGuard:          s.diskGuardSnapshot(),
+		SupervisorEvents:   supervisor.RecentEvents(),
+		SupervisorModules:  supervisor.ModuleStates(),
+		ExceptionCallbacks: supervisor.EventCallbackStates(),
+		ExceptionJournal: func() interface{} {
+			if s.incidentReporter == nil {
+				return map[string]interface{}{"configured": false}
+			}
+			return s.incidentReporter.Snapshot()
+		}(),
 	}
 	writeJSON(w, http.StatusOK, payload)
 }

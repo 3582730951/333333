@@ -333,6 +333,38 @@ func TestConvertAnthropicOversizedCompactionRequestsAutomaticPartialRetry(t *tes
 	}
 }
 
+func TestContextLengthErrorDoesNotInventUpstreamComparison(t *testing.T) {
+	err := (&ContextLengthError{
+		RequestedModel:   "gpt-5.6-sol",
+		KiroModel:        "gpt-5.6-sol",
+		EstimatedInput:   333301,
+		EffectiveLimit:   372000,
+		UpstreamRejected: true,
+	}).Error()
+	if strings.Contains(err, "333301 tokens > 372000") ||
+		!strings.Contains(err, "333301 tokens > 266640; retry_target=266640") ||
+		!strings.Contains(err, "without reporting its effective limit") ||
+		!strings.HasPrefix(err, claudeCodePromptTooLongPrefix) {
+		t.Fatalf("upstream context error invented a limit comparison: %s", err)
+	}
+}
+
+func TestContextLengthErrorNamesCodexForResponsesBridge(t *testing.T) {
+	err := (&ContextLengthError{
+		RequestedModel:         "gpt-5.6-sol",
+		KiroModel:              "gpt-5.6-sol",
+		EstimatedInput:         333301,
+		EffectiveLimit:         372000,
+		UpstreamRejected:       true,
+		NativeCompactionClient: "codex",
+	}).Error()
+	if !strings.Contains(err, "Codex should automatically compact the conversation and retry") ||
+		strings.Contains(err, "Claude Code should automatically compact") ||
+		strings.Contains(err, "333301 tokens > 372000") {
+		t.Fatalf("Codex context error contract=%s", err)
+	}
+}
+
 func TestConvertAnthropicPreservesPrefillThinkingUnknownBlocksAndLosses(t *testing.T) {
 	raw := []byte(`{
   "model":"claude-opus-4-9-20270101",

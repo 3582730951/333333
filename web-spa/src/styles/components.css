@@ -701,6 +701,25 @@
   color: var(--pool-text-3);
 }
 
+.pool-single-select__value,
+.pool-single-select__option-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-single-select__value {
+  flex: 1;
+  text-align: left;
+}
+
+.pool-single-select {
+  min-height: 34px;
+  padding: 0 10px;
+  font: inherit;
+}
+
 .pool-multi-select__content {
   z-index: 1300;
   width: var(--radix-popover-trigger-width);
@@ -1589,8 +1608,8 @@
 
 .pool-registration-start-layout {
   display: grid;
-  grid-template-columns: minmax(300px, 0.85fr) minmax(460px, 1.25fr);
-  gap: 18px;
+  grid-template-columns: minmax(280px, 0.78fr) minmax(0, 1.22fr);
+  gap: 22px;
   align-items: start;
 }
 
@@ -1633,11 +1652,11 @@
   align-items: flex-start;
   gap: 12px;
   min-width: 0;
-  padding: 10px 0 10px 14px;
-  border: 0;
-  border-inline-start: 2px solid var(--pool-accent);
-  border-radius: 0;
-  background: transparent;
+  padding: 12px 14px;
+  border: 1px solid var(--pool-border-subtle);
+  border-inline-start: 3px solid var(--pool-accent);
+  border-radius: 12px;
+  background: var(--pool-bg-surface-2);
   box-shadow: none;
 }
 
@@ -1701,11 +1720,10 @@
   grid-template-columns: minmax(150px, 210px) minmax(150px, 210px) auto minmax(180px, 1fr);
   gap: 12px;
   align-items: end;
-  padding: 14px 0;
-  border-radius: 0;
-  background: transparent;
-  border: 0;
-  border-block: 1px solid var(--pool-border);
+  padding: 14px;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: 12px;
+  background: var(--pool-bg-surface-2);
 }
 
 .pool-sms-price-policy label {
@@ -1732,8 +1750,8 @@
 .pool-sms-market-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0;
-  border-block: 1px solid var(--pool-border);
+  gap: 10px;
+  border: 0;
 }
 
 .pool-sms-market-item {
@@ -1742,11 +1760,10 @@
   gap: 10px;
   align-items: center;
   min-width: 0;
-  padding: 12px 0;
-  border: 0;
-  border-bottom: 1px solid var(--pool-border);
-  border-radius: 0;
-  background: transparent;
+  padding: 12px;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: 12px;
+  background: var(--pool-bg-surface-2);
   transition: background-color var(--pool-motion-fast) var(--pool-motion-ease);
 }
 
@@ -1799,10 +1816,17 @@
 .pool-sms-market-empty {
   grid-column: 1 / -1;
   padding: 26px;
-  border: 0;
-  border-radius: 0;
+  border: 1px dashed var(--pool-border-strong);
+  border-radius: 12px;
+  background: var(--pool-bg-surface-2);
   color: var(--pool-text-3);
   text-align: center;
+}
+
+@media (max-width: 1180px) {
+  .pool-registration-start-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 @media (max-width: 900px) {
@@ -3288,12 +3312,17 @@
 .pool-email-metrics {
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-material);
+  box-shadow: var(--pool-shadow-panel);
 }
 
 .pool-email-metrics .pool-metric-card {
   align-items: start;
   display: grid;
-  min-height: 82px;
+  min-height: 88px;
   padding: 14px 16px;
   border: 0;
   border-inline-start: 1px solid var(--pool-border);
@@ -3330,15 +3359,29 @@
   align-items: center;
   gap: 8px;
   min-width: 0;
-  padding: 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
+  padding: 8px;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-material);
+  box-shadow: var(--pool-shadow-panel);
+  backdrop-filter: var(--pool-material-blur);
+  -webkit-backdrop-filter: var(--pool-material-blur);
+}
+
+.pool-email-toolbar > .pool-input-wrap {
+  flex: 1 1 300px;
+  width: min(460px, 100%);
 }
 
 .pool-email-search {
-  width: min(360px, 40vw);
+  width: 100%;
+}
+
+.pool-email-table.pool-table-wrapper {
+  overflow: hidden;
+  border-color: var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  box-shadow: var(--pool-shadow-panel);
 }
 
 .pool-email-address {
@@ -3416,17 +3459,28 @@
   .pool-email-toolbar {
     width: 100%;
     overflow: visible;
-    padding: 0;
-    border-radius: 0;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 8px;
+    border-radius: 14px;
   }
 
   .pool-email-toolbar > * {
-    flex: 0 1 auto;
+    min-width: 0;
   }
 
-  .pool-email-search {
-    width: min(68vw, 280px);
+  .pool-email-toolbar > .pool-input-wrap {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .pool-email-toolbar > .pool-button {
+    width: 100%;
+  }
+
+  .pool-email-toolbar .pool-input-wrap,
+  .pool-email-toolbar .pool-input {
+    min-height: var(--pool-hit-target);
   }
 
   .pool-email-metrics {
@@ -3440,6 +3494,21 @@
   .pool-email-metrics .pool-metric-card {
     min-height: 82px;
     padding: 12px 14px;
+    border-top: 0;
+  }
+
+  .pool-mobile-list.pool-email-table {
+    gap: 10px;
+    padding: 0;
+    border: 0;
+  }
+
+  .pool-email-table .pool-mobile-list__item {
+    overflow: hidden;
+    border: 1px solid var(--pool-border-subtle);
+    border-radius: 14px;
+    background: var(--pool-bg-material);
+    box-shadow: var(--pool-shadow-panel);
   }
 
   .pool-email-table .pool-mobile-row {
@@ -3471,7 +3540,12 @@
 
   .pool-email-table .pool-email-row-actions {
     width: 100%;
-    justify-content: flex-end;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .pool-email-table .pool-email-row-actions .pool-button {
+    width: 100%;
   }
 }
 
@@ -3940,8 +4014,34 @@
 }
 
 .pool-settings-tabs.pool-tabs--left {
-  grid-template-columns: minmax(190px, 220px) minmax(0, 1fr);
-  gap: 18px;
+  grid-template-columns: minmax(208px, 228px) minmax(0, 1fr);
+  gap: 24px;
+}
+
+.pool-settings-tabs.pool-tabs--left > .pool-tabs-list {
+  position: sticky;
+  top: 76px;
+  gap: 3px;
+  padding: 8px;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-material);
+  box-shadow: var(--pool-shadow-panel);
+  backdrop-filter: var(--pool-material-blur);
+  -webkit-backdrop-filter: var(--pool-material-blur);
+}
+
+.pool-settings-tabs .pool-tab-trigger {
+  min-height: var(--pool-hit-target);
+  border-radius: 10px;
+  padding: 9px 12px;
+  font-weight: 620;
+}
+
+.pool-settings-tabs .pool-tab-trigger[data-state='active'] {
+  background: var(--pool-bg-selected);
+  color: var(--pool-accent-text);
+  font-weight: 680;
 }
 
 .pool-settings-shell {
@@ -3984,32 +4084,31 @@
 
 .pool-settings-categories {
   display: grid;
-  gap: 0;
-  border-block: 1px solid var(--pool-border);
+  gap: 12px;
+  border: 0;
 }
 
 .pool-settings-category {
   min-width: 0;
   overflow: hidden;
-  border: 0;
-  border-bottom: 1px solid var(--pool-border);
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-material);
+  box-shadow: var(--pool-shadow-panel);
 }
 
 .pool-settings-category:last-child {
-  border-bottom: 0;
+  border-bottom: 1px solid var(--pool-border-subtle);
 }
 
 .pool-settings-category__trigger {
   width: 100%;
-  min-height: 72px;
+  min-height: 68px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 14px;
-  padding: 14px 16px;
+  padding: 13px 16px;
   border: 0;
   background: transparent;
   color: var(--pool-text);
@@ -4031,7 +4130,7 @@
 }
 
 .pool-settings-category[data-expanded='true'] .pool-settings-category__trigger {
-  background: var(--pool-bg-hover);
+  background: var(--pool-bg-selected);
 }
 
 .pool-settings-category__leading,
@@ -4046,13 +4145,13 @@
 }
 
 .pool-settings-category__icon {
-  width: 22px;
-  height: 22px;
-  flex: 0 0 22px;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
   display: grid;
   place-items: center;
-  border-radius: 0;
-  background: transparent;
+  border-radius: 9px;
+  background: var(--pool-bg-surface-2);
   color: var(--pool-text-2);
   transition: transform var(--pool-motion-fast) var(--pool-motion-ease);
 }
@@ -4064,7 +4163,7 @@
 
 .pool-settings-category[data-expanded='true'] .pool-settings-category__icon {
   transform: rotate(180deg);
-  background: transparent;
+  background: var(--pool-accent-soft);
   color: var(--pool-accent);
 }
 
@@ -4099,7 +4198,8 @@
 
 .pool-settings-category__body {
   padding: 0 18px 3px;
-  border-top: 1px solid var(--pool-border);
+  border-top: 1px solid var(--pool-border-subtle);
+  background: color-mix(in srgb, var(--pool-bg-surface-2) 46%, transparent);
 }
 
 .pool-settings-category__body[hidden] {
@@ -4121,19 +4221,51 @@
 
 .pool-registrar-card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 14px;
 }
 
 .pool-registrar-provider-card {
   min-width: 0;
+  padding: 15px;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: 14px;
+  background: var(--pool-bg-surface);
   box-shadow: none;
+}
+
+.pool-registrar-provider-card .pool-card-head {
+  margin-bottom: 14px;
+  padding-bottom: 11px;
+  border-bottom: 1px solid var(--pool-border-subtle);
+}
+
+.pool-registrar-provider-card .pool-card-body {
+  row-gap: 2px !important;
+}
+
+.pool-registrar-provider-card .pool-field {
+  flex: 1 1 150px;
+  min-width: 0;
+  margin-bottom: 10px;
+}
+
+.pool-registrar-provider-card .pool-field > span,
+.pool-registrar-provider-card .pool-input,
+.pool-registrar-provider-card .pool-input-wrap,
+.pool-registrar-provider-card .pool-select {
+  width: 100% !important;
 }
 
 .pool-registrar-fields {
   display: flex;
   flex-wrap: wrap;
-  gap: 0 18px;
+  gap: 2px 14px;
+}
+
+.pool-registrar-fields .pool-field {
+  flex: 1 1 190px;
+  min-width: 0;
 }
 
 .pool-registrar-fields .pool-registrar-advanced {
@@ -4143,21 +4275,79 @@
 .pool-registrar-actions {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
-  padding: 2px;
+  padding: 14px 2px 2px;
+  border-top: 1px solid var(--pool-border-subtle);
+}
+
+.pool-registration-quickstart,
+.pool-registration-start-card,
+.pool-sms-market-card {
+  padding: 20px;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-material);
+  box-shadow: var(--pool-shadow-panel);
+}
+
+.pool-registration-quickstart {
+  border-block: 1px solid var(--pool-border-subtle);
+}
+
+.pool-registration-start-card .pool-card-head,
+.pool-sms-market-card .pool-card-head {
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--pool-border-subtle);
+}
+
+.pool-registration-start-card .pool-readiness-panel {
+  margin: 0;
+  border-radius: 14px;
+}
+
+.pool-registration-jobs.pool-table-wrapper {
+  overflow: hidden;
+  border-color: var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  box-shadow: var(--pool-shadow-panel);
+}
+
+.pool-registration-metrics {
+  overflow: hidden;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-material);
+  box-shadow: var(--pool-shadow-panel);
+}
+
+.pool-registration-metrics .pool-metric-card {
+  min-height: 78px;
+  padding: 13px 14px;
+  border: 0;
+  border-top: 1px solid var(--pool-border-subtle);
+}
+
+.pool-registration-metrics .pool-metric-card:first-child {
+  border-top: 0;
 }
 
 .pool-settings-empty {
   min-height: 150px;
   display: grid;
   align-content: center;
+  padding: 24px;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-material);
   text-align: center;
 }
 
 .pool-settings-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) minmax(180px, auto);
-  gap: 14px;
+  grid-template-columns: minmax(220px, 1fr) minmax(240px, 340px);
+  gap: 16px;
   align-items: center;
   padding: 14px 0;
   border-bottom: 1px solid var(--pool-border);
@@ -4195,7 +4385,16 @@
 }
 
 .pool-settings-row__control {
+  width: 100%;
   justify-self: end;
+}
+
+.pool-settings-row__control .pool-input,
+.pool-settings-row__control .pool-input-wrap,
+.pool-settings-row__control .pool-select,
+.pool-settings-row__control .pool-textarea,
+.pool-settings-row__control .pool-multi-select {
+  width: 100% !important;
 }
 
 .pool-ai-settings-layout {
@@ -5075,6 +5274,29 @@
   .pool-settings-tabs.pool-tabs--left {
     min-height: 0 !important;
     align-content: start;
+    gap: 12px;
+  }
+
+  .pool-settings-tabs.pool-tabs--left > .pool-tabs-list {
+    position: static;
+    top: auto;
+    gap: 4px;
+    padding: 6px;
+    overflow-x: auto;
+    border: 1px solid var(--pool-border-subtle);
+    border-radius: 14px;
+    background: var(--pool-bg-material);
+    box-shadow: var(--pool-shadow-panel);
+    scrollbar-width: none;
+  }
+
+  .pool-settings-tabs.pool-tabs--left > .pool-tabs-list::-webkit-scrollbar {
+    display: none;
+  }
+
+  .pool-settings-tabs .pool-tab-trigger {
+    min-width: max-content;
+    min-height: var(--pool-hit-target);
   }
 
   .pool-settings-commandbar {
@@ -5088,7 +5310,7 @@
 
   .pool-settings-commandbar__actions {
     display: grid;
-    grid-template-columns: var(--pool-hit-target) minmax(0, 1fr) auto;
+    grid-template-columns: var(--pool-hit-target) minmax(0, 1fr) minmax(96px, auto);
     justify-content: stretch;
     overflow: visible;
   }
@@ -5120,12 +5342,12 @@
   }
 
   .pool-settings-categories {
-    gap: 0;
+    gap: 10px;
   }
 
   .pool-settings-category__trigger {
     min-height: 68px;
-    align-items: flex-start;
+    align-items: center;
     padding: 13px 14px;
   }
 
@@ -5134,7 +5356,7 @@
   }
 
   .pool-settings-category__badges {
-    max-width: 48%;
+    max-width: 46%;
   }
 
   .pool-settings-category__body {
@@ -5151,6 +5373,11 @@
 
   .pool-registrar-provider-card {
     padding: 14px;
+  }
+
+  .pool-registrar-provider-card .pool-field,
+  .pool-registrar-fields .pool-field {
+    flex-basis: calc(50% - 7px);
   }
 
   .pool-registrar-provider-card .pool-input,
@@ -5170,8 +5397,15 @@
     padding: 8px;
     border: 1px solid var(--pool-border);
     border-radius: var(--pool-radius-sm);
-    background: var(--pool-bg-surface);
-    box-shadow: none;
+    justify-content: stretch;
+    background: var(--pool-bg-material-strong);
+    box-shadow: var(--pool-shadow-panel);
+    backdrop-filter: var(--pool-material-blur);
+    -webkit-backdrop-filter: var(--pool-material-blur);
+  }
+
+.pool-registrar-actions .pool-button {
+    flex: 1 1 120px;
   }
 
   .pool-metric-rail.pool-registration-metrics {
@@ -5325,8 +5559,16 @@
 
   .pool-settings-row__control .pool-input,
   .pool-settings-row__control .pool-select,
-  .pool-settings-row__control .pool-input-wrap {
+  .pool-settings-row__control .pool-input-wrap,
+  .pool-settings-row__control .pool-textarea,
+  .pool-settings-row__control .pool-multi-select,
+  .pool-registrar-form .pool-input,
+  .pool-registrar-form .pool-input-wrap,
+  .pool-registrar-form .pool-select,
+  .pool-registrar-form .pool-textarea,
+  .pool-registrar-form .pool-multi-select {
     width: 100% !important;
+    min-height: var(--pool-hit-target);
   }
 
   .pool-load-error {
@@ -5349,6 +5591,221 @@
 
   .pool-chart-card .recharts-wrapper .recharts-legend-wrapper {
     min-height: 44px;
+  }
+
+  /* Page workspaces own the final mobile layout so generic card/table rules
+     cannot reintroduce the older flat, overlong presentation. */
+  .pool-metric-rail.pool-email-metrics {
+    grid-template-columns: none;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(136px, 42vw);
+    gap: 0;
+    overflow-x: auto;
+    padding: 0;
+    scroll-snap-type: x proximity;
+    scrollbar-width: thin;
+  }
+
+  .pool-email-metrics .pool-metric-card {
+    border-top: 0;
+    scroll-snap-align: start;
+  }
+
+  .pool-registrar-provider-card,
+  .pool-settings-empty {
+    padding: 14px;
+    border: 1px solid var(--pool-border-subtle);
+    border-radius: 14px;
+    background: var(--pool-bg-material);
+  }
+
+  .pool-settings-tabs .pool-switch,
+  .pool-registrar-form .pool-switch {
+    width: var(--pool-hit-target);
+    min-width: var(--pool-hit-target);
+    height: var(--pool-hit-target);
+    border-color: transparent;
+    background: transparent;
+  }
+
+  .pool-settings-tabs .pool-switch[data-state='checked'],
+  .pool-registrar-form .pool-switch[data-state='checked'] {
+    border-color: transparent;
+    background: transparent;
+  }
+
+  .pool-settings-tabs .pool-switch::before,
+  .pool-registrar-form .pool-switch::before {
+    content: '';
+    position: absolute;
+    inset: 9px 1px;
+    border: 1px solid var(--pool-border);
+    border-radius: 999px;
+    background: var(--pool-bg-surface-3);
+  }
+
+  .pool-settings-tabs .pool-switch[data-state='checked']::before,
+  .pool-registrar-form .pool-switch[data-state='checked']::before {
+    border-color: var(--pool-accent);
+    background: var(--pool-accent);
+  }
+
+  .pool-settings-tabs .pool-switch__thumb,
+  .pool-registrar-form .pool-switch__thumb {
+    position: absolute;
+    z-index: 1;
+    top: 11px;
+    left: 2px;
+  }
+
+  .pool-registration-quickstart,
+  .pool-registration-start-card,
+  .pool-sms-market-card {
+    padding: 16px;
+    border: 1px solid var(--pool-border-subtle);
+    border-radius: 14px;
+    background: var(--pool-bg-material);
+    box-shadow: var(--pool-shadow-panel);
+  }
+
+  .pool-registration-quickstart .pool-card-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pool-registration-quickstart__copy > div:last-child {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    scrollbar-width: thin;
+  }
+
+  .pool-registration-quickstart__copy > div:last-child .pool-button {
+    flex: 0 0 auto;
+  }
+
+  .pool-registration-quickstart .pool-copy-code textarea {
+    min-height: 116px;
+    max-height: 180px;
+  }
+
+  .pool-registration-start-form {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+
+  .pool-registration-start-form .pool-input,
+  .pool-registration-start-form .pool-input-wrap,
+  .pool-registration-start-form .pool-select,
+  .pool-registration-start-form .pool-multi-select,
+  .pool-registration-control .pool-select,
+  .pool-registration-control .pool-multi-select,
+  .pool-sms-price-policy .pool-input {
+    min-height: var(--pool-hit-target);
+  }
+
+  .pool-registration-engine-summary,
+  .pool-registration-strategy-row,
+  .pool-registration-actions {
+    grid-column: 1 / -1;
+  }
+
+  .pool-registration-strategy-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .pool-registration-strategy-note {
+    grid-column: 1 / -1;
+  }
+
+  .pool-registration-actions .pool-button {
+    flex: 1 1 120px;
+    min-height: var(--pool-hit-target);
+  }
+
+  .pool-sms-price-policy {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .pool-sms-market-freshness {
+    grid-column: 1 / -1;
+    justify-self: start;
+    text-align: left;
+  }
+
+  .pool-sms-market-grid {
+    grid-template-columns: none;
+    grid-auto-flow: column;
+    grid-auto-columns: min(84vw, 340px);
+    gap: 10px;
+    overflow-x: auto;
+    padding: 2px 2px 9px;
+    scroll-snap-type: x proximity;
+    scrollbar-width: thin;
+  }
+
+  .pool-sms-market-item {
+    grid-template-columns: 28px minmax(0, 1fr) auto;
+    align-content: start;
+    scroll-snap-align: start;
+  }
+
+  .pool-sms-market-rank {
+    grid-column: 1;
+    grid-row: 1 / 3;
+  }
+
+  .pool-sms-market-country {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .pool-sms-market-item > .pool-tag {
+    grid-column: 3;
+    grid-row: 1;
+  }
+
+  .pool-sms-market-item .pool-sms-market-stat:nth-of-type(2) {
+    grid-column: 2;
+    grid-row: 2;
+  }
+
+  .pool-sms-market-item .pool-sms-market-stat:nth-of-type(3) {
+    grid-column: 3;
+    grid-row: 2;
+  }
+
+  .pool-metric-rail.pool-registration-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    overflow: hidden;
+    border-radius: 14px;
+  }
+
+  .pool-registration-metrics .pool-metric-card {
+    border: 0;
+    border-inline-start: 1px solid var(--pool-border-subtle);
+    border-top: 1px solid var(--pool-border-subtle);
+  }
+
+  .pool-registration-metrics .pool-metric-card:nth-child(odd) {
+    border-inline-start: 0;
+  }
+
+  .pool-registration-metrics .pool-metric-card:nth-child(-n + 2) {
+    border-top: 0;
+  }
+
+  .pool-mobile-list.pool-registration-jobs {
+    gap: 10px;
+    padding: 0;
+    border: 0;
+  }
+
+  .pool-registration-jobs .pool-mobile-list__item {
+    overflow: hidden;
+    border: 1px solid var(--pool-border-subtle);
+    border-radius: 14px;
+    background: var(--pool-bg-material);
+    box-shadow: var(--pool-shadow-panel);
   }
 }
 
@@ -5402,6 +5859,39 @@
   .pool-copy-line {
     align-items: stretch;
     flex-direction: column;
+  }
+}
+
+@media (max-width: 480px) {
+  .pool-settings-category__trigger {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .pool-settings-category__copy strong {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+  }
+
+  .pool-settings-category__badges {
+    max-width: 100%;
+    justify-content: flex-start;
+    padding-inline-start: 39px;
+  }
+
+  .pool-registrar-provider-card .pool-field,
+  .pool-registrar-fields .pool-field {
+    flex-basis: 100%;
+  }
+}
+
+@media (max-width: 390px) {
+  .pool-registration-start-form,
+  .pool-registration-strategy-row,
+  .pool-sms-price-policy {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -5904,33 +6394,45 @@
 /* Dashboard hierarchy */
 .pool-dashboard-command {
   align-items: start;
-  gap: 32px;
-  margin-bottom: 22px;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.pool-dashboard-command__main,
+.pool-dashboard-command__side {
+  padding: 20px;
+  overflow: hidden;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-material);
+  box-shadow: var(--pool-shadow-panel);
 }
 
 .pool-dashboard-command__main {
-  padding: 18px 0;
-  border-block: 1px solid var(--pool-border);
-  background: transparent;
-}
-
-.pool-dashboard-command__side {
-  padding: 18px 0;
-  border-block: 1px solid var(--pool-border);
-  background: transparent;
+  gap: 16px;
 }
 
 .pool-dashboard-command__metric strong {
+  font-size: clamp(42px, 5vw, 58px);
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.045em;
 }
 
+.pool-dashboard-command__subgrid {
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: 12px;
+  background: var(--pool-border-subtle);
+}
+
 .pool-dashboard-command__subgrid div {
-  padding: 8px 12px;
+  min-height: 72px;
+  padding: 11px 12px;
   border: 0;
-  border-inline-start: 1px solid var(--pool-border);
+  border-inline-start: 1px solid var(--pool-border-subtle);
   border-radius: 0;
-  background: transparent;
+  background: var(--pool-bg-surface-2);
 }
 
 .pool-dashboard-command__subgrid div:first-child {
@@ -5938,30 +6440,32 @@
 }
 
 .pool-dashboard-command__side {
-  gap: 10px;
+  gap: 12px;
 }
 
 .pool-dashboard-command__side .pool-attention-list {
-  gap: 0;
-  border-top: 1px solid var(--pool-border);
+  gap: 8px;
+  border: 0;
 }
 
 .pool-dashboard-command__side .pool-attention-list div {
-  padding: 10px 0;
-  border: 0;
-  border-bottom: 1px solid var(--pool-border);
-  border-radius: 0;
-  background: transparent;
+  padding: 11px 12px;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: 12px;
+  background: var(--pool-bg-surface-2);
 }
 
 .pool-dashboard-command__side .pool-attention-list .pool-attention-item--issue {
-  padding-inline-start: 10px;
-  border-inline-start: 2px solid var(--pool-danger);
-  background: transparent;
+  border-inline-start: 3px solid var(--pool-danger);
+  background: color-mix(in srgb, var(--pool-danger-soft) 42%, var(--pool-bg-surface-2));
 }
 
 .pool-dashboard-command__side .pool-attention-list .pool-attention-item--clear {
-  border-color: var(--pool-border);
+  border-color: var(--pool-border-subtle);
+}
+
+.pool-dashboard-command__side .pool-attention-list p {
+  line-height: 1.5;
 }
 
 .pool-quick-actions {
@@ -5983,12 +6487,12 @@
 
 .pool-dashboard-command__main > .pool-quick-actions {
   margin: 0;
-  padding-top: 2px;
+  padding-top: 0;
 }
 
 @media (min-width: 1101px) {
   .pool-dashboard-command {
-    grid-template-columns: minmax(0, 1fr) minmax(380px, 420px);
+    grid-template-columns: minmax(0, 1fr) minmax(340px, 390px);
   }
 
   .pool-dashboard-command__side .pool-attention-list {
@@ -5998,7 +6502,16 @@
 
 .pool-dashboard-trend,
 .pool-dashboard-chart-grid {
-  margin-bottom: 22px;
+  margin-bottom: 16px;
+}
+
+.pool-dashboard-trend,
+.pool-dashboard-chart-grid > .pool-chart-card {
+  padding: 18px;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-material);
+  box-shadow: var(--pool-shadow-panel);
 }
 
 .pool-dashboard-trend__canvas {
@@ -6015,6 +6528,14 @@
 }
 
 @media (min-width: 768px) and (max-width: 1100px) {
+  .pool-dashboard-command {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pool-dashboard-command__side .pool-attention-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .pool-dashboard-chart-grid.pool-grid.cols-3 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -6031,12 +6552,18 @@
 
   .pool-dashboard-command__subgrid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
+    gap: 0;
+  }
+
+  .pool-dashboard-command__main,
+  .pool-dashboard-command__side {
+    padding: 16px;
+    border-radius: 14px;
   }
 
   .pool-dashboard-command__subgrid div {
-    min-height: 70px;
-    border-inline-start: 1px solid var(--pool-border);
+    min-height: 68px;
+    border-inline-start: 1px solid var(--pool-border-subtle);
   }
 
   .pool-dashboard-command__subgrid div:nth-child(odd) {
@@ -6044,19 +6571,49 @@
   }
 
   .pool-dashboard-command__subgrid div:nth-child(n + 3) {
-    border-top: 1px solid var(--pool-border);
+    border-top: 1px solid var(--pool-border-subtle);
   }
 
   .pool-quick-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     width: 100%;
     overflow: visible;
     padding: 8px 0 0;
-    border-top: 1px solid var(--pool-border);
-    flex-wrap: wrap;
+    border-top: 1px solid var(--pool-border-subtle);
   }
 
-  .pool-quick-actions > * {
-    flex: 0 1 auto;
+  .pool-quick-actions__label {
+    grid-column: 1 / -1;
+  }
+
+  .pool-quick-actions .pool-button {
+    width: 100%;
+    min-width: 0;
+    min-height: var(--pool-hit-target);
+  }
+
+  .pool-dashboard-command__side .pool-attention-list {
+    grid-template-columns: none;
+    grid-auto-flow: column;
+    grid-auto-columns: min(82vw, 292px);
+    gap: 10px;
+    overflow-x: auto;
+    padding: 2px 2px 8px;
+    scroll-snap-type: x proximity;
+    scrollbar-width: thin;
+  }
+
+  .pool-dashboard-command__side .pool-attention-list > div {
+    min-height: 112px;
+    scroll-snap-align: start;
+  }
+
+  .pool-dashboard-command__side .pool-attention-list p {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
   }
 
   .pool-dashboard-trend__canvas,
@@ -6065,7 +6622,21 @@
   }
 
   .pool-dashboard-chart-grid.pool-grid.cols-3 {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: none;
+    grid-auto-flow: column;
+    grid-auto-columns: min(86vw, 360px);
+    gap: 12px;
+    overflow-x: auto;
+    padding: 2px 2px 10px;
+    scroll-snap-type: x proximity;
+    scrollbar-width: thin;
+  }
+
+  .pool-dashboard-chart-grid > .pool-chart-card {
+    min-height: 320px;
+    padding: 16px;
+    border-radius: 14px;
+    scroll-snap-align: start;
   }
 
   .pool-chart-card {

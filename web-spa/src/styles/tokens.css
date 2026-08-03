@@ -10,6 +10,8 @@ html[data-theme='dark'] {
   --pool-bg-surface-2: #272c33;
   --pool-bg-surface-3: #313740;
   --pool-bg-elevated: #272c33;
+  --pool-bg-material: rgba(32, 36, 42, 0.88);
+  --pool-bg-material-strong: rgba(39, 44, 51, 0.96);
   --pool-bg-overlay: rgba(0, 0, 0, 0.50);
   --pool-bg-hover: rgba(255, 255, 255, 0.07);
   --pool-bg-pressed: rgba(255, 255, 255, 0.11);
@@ -21,9 +23,12 @@ html[data-theme='dark'] {
   --pool-text-disabled: #68717d;
   --pool-border: #343b45;
   --pool-border-strong: #4b5563;
+  --pool-border-subtle: rgba(255, 255, 255, 0.09);
 
   --pool-shadow-sm: none;
   --pool-shadow-md: 0 18px 48px rgba(0, 0, 0, 0.34);
+  --pool-shadow-lg: 0 28px 80px rgba(0, 0, 0, 0.44);
+  --pool-shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.22), 0 14px 38px rgba(0, 0, 0, 0.16);
   --pool-shadow-compact: none;
   --pool-shadow-orbit: none;
   --pool-shadow-card-lift: none;
@@ -57,6 +62,8 @@ html[data-theme='dark'] {
   --pool-radius-md: 8px;
   --pool-radius-lg: 10px;
   --pool-radius-xl: 12px;
+  --pool-radius-panel: 16px;
+  --pool-material-blur: saturate(180%) blur(18px);
   --pool-hit-target: 44px;
   --pool-space-1: 4px;
   --pool-space-2: 8px;
@@ -120,6 +127,8 @@ html[data-theme='light'] {
   --pool-bg-surface-2: #f1f3f6;
   --pool-bg-surface-3: #e6e9ed;
   --pool-bg-elevated: #ffffff;
+  --pool-bg-material: rgba(255, 255, 255, 0.90);
+  --pool-bg-material-strong: rgba(255, 255, 255, 0.97);
   --pool-bg-overlay: rgba(60, 60, 67, 0.28);
   --pool-bg-hover: rgba(60, 60, 67, 0.07);
   --pool-bg-pressed: rgba(60, 60, 67, 0.11);
@@ -131,9 +140,12 @@ html[data-theme='light'] {
   --pool-text-disabled: #98a0aa;
   --pool-border: #d8dde3;
   --pool-border-strong: #b8c0ca;
+  --pool-border-subtle: rgba(36, 43, 51, 0.11);
 
   --pool-shadow-sm: none;
   --pool-shadow-md: 0 18px 48px rgba(22, 29, 37, 0.16);
+  --pool-shadow-lg: 0 28px 80px rgba(22, 29, 37, 0.20);
+  --pool-shadow-panel: 0 1px 2px rgba(22, 29, 37, 0.06), 0 12px 32px rgba(22, 29, 37, 0.08);
   --pool-shadow-compact: none;
   --pool-shadow-orbit: none;
   --pool-shadow-card-lift: none;

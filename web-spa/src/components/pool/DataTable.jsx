@@ -149,7 +149,7 @@ export function DataTable({
                     checked={checked}
                     disabled={checkboxProps.disabled}
                     onChange={(event) => toggleRow(key, event.target.checked)}
-                    aria-label={`选择第 ${index + 1} 行`}
+                    aria-label={checkboxProps['aria-label'] || `选择第 ${index + 1} 行`}
                   />
                 </td>
               ) : null}

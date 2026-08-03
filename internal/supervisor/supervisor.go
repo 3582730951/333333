@@ -74,6 +74,14 @@ func Recover(name string) {
 	}
 }
 
+// RecoverEvent is Recover with structured operation/request metadata. It is the
+// preferred panic boundary for newly added callbacks, goroutines, and handlers.
+func RecoverEvent(event Event) {
+	if v := recover(); v != nil {
+		LogPanicEvent(event, v)
+	}
+}
+
 // RecoverWithLogf is Recover with an injectable logger for tests.
 func RecoverWithLogf(name string, logf Logf) {
 	if v := recover(); v != nil {
@@ -88,8 +96,20 @@ func LogPanic(name string, panicVal any) {
 
 // LogPanicWithLogf is LogPanic with an injectable logger for tests.
 func LogPanicWithLogf(name string, panicVal any, logf Logf) {
-	opts := normalizeOptions(Options{Name: name, Logf: logf})
-	recordPanicEvent(opts.Name, panicVal)
+	LogPanicEventWithLogf(Event{Module: name}, panicVal, logf)
+}
+
+// LogPanicEvent records and logs an already-recovered panic with structured
+// metadata suitable for durable diagnostics.
+func LogPanicEvent(event Event, panicVal any) {
+	LogPanicEventWithLogf(event, panicVal, log.Printf)
+}
+
+// LogPanicEventWithLogf is LogPanicEvent with an injectable logger for tests.
+func LogPanicEventWithLogf(event Event, panicVal any, logf Logf) {
+	opts := normalizeOptions(Options{Name: event.Module, Logf: logf})
+	event.Module = opts.Name
+	recordPanicEvent(event, panicVal)
 	opts.Logf("[SUPERVISOR] module=%s panic=%v\n%s", opts.Name, panicVal, debug.Stack())
 }
 
@@ -186,12 +206,19 @@ func retryUntilSuccess(ctx context.Context, opts Options, run func(context.Conte
 		}
 		if result.panicked {
 			event.Type = "panic_restart"
+			event.Severity = "error"
+			event.Operation = "task_run"
+			event.ErrorClass = errorClass(result.panicVal)
+			event.Recovered = true
 			event.Message = "task panic; retrying"
 			event.Panic = fmt.Sprint(result.panicVal)
 			opts.Logf("[SUPERVISOR] module=%s panic=%v uptime=%s; retrying after %s\n%s",
 				opts.Name, result.panicVal, uptime, backoff, result.stack)
 		} else {
 			event.Type = "error_retry"
+			event.Severity = "warning"
+			event.Operation = "task_run"
+			event.ErrorClass = errorClass(result.err)
 			event.Message = fmt.Sprintf("task failed; retrying: %v", result.err)
 			opts.Logf("[SUPERVISOR] module=%s error=%v uptime=%s; retrying after %s",
 				opts.Name, result.err, uptime, backoff)
@@ -245,7 +272,11 @@ func supervise(ctx context.Context, opts Options, run func(context.Context)) {
 		if result.panicked {
 			event := Event{
 				Type:          "panic_restart",
+				Severity:      "error",
 				Module:        opts.Name,
+				Operation:     "module_run",
+				ErrorClass:    errorClass(result.panicVal),
+				Recovered:     true,
 				Message:       "module panic; restarting",
 				Panic:         fmt.Sprint(result.panicVal),
 				UptimeMillis:  uptime.Milliseconds(),
@@ -258,7 +289,9 @@ func supervise(ctx context.Context, opts Options, run func(context.Context)) {
 		} else {
 			event := Event{
 				Type:          "unexpected_exit",
+				Severity:      "warning",
 				Module:        opts.Name,
+				Operation:     "module_run",
 				Message:       "module exited unexpectedly; restarting",
 				UptimeMillis:  uptime.Milliseconds(),
 				BackoffMillis: backoff.Milliseconds(),

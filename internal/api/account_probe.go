@@ -298,7 +298,7 @@ func kiroCatalogCapabilities(accountID string, catalog []storage.KiroModelDescri
 			Source:                        "kiro_live_catalog",
 			LastProbeAt:                   now,
 		}
-		out = append(out, capability.ApplyGPT56ContextContract(cap))
+		out = append(out, cap)
 	}
 	return out
 }

@@ -28,6 +28,21 @@ func normalizeEmailPoolStatus(value string) string {
 	}
 }
 
+// normalizeEmailPoolStatusFilter preserves the legacy list contract: an omitted
+// status means "all accounts". Stored legacy rows still normalize an empty
+// status to idle through normalizeEmailPoolStatus, but applying that rule to a
+// missing query parameter would silently narrow an old client's result set.
+func normalizeEmailPoolStatusFilter(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	switch normalized {
+	case "", "all", "any", "*":
+		return ""
+	default:
+		return normalizeEmailPoolStatus(normalized)
+	}
+}
+
 func normalizeEmailPoolCounts(input map[string]int) map[string]int {
 	out := map[string]int{}
 	for status, count := range input {

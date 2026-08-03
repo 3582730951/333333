@@ -18,12 +18,13 @@ import (
 )
 
 const (
-	diskPressureFreeBytes  = uint64(2 << 30)
-	diskCriticalFreeBytes  = uint64(512 << 20)
-	diskEmergencyFreeBytes = uint64(128 << 20)
-	diskRecoveryFreeBytes  = uint64(4 << 30)
-	goalStorageReserveMin  = int64(8 << 20)
-	goalStorageReserveMax  = int64(128 << 20)
+	diskPressureFreeBytes             = uint64(2 << 30)
+	diskCriticalFreeBytes             = uint64(512 << 20)
+	diskEmergencyFreeBytes            = uint64(128 << 20)
+	diskRecoveryFreeBytes             = uint64(4 << 30)
+	goalStorageReserveMin             = int64(8 << 20)
+	goalStorageReserveMax             = int64(128 << 20)
+	goalStorageMaintenanceStepsPerRun = 16
 )
 
 type DiskFilesystemSnapshot struct {
@@ -191,11 +192,25 @@ func (s *Server) runSafeDiskCleanup(ctx context.Context, snap *DiskGuardSnapshot
 	} else {
 		snap.GoalsDeleted += goals
 	}
-	if freed, goals, err := s.store.EnforceGoalStorageBudget(cleanupCtx, snap.GoalStorageTargetBytes); err != nil {
-		snap.LastError = appendDiskGuardCode(snap.LastError, "goal_budget_cleanup_failed")
-	} else {
-		snap.GoalBytesReclaimed += freed
-		snap.GoalsDeleted += goals
+	for step := 0; step < goalStorageMaintenanceStepsPerRun; step++ {
+		used, err := s.store.GoalStorageBytes(cleanupCtx)
+		if err != nil {
+			snap.LastError = appendDiskGuardCode(snap.LastError, "goal_budget_measure_failed")
+			break
+		}
+		if used <= snap.GoalStorageTargetBytes {
+			break
+		}
+		reclaimed, err := s.store.EnforceGoalStorageBudgetStep(cleanupCtx, snap.GoalStorageTargetBytes)
+		if err != nil {
+			snap.LastError = appendDiskGuardCode(snap.LastError, "goal_budget_cleanup_failed")
+			break
+		}
+		snap.GoalBytesReclaimed += reclaimed.BytesFreed
+		snap.GoalsDeleted += reclaimed.Goals
+		if !reclaimed.Progressed {
+			break
+		}
 	}
 	if mappings, err := s.store.CleanupCodexSessionMappings(cleanupCtx); err != nil {
 		snap.LastError = appendDiskGuardCode(snap.LastError, "mapping_cleanup_failed")

@@ -691,13 +691,26 @@ const (
 
 func probeEarlyCodexSSEFailure(body io.Reader) ([]byte, leakfilter.CodexFailureFrame, bool, error) {
 	var failure leakfilter.CodexFailureFrame
+	sawContent := false
 	prefix, terminal, err := probeEarlySSEFailure(body, func(frame []byte) bool {
 		parsed, ok := leakfilter.ParseCodexFailureFrame(frame)
 		if ok {
 			failure = parsed
+			// Once output is present, replaying a context failure duplicates visible
+			// content and tool effects. Relay the buffered prefix; the stream ledger
+			// will neutralize the error and retire the epoch for the next request.
+			if sawContent && parsed.ContextError != leakfilter.ResponsesContextErrorNone {
+				return false
+			}
 		}
 		return ok
-	}, codexSSEFrameCommitsContent, true)
+	}, func(frame []byte) bool {
+		commits := codexSSEFrameCommitsContent(frame)
+		if commits {
+			sawContent = true
+		}
+		return commits
+	}, true)
 	return prefix, failure, terminal, err
 }
 
@@ -836,6 +849,10 @@ func probeEarlyCodexSSEFailureWithIdleRelease(body io.Reader, idle time.Duration
 			frames++
 			if parsed, ok := leakfilter.ParseCodexFailureFrame(frame); ok {
 				failure = parsed
+				if committedInBatch && parsed.ContextError != leakfilter.ResponsesContextErrorNone {
+					processed = end
+					continue
+				}
 				return buf, reader, failure, true, nil
 			}
 			if codexSSEFrameCommitsContent(frame) {

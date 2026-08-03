@@ -193,12 +193,48 @@ func (d oauthProviderDesc) authorizeURL(challenge, state string) string {
 }
 
 func (d oauthProviderDesc) authorizeURLWithOptions(challenge, state string, opts oauthAuthorizeOptions) string {
-	params := url.Values{
-		"client_id":     {d.clientID},
-		"response_type": {"code"},
-		"redirect_uri":  {d.redirectURI},
-		"scope":         {d.scope},
-		"state":         {state},
+	raw, _ := d.buildAuthorizeURLWithOptions(challenge, state, opts)
+	return raw
+}
+
+// buildAuthorizeURLWithOptions validates the operator-configured endpoints and
+// merges OAuth parameters into any existing query string. The old string
+// concatenation produced `...?tenant=x?client_id=...` for configured endpoints
+// that already carried a query, yielding a link that looked generated in the UI
+// but could never be used.
+func (d oauthProviderDesc) buildAuthorizeURLWithOptions(challenge, state string, opts oauthAuthorizeOptions) (string, error) {
+	authEndpoint, err := url.Parse(strings.TrimSpace(d.authURL))
+	if err != nil || authEndpoint.Host == "" || (authEndpoint.Scheme != "https" && authEndpoint.Scheme != "http") || authEndpoint.Fragment != "" {
+		return "", errors.New("OAuth authorization endpoint must be an absolute HTTP(S) URL without a fragment")
+	}
+	if strings.TrimSpace(d.clientID) == "" {
+		return "", errors.New("OAuth client id is empty")
+	}
+	tokenEndpoint, err := url.Parse(strings.TrimSpace(d.tokenURL))
+	if err != nil || tokenEndpoint.Host == "" || (tokenEndpoint.Scheme != "https" && tokenEndpoint.Scheme != "http") || tokenEndpoint.Fragment != "" {
+		return "", errors.New("OAuth token endpoint must be an absolute HTTP(S) URL without a fragment")
+	}
+	redirectURI := strings.TrimSpace(d.redirectURI)
+	redirect, err := url.Parse(redirectURI)
+	if err != nil || redirect.Host == "" || (redirect.Scheme != "https" && redirect.Scheme != "http") || redirect.Fragment != "" {
+		return "", errors.New("OAuth redirect URI must be an absolute HTTP(S) URL without a fragment")
+	}
+	if strings.TrimSpace(state) == "" {
+		return "", errors.New("OAuth state is empty")
+	}
+	if d.provider != "antigravity" && strings.TrimSpace(challenge) == "" {
+		return "", errors.New("OAuth PKCE challenge is empty")
+	}
+
+	params := authEndpoint.Query()
+	for key, value := range map[string]string{
+		"client_id":     strings.TrimSpace(d.clientID),
+		"response_type": "code",
+		"redirect_uri":  redirectURI,
+		"scope":         d.scope,
+		"state":         state,
+	} {
+		params.Set(key, value)
 	}
 	if d.provider != "antigravity" {
 		params.Set("code_challenge", challenge)
@@ -233,7 +269,8 @@ func (d oauthProviderDesc) authorizeURLWithOptions(challenge, state string, opts
 	} else {
 		params.Set("code", "true")
 	}
-	return d.authURL + "?" + params.Encode()
+	authEndpoint.RawQuery = params.Encode()
+	return authEndpoint.String(), nil
 }
 
 // generatePKCE returns a fresh (verifier, S256 challenge) pair. The verifier is
@@ -497,6 +534,11 @@ func (s *Server) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	authURL, err := desc.buildAuthorizeURLWithOptions(challenge, state, oauthAuthorizeOptions{AllowedWorkspaceID: req.AllowedWorkspaceID})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("invalid OAuth provider configuration: %w", err))
+		return
+	}
 	sid, err := randomToken(18)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -518,7 +560,7 @@ func (s *Server) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"session_id": sid,
 		"provider":   desc.provider,
-		"auth_url":   desc.authorizeURLWithOptions(challenge, state, oauthAuthorizeOptions{AllowedWorkspaceID: req.AllowedWorkspaceID}),
+		"auth_url":   authURL,
 		"expires_in": int(s.oauth.ttl.Seconds()),
 	})
 }

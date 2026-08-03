@@ -34,6 +34,8 @@ export interface SettingsDiff {
 
 export interface SettingsSaveResponse {
   saved: SettingsDiff[];
+  reloadOk?: boolean;
+  warning?: string;
 }
 
 export interface LogRecordCounts {

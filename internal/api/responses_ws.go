@@ -379,7 +379,13 @@ func (s *Server) handleGatewayWebSocketTurn(w *responsesWebSocketWriter, r *http
 			panicked = true
 			requestID := requestIDFromContext(r.Context())
 			log.Printf("[PANIC] responses websocket turn request_id=%s panic=%v", requestID, value)
-			supervisor.LogPanic("responses-websocket-turn", fmt.Sprintf("request_id=%s panic=%v", requestID, value))
+			panicContext := fmt.Sprintf("request_id=%s panic=%v", requestID, value)
+			supervisor.LogPanicEvent(supervisor.Event{
+				Module: "responses-websocket-turn", Operation: "serve_turn",
+				RequestID: requestID, Route: "v1.responses.websocket",
+				Status: http.StatusInternalServerError, Recovered: true, ResponseCommitted: true,
+				Message: "module panic: " + panicContext, Panic: panicContext,
+			}, value)
 		}
 	}()
 	s.handleGatewayPost(w, r)
