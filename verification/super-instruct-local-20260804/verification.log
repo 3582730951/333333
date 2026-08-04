@@ -1,0 +1,82 @@
+$ git show :config.example.json | grep -n super_instruct_local_enabled
+[exit=1]
+
+$ grep -n super_instruct_local_enabled config.example.json
+171:  "super_instruct_local_enabled": false,
+[exit=0]
+
+$ sha256sum other/Super-Instruct-Codex-5.6/bridge.md super-instruct/bridge.md
+74fa11b3da394daf07d651eee0f724341263e87519d2788ef2c8a7a69bb54afb  other/Super-Instruct-Codex-5.6/bridge.md
+74fa11b3da394daf07d651eee0f724341263e87519d2788ef2c8a7a69bb54afb  super-instruct/bridge.md
+[exit=0]
+
+$ printf 'bundled_skills='; find super-instruct/codex-skills -name SKILL.md -type f | wc -l; printf 'source_skills='; find other/Super-Instruct-Codex-5.6 -path '*/SKILL.md' -type f | wc -l
+bundled_skills=28
+source_skills=28
+[exit=0]
+
+$ /tmp/go1.25.12/bin/go test ./internal/superinstruct -run 'Test(InjectSystemMatchesM1Carriers|BundledHeadlessResourcesMatchSourceProject|ExtractUserSourceMatchesInputPrecedenceAndFiltering)$' -v -count=1
+=== RUN   TestInjectSystemMatchesM1Carriers
+--- PASS: TestInjectSystemMatchesM1Carriers (0.00s)
+=== RUN   TestBundledHeadlessResourcesMatchSourceProject
+--- PASS: TestBundledHeadlessResourcesMatchSourceProject (0.41s)
+=== RUN   TestExtractUserSourceMatchesInputPrecedenceAndFiltering
+--- PASS: TestExtractUserSourceMatchesInputPrecedenceAndFiltering (0.00s)
+PASS
+ok  	codex-account-pool/internal/superinstruct	0.420s
+[exit=0]
+
+$ /tmp/go1.25.12/bin/go test ./internal/api -run 'Test(HeadlessLocalSuperInstructEnablesFullFallbackAndRespectsProfiles|CodexInstructionPlanLocalM1ReplacesSystemCarriers|SuperInstructMonitorPublishesHeadlessM6Events|HeadlessLocalResponsePipelineRunsM4M3M5M6Once)$' -v -count=1
+=== RUN   TestHeadlessLocalSuperInstructEnablesFullFallbackAndRespectsProfiles
+--- PASS: TestHeadlessLocalSuperInstructEnablesFullFallbackAndRespectsProfiles (0.01s)
+=== RUN   TestCodexInstructionPlanLocalM1ReplacesSystemCarriers
+--- PASS: TestCodexInstructionPlanLocalM1ReplacesSystemCarriers (0.00s)
+=== RUN   TestSuperInstructMonitorPublishesHeadlessM6Events
+--- PASS: TestSuperInstructMonitorPublishesHeadlessM6Events (0.32s)
+=== RUN   TestHeadlessLocalResponsePipelineRunsM4M3M5M6Once
+--- PASS: TestHeadlessLocalResponsePipelineRunsM4M3M5M6Once (0.00s)
+PASS
+ok  	codex-account-pool/internal/api	0.520s
+[exit=0]
+
+$ bash -n scripts/install.sh scripts/test-install-single-worker.sh && echo shell_syntax=OK
+shell_syntax=OK
+[exit=0]
+
+$ bash scripts/test-install-single-worker.sh
+test warning: Keeping existing config: /tmp/tmp.u4uUhiTqid/release-perms.8jIz3j/etc/config.json
+single-worker installer lifecycle: OK
+[exit=0]
+
+$ git diff --check && echo worktree_diff_check=OK
+worktree_diff_check=OK
+[exit=0]
+
+$ /tmp/go1.25.12/bin/go test ./... -count=1
+[complete-run literal output excerpt]
+ok  	codex-account-pool/internal/api	197.189s
+ok  	codex-account-pool/internal/config	0.068s
+ok  	codex-account-pool/internal/scheduler	14.194s
+ok  	codex-account-pool/internal/storage	21.003s
+ok  	codex-account-pool/internal/superinstruct	0.868s
+ok  	codex-account-pool/internal/upstream	5.228s
+ok  	codex-account-pool/tools/e2e/codex-multiagent	0.010s
+[exit=0]
+
+$ patch round-trip: git apply --check; git apply; byte-compare patched tree
+patch_check_exit=0
+patch_apply_exit=0
+patched_bytes=OK
+[exit=0]
+
+$ rollback dry-run against patched temporary tree; byte-compare baseline
+rollback restored 19 baseline files and removed 3 task-added files
+rollback_exit=0
+rollback_bytes=OK
+[exit=0]
+$ git diff --check --cached -- [22 task source paths]
+task_source_cached_diff_check=OK
+task_source_paths=22
+artifact_staged_paths=55
+verification_log_staged=OK
+[exit=0]

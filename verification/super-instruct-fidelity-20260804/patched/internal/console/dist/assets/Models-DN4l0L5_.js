@@ -1,0 +1,1 @@
+import"./rolldown-runtime-QTnfLwEv.js";import{g as e}from"./vendor-charts-BYoLSlSF.js";import{u as t}from"./vendor-react-BztPifgQ.js";import{t as n}from"./ModelNameList-DLiugRtW.js";e();var r=t();function i(){return(0,r.jsx)(n,{endpoint:`/admin/models`,title:`模型列表`,subtitle:`当前账号池能力快照中的模型名称`})}export{i as default};
