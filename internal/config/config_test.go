@@ -78,17 +78,17 @@ func TestPhaseRollbackEnvironmentOverrides(t *testing.T) {
 	}
 }
 
-func TestSuperInstructLocalModeDefaultsOffAndEnvironmentOverrides(t *testing.T) {
+func TestSuperInstructCompatibilityFieldDefaultsOffAndEnvironmentIsIgnored(t *testing.T) {
 	if Default().SuperInstructLocalEnabled {
-		t.Fatal("headless local Super-Instruct mode must remain opt-in")
+		t.Fatal("compatibility-only Super-Instruct field must default off")
 	}
 	t.Setenv("CODEX_POOL_SUPER_INSTRUCT_LOCAL_ENABLED", "true")
 	cfg, err := Load("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.SuperInstructLocalEnabled {
-		t.Fatal("CODEX_POOL_SUPER_INSTRUCT_LOCAL_ENABLED=true was ignored")
+	if cfg.SuperInstructLocalEnabled {
+		t.Fatal("legacy server-wide Super-Instruct environment override remains active")
 	}
 }
 

@@ -452,6 +452,44 @@ base_url = "https://other.example/v1"
 	}
 }
 
+func TestSetupScriptCodexBranchPersistsEnabledSuperInstructChoice(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	home := t.TempDir()
+	options := CodexSetupScriptOptions{
+		SuperInstruct: CodexSuperInstructInstallPolicy{
+			GroupName:    "team-super",
+			Assigned:     true,
+			Entitled:     true,
+			Capabilities: "指令与分组允许的全部 skills、响应改写、Memory、Monitor",
+		},
+	}
+	script := buildCodexConfigScript("https://pool.example/", "cap_super_choice", "gpt-5.6-sol", "", "", "", options)
+	path := filepath.Join(t.TempDir(), "setup.sh")
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", path, "--super-instruct", "enabled")
+	cmd.Env = append(os.Environ(),
+		"HOME="+home,
+		"CODEX_HOME="+filepath.Join(home, ".codex"),
+		"POOL_CLIENT=codex",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("combined Codex setup failed: %v\n%s", err, output)
+	}
+	config, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `http_headers = { "X-Pool-Super-Instruct" = "enabled" }`
+	if strings.Count(string(config), want) != 1 {
+		t.Fatalf("combined Codex branch did not persist enabled choice exactly once\nwant: %s\n---\n%s", want, config)
+	}
+}
+
 func TestSetupScriptMinimalCodexConfigParsesWithInstalledCLI(t *testing.T) {
 	codex, err := exec.LookPath("codex")
 	if err != nil {

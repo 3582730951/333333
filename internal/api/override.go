@@ -292,8 +292,7 @@ func normalizeProviderHintLoose(v string) string {
 
 func (s *Server) attachUserGroupPolicy(w http.ResponseWriter, r *http.Request, pol downstreamPolicy) (*http.Request, bool) {
 	if strings.TrimSpace(pol.UserGroupID) == "" {
-		group := s.effectiveSuperInstructPolicy(storage.Group{})
-		return r.WithContext(withRequestAccountGroupPolicy(r.Context(), group)), true
+		return r.WithContext(withRequestAccountGroupPolicy(r.Context(), storage.Group{})), true
 	}
 	group, ok, err := s.store.GetUserGroup(r.Context(), pol.UserGroupID)
 	if err != nil {
@@ -304,8 +303,8 @@ func (s *Server) attachUserGroupPolicy(w http.ResponseWriter, r *http.Request, p
 		writePoolCodeError(w, http.StatusUnprocessableEntity, "user_group_not_found", "configured user group was not found")
 		return r, false
 	}
-	effective := s.effectiveSuperInstructPolicy(userGroupPolicyAsAccountGroup(group))
-	return r.WithContext(withRequestAccountGroupPolicy(r.Context(), effective)), true
+	requestGroup := superInstructPolicyForClient(userGroupPolicyAsAccountGroup(group), r)
+	return r.WithContext(withRequestAccountGroupPolicy(r.Context(), requestGroup)), true
 }
 
 func normalizeProviderHint(v string) (string, bool) {

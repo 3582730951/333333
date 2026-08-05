@@ -302,11 +302,7 @@ func NewServer(dep Dependencies) *Server {
 }
 
 func superInstructMemoryPath(cfg config.Config) string {
-	name := "super-instruct-memory.json"
-	if cfg.SuperInstructLocalEnabled {
-		name = "memory.json"
-	}
-	return filepath.Join(cfg.DataDir, name)
+	return filepath.Join(cfg.DataDir, "super-instruct-memory.json")
 }
 
 // StartRuntime opens the usage journal and starts write/compaction workers.

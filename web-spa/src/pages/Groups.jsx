@@ -917,8 +917,8 @@ function UserGroupEditor({
       <Card title="Super-Instruct 热插拔模块" className="pool-card">
         <Banner
           type="info"
-          title="按模型家族启用 Super-Instruct"
-          description="默认关闭。快捷开关仅启用指令注入，以保留原生流式与响应协议；响应改写、Memory、Monitor 默认保持关闭，可在此按模型家族显式启用。"
+          title="按模型家族授予 Super-Instruct 能力"
+          description="默认关闭。这里设置分组能力上限；API Key 用户还需在一键安装脚本配置 Codex 时选择启用。快捷开关仅授权指令注入；响应改写、Memory、Monitor 需在此逐项授权。"
         />
         {superSkillsError ? (
           <Banner type="warning" title="Super-Instruct 技能目录加载失败" description="未开启的分组不受影响；开启前请确认服务端资源目录存在。" />
@@ -1213,7 +1213,7 @@ export default function Groups() {
         const enabled = superInstructAnyEnabled(row);
         const busy = savingUserGroup || removingUserGroup || isTogglingSuperInstruct(row.id);
         return (
-          <label className="pool-inline-switch pool-user-group-super-switch" title="按用户分组开启或关闭兼容优先的 Super-Instruct 指令注入">
+          <label className="pool-inline-switch pool-user-group-super-switch" title="设置用户分组的 Super-Instruct 能力上限；客户端仍需在 API Key 安装脚本中启用">
             <Switch
               checked={enabled}
               disabled={busy}
@@ -1310,7 +1310,7 @@ export default function Groups() {
           </div>
         </TabPane>
         <TabPane key="user" tab="用户分组" itemKey="user">
-          <Banner type="info" title="Super-Instruct 按用户分组开关" description="列表开关默认关闭；开启后仅为 GPT/ChatGPT/Codex、Claude、Gemini 注入指令，流式响应保持原生直通。响应改写、Memory、Monitor 请在“编辑完整策略”中单独启用。" />
+          <Banner type="info" title="Super-Instruct：分组授权 + API Key 安装选择" description="列表开关默认关闭并设置分组能力上限；API Key 用户运行一键安装命令时，还需在 Codex 配置步骤选择启用，两项同时开启才生效。响应改写、Memory、Monitor 请在“编辑完整策略”中逐项授权。" />
           <div className="pool-resource-split pool-group-resource-split">
             <ResourceTable error={userGroupsResource.error} onRetry={userGroupsResource.reload} loading={userGroupsResource.loading} lastRefresh={userGroupsResource.lastRefresh} dataSource={data.userGroups} columns={userColumns} rowKey="id" pagination={false} density="compact" layout="fit" scroll={false} rowHeight={68} emptyTitle="暂无用户分组" emptyDescription="创建后可混合选择账号池分组与模型提供商，并按模型设置优先层级。" skeletonRows={5} />
             {!userGroupsResource.error || userGroupsResource.lastRefresh ? <MetricRail items={userMetrics} /> : null}

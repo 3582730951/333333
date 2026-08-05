@@ -589,10 +589,9 @@ type Config struct {
 	CodexInstallEffort         string `json:"codex_install_effort"`          // default empty: preserve Codex config
 	CodexInstallApprovalPolicy string `json:"codex_install_approval_policy"` // default empty: preserve Codex config
 	CodexInstallSandboxMode    string `json:"codex_install_sandbox_mode"`    // default empty: preserve Codex config
-	// SuperInstructLocalEnabled enables the bundled, headless M1→M4→M3→M5→M6
-	// runtime. The resolved user group still supplies M1's appended instruction
-	// blocks. The installer exposes this as an opt-in local mode and may override
-	// it through CODEX_POOL_SUPER_INSTRUCT_LOCAL_ENABLED.
+	// SuperInstructLocalEnabled is retained for configuration compatibility only.
+	// Runtime Super-Instruct capability is the intersection of the resolved user
+	// group policy and the request's explicit client opt-in header.
 	SuperInstructLocalEnabled bool `json:"super_instruct_local_enabled"`
 	// Claude gateway local runtime / egress policy. These are surfaced through the
 	// admin System config page and returned by /v1/gateway/identity so installed
@@ -1293,11 +1292,6 @@ func (c *Config) applyEnv() error {
 	if v := os.Getenv("CODEX_POOL_SCHEDULER_INDEX_ENABLED"); v != "" {
 		if parsed, err := strconv.ParseBool(v); err == nil {
 			c.SchedulerIndexEnabled = parsed
-		}
-	}
-	if v := os.Getenv("CODEX_POOL_SUPER_INSTRUCT_LOCAL_ENABLED"); v != "" {
-		if parsed, err := strconv.ParseBool(v); err == nil {
-			c.SuperInstructLocalEnabled = parsed
 		}
 	}
 	if v := os.Getenv("CODEX_POOL_BODY_MEMORY_BUDGET_BYTES"); v != "" {

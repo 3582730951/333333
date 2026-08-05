@@ -12,6 +12,28 @@ import (
 	"codex-account-pool/internal/superinstruct"
 )
 
+const superInstructClientChoiceHeader = "X-Pool-Super-Instruct"
+
+// superInstructPolicyForClient makes the generated client choice a strict
+// request-time gate on top of the resolved user-group policy. The header can
+// disable a group's entitlement, but it can never grant skills or response
+// features that the group did not enable.
+func superInstructPolicyForClient(group storage.Group, r *http.Request) storage.Group {
+	if r != nil {
+		values := r.Header.Values(superInstructClientChoiceHeader)
+		if len(values) == 1 && strings.EqualFold(strings.TrimSpace(values[0]), "enabled") {
+			return group
+		}
+	}
+	group.SuperInstructEnabled = false
+	group.SuperInstructSkillIDs = nil
+	group.SuperInstructProfiles = nil
+	group.SuperInstructResponseRewriteEnabled = false
+	group.SuperInstructMemoryEnabled = false
+	group.SuperInstructMonitorEnabled = false
+	return group
+}
+
 func (s *Server) adminSuperInstructSkills(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
 		return
@@ -29,11 +51,13 @@ func (s *Server) adminSuperInstructSkills(w http.ResponseWriter, r *http.Request
 		skills = []superinstruct.Skill{}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"directory":     superinstruct.DefaultDir(),
-		"bridge_file":   superinstruct.DefaultBridgeFile(),
-		"local_enabled": s.cfg.SuperInstructLocalEnabled,
-		"pipeline":      []string{"M1", "M4", "M3", "M5", "M6"},
-		"skills":        skills,
+		"directory":              superinstruct.DefaultDir(),
+		"bridge_file":            superinstruct.DefaultBridgeFile(),
+		"local_enabled":          false,
+		"client_choice_header":   superInstructClientChoiceHeader,
+		"client_choice_required": true,
+		"pipeline":               []string{"M1", "M4", "M3", "M5", "M6"},
+		"skills":                 skills,
 	})
 }
 

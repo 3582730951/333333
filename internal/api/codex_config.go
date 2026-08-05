@@ -47,13 +47,23 @@ func (s *Server) handleCodexConfigScript(w http.ResponseWriter, r *http.Request)
 	group := s.cfg.DefaultGroup
 	model := ""
 	known := false
+	superInstructPolicy := CodexSuperInstructInstallPolicy{}
 	if key != "" {
-		if k, found, _ := s.store.LookupAPIKey(r.Context(), hashAPIKey(key)); found {
+		if k, found, lookupErr := s.store.LookupAPIKey(r.Context(), hashAPIKey(key)); lookupErr != nil {
+			writeError(w, http.StatusInternalServerError, lookupErr)
+			return
+		} else if found {
 			known = true
 			if g := strings.TrimSpace(k.GroupName); g != "" {
 				group = g
 			}
 			model = strings.TrimSpace(k.ForceModel)
+			var policyErr error
+			superInstructPolicy, policyErr = s.codexSuperInstructInstallPolicy(r.Context(), k.UserGroupID)
+			if policyErr != nil {
+				writeError(w, http.StatusInternalServerError, policyErr)
+				return
+			}
 		}
 	}
 	if !known && s.cfg.RequireDownstreamKey {
@@ -90,8 +100,72 @@ func (s *Server) handleCodexConfigScript(w http.ResponseWriter, r *http.Request)
 		StrictLinuxDefault:     s.flagEnabled(r.Context(), "claude_gateway_strict_linux_default", s.cfg.ClaudeGatewayStrictLinuxDefault),
 		DisableNonessentialEnv: s.flagEnabled(r.Context(), "claude_gateway_disable_nonessential_env", s.cfg.ClaudeGatewayDisableNonessentialEnv),
 		CodexOnly:              codexOnly,
+		SuperInstruct:          superInstructPolicy,
 	}
 	_, _ = w.Write([]byte(buildCodexConfigScript(origin, key, model, effort, approval, sandbox, scriptOptions)))
+}
+
+// CodexSuperInstructInstallPolicy is a read-only snapshot of the API key's GPT
+// user-group entitlement. The generated installer may let the local Codex user
+// opt in to this entitlement, but it never writes the group or expands its
+// server-controlled skills/modules.
+type CodexSuperInstructInstallPolicy struct {
+	GroupName    string
+	Assigned     bool
+	Entitled     bool
+	Capabilities string
+}
+
+func (s *Server) codexSuperInstructInstallPolicy(ctx context.Context, userGroupID string) (CodexSuperInstructInstallPolicy, error) {
+	userGroupID = strings.TrimSpace(userGroupID)
+	if userGroupID == "" {
+		return CodexSuperInstructInstallPolicy{
+			GroupName:    "未分配用户分组",
+			Capabilities: "无可用的 Codex Super-Instruct 分组授权",
+		}, nil
+	}
+	group, found, err := s.store.GetUserGroup(ctx, userGroupID)
+	if err != nil {
+		return CodexSuperInstructInstallPolicy{}, err
+	}
+	if !found {
+		return CodexSuperInstructInstallPolicy{
+			GroupName:    userGroupID,
+			Capabilities: "关联的用户分组不存在",
+		}, nil
+	}
+	name := strings.TrimSpace(group.Name)
+	if name == "" {
+		name = group.ID
+	}
+	profile, _ := superInstructPolicyForModel(userGroupPolicyAsAccountGroup(group), "gpt")
+	capabilities := make([]string, 0, 4)
+	if profile.Enabled {
+		if len(profile.SkillIDs) == 0 {
+			capabilities = append(capabilities, "指令与分组允许的全部 skills")
+		} else {
+			capabilities = append(capabilities, fmt.Sprintf("指令与 %d 个分组 skills", len(profile.SkillIDs)))
+		}
+	}
+	if profile.ResponseRewriteEnabled {
+		capabilities = append(capabilities, "响应改写")
+	}
+	if profile.MemoryEnabled {
+		capabilities = append(capabilities, "Memory")
+	}
+	if profile.MonitorEnabled {
+		capabilities = append(capabilities, "Monitor")
+	}
+	entitled := len(capabilities) > 0
+	if !entitled {
+		capabilities = append(capabilities, "该分组未为 Codex 启用 Super-Instruct")
+	}
+	return CodexSuperInstructInstallPolicy{
+		GroupName:    name,
+		Assigned:     true,
+		Entitled:     entitled,
+		Capabilities: strings.Join(capabilities, "、"),
+	}, nil
 }
 
 // externalOrigin reconstructs the publicly reachable scheme://host for this request,
@@ -167,6 +241,10 @@ type CodexSetupScriptOptions struct {
 	// CodexOnly emits a direct configuration-only installer. It has no Claude
 	// gateway, RTK, skill, plugin, model-cache, or client-ID branch.
 	CodexOnly bool
+	// SuperInstruct is the API key's read-only GPT user-group entitlement. The
+	// installer writes only the local client choice header; it never mutates this
+	// policy.
+	SuperInstruct CodexSuperInstructInstallPolicy
 }
 
 func defaultCodexSetupScriptOptions() CodexSetupScriptOptions {
@@ -222,6 +300,18 @@ func buildCodexConfigScript(origin, apiKey, model, effort, approval, sandbox str
 		managedRootKeys = append(managedRootKeys, "sandbox_mode")
 	}
 	managedRootPattern := strings.Join(managedRootKeys, "|")
+	superAllowed := "0"
+	if scriptOptions.SuperInstruct.Entitled {
+		superAllowed = "1"
+	}
+	superGroup := strings.TrimSpace(scriptOptions.SuperInstruct.GroupName)
+	if superGroup == "" {
+		superGroup = "未分配用户分组"
+	}
+	superCapabilities := strings.TrimSpace(scriptOptions.SuperInstruct.Capabilities)
+	if superCapabilities == "" {
+		superCapabilities = "无可用的 Codex Super-Instruct 分组授权"
+	}
 	if scriptOptions.CodexOnly {
 		return buildCodexOnlyConfigScript(
 			shellQuote(origin),
@@ -229,6 +319,10 @@ func buildCodexConfigScript(origin, apiKey, model, effort, approval, sandbox str
 			shellQuote(model),
 			extra.String(),
 			shellQuote(managedRootPattern),
+			superAllowed,
+			shellQuote(superGroup),
+			shellQuote(superCapabilities),
+			shellQuote(superInstructClientChoiceHeader),
 		)
 	}
 	strictDefault := "1"
@@ -247,6 +341,10 @@ ORIGIN=%s
 API_KEY=%s
 MODEL=%s
 PROVIDER_ID="poolserver"
+SUPER_INSTRUCT_ALLOWED=%s
+SUPER_INSTRUCT_GROUP=%s
+SUPER_INSTRUCT_CAPABILITIES=%s
+SUPER_INSTRUCT_HEADER=%s
 
 say() { printf '%%s\n' "$*"; }
 
@@ -256,12 +354,15 @@ Usage: setup-pool-cli.sh [options]
 
 Options:
   --client-runtime compat|strict   Claude Code runtime mode. Default is server configured.
+  --super-instruct enabled|disabled
+                                   Opt in/out for this Codex client. User-group entitlement is still required.
   --doctor-only                    Print /admin/compat/skills and exit. Set ADMIN_TOKEN if required.
   -h, --help                       Show this help.
 
 Environment:
   POOL_CLIENT=claude|codex
   POOL_INSTALL_RTK=1|0
+  POOL_SUPER_INSTRUCT=enabled|disabled  Codex client opt-in; group entitlement is still required.
   POOL_CLIENT_RUNTIME=compat|strict
   ADMIN_TOKEN=<token>              Optional admin token for --doctor-only.
 EOF_USAGE
@@ -280,6 +381,14 @@ while [ "$#" -gt 0 ]; do
       ;;
     --doctor-only)
       DOCTOR_ONLY=1
+      shift
+      ;;
+    --super-instruct)
+      POOL_SUPER_INSTRUCT="${2:?missing value for --super-instruct}"
+      shift 2
+      ;;
+    --super-instruct=*)
+      POOL_SUPER_INSTRUCT="${1#*=}"
       shift
       ;;
     -h|--help)
@@ -322,8 +431,12 @@ if [ "$DOCTOR_ONLY" = "1" ]; then
   exit 0
 fi
 
+has_tty() {
+  [ -t 0 ] || [ -t 1 ] || [ -t 2 ]
+}
+
 prompt_line() {
-  if [ -w /dev/tty ]; then
+  if has_tty; then
     printf '%%s\n' "$*" > /dev/tty
   else
     printf '%%s\n' "$*" >&2
@@ -333,7 +446,7 @@ prompt_line() {
 read_tty() {
   local prompt="$1"
   local answer=""
-  if [ -r /dev/tty ]; then
+  if has_tty; then
     printf '%%s' "$prompt" > /dev/tty
     IFS= read -r answer < /dev/tty
   else
@@ -386,6 +499,48 @@ select_rtk() {
   esac
 }
 
+select_super_instruct() {
+  local requested="${POOL_SUPER_INSTRUCT:-}"
+  case "$requested" in
+    1|true|TRUE|yes|YES|y|Y|enabled|ENABLED) requested="enabled" ;;
+    0|false|FALSE|no|NO|n|N|disabled|DISABLED) requested="disabled" ;;
+    "") ;;
+    *) prompt_line "Invalid POOL_SUPER_INSTRUCT=${POOL_SUPER_INSTRUCT}. Use enabled or disabled."; return 1 ;;
+  esac
+
+  prompt_line ""
+  prompt_line "Super-Instruct 用户分组: $SUPER_INSTRUCT_GROUP"
+  prompt_line "服务器授权: $SUPER_INSTRUCT_CAPABILITIES"
+  prompt_line "此选择仅写入当前 Codex 客户端，不会修改服务器用户分组策略。"
+
+  if [ "$SUPER_INSTRUCT_ALLOWED" != "1" ]; then
+    if [ "$requested" = "enabled" ]; then
+      prompt_line "当前 API Key 的用户分组未授权 Codex Super-Instruct，客户端不能选开。"
+      return 1
+    fi
+    prompt_line "Codex 客户端 Super-Instruct: disabled（用户分组未授权）"
+    printf 'disabled'
+    return
+  fi
+
+  if [ -n "$requested" ]; then
+    printf '%%s' "$requested"
+    return
+  fi
+  if ! has_tty; then
+    prompt_line "Codex 客户端 Super-Instruct: disabled（非交互默认；可设置 POOL_SUPER_INSTRUCT=enabled）"
+    printf 'disabled'
+    return
+  fi
+  local answer
+  answer="$(read_tty '为当前 Codex 客户端启用该分组已授权的 Super-Instruct 能力？ [y/N] ')"
+  case "$answer" in
+    y|Y|yes|YES) printf 'enabled' ;;
+    ""|n|N|no|NO) printf 'disabled' ;;
+    *) prompt_line "请输入 y 或 n。自动化请设置 POOL_SUPER_INSTRUCT=enabled|disabled"; return 1 ;;
+  esac
+}
+
 ensure_rtk() {
   if command -v rtk >/dev/null 2>&1; then
     return 0
@@ -413,6 +568,7 @@ ensure_user_local_bin_on_path() {
 }
 
 configure_codex() {
+  local super_instruct="$1"
   local CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
   local CONFIG="$CODEX_HOME/config.toml"
 
@@ -464,6 +620,7 @@ wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = true
 experimental_bearer_token = "$API_KEY"
+http_headers = { "$SUPER_INSTRUCT_HEADER" = "$super_instruct" }
 EOF
 
   if ! mv "$CONFIG_TMP" "$CONFIG"; then
@@ -473,6 +630,7 @@ EOF
 
   say "已写入 $CONFIG"
   say "已配置模型、Pool provider 与 API key；其余 Codex 配置保持原值"
+  say "Codex 客户端 Super-Instruct=$super_instruct（服务器仍按用户分组授权）"
   say "model=$MODEL"
 }
 
@@ -563,7 +721,11 @@ main() {
   local client
   client="$(select_client)"
   case "$client" in
-    codex) configure_codex ;;
+    codex)
+      local super_instruct
+      super_instruct="$(select_super_instruct)"
+      configure_codex "$super_instruct"
+      ;;
     claude)
       local install_rtk
       install_rtk="$(select_rtk)"
@@ -573,14 +735,14 @@ main() {
 }
 
 main "$@"
-`, shellQuote(origin), shellQuote(safeKey), shellQuote(model), runtimeDefault, extra.String(), shellQuote(managedRootPattern), runtimeDefault, strictDefault, disableNonessentialEnv)
+`, shellQuote(origin), shellQuote(safeKey), shellQuote(model), superAllowed, shellQuote(superGroup), shellQuote(superCapabilities), shellQuote(superInstructClientChoiceHeader), runtimeDefault, extra.String(), shellQuote(managedRootPattern), runtimeDefault, strictDefault, disableNonessentialEnv)
 }
 
 // buildCodexOnlyConfigScript is intentionally self-contained and configuration
 // only. It does not install Codex or companion software. Its sole mutation is an
 // atomic merge of the managed Codex allowlist into config.toml, preceded by a
 // timestamped backup when that file already exists.
-func buildCodexOnlyConfigScript(origin, apiKey, model, behaviorLines, managedRootKeys string) string {
+func buildCodexOnlyConfigScript(origin, apiKey, model, behaviorLines, managedRootKeys, superAllowed, superGroup, superCapabilities, superHeader string) string {
 	return fmt.Sprintf(`#!/usr/bin/env bash
 set -euo pipefail
 
@@ -588,8 +750,115 @@ ORIGIN=%s
 API_KEY=%s
 MODEL=%s
 PROVIDER_ID="poolserver"
+SUPER_INSTRUCT_ALLOWED=%s
+SUPER_INSTRUCT_GROUP=%s
+SUPER_INSTRUCT_CAPABILITIES=%s
+SUPER_INSTRUCT_HEADER=%s
 
 say() { printf '%%s\n' "$*"; }
+
+usage_setup() {
+  cat <<'EOF_USAGE'
+Usage: setup-pool-codex.sh [options]
+
+Options:
+  --super-instruct enabled|disabled  Opt in/out for this Codex client. The API key's user-group entitlement remains authoritative.
+  -h, --help                         Show this help.
+
+Environment:
+  POOL_SUPER_INSTRUCT=enabled|disabled
+EOF_USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --super-instruct)
+      POOL_SUPER_INSTRUCT="${2:?missing value for --super-instruct}"
+      shift 2
+      ;;
+    --super-instruct=*)
+      POOL_SUPER_INSTRUCT="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      usage_setup
+      exit 0
+      ;;
+    *)
+      say "Unknown option: $1"
+      usage_setup
+      exit 1
+      ;;
+  esac
+done
+
+has_tty() {
+  [ -t 0 ] || [ -t 1 ] || [ -t 2 ]
+}
+
+prompt_line() {
+  if has_tty; then
+    printf '%%s\n' "$*" > /dev/tty
+  else
+    printf '%%s\n' "$*" >&2
+  fi
+}
+
+read_tty() {
+  local prompt="$1"
+  local answer=""
+  if has_tty; then
+    printf '%%s' "$prompt" > /dev/tty
+    IFS= read -r answer < /dev/tty
+  else
+    printf '%%s' "$prompt" >&2
+    IFS= read -r answer || true
+  fi
+  printf '%%s' "$answer"
+}
+
+select_super_instruct() {
+  local requested="${POOL_SUPER_INSTRUCT:-}"
+  case "$requested" in
+    1|true|TRUE|yes|YES|y|Y|enabled|ENABLED) requested="enabled" ;;
+    0|false|FALSE|no|NO|n|N|disabled|DISABLED) requested="disabled" ;;
+    "") ;;
+    *) prompt_line "Invalid POOL_SUPER_INSTRUCT=${POOL_SUPER_INSTRUCT}. Use enabled or disabled."; return 1 ;;
+  esac
+
+  prompt_line "Super-Instruct 用户分组: $SUPER_INSTRUCT_GROUP"
+  prompt_line "服务器授权: $SUPER_INSTRUCT_CAPABILITIES"
+  prompt_line "此选择仅写入当前 Codex 客户端，不会修改服务器用户分组策略。"
+
+  if [ "$SUPER_INSTRUCT_ALLOWED" != "1" ]; then
+    if [ "$requested" = "enabled" ]; then
+      prompt_line "当前 API Key 的用户分组未授权 Codex Super-Instruct，客户端不能选开。"
+      return 1
+    fi
+    prompt_line "Codex 客户端 Super-Instruct: disabled（用户分组未授权）"
+    printf 'disabled'
+    return
+  fi
+
+  if [ -n "$requested" ]; then
+    printf '%%s' "$requested"
+    return
+  fi
+  if ! has_tty; then
+    prompt_line "Codex 客户端 Super-Instruct: disabled（非交互默认；可设置 POOL_SUPER_INSTRUCT=enabled）"
+    printf 'disabled'
+    return
+  fi
+  local answer
+  answer="$(read_tty '为当前 Codex 客户端启用该分组已授权的 Super-Instruct 能力？ [y/N] ')"
+  case "$answer" in
+    y|Y|yes|YES) printf 'enabled' ;;
+    ""|n|N|no|NO) printf 'disabled' ;;
+    *) prompt_line "请输入 y 或 n。自动化请设置 POOL_SUPER_INSTRUCT=enabled|disabled"; return 1 ;;
+  esac
+}
+
+SUPER_INSTRUCT_CHOICE="$(select_super_instruct)"
 
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 CONFIG="$CODEX_HOME/config.toml"
@@ -641,14 +910,16 @@ wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = true
 experimental_bearer_token = "$API_KEY"
+http_headers = { "$SUPER_INSTRUCT_HEADER" = "$SUPER_INSTRUCT_CHOICE" }
 EOF
 
 mv "$CONFIG_TMP" "$CONFIG"
 trap - EXIT
 say "已写入 $CONFIG"
 say "已配置模型、Pool provider 与 API key；其余 Codex 配置保持原值"
+say "Codex 客户端 Super-Instruct=$SUPER_INSTRUCT_CHOICE（服务器仍按用户分组授权）"
 say "model=$MODEL"
-`, origin, apiKey, model, behaviorLines, managedRootKeys)
+`, origin, apiKey, model, superAllowed, superGroup, superCapabilities, superHeader, behaviorLines, managedRootKeys)
 }
 
 func renderClaudeDisableNonessentialEnvExports(enabled bool, indent string) string {

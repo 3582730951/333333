@@ -85,41 +85,20 @@ func superInstructResponseFeatures(group storage.Group, model string) superinstr
 	}
 }
 
-func (s *Server) effectiveSuperInstructResponseFeatures(group storage.Group, model string) superinstruct.ProcessOptions {
-	opts := superInstructResponseFeatures(group, model)
-	if s != nil && s.cfg.SuperInstructLocalEnabled {
-		// The headless local deployment mirrors the source MITM chain: M3, M5,
-		// and the ungated M6 observer are all installed after the single M4 parser.
-		opts.ResponseRewriteEnabled = true
-		opts.MemoryEnabled = true
-		opts.MonitorEnabled = true
-	}
-	return opts
-}
-
 func (s *Server) maybeSuperInstructResponsePipeline(w http.ResponseWriter, r *http.Request, raw []byte, model string) (http.ResponseWriter, *http.Request, func(), bool) {
 	if s == nil || r == nil || superInstructResponsePipelineActive(r.Context()) {
 		return w, r, nil, false
 	}
-	opts := s.effectiveSuperInstructResponseFeatures(requestUserGroupPolicy(r.Context()), model)
+	opts := superInstructResponseFeatures(requestUserGroupPolicy(r.Context()), model)
 	if !opts.Enabled() {
 		return w, r, nil, false
 	}
 	stream := isStreamRequest(raw)
-	// A streamed response is already committed as soon as its first SSE event is
-	// delivered, so a whole-response rewrite cannot be applied without destroying
-	// first-byte latency and native event timing. Keep the wire path transparent;
-	// Memory/Monitor, when enabled, observe a tee after bytes have been forwarded.
-	// Rewrite-only streamed profiles therefore add zero response-path overhead.
 	if stream && !opts.MemoryEnabled && !opts.MonitorEnabled {
 		return w, r, nil, false
 	}
-	userMessage := superinstruct.ExtractUser(raw)
-	if s.cfg.SuperInstructLocalEnabled {
-		userMessage = superinstruct.ExtractUserSource(raw)
-	}
 	meta := superinstruct.RequestMeta{
-		UserMessage: userMessage,
+		UserMessage: superinstruct.ExtractUserSource(raw),
 		Path:        r.URL.RequestURI(),
 		Timestamp:   time.Now().UTC(),
 	}
@@ -127,7 +106,9 @@ func (s *Server) maybeSuperInstructResponsePipeline(w http.ResponseWriter, r *ht
 	start := time.Now()
 	processor := s.superInstructProcessor()
 	startSuperInstructObservationWorker()
-	if !s.cfg.SuperInstructLocalEnabled && (stream || !opts.ResponseRewriteEnabled) {
+	// Streaming stays byte-transparent: M3 is non-streaming only, while group-
+	// authorized Memory/Monitor observe a bounded tee after bytes are forwarded.
+	if stream || !opts.ResponseRewriteEnabled {
 		ow := newSuperInstructObservingResponseWriter(w)
 		r = r.WithContext(withSuperInstructResponsePipelineActive(r.Context()))
 		finish := func() {
@@ -137,10 +118,7 @@ func (s *Server) maybeSuperInstructResponsePipeline(w http.ResponseWriter, r *ht
 		return ow, r, finish, true
 	}
 	bw := newSuperInstructBufferingResponseWriter(w)
-	if s.cfg.SuperInstructLocalEnabled {
-		bw.observationLimit = 0
-		bw.bufferStreams = true
-	}
+	bw.observationLimit = 0
 	r = r.WithContext(withSuperInstructResponsePipelineActive(r.Context()))
 	finish := func() {
 		s.finishSuperInstructResponsePipeline(bw, r, raw, model, meta, opts, time.Since(start))
@@ -177,46 +155,37 @@ func (s *Server) finishSuperInstructResponsePipeline(w *superInstructBufferingRe
 		status = http.StatusOK
 	}
 	if w.passthrough {
-		if s.cfg.SuperInstructLocalEnabled {
-			s.superInstructProcessor().Process(meta, status, w.body.Bytes(), duration, opts)
-			return
-		}
 		opts.ResponseRewriteEnabled = false
 		finishSuperInstructObservation(s.superInstructProcessor(), status, w.body.Bytes(), false, meta, opts, duration)
 		return
 	}
 	original := w.body.Bytes()
-	if s.cfg.SuperInstructLocalEnabled {
-		// Source-compatible local path: one M4 parse followed by M3, M5, and M6
-		// on the same ResponseContext. A matched M3 rule returns the source Rei
-		// replacement body. Tool/reasoning envelopes are protocol control data,
-		// not assistant prose; rewriting them would erase executable calls.
-		if opts.ResponseRewriteEnabled && superInstructResponseHasStructuredOutput(original) {
-			opts.ResponseRewriteEnabled = false
-		}
-		result := s.superInstructProcessor().Process(meta, status, original, duration, opts)
-		body := result.Body
-		contentType := "application/json"
-		if result.Tampered && isStreamRequest(requestRaw) {
-			body = wrapSuperInstructTamperSSE(string(result.Body))
-			contentType = "text/event-stream"
-		}
-		w.writeFinal(status, body, result.Tampered, contentType)
+	if isStreamRequest(requestRaw) {
+		opts.ResponseRewriteEnabled = false
+		w.writeFinal(status, original, false, "")
+		finishSuperInstructObservation(s.superInstructProcessor(), status, original, false, meta, opts, duration)
 		return
 	}
 	body := original
 	tampered := false
-	if _, valid := superInstructRewriteSingleAssistantText(r, original, ""); valid {
-		rewriteOnly := superinstruct.ProcessOptions{ResponseRewriteEnabled: true}
-		result := s.superInstructProcessor().Process(meta, status, original, duration, rewriteOnly)
-		if result.Tampered {
-			body, tampered = superInstructRewriteSingleAssistantText(r, original, string(result.Body))
+	// M3 is allowed only for one unambiguous assistant-text field. Tool and
+	// reasoning envelopes remain byte-identical, and a successful rewrite is
+	// placed back into the original protocol envelope.
+	if opts.ResponseRewriteEnabled && !superInstructResponseHasStructuredOutput(original) {
+		if _, valid := superInstructRewriteSingleAssistantText(r, original, ""); valid {
+			result := s.superInstructProcessor().Process(meta, status, original, duration, opts)
+			if result.Tampered {
+				body, tampered = superInstructRewriteSingleAssistantText(r, original, string(result.Body))
+			}
+			w.writeFinal(status, body, tampered, "application/json")
+			return
 		}
-	} else {
-		opts.ResponseRewriteEnabled = false
 	}
-	w.writeFinal(status, body, tampered, "application/json")
-	finishSuperInstructObservation(s.superInstructProcessor(), status, original, false, meta, opts, duration)
+	opts.ResponseRewriteEnabled = false
+	if opts.MemoryEnabled || opts.MonitorEnabled {
+		s.superInstructProcessor().Process(meta, status, original, duration, opts)
+	}
+	w.writeFinal(status, original, false, "")
 }
 
 func superInstructResponseHasStructuredOutput(raw []byte) bool {

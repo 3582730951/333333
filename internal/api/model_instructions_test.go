@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -155,6 +154,7 @@ REI DIRECTIVE MUST NOT LOAD`)
 	req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt","instructions":"downstream should be replaced","input":"hi"}`))
 	req.Header.Set("Authorization", "Bearer "+routeKey)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(superInstructClientChoiceHeader, "enabled")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -173,121 +173,109 @@ REI DIRECTIVE MUST NOT LOAD`)
 		t.Fatalf("upstream json: %v\n%s", err, reqs[0].Body)
 	}
 	instructions, _ := upstream["instructions"].(string)
-	for _, want := range []string{"downstream should be replaced", "Super-Instruct Codex 5.6", "ANTI DEBUG DIRECTIVE"} {
+	for _, want := range []string{"Super-Instruct Codex 5.6", "ANTI DEBUG DIRECTIVE"} {
 		if !strings.Contains(instructions, want) {
 			t.Fatalf("instructions missing %q:\n%s", want, instructions)
 		}
 	}
-	for _, forbidden := range []string{"REI DIRECTIVE MUST NOT LOAD"} {
+	for _, forbidden := range []string{"downstream should be replaced", "REI DIRECTIVE MUST NOT LOAD"} {
 		if strings.Contains(instructions, forbidden) {
 			t.Fatalf("instructions contains forbidden %q:\n%s", forbidden, instructions)
 		}
 	}
 }
 
-func TestHeadlessLocalSuperInstructEnablesFullFallbackAndRespectsProfiles(t *testing.T) {
-	root := t.TempDir()
-	dir := filepath.Join(root, "codex-skills")
-	writeAPISuperSkill(t, dir, "alpha", "---\nname: alpha\ndescription: Alpha workflow\n---\nALPHA LOCAL DIRECTIVE")
-	writeAPISuperSkill(t, dir, "beta", "---\nname: beta\ndescription: Beta workflow\n---\nBETA LOCAL DIRECTIVE")
-	bridgePath := filepath.Join(root, "bridge.md")
-	if err := os.WriteFile(bridgePath, []byte("LOCAL M1 BRIDGE"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	instructionDir := filepath.Join(root, "model-instructions")
-	if err := os.MkdirAll(instructionDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(instructionDir, "group.md"), []byte("GROUP FILE ADDITION"), 0o600); err != nil {
+func TestSuperInstructRequiresUserGroupAndExplicitClientOptIn(t *testing.T) {
+	dir := t.TempDir()
+	writeAPISuperSkill(t, dir, "alpha", "---\nname: alpha\ndescription: Alpha workflow\n---\nALPHA GROUP DIRECTIVE")
+	bridgePath := dir + "/bridge.md"
+	if err := os.WriteFile(bridgePath, []byte("GROUP CLIENT BRIDGE"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("CODEX_POOL_SUPER_INSTRUCT_DIR", dir)
 	t.Setenv("CODEX_POOL_SUPER_INSTRUCT_BRIDGE_FILE", bridgePath)
 
-	s := &Server{cfg: config.Config{SuperInstructLocalEnabled: true, DatabasePath: filepath.Join(root, "pool.sqlite3")}}
-	effective := s.effectiveSuperInstructPolicy(storage.Group{
-		Name:                     "local-default",
-		SystemPrompt:             "GROUP CONFIG ADDITION",
-		ModelInstructionsEnabled: true,
-		ModelInstructionsFiles:   []string{"group.md"},
-	})
-	profile, family := superInstructPolicyForModel(effective, "gpt-5.6-sol")
-	if family != "legacy" || !profile.Enabled || !profile.ResponseRewriteEnabled || !profile.MemoryEnabled || !profile.MonitorEnabled {
-		t.Fatalf("local fallback profile = %+v family=%q", profile, family)
+	// The compatibility config bit must not grant any instruction or response
+	// feature to an ungrouped request, even when the client opts in.
+	s := &Server{cfg: config.Config{SuperInstructLocalEnabled: true}}
+	optedIn := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	optedIn.Header.Set(superInstructClientChoiceHeader, "enabled")
+	ungrouped := superInstructPolicyForClient(storage.Group{}, optedIn)
+	profile, _ := superInstructPolicyForModel(ungrouped, "gpt-5.6-sol")
+	if profile.Enabled || superInstructResponseFeatures(ungrouped, "gpt-5.6-sol").Enabled() {
+		t.Fatalf("client opt-in or compatibility config granted an ungrouped policy: %+v", profile)
 	}
-	compiled, _, err := s.compileGroupSuperInstructForModel(t.Context(), effective, "gpt-5.6-sol")
-	if err != nil {
-		t.Fatal(err)
+	raw := []byte(`{"model":"gpt-5.6-sol","instructions":"client directive","input":"keep me"}`)
+	got, err := s.applyModelInstructionsForEntrypoint(t.Context(), ungrouped, "gpt-5.6-sol", "/v1/responses", raw)
+	if err != nil || !bytes.Equal(got, raw) {
+		t.Fatalf("ungrouped request was modified: err=%v\nwant %s\n got %s", err, raw, got)
 	}
-	for _, want := range []string{"ALPHA LOCAL DIRECTIVE", "BETA LOCAL DIRECTIVE"} {
-		if !strings.Contains(compiled, want) {
-			t.Fatalf("local fallback did not load every installed skill; missing %q:\n%s", want, compiled)
-		}
-	}
-	raw := []byte(`{"model":"gpt-5.6-sol","instructions":"OLD DIRECTIVE","input":[{"role":"system","content":"OLD SYSTEM"},{"role":"user","content":"keep me"}]}`)
-	injected, err := s.applyModelInstructionsForEntrypoint(t.Context(), effective, "gpt-5.6-sol", "/v1/responses", raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var envelope map[string]interface{}
-	if err := json.Unmarshal(injected, &envelope); err != nil {
-		t.Fatal(err)
-	}
-	wantM1 := envelope["instructions"].(string)
-	for _, want := range []string{"LOCAL M1 BRIDGE", "GROUP CONFIG ADDITION", "GROUP FILE ADDITION", "ALPHA LOCAL DIRECTIVE", "BETA LOCAL DIRECTIVE"} {
-		if !strings.Contains(wantM1, want) {
-			t.Fatalf("M1 did not append resolved group content %q:\n%s", want, wantM1)
-		}
-	}
-	if strings.Contains(wantM1, "OLD DIRECTIVE") {
-		t.Fatalf("M1 retained replaced downstream instructions: %s", wantM1)
-	}
-	input := envelope["input"].([]interface{})
-	if input[0].(map[string]interface{})["content"] != wantM1 || input[1].(map[string]interface{})["content"] != "keep me" {
-		t.Fatalf("M1 system carrier replacement mismatch: %s", injected)
-	}
-	messageRaw := []byte(`{"model":"gemini-3-flash","system":"OLD ANTHROPIC SYSTEM","messages":[{"role":"user","content":"first"},{"role":"system","content":"OLD MESSAGE SYSTEM"},{"role":"assistant","content":"answer"},{"role":"user","content":"next"}]}`)
-	messageInjected, err := s.applyModelInstructionsForEntrypoint(t.Context(), effective, "gemini-3-flash", "/v1/messages", messageRaw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var messageEnvelope map[string]interface{}
-	if err := json.Unmarshal(messageInjected, &messageEnvelope); err != nil {
-		t.Fatal(err)
-	}
-	messageSystem, _ := messageEnvelope["system"].(string)
-	if !strings.Contains(messageSystem, "LOCAL M1 BRIDGE") || strings.Contains(messageSystem, "OLD ANTHROPIC SYSTEM") {
-		t.Fatalf("M1 Anthropic top-level system replacement mismatch: %s", messageInjected)
-	}
-	for index, value := range messageEnvelope["messages"].([]interface{}) {
-		if value.(map[string]interface{})["role"] == "system" {
-			t.Fatalf("M1 inserted unsupported messages[%d] system role: %s", index, messageInjected)
-		}
-	}
-	if strings.Contains(string(messageInjected), "OLD MESSAGE SYSTEM") || len(messageEnvelope["messages"].([]interface{})) != 3 {
-		t.Fatalf("M1 retained a replaced Anthropic message system carrier: %s", messageInjected)
-	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	attached, ok := s.attachUserGroupPolicy(httptest.NewRecorder(), req, downstreamPolicy{})
-	if !ok {
-		t.Fatal("local fallback was not attached to an ungrouped request")
-	}
-	attachedProfile, _ := superInstructPolicyForModel(requestUserGroupPolicy(attached.Context()), "gpt-5.6-sol")
-	if !attachedProfile.Enabled || !attachedProfile.ResponseRewriteEnabled || !attachedProfile.MemoryEnabled || !attachedProfile.MonitorEnabled {
-		t.Fatalf("ungrouped request did not receive the local fallback: %+v", attachedProfile)
+	selectionReq := optedIn.WithContext(withRequestAccountGroupPolicy(optedIn.Context(), ungrouped))
+	if _, _, _, enabled := s.maybeSuperInstructResponsePipeline(httptest.NewRecorder(), selectionReq, raw, "gpt-5.6-sol"); enabled {
+		t.Fatal("compatibility config enabled response processing without group entitlement")
 	}
 
-	explicit := storage.Group{SuperInstructProfiles: storage.SuperInstructProfiles{
-		storage.ModelInstructionFamilyGPT: {Enabled: false},
-	}}
-	got := s.effectiveSuperInstructPolicy(explicit)
-	gotProfile, _ := superInstructPolicyForModel(got, "gpt-5.6-sol")
-	if gotProfile.Enabled || gotProfile.ResponseRewriteEnabled || gotProfile.MemoryEnabled || gotProfile.MonitorEnabled {
-		t.Fatalf("explicit disabled profile was overwritten by local fallback: %+v", gotProfile)
+	entitled := storage.Group{
+		Name:                                "entitled",
+		SystemPrompt:                        "GROUP PROMPT REMAINS INDEPENDENT",
+		SuperInstructEnabled:                true,
+		SuperInstructResponseRewriteEnabled: true,
+		SuperInstructMemoryEnabled:          true,
+		SuperInstructMonitorEnabled:         true,
 	}
-	responseOpts := s.effectiveSuperInstructResponseFeatures(got, "gpt-5.6-sol")
-	if !responseOpts.ResponseRewriteEnabled || !responseOpts.MemoryEnabled || !responseOpts.MonitorEnabled {
-		t.Fatalf("local M3/M5/M6 chain was gated by group policy: %+v", responseOpts)
+	allowed := superInstructPolicyForClient(entitled, optedIn)
+	allowedProfile, family := superInstructPolicyForModel(allowed, "gpt-5.6-sol")
+	if family != "legacy" || !allowedProfile.Enabled || !allowedProfile.ResponseRewriteEnabled || !allowedProfile.MemoryEnabled || !allowedProfile.MonitorEnabled {
+		t.Fatalf("explicit opt-in did not retain the group policy: profile=%+v family=%q", allowedProfile, family)
+	}
+	compiled, _, err := s.compileGroupSuperInstructForModel(t.Context(), allowed, "gpt-5.6-sol")
+	if err != nil || !strings.Contains(compiled, "ALPHA GROUP DIRECTIVE") {
+		t.Fatalf("enabled group did not compile its selected skills: err=%v\n%s", err, compiled)
+	}
+	injected, err := s.applyModelInstructionsForEntrypoint(t.Context(), allowed, "gpt-5.6-sol", "/v1/responses", raw)
+	if err != nil || !strings.Contains(string(injected), "GROUP CLIENT BRIDGE") || !strings.Contains(string(injected), "ALPHA GROUP DIRECTIVE") || strings.Contains(string(injected), "client directive") {
+		t.Fatalf("enabled group/client M1 bridge mismatch: err=%v\n%s", err, injected)
+	}
+
+	profilePolicy := storage.Group{SuperInstructProfiles: storage.SuperInstructProfiles{
+		storage.ModelInstructionFamilyGPT: {
+			Enabled:                true,
+			SkillIDs:               []string{"alpha"},
+			ResponseRewriteEnabled: true,
+		},
+	}}
+	profileAllowed := superInstructPolicyForClient(profilePolicy, optedIn)
+	profileOpts := superInstructResponseFeatures(profileAllowed, "gpt-5.6-sol")
+	if !profileOpts.ResponseRewriteEnabled || profileOpts.MemoryEnabled || profileOpts.MonitorEnabled {
+		t.Fatalf("one profile flag escalated sibling modules: %+v", profileOpts)
+	}
+	if superInstructResponseFeatures(profileAllowed, "claude-sonnet-4.6").Enabled() {
+		t.Fatal("missing model-family profile inherited GPT response features")
+	}
+
+	for _, tc := range []struct {
+		name   string
+		values []string
+	}{
+		{name: "missing"},
+		{name: "disabled", values: []string{"disabled"}},
+		{name: "unknown", values: []string{"yes"}},
+		{name: "ambiguous", values: []string{"enabled", "disabled"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			for _, value := range tc.values {
+				req.Header.Add(superInstructClientChoiceHeader, value)
+			}
+			blocked := superInstructPolicyForClient(entitled, req)
+			blockedProfile, _ := superInstructPolicyForModel(blocked, "gpt-5.6-sol")
+			if blockedProfile.Enabled || superInstructResponseFeatures(blocked, "gpt-5.6-sol").Enabled() || len(blocked.SuperInstructProfiles) != 0 {
+				t.Fatalf("client choice %v retained Super-Instruct: %+v", tc.values, blocked)
+			}
+			if blocked.SystemPrompt != entitled.SystemPrompt {
+				t.Fatalf("client choice erased independent group policy: %+v", blocked)
+			}
+		})
 	}
 }
 
@@ -402,6 +390,38 @@ func TestCodexInstructionPlanLocalM1KeepsLiteToolsThroughCustomBridge(t *testing
 	}
 	if !seen["exec"] || !seen["request_user_input"] {
 		t.Fatalf("Lite tools disappeared in Responses-to-custom bridge: %s", converted.Body)
+	}
+}
+
+func TestStrictCPASuperInstructSnapshotIsMaskedOnClientOptOut(t *testing.T) {
+	snapshot := encodeCodexInstructionSnapshot(codexInstructionSnapshotV2{
+		Bridge:        "ROOT BRIDGE MUST BE MASKED",
+		GroupPrompt:   "ROOT GROUP PROMPT",
+		Administrator: "ROOT ADMINISTRATOR",
+		SuperInstruct: "ROOT SUPER SKILL MUST BE MASKED",
+	})
+	plan := newCodexInstructionPlan(snapshot, "revision", "tree", "snapshot", true)
+	entitled := storage.Group{SuperInstructProfiles: storage.SuperInstructProfiles{
+		storage.ModelInstructionFamilyGPT: {Enabled: true, SkillIDs: []string{"alpha"}},
+	}}
+	missingHeader := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	masked := superInstructPolicyForClient(entitled, missingHeader)
+	policy, _ := superInstructPolicyForModel(masked, "gpt-5.6-sol")
+	configured, err := (&Server{}).configureSuperInstructM1Plan(plan, policy.Enabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"model":"gpt-5.6-sol","instructions":"client base","input":"continue"}`)
+	got := configured.apply(raw)
+	for _, forbidden := range []string{"ROOT BRIDGE MUST BE MASKED", "ROOT SUPER SKILL MUST BE MASKED"} {
+		if strings.Contains(string(got), forbidden) {
+			t.Fatalf("disabled continuation replayed %q: %s", forbidden, got)
+		}
+	}
+	for _, want := range []string{"ROOT GROUP PROMPT", "ROOT ADMINISTRATOR"} {
+		if !strings.Contains(string(got), want) {
+			t.Fatalf("disabled continuation lost independent snapshot %q: %s", want, got)
+		}
 	}
 }
 
@@ -921,6 +941,7 @@ FIRST SUPER INSTRUCT DIRECTIVE`)
 		}
 		req.Header.Set("Authorization", "Bearer "+key)
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(superInstructClientChoiceHeader, "enabled")
 		req.Header.Set("Thread-Id", "strict-super-snapshot-root")
 		req.Header.Set("Session-Id", "strict-super-snapshot-root")
 		resp, err := http.DefaultClient.Do(req)

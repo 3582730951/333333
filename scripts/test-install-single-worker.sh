@@ -198,10 +198,9 @@ EOF
 }
 
 test_fresh_config_preserves_codex_client_policy() {
-  local rendered original_mode choice_reader
-  original_mode="$WITH_SUPER_INSTRUCT"
-  choice_reader="$(declare -f read_super_instruct_choice)"
-  WITH_SUPER_INSTRUCT=0
+  local rendered help_text
+  # A legacy environment value must not create a cloud-installer-wide gate.
+  WITH_SUPER_INSTRUCT=1
   rendered="$(render_runtime_config)"
   python3 - "$rendered" <<'PY'
 import json
@@ -218,28 +217,12 @@ for key in (
     assert config[key] == "", f"fresh install unexpectedly overrides {key}: {config[key]!r}"
 PY
 
-  WITH_SUPER_INSTRUCT=yes
-  normalize_super_instruct_mode
-  [[ "$WITH_SUPER_INSTRUCT" == 1 ]] || die "Super-Instruct yes mode did not normalize to 1"
-  rendered="$(render_runtime_config)"
-  python3 - "$rendered" <<'PY'
-import json
-import sys
-
-config = json.loads(sys.argv[1])
-assert config["super_instruct_local_enabled"] is True, "explicit local Super-Instruct choice was not rendered"
-PY
-
-  WITH_SUPER_INSTRUCT=off
-  normalize_super_instruct_mode
-  [[ "$WITH_SUPER_INSTRUCT" == 0 ]] || die "Super-Instruct off mode did not normalize to 0"
-
-  read_super_instruct_choice() { printf 'yes'; }
-  WITH_SUPER_INSTRUCT=ask
-  normalize_super_instruct_mode
-  [[ "$WITH_SUPER_INSTRUCT" == 1 ]] || die "interactive Super-Instruct yes choice did not enable local mode"
-  eval "$choice_reader"
-  WITH_SUPER_INSTRUCT="$original_mode"
+  help_text="$(usage)"
+  [[ "$help_text" != *"--with-super-instruct"* ]] || die "cloud installer still advertises a global Super-Instruct switch"
+  [[ "$help_text" != *"--without-super-instruct"* ]] || die "cloud installer still advertises a global Super-Instruct switch"
+  ! grep -q 'Enable headless local Super-Instruct' scripts/install.sh || die "cloud installer still prompts for global Super-Instruct mode"
+  ! grep -q 'CODEX_POOL_SUPER_INSTRUCT_LOCAL_ENABLED' scripts/install.sh || die "cloud installer still exports a global Super-Instruct override"
+  unset WITH_SUPER_INSTRUCT
 }
 reclaim_superseded_install_resources "release-current"
 [[ ! -e "$PROC_ROOT/555" && -e "$PROC_ROOT/666/exe" ]]

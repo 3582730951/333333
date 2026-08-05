@@ -6,24 +6,28 @@ Tauri tray, frontend, or second loopback proxy:
 
 - all bundled `codex-skills` are installed with every release;
 - `bridge.md` is copied byte-for-byte from the source tree and the Go gateway
-  performs its request injection directly on the existing request path;
-- Memory and Monitor reuse gateway-owned state; local mode runs them on the same
-  parsed response context after M3;
-- local-mode SSE is accumulated for M4 just like the source proxy; an M3 match
-  is emitted with the source-compatible four-event Responses SSE wrapper;
+  injects it only when both the Codex client and its model-family group profile
+  enable M1;
+- Memory and Monitor reuse gateway-owned state and run only when their resolved
+  group-profile fields are authorized;
+- SSE remains native streaming passthrough. Memory/Monitor may observe a bounded
+  tee after bytes are forwarded; response rewrite is deliberately non-streaming;
 - no desktop session, WebView, Rust sidecar, or modification of `~/.codex` is
   required.
 
-The enabled request path keeps the source module order:
+The enabled modules keep the source order while retaining the pool's native
+streaming contract:
 
 1. **M1 SystemPromptInjector** replaces every supported system carrier
    (`instructions`, `system`, `system_prompt`, `personality`, Chat `messages`,
    and Responses `input`). Its value is `bridge.md` followed by additions
    compiled from the request's resolved project user group: group system prompt,
    model-family instruction files, and the group's Super-Instruct skill profile.
-2. **M4 UniversalSseParser** parses JSON, Responses, Chat, and SSE once.
+2. **M4 UniversalSseParser** parses non-streaming responses for enabled response
+   modules and observes an already-forwarded bounded SSE tee when required.
 3. **M3 TamperEngine** runs the complete source-project regular-expression set
-   and self-gates after a response was changed.
+   for authorized non-streaming rewrite profiles and self-gates after a response
+   was changed.
 4. **M5 MemoryKernel** self-gates changed/short responses and atomically persists
    successful interactions under the server data directory.
 5. **M6 MonitorPanel** observes every interaction. Its history/stats are available
@@ -31,28 +35,25 @@ The enabled request path keeps the source module order:
    Tauri events is `/admin/super-instruct/monitor/events` (SSE events
    `interaction` and `stats`).
 
-## Enable during installation
+## Enable per API key and user group
 
-An interactive install asks whether to enable the deployment-wide local mode.
-Automation can make the choice explicitly:
+The cloud-server installer always places the bridge and skills in each release;
+it has no global Super-Instruct prompt, flag, or environment switch. The legacy
+`super_instruct_local_enabled` configuration field remains readable only for
+configuration compatibility and does not grant runtime capability.
 
-```bash
-sudo scripts/install.sh --with-super-instruct
-sudo scripts/install.sh --without-super-instruct
-WITH_SUPER_INSTRUCT=1 sudo -E scripts/install.sh
-```
+An administrator grants the desired model-family features in the API key's user
+group. The user then runs the copied `/file/<API_KEY>` one-click command and the
+generated installer asks, while configuring Codex, whether to opt in. Effective
+behavior is the intersection of these two decisions: the client must explicitly
+select Super-Instruct and the resolved user-group profile must allow each module.
+A disabled or absent client selection leaves M1/M3/M5/M6 inactive.
 
-The choice is written to fresh configuration and exported to managed workers as
-`CODEX_POOL_SUPER_INSTRUCT_LOCAL_ENABLED`. The equivalent JSON key is
-`super_instruct_local_enabled` (default `false`).
-
-When enabled, an unconfigured group receives every installed skill through
-progressive disclosure. Configured per-model-family profiles determine the M1
-skill additions for that group, while the local M3/M5/M6 chain remains active as
-one complete deployment. This keeps project-group instruction selection intact
-without requiring the removed desktop GUI.
+Configured per-model-family profiles determine the M1 skill additions and the
+allowed M3/M5/M6 modules. This keeps project-group instruction selection intact
+without requiring a desktop GUI or a server-wide override.
 
 `bridge.md` stays inside the server release rather than a client home directory.
 Supporting UTF-8 resources remain available for explicitly selected skills,
-while the deployment-wide all-skills fallback sends each `SKILL.md` without
+while an enabled group's empty skill selection sends each `SKILL.md` without
 eagerly inflating every request with helper files.

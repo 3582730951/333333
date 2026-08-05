@@ -122,6 +122,136 @@ func TestCodexOnlyConfigScriptEndpointContainsNoOtherInstallerBranches(t *testin
 	}
 }
 
+func TestCodexConfigScriptCarriesReadOnlyUserGroupSuperInstructEntitlement(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	const (
+		plain       = "cap_super_install"
+		userGroupID = "ug_super_install"
+	)
+	if err := h.store.CreateUserGroup(ctx, storage.UserGroup{
+		ID:   userGroupID,
+		Name: "Codex 团队",
+		SuperInstructProfiles: storage.SuperInstructProfiles{
+			storage.ModelInstructionFamilyGPT: {
+				Enabled:                true,
+				SkillIDs:               []string{"anti-debug", "reverse-engineering"},
+				ResponseRewriteEnabled: true,
+				MemoryEnabled:          true,
+				MonitorEnabled:         true,
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertAPIKey(ctx, storage.APIKey{
+		KeyHash: hashAPIKey(plain), Label: "super-install", UserGroupID: userGroupID,
+		ForceModel: "gpt-5.6-sol", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Get(h.pool.URL + "/file/" + plain + "?client=codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	script := string(body)
+	for _, want := range []string{
+		"SUPER_INSTRUCT_ALLOWED=1",
+		"SUPER_INSTRUCT_GROUP='Codex 团队'",
+		"指令与 2 个分组 skills、响应改写、Memory、Monitor",
+		"POOL_SUPER_INSTRUCT=enabled|disabled",
+		"--super-instruct enabled|disabled",
+		"[y/N]",
+		`SUPER_INSTRUCT_HEADER='` + superInstructClientChoiceHeader + `'`,
+		`http_headers = { "$SUPER_INSTRUCT_HEADER" = "$SUPER_INSTRUCT_CHOICE" }`,
+		"不会修改服务器用户分组策略",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("Codex installer missing Super-Instruct contract %q\n---\n%s", want, script)
+		}
+	}
+	for _, forbidden := range []string{"/admin/user-groups", "super_instruct_enabled=true", "PATCH "} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("API-key installer may not mutate user-group policy; found %q\n---\n%s", forbidden, script)
+		}
+	}
+}
+
+func TestCodexOnlySuperInstructChoiceWritesExplicitProviderHeader(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	policy := CodexSuperInstructInstallPolicy{
+		GroupName:    "team-super",
+		Assigned:     true,
+		Entitled:     true,
+		Capabilities: "指令与分组允许的全部 skills、响应改写、Memory、Monitor",
+	}
+	for _, tc := range []struct {
+		name   string
+		choice string
+		args   []string
+		want   string
+	}{
+		{name: "enabled", choice: "enabled", want: `http_headers = { "X-Pool-Super-Instruct" = "enabled" }`},
+		{name: "disabled flag", args: []string{"--super-instruct=disabled"}, want: `http_headers = { "X-Pool-Super-Instruct" = "disabled" }`},
+		{name: "non-interactive default", want: `http_headers = { "X-Pool-Super-Instruct" = "disabled" }`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			options := CodexSetupScriptOptions{CodexOnly: true, SuperInstruct: policy}
+			script := buildCodexConfigScript("https://pool.example", "cap_choice", "gpt-5.6-sol", "", "", "", options)
+			path := filepath.Join(t.TempDir(), "setup.sh")
+			if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", append([]string{path}, tc.args...)...)
+			cmd.Env = append(os.Environ(), "CODEX_HOME="+home)
+			if tc.choice != "" {
+				cmd.Env = append(cmd.Env, "POOL_SUPER_INSTRUCT="+tc.choice)
+			}
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("setup failed: %v\n%s", err, output)
+			}
+			config, err := os.ReadFile(filepath.Join(home, "config.toml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Count(string(config), tc.want) != 1 {
+				t.Fatalf("choice must be persisted exactly once as provider header; want %q\n---\n%s", tc.want, config)
+			}
+		})
+	}
+}
+
+func TestCodexOnlySuperInstructCannotExceedUserGroupEntitlement(t *testing.T) {
+	home := t.TempDir()
+	options := CodexSetupScriptOptions{
+		CodexOnly: true,
+		SuperInstruct: CodexSuperInstructInstallPolicy{
+			GroupName: "team-standard", Assigned: true,
+			Capabilities: "该分组未为 Codex 启用 Super-Instruct",
+		},
+	}
+	script := buildCodexConfigScript("https://pool.example", "cap_no_entitlement", "gpt-5.6-sol", "", "", "", options)
+	path := filepath.Join(t.TempDir(), "setup.sh")
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", path)
+	cmd.Env = append(os.Environ(), "CODEX_HOME="+home, "POOL_SUPER_INSTRUCT=enabled")
+	output, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "用户分组未授权") {
+		t.Fatalf("unentitled enabled choice should fail clearly: err=%v output=%s", err, output)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, "config.toml")); !os.IsNotExist(statErr) {
+		t.Fatalf("rejected choice must not write Codex config: %v", statErr)
+	}
+}
+
 func TestCodexOnlyConfigMergePreservesClientOwnedSettings(t *testing.T) {
 	home := t.TempDir()
 	existing := `  model = "client-model"

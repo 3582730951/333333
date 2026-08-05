@@ -51,11 +51,11 @@ func TestSuperInstructMonitorPublishesHeadlessM6Events(t *testing.T) {
 	}
 }
 
-func TestHeadlessLocalResponsePipelineRunsM4M3M5M6Once(t *testing.T) {
+func TestGroupScopedResponsePipelineRunsNonStreamingModulesAndPreservesStreams(t *testing.T) {
 	dataDir := t.TempDir()
 	localCfg := config.Config{SuperInstructLocalEnabled: true, DataDir: dataDir}
-	if got, want := superInstructMemoryPath(localCfg), filepath.Join(dataDir, "memory.json"); got != want {
-		t.Fatalf("local M5 path=%q, want %q", got, want)
+	if got, want := superInstructMemoryPath(localCfg), filepath.Join(dataDir, "super-instruct-memory.json"); got != want {
+		t.Fatalf("group-scoped M5 path=%q, want %q", got, want)
 	}
 	memory := superinstruct.NewMemoryKernel(superInstructMemoryPath(localCfg))
 	monitor := superinstruct.NewMonitorPanel()
@@ -64,32 +64,28 @@ func TestHeadlessLocalResponsePipelineRunsM4M3M5M6Once(t *testing.T) {
 		superMemory:  memory,
 		superMonitor: monitor,
 	}
-	selectionReq := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	selectedWriter, _, _, enabled := s.maybeSuperInstructResponsePipeline(
-		httptest.NewRecorder(), selectionReq, []byte(`{"stream":true}`), "gpt-5.6-sol",
-	)
-	selectedBuffer, bufferedSelection := selectedWriter.(*superInstructBufferingResponseWriter)
-	if !enabled || !bufferedSelection || !selectedBuffer.bufferStreams {
-		t.Fatalf("local streamed response did not select the source buffering pipeline: enabled=%v writer=%T", enabled, selectedWriter)
-	}
 	opts := superinstruct.ProcessOptions{ResponseRewriteEnabled: true, MemoryEnabled: true, MonitorEnabled: true}
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	refusal := []byte(`{"output_text":"I can't assist with that request to bypass license activation."}`)
+	refusal := []byte(`{"id":"resp_refusal","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I can't assist with that request to bypass license activation."}]}],"output_text":"I can't assist with that request to bypass license activation."}`)
 	recorder := httptest.NewRecorder()
 	buffered := newSuperInstructBufferingResponseWriter(recorder)
 	_, _ = buffered.Write(refusal)
 	s.finishSuperInstructResponsePipeline(buffered, req, nil, "gpt-5.6-sol", superinstruct.RequestMeta{
 		UserMessage: "bypass license activation", Category: superinstruct.CategoryCrack, Timestamp: time.Unix(200, 0).UTC(),
 	}, opts, 20*time.Millisecond)
-	if !strings.Contains(recorder.Body.String(), "Rei Protocol") || strings.HasPrefix(strings.TrimSpace(recorder.Body.String()), "{") {
-		t.Fatalf("local M3 did not return the source replacement body: %s", recorder.Body.String())
+	if !strings.Contains(recorder.Body.String(), "Rei Protocol") {
+		t.Fatalf("group-scoped M3 did not rewrite the assistant text: %s", recorder.Body.String())
+	}
+	var rewritten map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &rewritten); err != nil || rewritten["id"] != "resp_refusal" {
+		t.Fatalf("group-scoped M3 broke the response envelope: err=%v body=%s", err, recorder.Body.String())
 	}
 	if memory.SuccessCount() != 0 {
-		t.Fatalf("local M5 learned an M3-modified response: %+v", memory.Snapshot())
+		t.Fatalf("M5 learned an M3-modified response: %+v", memory.Snapshot())
 	}
 	snapshot := monitor.Snapshot(memory.SuccessCount())
 	if snapshot.Stats.Total != 1 || snapshot.Stats.Tamper != 1 || len(snapshot.History) != 1 {
-		t.Fatalf("local M6 was skipped or invoked more than once: %+v", snapshot)
+		t.Fatalf("M6 was skipped or invoked more than once: %+v", snapshot)
 	}
 
 	success := []byte(`{"output_text":"This successful response is deliberately longer than fifty bytes so the local memory kernel records it exactly once."}`)
@@ -100,45 +96,56 @@ func TestHeadlessLocalResponsePipelineRunsM4M3M5M6Once(t *testing.T) {
 		UserMessage: "reverse sample", Category: superinstruct.CategoryReverse, Timestamp: time.Unix(201, 0).UTC(),
 	}, opts, 10*time.Millisecond)
 	if recorder.Body.String() != string(success) || memory.SuccessCount() != 1 {
-		t.Fatalf("local M4/M5 success path mismatch body=%s memory=%+v", recorder.Body.String(), memory.Snapshot())
+		t.Fatalf("M4/M5 success path mismatch body=%s memory=%+v", recorder.Body.String(), memory.Snapshot())
 	}
-	if _, err := os.Stat(filepath.Join(dataDir, "memory.json")); err != nil {
-		t.Fatalf("local M5 did not persist memory.json: %v", err)
+	if _, err := os.Stat(filepath.Join(dataDir, "super-instruct-memory.json")); err != nil {
+		t.Fatalf("M5 did not persist group-scoped memory: %v", err)
 	}
 	snapshot = monitor.Snapshot(memory.SuccessCount())
 	if snapshot.Stats.Total != 2 || snapshot.Stats.MemoryCount != 1 || len(snapshot.History) != 2 {
-		t.Fatalf("local M6 success observation mismatch: %+v", snapshot)
+		t.Fatalf("M6 success observation mismatch: %+v", snapshot)
 	}
 
 	streamRefusal := []byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"I can't assist with that bypass license request.\"}\n\n")
-	recorder = httptest.NewRecorder()
-	buffered = newSuperInstructBufferingResponseWriter(recorder)
-	buffered.bufferStreams = true
-	buffered.Header().Set("Content-Type", "text/event-stream")
-	_, _ = buffered.Write(streamRefusal)
-	buffered.Flush()
-	if recorder.Body.Len() != 0 {
-		t.Fatalf("local source-compatible stream leaked upstream chunks before M4: %s", recorder.Body.String())
+	streamRecorder := newFlushSnapshotWriter()
+	streamReq := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	streamGroup := storage.Group{
+		SuperInstructResponseRewriteEnabled: true,
+		SuperInstructMemoryEnabled:          true,
+		SuperInstructMonitorEnabled:         true,
 	}
-	s.finishSuperInstructResponsePipeline(buffered, req, []byte(`{"stream":true}`), "gpt-5.6-sol", superinstruct.RequestMeta{
-		UserMessage: "bypass license", Category: superinstruct.CategoryCrack, Timestamp: time.Unix(202, 0).UTC(),
-	}, opts, 30*time.Millisecond)
-	streamBody := recorder.Body.String()
-	for _, event := range []string{"response.created", "response.output_text.delta", "response.output_text.done", "response.completed"} {
-		if !strings.Contains(streamBody, "event: "+event) {
-			t.Fatalf("local M3 SSE replacement missing %s: %s", event, streamBody)
+	streamReq = streamReq.WithContext(withRequestAccountGroupPolicy(streamReq.Context(), streamGroup))
+	selectedWriter, _, finish, enabled := s.maybeSuperInstructResponsePipeline(streamRecorder, streamReq, []byte(`{"stream":true,"input":"bypass license"}`), "gpt-5.6-sol")
+	observer, observing := selectedWriter.(*superInstructObservingResponseWriter)
+	if !enabled || !observing {
+		t.Fatalf("stream did not select the transparent observer: enabled=%v writer=%T", enabled, selectedWriter)
+	}
+	observer.Header().Set("Content-Type", "text/event-stream")
+	_, _ = observer.Write(streamRefusal)
+	observer.Flush()
+	select {
+	case flushed := <-streamRecorder.flushes:
+		if !bytes.Equal(flushed, streamRefusal) {
+			t.Fatalf("stream changed before completion:\nwant %q\n got %q", streamRefusal, flushed)
 		}
+	case <-time.After(time.Second):
+		t.Fatal("Super-Instruct delayed the native stream")
 	}
-	if !strings.Contains(streamBody, `"id":"resp_tamper"`) || memory.SuccessCount() != 1 {
-		t.Fatalf("local streamed M3/M5 behavior mismatch body=%s memory=%+v", streamBody, memory.Snapshot())
+	finish()
+	deadline := time.Now().Add(3 * time.Second)
+	for monitor.Stats(memory.SuccessCount()).Total < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("stream observation did not finish: %+v", monitor.Snapshot(memory.SuccessCount()))
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	snapshot = monitor.Snapshot(memory.SuccessCount())
-	if snapshot.Stats.Total != 3 || snapshot.Stats.Tamper != 2 || len(snapshot.History) != 3 {
-		t.Fatalf("local streamed M6 observation mismatch: %+v", snapshot)
+	if snapshot.Stats.Tamper != 1 || !bytes.Equal(streamRecorder.Bytes(), streamRefusal) {
+		t.Fatalf("stream rewrite was not transparent: snapshot=%+v body=%q", snapshot, streamRecorder.Bytes())
 	}
 }
 
-func TestHeadlessLocalResponsePipelinePreservesExecutableToolOutput(t *testing.T) {
+func TestGroupScopedResponsePipelinePreservesExecutableToolOutput(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		requestRaw []byte
@@ -255,6 +262,7 @@ func TestSuperInstructResponseRewriteMemoryMonitor(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"please bypass license activation"}`))
 	req.Header.Set("Authorization", "Bearer "+rewriteKey)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(superInstructClientChoiceHeader, "enabled")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -302,6 +310,7 @@ func TestSuperInstructResponseRewriteMemoryMonitor(t *testing.T) {
 	req, _ = http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"reverse this binary safely"}`))
 	req.Header.Set("Authorization", "Bearer "+memoryKey)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(superInstructClientChoiceHeader, "enabled")
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

@@ -19,7 +19,6 @@ INSTALL_SYSTEMD="${INSTALL_SYSTEMD:-auto}"
 START_SERVICE="${START_SERVICE:-1}"
 WITH_SIDECAR="${WITH_SIDECAR:-1}"
 WITH_WARP="${WITH_WARP:-0}"
-WITH_SUPER_INSTRUCT="${WITH_SUPER_INSTRUCT:-ask}"
 MIGRATE_USER_GROUPS="${MIGRATE_USER_GROUPS:-0}"
 # Node registration engine: installs Node.js + a headless
 # Chrome + Xvfb and the puppeteer-real-browser registrar so the pool can auto-register
@@ -158,10 +157,6 @@ Options:
   --minimal                 Install only the Go gateway
   --with-sidecar            Install and manage the curl_cffi sidecar (default)
   --without-sidecar         Do not install the curl_cffi sidecar
-  --with-super-instruct     Enable the bundled headless local Super-Instruct runtime
-                            (all skills, response rewrite, memory, and monitor)
-  --without-super-instruct  Disable deployment-wide local Super-Instruct mode
-                            (the installer asks on an interactive terminal by default)
   --with-registration       Install all repository-owned registration workers: the locked
                             Python protocol/browser runtime plus Node.js, Chrome and Xvfb.
                             Default. Registration remains disabled until readiness and a
@@ -190,8 +185,7 @@ Options:
 Environment overrides:
   SERVICE_NAME, SERVICE_USER, SERVICE_GROUP, INSTALL_PREFIX, BIN_DIR, APP_DIR,
   CONFIG_DIR, CONFIG_FILE, DATA_DIR, DATABASE_PATH, SYSTEMD_DIR,
-  RUN_TESTS, INSTALL_SYSTEMD, START_SERVICE, WITH_SIDECAR, WITH_SUPER_INSTRUCT,
-  MIGRATE_USER_GROUPS,
+  RUN_TESTS, INSTALL_SYSTEMD, START_SERVICE, WITH_SIDECAR, MIGRATE_USER_GROUPS,
   WITH_WARP, WARP_EXITS, WARP_BASE_PORT, WARP_ACCOUNTS_PER_EXIT, WARP_DIR, CF_SOLVER_URL,
   LISTEN_ADDR, ADMIN_TOKEN, PUBLIC_URL, OPEN_FIREWALL,
   SIDECAR_ADDR, SIDECAR_VENV, SIDECAR_INSTALL_DIR, SIDECAR_COOKIE_DIR,
@@ -339,14 +333,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --without-sidecar)
       WITH_SIDECAR=0
-      shift
-      ;;
-    --with-super-instruct)
-      WITH_SUPER_INSTRUCT=1
-      shift
-      ;;
-    --without-super-instruct)
-      WITH_SUPER_INSTRUCT=0
       shift
       ;;
     --with-registration)
@@ -522,50 +508,6 @@ bool_enabled() {
   case "${1:-}" in
     1|true|TRUE|yes|YES|on|ON) return 0 ;;
     *) return 1 ;;
-  esac
-}
-
-read_super_instruct_choice() {
-  local answer=""
-  if [[ -t 0 && -t 2 ]]; then
-    printf 'Enable headless local Super-Instruct (all bundled skills + rewrite, memory, monitor)? [y/N] ' >&2
-    IFS= read -r answer || answer=""
-    printf '%s' "$answer"
-    return 0
-  fi
-
-  # Keep curl|bash and other piped interactive installs usable by reading the
-  # controlling terminal instead of consuming the installer source on stdin.
-  [[ -c /dev/tty ]] || return 1
-  exec 9<>/dev/tty 2>/dev/null || return 1
-  if [[ ! -t 9 ]]; then
-    exec 9>&-
-    return 1
-  fi
-  printf 'Enable headless local Super-Instruct (all bundled skills + rewrite, memory, monitor)? [y/N] ' >&9
-  IFS= read -r answer <&9 || answer=""
-  exec 9>&-
-  printf '%s' "$answer"
-}
-
-normalize_super_instruct_mode() {
-  local mode answer
-  mode="$(printf '%s' "${WITH_SUPER_INSTRUCT:-ask}" | tr '[:upper:]' '[:lower:]')"
-  case "$mode" in
-    1|true|yes|on) WITH_SUPER_INSTRUCT=1 ;;
-    0|false|no|off) WITH_SUPER_INSTRUCT=0 ;;
-    ""|ask)
-      if answer="$(read_super_instruct_choice)"; then
-        case "$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')" in
-          y|yes) WITH_SUPER_INSTRUCT=1 ;;
-          *) WITH_SUPER_INSTRUCT=0 ;;
-        esac
-      else
-        WITH_SUPER_INSTRUCT=0
-        log "Super-Instruct local mode: disabled for non-interactive install (use --with-super-instruct to enable)"
-      fi
-      ;;
-    *) die "WITH_SUPER_INSTRUCT must be ask or a boolean (0/1, false/true, no/yes, off/on)" ;;
   esac
 }
 
@@ -878,7 +820,7 @@ config_string_value() {
 }
 
 render_runtime_config() {
-  local listen_json data_json database_json admin_json sidecar_json reauth_json super_instruct_json
+  local listen_json data_json database_json admin_json sidecar_json reauth_json
   listen_json="$(json_escape "$LISTEN_ADDR")"
   data_json="$(json_escape "${DATA_DIR%/}/data")"
   database_json="$(json_escape "$DATABASE_PATH")"
@@ -893,18 +835,13 @@ render_runtime_config() {
   else
     reauth_json=""
   fi
-  super_instruct_json=false
-  if bool_enabled "$WITH_SUPER_INSTRUCT"; then
-    super_instruct_json=true
-  fi
   awk \
     -v listen="$listen_json" \
     -v data_dir="$data_json" \
     -v database="$database_json" \
     -v admin="$admin_json" \
     -v sidecar="$sidecar_json" \
-    -v reauth="$reauth_json" \
-    -v super_instruct="$super_instruct_json" '
+    -v reauth="$reauth_json" '
       /^[[:space:]]*"listen_addr"[[:space:]]*:/ {
         print "  \"listen_addr\": \"" listen "\","
         next
@@ -930,7 +867,10 @@ render_runtime_config() {
         next
       }
       /^[[:space:]]*"super_instruct_local_enabled"[[:space:]]*:/ {
-        print "  \"super_instruct_local_enabled\": " super_instruct ","
+        # Compatibility-only field: deployment-wide enablement was retired.
+        # Effective behavior is selected by API-key installation and bounded
+        # by the API key user-group policy.
+        print "  \"super_instruct_local_enabled\": false,"
         next
       }
       # A fresh server install must not turn optional Codex client policy into
@@ -1194,10 +1134,10 @@ ensure_project_files() {
   [[ -f cmd/pool-handoff/main.go ]] || die "cmd/pool-handoff/main.go not found"
   [[ -f scripts/rollback-release.sh ]] || die "scripts/rollback-release.sh not found"
   [[ -f config.example.json ]] || die "config.example.json not found"
-  if bool_enabled "$WITH_SUPER_INSTRUCT"; then
-    [[ -f super-instruct/bridge.md ]] || die "Super-Instruct M1 bridge not found: super-instruct/bridge.md"
-    [[ -d super-instruct/codex-skills ]] || die "Super-Instruct skills not found: super-instruct/codex-skills"
-  fi
+  # These resources are always shipped. User-group policy plus the API-key
+  # Codex installer choice controls use; the cloud installer has no global gate.
+  [[ -f super-instruct/bridge.md ]] || die "Super-Instruct M1 bridge not found: super-instruct/bridge.md"
+  [[ -d super-instruct/codex-skills ]] || die "Super-Instruct skills not found: super-instruct/codex-skills"
   if bool_enabled "$WITH_SIDECAR"; then
     [[ -f sidecar/curl_cffi_sidecar.py ]] || die "sidecar/curl_cffi_sidecar.py not found"
     [[ -f sidecar/requirements.txt ]] || die "sidecar/requirements.txt not found"
@@ -2253,7 +2193,6 @@ Environment="CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS}"
 Environment="CODEX_POOL_DATA_DIR=${DATA_DIR%/}/data"
 Environment="CODEX_POOL_SUPER_INSTRUCT_DIR=${APP_DIR%/}/releases/%i/super-instruct/codex-skills"
 Environment="CODEX_POOL_SUPER_INSTRUCT_BRIDGE_FILE=${APP_DIR%/}/releases/%i/super-instruct/bridge.md"
-Environment="CODEX_POOL_SUPER_INSTRUCT_LOCAL_ENABLED=${WITH_SUPER_INSTRUCT}"
 LoadCredential=master.key:${DATA_DIR%/}/data/keys/master.key
 LoadCredential=identity.key:${DATA_DIR%/}/data/keys/identity.key
 LoadCredential=diagnostic-alias.key:${DATA_DIR%/}/data/keys/diagnostic-alias.key
@@ -2866,11 +2805,7 @@ print_summary() {
   else
     migration_summary="disabled (account-pool groups stay separate)"
   fi
-  if bool_enabled "$WITH_SUPER_INSTRUCT"; then
-    super_instruct_summary="enabled (headless local full suite; all bundled skills, rewrite, memory, monitor)"
-  else
-    super_instruct_summary="disabled"
-  fi
+  super_instruct_summary="bundled; enabled per API-key install choice within user-group policy"
   frontend_url="$(frontend_url_hint)"
   manual_admin_env=""
   admin_token_summary="<empty>"
@@ -2902,7 +2837,7 @@ WARP:          ${warp_summary}
 Admin token:   ${admin_token_summary}
 
 Manual run:
-  CODEX_POOL_DATABASE=${DATABASE_PATH} CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS} CODEX_POOL_LISTEN_ADDR=${LISTEN_ADDR} CODEX_POOL_SUPER_INSTRUCT_DIR=${APP_DIR%/}/current/super-instruct/codex-skills CODEX_POOL_SUPER_INSTRUCT_BRIDGE_FILE=${APP_DIR%/}/current/super-instruct/bridge.md CODEX_POOL_SUPER_INSTRUCT_LOCAL_ENABLED=${WITH_SUPER_INSTRUCT}${manual_admin_env} ${BIN_DIR}/${APP_NAME} --config ${CONFIG_FILE}${reauth_manual}
+  CODEX_POOL_DATABASE=${DATABASE_PATH} CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS} CODEX_POOL_LISTEN_ADDR=${LISTEN_ADDR} CODEX_POOL_SUPER_INSTRUCT_DIR=${APP_DIR%/}/current/super-instruct/codex-skills CODEX_POOL_SUPER_INSTRUCT_BRIDGE_FILE=${APP_DIR%/}/current/super-instruct/bridge.md${manual_admin_env} ${BIN_DIR}/${APP_NAME} --config ${CONFIG_FILE}${reauth_manual}
 
 Useful service commands:
   systemctl status ${HANDOFF_SERVICE_NAME}.service
@@ -2918,7 +2853,6 @@ EOF
 main() {
   apply_port_overrides
   normalize_migrate_user_groups
-  normalize_super_instruct_mode
   ensure_project_files
   ensure_absolute_paths
   validate_codex_reauth_settings

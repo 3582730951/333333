@@ -293,8 +293,9 @@ curl -sS http://127.0.0.1:8787/admin/accounts/<account_id>/browser-repair \
   ```bash
   sudo scripts/install.sh
   ```
-  交互安装会询问是否启用无 GUI 的本地 Super-Instruct 全套能力；自动化部署可直接指定
-  `--with-super-instruct` 或 `--without-super-instruct`。
+  云服务器安装器始终随 release 部署 Super-Instruct 资源，但不提供部署级开关。
+  管理员在“用户分组”中授予对应模型家族能力；用户复制该 API Key 的一键安装命令后，
+  安装脚本在配置 Codex 时再询问是否启用。只有分组策略和客户端选择同时开启才生效。
 - 只安装 Go 网关：
   ```bash
   sudo scripts/install.sh --minimal

@@ -239,30 +239,6 @@ func superInstructPolicyForModel(group storage.Group, model string) (storage.Sup
 	return profile, family
 }
 
-func hasExplicitSuperInstructPolicy(group storage.Group) bool {
-	return len(group.SuperInstructProfiles) > 0 ||
-		group.SuperInstructEnabled ||
-		len(group.SuperInstructSkillIDs) > 0 ||
-		group.SuperInstructResponseRewriteEnabled ||
-		group.SuperInstructMemoryEnabled ||
-		group.SuperInstructMonitorEnabled
-}
-
-// effectiveSuperInstructPolicy supplies the all-skills M1 addition only when the
-// resolved group has no Super-Instruct instruction policy. Explicit group skill
-// profiles remain authoritative; local M3/M5/M6 activation is handled separately.
-func (s *Server) effectiveSuperInstructPolicy(group storage.Group) storage.Group {
-	if s == nil || !s.cfg.SuperInstructLocalEnabled || hasExplicitSuperInstructPolicy(group) {
-		return group
-	}
-	group.SuperInstructEnabled = true
-	group.SuperInstructSkillIDs = nil // Empty selects every installed skill via progressive disclosure.
-	group.SuperInstructResponseRewriteEnabled = true
-	group.SuperInstructMemoryEnabled = true
-	group.SuperInstructMonitorEnabled = true
-	return group
-}
-
 func normalizeUserGroupInstructionConfig(group *storage.UserGroup) error {
 	if group == nil {
 		return nil
@@ -479,20 +455,16 @@ func (s *Server) applyModelInstructionsForEntrypoint(ctx context.Context, group 
 	if prompt.ShouldRewrite(group.SystemPrompt, routing.IsCompaction(path, raw), group.SystemPromptApplyToCompaction) {
 		groupPrompt = strings.TrimSpace(group.SystemPrompt)
 	}
-	if s != nil && s.cfg.SuperInstructLocalEnabled {
+	superPolicy, _ := superInstructPolicyForModel(group, model)
+	if superPolicy.Enabled {
 		bridge, bridgeErr := superinstruct.LoadBridge()
 		if bridgeErr != nil {
 			return raw, bridgeErr
 		}
-		// M1 always starts from the source bridge. The request's resolved user
-		// group supplies every appended block: group prompt, administrator files,
-		// and that group's model-family Super-Instruct skill selection.
+		// M1 replacement is selected by this request's client-masked model-family
+		// group policy. Response-only module flags never inject the bridge.
 		instructions := joinInstructionParts(bridge, groupPrompt, components.Administrator, components.SuperInstruct)
 		if path == "/v1/messages" || path == "/v1/messages/count_tokens" {
-			// Anthropic Messages carries system instructions at the top level;
-			// a Chat-style messages[].role=system item is rejected by Antigravity
-			// and strict Anthropic-compatible relays. M1 replacement semantics
-			// intentionally discard every previous system carrier first.
 			withoutSystem, deleteErr := stripAnthropicSystemCarriers(raw)
 			if deleteErr != nil {
 				return raw, deleteErr
@@ -643,8 +615,21 @@ func newCodexInstructionPlan(instructions, revision, treeID, source string, stri
 	}
 }
 
-func (s *Server) configureLocalM1Plan(plan *CodexInstructionPlan) (*CodexInstructionPlan, error) {
-	if plan == nil || s == nil || !s.cfg.SuperInstructLocalEnabled {
+// configureSuperInstructM1Plan applies the current request's strict group ×
+// client gate to a tree snapshot. A disabled continuation keeps its snapshotted
+// group/admin instructions but must not reuse the root's bridge or skill bundle.
+func (s *Server) configureSuperInstructM1Plan(plan *CodexInstructionPlan, enabled bool) (*CodexInstructionPlan, error) {
+	if plan == nil {
+		return nil, nil
+	}
+	if !enabled {
+		plan.Bridge = ""
+		plan.SuperInstruct = ""
+		plan.LocalM1 = false
+		return plan, nil
+	}
+	if strings.TrimSpace(plan.Bridge) == "" && strings.TrimSpace(plan.SuperInstruct) == "" {
+		plan.LocalM1 = false
 		return plan, nil
 	}
 	plan.LocalM1 = true
@@ -668,7 +653,8 @@ func (s *Server) compileCodexInstructionSnapshot(ctx context.Context, group stor
 		groupPrompt = group.SystemPrompt
 	}
 	bridge := ""
-	if s != nil && s.cfg.SuperInstructLocalEnabled {
+	superPolicy, _ := superInstructPolicyForModel(group, model)
+	if superPolicy.Enabled {
 		bridge, err = superinstruct.LoadBridge()
 		if err != nil {
 			return "", err
@@ -693,8 +679,12 @@ func (s *Server) codexGroupInstructionPolicyRevision(group storage.Group) string
 		"system_prompt:"+group.SystemPrompt,
 		fmt.Sprintf("system_prompt_compaction:%t", group.SystemPromptApplyToCompaction),
 	)
-	if s != nil && s.cfg.SuperInstructLocalEnabled {
-		parts = append(parts, "super_instruct_local_m1")
+	bridgeEnabled := group.SuperInstructEnabled
+	for _, profile := range group.SuperInstructProfiles {
+		bridgeEnabled = bridgeEnabled || profile.Enabled
+	}
+	if bridgeEnabled {
+		parts = append(parts, "super_instruct_m1")
 		if bridge, err := superinstruct.LoadBridge(); err == nil {
 			sum := sha256.Sum256([]byte(bridge))
 			parts = append(parts, "bridge:"+hex.EncodeToString(sum[:]))
@@ -769,19 +759,19 @@ func (s *Server) codexGroupInstructionPolicyRevision(group storage.Group) string
 func (s *Server) codexInstructionPlan(ctx context.Context, group storage.Group, mapping *codexSessionMapping, strict bool, model string, includeGroupPrompt bool) (*CodexInstructionPlan, error) {
 	modelInstructionsEnabled, _, _ := modelInstructionPolicyForModel(group, model)
 	superPolicy, _ := superInstructPolicyForModel(group, model)
-	enabled := (s != nil && s.cfg.SuperInstructLocalEnabled) || modelInstructionsEnabled || superPolicy.Enabled || (includeGroupPrompt && strings.TrimSpace(group.SystemPrompt) != "")
+	enabled := modelInstructionsEnabled || superPolicy.Enabled || (includeGroupPrompt && strings.TrimSpace(group.SystemPrompt) != "")
 	if !strict {
 		instructions, err := s.compileCodexInstructionSnapshot(ctx, group, model, includeGroupPrompt)
 		if err != nil {
 			return nil, err
 		}
-		return s.configureLocalM1Plan(newCodexInstructionPlan(
+		return s.configureSuperInstructM1Plan(newCodexInstructionPlan(
 			instructions,
 			s.store.CodexInstructionRevision(instructions),
 			"",
 			map[bool]string{true: "configured", false: "disabled"}[enabled],
 			false,
-		))
+		), superPolicy.Enabled)
 	}
 
 	treeID := ""
@@ -791,7 +781,7 @@ func (s *Server) codexInstructionPlan(ctx context.Context, group storage.Group, 
 	if treeID != "" {
 		snapshot, err := s.store.GetCodexInstructionSnapshot(ctx, treeID)
 		if err == nil {
-			return s.configureLocalM1Plan(newCodexInstructionPlan(snapshot.Instructions, snapshot.Revision, snapshot.TreeID, "snapshot", true))
+			return s.configureSuperInstructM1Plan(newCodexInstructionPlan(snapshot.Instructions, snapshot.Revision, snapshot.TreeID, "snapshot", true), superPolicy.Enabled)
 		}
 		if !errors.Is(err, storage.ErrCodexInstructionSnapshotNotFound) {
 			return nil, err
@@ -809,14 +799,14 @@ func (s *Server) codexInstructionPlan(ctx context.Context, group storage.Group, 
 		if ensureErr != nil {
 			return nil, ensureErr
 		}
-		return s.configureLocalM1Plan(newCodexInstructionPlan(stored.Instructions, stored.Revision, stored.TreeID, "lazy_migration", true))
+		return s.configureSuperInstructM1Plan(newCodexInstructionPlan(stored.Instructions, stored.Revision, stored.TreeID, "lazy_migration", true), superPolicy.Enabled)
 	}
 
 	instructions, err := s.compileCodexInstructionSnapshot(ctx, group, model, includeGroupPrompt)
 	if err != nil {
 		return nil, err
 	}
-	return s.configureLocalM1Plan(newCodexInstructionPlan(instructions, s.store.CodexInstructionRevision(instructions), "", "pending_root", true))
+	return s.configureSuperInstructM1Plan(newCodexInstructionPlan(instructions, s.store.CodexInstructionRevision(instructions), "", "pending_root", true), superPolicy.Enabled)
 }
 
 func setResponsesInstructions(raw []byte, instructions string) []byte {
