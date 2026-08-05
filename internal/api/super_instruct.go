@@ -14,6 +14,58 @@ import (
 
 const superInstructClientChoiceHeader = "X-Pool-Super-Instruct"
 
+// superInstructClientChoiceClass returns a closed diagnostic enum. Keeping the
+// distinction between a missing, malformed, and duplicated header makes it
+// possible to explain why an entitled user group was masked without exporting
+// any caller-supplied header value.
+func superInstructClientChoiceClass(r *http.Request) string {
+	if r == nil {
+		return "missing"
+	}
+	values := r.Header.Values(superInstructClientChoiceHeader)
+	if len(values) == 0 {
+		return "missing"
+	}
+	if len(values) != 1 {
+		return "ambiguous"
+	}
+	switch strings.ToLower(strings.TrimSpace(values[0])) {
+	case "enabled":
+		return "enabled"
+	case "disabled":
+		return "disabled"
+	default:
+		return "invalid"
+	}
+}
+
+// superInstructEffectiveModules reports only fixed module identifiers selected
+// by the already client-masked request policy. Skill names and prompt content are
+// deliberately absent from this diagnostic value.
+func superInstructEffectiveModules(group storage.Group, model string) string {
+	profile, _ := superInstructPolicyForModel(group, model)
+	modules := make([]string, 0, 5)
+	if profile.Enabled {
+		modules = append(modules, "M1")
+	}
+	if profile.ResponseRewriteEnabled || profile.MemoryEnabled || profile.MonitorEnabled {
+		modules = append(modules, "M4")
+	}
+	if profile.ResponseRewriteEnabled {
+		modules = append(modules, "M3")
+	}
+	if profile.MemoryEnabled {
+		modules = append(modules, "M5")
+	}
+	if profile.MonitorEnabled {
+		modules = append(modules, "M6")
+	}
+	if len(modules) == 0 {
+		return "none"
+	}
+	return strings.Join(modules, ",")
+}
+
 // superInstructPolicyForClient makes the generated client choice a strict
 // request-time gate on top of the resolved user-group policy. The header can
 // disable a group's entitlement, but it can never grant skills or response

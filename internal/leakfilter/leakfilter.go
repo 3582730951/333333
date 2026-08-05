@@ -317,7 +317,11 @@ func NewSSEFilter(provider string, words *streamrewrite.Matcher) *SSEFilter {
 // transports may emit error or response.error with the real status and quota
 // headers embedded in the JSON body.
 type CodexFailureFrame struct {
-	EventType        string
+	EventType string
+	// ErrorCode is the structured upstream error code. It is intentionally kept
+	// separate from Body so callers can classify a terminal SSE response without
+	// logging or exporting the upstream message.
+	ErrorCode        string
 	StatusCode       int
 	ContextError     ResponsesContextErrorKind
 	RequestError     ResponsesRequestErrorKind
@@ -406,8 +410,15 @@ func ParseCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 			status = http.StatusBadRequest
 		}
 	}
+	// backend-api currently emits cyber_policy as a statusless response.failed
+	// event inside an otherwise successful HTTP 200 SSE response. It is a
+	// deterministic request-scoped 400, not a successful completion and not an
+	// account-local retry signal.
+	if requestCode == "cyber_policy" && status == 0 {
+		status = http.StatusBadRequest
+	}
 	contextError := ResponsesContextErrorNone
-	if requestError == ResponsesRequestErrorNone {
+	if requestError == ResponsesRequestErrorNone && requestCode != "cyber_policy" {
 		contextError = DetectResponsesContextError(status, data)
 		if status == 0 {
 			// Some Codex SSE transports omit the redundant HTTP status from an
@@ -425,10 +436,11 @@ func ParseCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 		status == http.StatusServiceUnavailable || status >= 500
 	signatureRetryable := containsAnyFold(lower, codexFailedLeakSignatures)
 	builtinRetryable := statusRetryable || signatureRetryable || contextError != ResponsesContextErrorNone
-	if requestError != ResponsesRequestErrorNone {
+	if requestError != ResponsesRequestErrorNone || requestCode == "cyber_policy" {
 		// Request size is deterministic for this payload. Rotating or cooling down an
-		// account cannot repair it, and would hide the native signal Codex uses to
-		// report/coordinate compaction.
+		// account cannot repair it. The same is true for the structured cyber_policy
+		// request rejection, whose message must not accidentally opt into retry via a
+		// generic overload phrase.
 		builtinRetryable = false
 	}
 	if status == 0 && builtinRetryable {
@@ -447,6 +459,7 @@ func ParseCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 	}
 	return CodexFailureFrame{
 		EventType:        kind,
+		ErrorCode:        requestCode,
 		StatusCode:       status,
 		ContextError:     contextError,
 		RequestError:     requestError,

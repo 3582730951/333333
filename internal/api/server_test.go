@@ -4622,6 +4622,87 @@ func TestCodexStreamingContextLengthExceededIsPassedThroughWithoutFailover(t *te
 	}
 }
 
+func TestCodexStreamingCyberPolicySuppressesEstimatedUsageAndSettlesTerminal(t *testing.T) {
+	var calls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.failed\n"+
+			`data: {"type":"response.failed","response":{"id":"resp_policy","status":"failed","error":{"type":"invalid_request_error","code":"cyber_policy","message":"policy terminal"},"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`+"\n\n")
+	})
+	accountID := h.importAccount(t, "policy-account", "upstream-policy-account", "access-policy-account")
+	reqBody := `{"model":"gpt","stream":true,"input":[{"role":"user","content":"large rejected request"}]}`
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"code":"cyber_policy"`)) || calls.Load() != 1 {
+		t.Fatalf("policy terminal status=%d calls=%d body=%s", resp.StatusCode, calls.Load(), body)
+	}
+	h.app.WaitForAsyncWrites()
+	var usageRows int
+	if err := h.store.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM usage_records WHERE account_id=?`, accountID).Scan(&usageRows); err != nil {
+		t.Fatal(err)
+	}
+	if usageRows != 0 {
+		t.Fatalf("statusless cyber_policy produced %d usage rows, want zero", usageRows)
+	}
+	var holdStatus string
+	var usageExpected, usageRecordedAt int
+	if err := h.store.DB().QueryRowContext(t.Context(), `SELECT status,usage_expected,usage_recorded_at FROM billing_holds WHERE account_id=? ORDER BY created_at DESC LIMIT 1`, accountID).Scan(&holdStatus, &usageExpected, &usageRecordedAt); err != nil {
+		t.Fatal(err)
+	}
+	if holdStatus != "terminal_policy_failure" || usageExpected != 0 || usageRecordedAt != 0 {
+		t.Fatalf("policy billing hold status=%q usage_expected=%d usage_recorded_at=%d", holdStatus, usageExpected, usageRecordedAt)
+	}
+	attempts, err := h.store.ListCodexUpstreamAttemptDiagnostics(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundTerminal := false
+	for _, attempt := range attempts {
+		if attempt.AccountID == accountID && attempt.State == "terminal_policy_failure" && attempt.StatusCode == http.StatusBadRequest {
+			foundTerminal = true
+		}
+	}
+	if !foundTerminal {
+		t.Fatalf("terminal policy attempt diagnostic missing: %+v", attempts)
+	}
+}
+
+func TestCodexChatStreamingCyberPolicyIsNotSettledAsSuccess(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.failed\n"+
+			`data: {"type":"response.failed","response":{"id":"resp_chat_policy","status":"failed","error":{"type":"invalid_request_error","code":"cyber_policy","message":"policy terminal"}}}`+"\n\n")
+	})
+	accountID := h.importAccount(t, "chat-policy-account", "upstream-chat-policy", "access-chat-policy")
+	resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(
+		`{"model":"gpt","stream":true,"messages":[{"role":"user","content":"rejected"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"code":"server_error"`)) || bytes.Contains(body, []byte("policy terminal")) {
+		t.Fatalf("chat policy terminal status=%d body=%s", resp.StatusCode, body)
+	}
+	h.app.WaitForAsyncWrites()
+	var holdStatus string
+	var usageExpected, usageRows int
+	if err := h.store.DB().QueryRowContext(t.Context(), `SELECT status,usage_expected FROM billing_holds WHERE account_id=? ORDER BY created_at DESC LIMIT 1`, accountID).Scan(&holdStatus, &usageExpected); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM usage_records WHERE account_id=?`, accountID).Scan(&usageRows); err != nil {
+		t.Fatal(err)
+	}
+	if holdStatus != "terminal_policy_failure" || usageExpected != 0 || usageRows != 0 {
+		t.Fatalf("chat policy billing status=%q usage_expected=%d usage_rows=%d", holdStatus, usageExpected, usageRows)
+	}
+}
+
 func readBody(t *testing.T, r *http.Request) string {
 	t.Helper()
 	raw, _ := io.ReadAll(r.Body)

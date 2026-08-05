@@ -9,5 +9,6 @@ Git index as their baseline so their pre-existing ownership fix remains intact.
 - `patched/`: final bytes for every modified/added path.
 - `super-instruct-fidelity.patch`: task-only patch.
 - `super-instruct-fidelity-source.tar.gz`: modified source/output bundle.
+  Historical checksum metadata is retained, while the archive itself is excluded from Git by repository hygiene policy; current deliverables live under the ignored `.run/` evidence tree.
 - `verification.log`: commands, literal output, and exit codes.
 - `rollback.sh [workspace]`: restores the task baseline without touching the index.

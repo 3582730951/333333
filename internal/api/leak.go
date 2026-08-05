@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -328,11 +329,15 @@ func (s *Server) writeUpstreamHeaders(ctx context.Context, dst, src http.Header)
 // frames entirely — those frames carry no usage data by definition.
 type scannerResponseWriter struct {
 	http.ResponseWriter
-	scanner *usage.StreamScanner
+	scanner  *usage.StreamScanner
+	terminal *responsesRouteAliasTracker
 }
 
 func (sw *scannerResponseWriter) Write(p []byte) (int, error) {
 	sw.scanner.Write(p)
+	if sw.terminal != nil {
+		_, _ = sw.terminal.Write(p)
+	}
 	return sw.ResponseWriter.Write(p)
 }
 
@@ -362,9 +367,13 @@ func (sw *scannerResponseWriter) Flush() {
 func (s *Server) streamSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, words *streamrewrite.Matcher, provider, accountID, routeHash string) error {
 	ctx = withStreamStallRecovery(ctx, s.streamStallRecoveryInterval(ctx))
 	scanner := usage.NewStreamScanner(provider)
+	var terminal *responsesRouteAliasTracker
+	if provider == "codex" {
+		terminal = &responsesRouteAliasTracker{}
+	}
 	// Wrap the client writer so every byte forwarded to the downstream also feeds
 	// the scanner — no TeeReader copy on the read side.
-	sw := &scannerResponseWriter{ResponseWriter: w, scanner: scanner}
+	sw := &scannerResponseWriter{ResponseWriter: w, scanner: scanner, terminal: terminal}
 	var err error
 	var rf *responseRuleFilter
 	if v, ok := ctx.Value(responseRuleFilterKey{}).(*responseRuleFilter); ok {
@@ -410,9 +419,17 @@ func (s *Server) streamSSE(ctx context.Context, w http.ResponseWriter, body io.R
 	} else {
 		err = leakfilter.NewSSEFilter(provider, words).Copy(sw, body)
 	}
+	terminalFailure := false
+	if terminal != nil {
+		_, terminalFailure = terminal.TerminalFailure()
+	}
 	if parsed, ok := scanner.Parsed(); ok {
-		s.recordParsedUsage(ctx, accountID, routeHash, parsed)
-	} else {
+		if terminalFailure && parsed.TotalTokens == 0 && parsed.PromptTokens == 0 && parsed.CompletionTokens == 0 {
+			log.Printf("[USAGE] request_id=%s: terminal SSE failure reported zero usage; estimate suppressed", requestIDFromContext(ctx))
+		} else {
+			s.recordParsedUsage(ctx, accountID, routeHash, parsed)
+		}
+	} else if !terminalFailure {
 		// Some otherwise successful upstream streams omit response.usage. Feed a
 		// zero-valued record into the existing billing-hold fallback instead of
 		// dropping metering entirely; recordParsedUsage substitutes the bounded
@@ -421,6 +438,13 @@ func (s *Server) streamSSE(ctx context.Context, w http.ResponseWriter, body io.R
 		s.recordParsedUsage(ctx, accountID, routeHash, usage.Parsed{
 			Model: firstNonEmpty(modelDiag.Resolved, modelDiag.Requested),
 		})
+	} else {
+		// A semantic response.failed event inside HTTP 200 is not a successful
+		// response with missing metering. In particular, estimating the full request
+		// for cyber_policy would turn a zero-token rejection into a very large false
+		// uncached usage row. The billing hold is finalized as a non-usage terminal by
+		// the caller; retain real upstream usage above if it was explicitly present.
+		log.Printf("[USAGE] request_id=%s: terminal SSE failure omitted usage; estimate suppressed", requestIDFromContext(ctx))
 	}
 	return err
 }

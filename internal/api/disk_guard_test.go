@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"testing"
 
 	"codex-account-pool/internal/config"
@@ -59,6 +60,122 @@ func TestGoalStorageMaintenanceTarget(t *testing.T) {
 		if target != tc.target || reserve != tc.reserve {
 			t.Errorf("max=%d target/reserve=%d/%d, want %d/%d", tc.max, target, reserve, tc.target, tc.reserve)
 		}
+	}
+}
+
+func TestLegacyGoalPolicyUpgradeLetsSaturatedAwaitingToolGoalContinue(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	// Reproduce the latest deployed package: both values came from the old
+	// bootstrap config and there was no runtime override.
+	cfg.GoalStorageMaxMB = config.LegacyDefaultGoalStorageMaxMB
+	cfg.GoalLegacyJournalDualWrite = true
+	s := &Server{cfg: cfg, store: store}
+	first := storage.GoalTurn{
+		Protocol: "codex", DownstreamKeyHash: "saturated-key", WorkspaceHash: "saturated-workspace",
+		InitialGoalHash: "saturated-initial", ResponseID: "saturated-r1",
+		Aliases:           []storage.GoalAlias{{Type: "codex_root_thread", Value: "saturated-root"}},
+		CheckpointPayload: `{"model":"gpt-test","input":[]}`,
+		SegmentPayload:    `{"history_key":"input","input":[{"role":"user","content":"before-saturation"}],"output":[{"type":"custom_tool_call","call_id":"pending-call","name":"tool","arguments":"{}"}]}`,
+		WorkingState:      `{"state":"waiting"}`,
+		AwaitingTool:      true,
+		ExpiresAt:         storage.Now() + 86400,
+	}
+	goal, err := store.CommitGoalTurn(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyMax := int64(config.LegacyDefaultGoalStorageMaxMB) << 20
+	if _, err = store.DB().ExecContext(ctx, `UPDATE goal_session SET storage_bytes=? WHERE id=?`, legacyMax-1, goal.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The startup disk guard owns the idempotent policy-default migration. It must
+	// raise both the hard admission budget and its maintenance target before trying
+	// to append the next successful terminal.
+	s.runDiskGuard(ctx)
+	effectiveMax := s.goalStorageMaxBytes(ctx)
+	target, reserve := goalStorageMaintenanceTarget(effectiveMax)
+	if effectiveMax != int64(config.DefaultGoalStorageMaxMB)<<20 || target != 896<<20 || reserve != 128<<20 {
+		t.Fatalf("effective max/target/reserve=%d/%d/%d, want %d/%d/%d", effectiveMax, target, reserve,
+			int64(config.DefaultGoalStorageMaxMB)<<20, int64(896<<20), int64(128<<20))
+	}
+	storageSetting, ok, err := store.GetSetting(ctx, "goal_storage_max_mb")
+	if err != nil || !ok || storageSetting != "1024" {
+		t.Fatalf("migrated storage setting=%q present=%t err=%v", storageSetting, ok, err)
+	}
+	dualSetting, ok, err := store.GetSetting(ctx, "goal_legacy_journal_dual_write")
+	if err != nil || !ok || dualSetting != "false" {
+		t.Fatalf("migrated dual-write setting=%q present=%t err=%v", dualSetting, ok, err)
+	}
+	// Disabling future v1 writes must not delete or hide the existing fallback tail;
+	// it remains readable until its normal TTL expires.
+	if err = store.PutContextJournal(ctx, storage.ContextJournal{
+		ResponseID: "legacy-tail", AccountID: "account", ExpiresAt: storage.Now() + 3600,
+		Payload: `{"model":"gpt-test","input":[{"role":"user","content":"legacy-readable"}]}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	legacyReplay, legacyOK := s.journalReplayBody(ctx, []byte(`{"model":"gpt-test","previous_response_id":"legacy-tail","input":[{"role":"user","content":"new-tail"}]}`))
+	if !legacyOK || !strings.Contains(string(legacyReplay), "legacy-readable") || !strings.Contains(string(legacyReplay), "new-tail") {
+		t.Fatalf("legacy read fallback after dual-write migration ok=%t replay=%s", legacyOK, legacyReplay)
+	}
+
+	next := first
+	next.ResponseID = "saturated-r2"
+	next.AwaitingTool = false
+	next.WorkingState = `{"state":"continued"}`
+	next.SegmentPayload = `{"history_key":"input","input":[{"type":"custom_tool_call_output","call_id":"pending-call","output":"tool-finished"}],"output":[{"type":"message","content":"after-saturation"}]}`
+	next.StorageMaxBytes = effectiveMax
+	continued, err := store.CommitGoalTurn(ctx, next)
+	if err != nil || continued.ID != goal.ID {
+		t.Fatalf("continued saturated goal=%+v err=%v", continued, err)
+	}
+	replay, session, err := store.BuildGoalReplay(ctx, goal.ID)
+	if err != nil || session.State != "ready" {
+		t.Fatalf("continued replay session=%+v err=%v", session, err)
+	}
+	for _, marker := range []string{"before-saturation", "pending-call", "tool-finished", "after-saturation"} {
+		if !strings.Contains(string(replay), marker) {
+			t.Fatalf("continued replay lost %q: %s", marker, replay)
+		}
+	}
+}
+
+func TestLegacyGoalPolicyUpgradePreservesExplicitRuntimeCap(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.SetSetting(ctx, "goal_storage_max_mb", "256"); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.SetSetting(ctx, "goal_legacy_journal_dual_write", "true"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.GoalStorageMaxMB = config.LegacyDefaultGoalStorageMaxMB
+	cfg.GoalLegacyJournalDualWrite = true
+	s := &Server{cfg: cfg, store: store}
+	s.runDiskGuard(ctx)
+	if max := s.goalStorageMaxBytes(ctx); max != 256<<20 {
+		t.Fatalf("explicit runtime cap changed to %d", max)
+	}
+	if enabled := s.flagEnabled(ctx, "goal_legacy_journal_dual_write", cfg.GoalLegacyJournalDualWrite); !enabled {
+		t.Fatal("explicit runtime dual-write choice was changed")
 	}
 }
 

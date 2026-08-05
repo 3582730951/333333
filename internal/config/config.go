@@ -22,9 +22,9 @@ const (
 	// discovery and on version-gated live Codex requests. ChatGPT gates the returned
 	// model catalog and some live models by this value, so old preserved config
 	// values are floored to this default during normalization.
-	// Refreshed 2026-07-29 from the official Codex rust-v0.146.0 release and
+	// Refreshed 2026-08-05 from the official Codex rust-v0.146.1 release and
 	// matching source tree.
-	DefaultClientVersion                  = "0.146.0"
+	DefaultClientVersion                  = "0.146.1"
 	DefaultStickyWaitMillis               = 100
 	DefaultStrictStickyMaxCooldownSeconds = 60
 	DefaultCooldownWaitMaxSeconds         = 30
@@ -33,16 +33,22 @@ const (
 	DefaultAdmissionWaitMillis = 600000
 	// Cooldown→health-recheck loop: how often to probe benched accounts, and how long
 	// to re-bench one whose probe still fails before the next attempt.
-	DefaultAccountRecheckIntervalSeconds  = 20
-	DefaultAccountRecheckBackoffSeconds   = 120
-	DefaultRequestTimeoutSec              = 600
-	DefaultShutdownDrainSec               = 30
-	DefaultMaxBodyBytes                   = 1 << 30
-	DefaultBodyMemoryThresholdBytes       = 8 << 20
-	DefaultBodyMemoryBudgetMaxBytes       = 256 << 20
-	DefaultBodySpoolMaxBytes              = 32 << 30
-	DefaultBodyDiskReserveBytes           = 0
-	DefaultUsageJournalSegmentBytes       = 8 << 20
+	DefaultAccountRecheckIntervalSeconds = 20
+	DefaultAccountRecheckBackoffSeconds  = 120
+	DefaultRequestTimeoutSec             = 600
+	DefaultShutdownDrainSec              = 30
+	DefaultMaxBodyBytes                  = 1 << 30
+	DefaultBodyMemoryThresholdBytes      = 8 << 20
+	DefaultBodyMemoryBudgetMaxBytes      = 256 << 20
+	DefaultBodySpoolMaxBytes             = 32 << 30
+	DefaultBodyDiskReserveBytes          = 0
+	DefaultUsageJournalSegmentBytes      = 8 << 20
+	// Goal continuity keeps a seven-day sliding window. The original 256 MiB
+	// bootstrap default was exhausted by sustained Codex tool traffic while the
+	// server still had ample disk. One GiB provides fourfold admission headroom;
+	// the legacy value is retained only for the one-time runtime-default migration.
+	LegacyDefaultGoalStorageMaxMB         = 256
+	DefaultGoalStorageMaxMB               = 1024
 	DefaultStreamFailoverHoldMemoryBytes  = 8 << 20
 	DefaultStreamFailoverHoldDiskBytes    = 0
 	DefaultVirtualWindow                  = 2_000_000
@@ -865,9 +871,9 @@ func Default() Config {
 		ContextJournalMaxRows:            50000,
 		ContextJournalMaxMB:              200,
 		GoalContinuityEnabled:            true,
-		GoalLegacyJournalDualWrite:       true,
+		GoalLegacyJournalDualWrite:       false,
 		GoalRetentionDays:                7,
-		GoalStorageMaxMB:                 256,
+		GoalStorageMaxMB:                 DefaultGoalStorageMaxMB,
 		GoalCompressionChunkRatio:        0.70,
 		GoalCompressionMaxStages:         16,
 		GoalLeaseSeconds:                 90,
@@ -1595,7 +1601,7 @@ func (c *Config) normalize() {
 		c.GoalRetentionDays = 7
 	}
 	if c.GoalStorageMaxMB <= 0 {
-		c.GoalStorageMaxMB = 256
+		c.GoalStorageMaxMB = DefaultGoalStorageMaxMB
 	}
 	if c.GoalCompressionChunkRatio <= 0 || c.GoalCompressionChunkRatio >= 1 {
 		c.GoalCompressionChunkRatio = 0.70

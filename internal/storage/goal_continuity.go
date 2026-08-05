@@ -371,6 +371,76 @@ type GoalMetrics struct {
 }
 
 const goalContinuityV2MigrationMarker = "goal_continuity_v2_storage_accounted"
+const goalPolicyDefaultsMigrationMarker = "goal_policy_defaults_v3_1gib_no_legacy_dual_write"
+
+type GoalPolicyDefaultsMigration struct {
+	AlreadyCompleted        bool
+	StorageDefaultUpgraded  bool
+	LegacyDualWriteDisabled bool
+}
+
+// MigrateGoalPolicyDefaults upgrades only inherited bootstrap defaults. A setting
+// row is an explicit operator choice and always wins, including a deliberate
+// 256-MiB cap or an explicitly enabled legacy dual-write. The marker, overrides,
+// and aggregate-only audit record commit atomically so an interrupted upgrade can
+// be retried without a partially effective policy.
+func (s *Store) MigrateGoalPolicyDefaults(ctx context.Context, bootstrapStorageMB, legacyStorageMB, upgradedStorageMB int, bootstrapLegacyDualWrite bool) (GoalPolicyDefaultsMigration, error) {
+	var result GoalPolicyDefaultsMigration
+	if upgradedStorageMB <= legacyStorageMB || legacyStorageMB <= 0 {
+		return result, errors.New("invalid goal policy default migration")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return result, err
+	}
+	defer tx.Rollback()
+	var completed int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key=?`, goalPolicyDefaultsMigrationMarker).Scan(&completed); err != nil {
+		return result, err
+	}
+	if completed > 0 {
+		result.AlreadyCompleted = true
+		return result, tx.Commit()
+	}
+	now := Now()
+	if bootstrapStorageMB == legacyStorageMB {
+		var explicit int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key='goal_storage_max_mb' AND trim(value)<>''`).Scan(&explicit); err != nil {
+			return result, err
+		}
+		if explicit == 0 {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES('goal_storage_max_mb',?,?)
+ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at WHERE trim(settings.value)=''`, fmt.Sprintf("%d", upgradedStorageMB), now); err != nil {
+				return result, err
+			}
+			result.StorageDefaultUpgraded = true
+		}
+	}
+	if bootstrapLegacyDualWrite {
+		var explicit int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key='goal_legacy_journal_dual_write' AND trim(value)<>''`).Scan(&explicit); err != nil {
+			return result, err
+		}
+		if explicit == 0 {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES('goal_legacy_journal_dual_write','false',?)
+ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at WHERE trim(settings.value)=''`, now); err != nil {
+				return result, err
+			}
+			result.LegacyDualWriteDisabled = true
+		}
+	}
+	markerValue := fmt.Sprintf("storage_upgraded=%t,legacy_dual_write_disabled=%t", result.StorageDefaultUpgraded, result.LegacyDualWriteDisabled)
+	if _, err = tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO NOTHING`, goalPolicyDefaultsMigrationMarker, markerValue, now); err != nil {
+		return result, err
+	}
+	if result.StorageDefaultUpgraded || result.LegacyDualWriteDisabled {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO audit_log(account_id,account_label,action,state,reason,detail,created_at) VALUES('', '', ?, ?, ?, ?, ?)`,
+			"goal_policy_defaults_migrated", "completed", "legacy_bootstrap_defaults", markerValue, now); err != nil {
+			return result, err
+		}
+	}
+	return result, tx.Commit()
+}
 
 func (s *Store) migrateGoalContinuityV2(ctx context.Context) error {
 	var completed int

@@ -127,6 +127,14 @@ func TestNormalizeSkillIDsRejectsPathTraversal(t *testing.T) {
 }
 
 func TestExtractUserSourceMatchesInputPrecedenceAndFiltering(t *testing.T) {
+	stringInput := []byte(`{"input":"reverse SAMPLE from string","messages":[{"role":"user","content":"ignored"}]}`)
+	if got := ExtractUserSource(stringInput); got != "reverse SAMPLE from string" {
+		t.Fatalf("string input source extractor=%q", got)
+	}
+	if got := Categorize(ExtractUserSource(stringInput)); got != CategoryReverse {
+		t.Fatalf("string input source category=%q", got)
+	}
+
 	raw := []byte(`{
   "input":[
     {"role":"system","content":"ignore system"},

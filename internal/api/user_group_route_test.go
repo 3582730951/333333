@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/bodysource"
+	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
 )
@@ -1257,6 +1258,75 @@ func TestDispatchUserGroupRouteCandidatesNeverReplaysCommittedStream(t *testing.
 	})
 	if attempts != 1 || recorder.Code != http.StatusOK || recorder.Body.String() != "data: committed\n\n" {
 		t.Fatalf("attempts=%d code=%d body=%q", attempts, recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestDispatchUserGroupRouteCandidatesClassifiesStatuslessCyberPolicyTerminal(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: "policy-secondary"}); err != nil {
+		t.Fatal(err)
+	}
+	targets := []storage.TargetRef{
+		{Kind: storage.TargetKindAccountPoolGroup, ID: "cyber"},
+		{Kind: storage.TargetKindAccountPoolGroup, ID: "policy-secondary"},
+	}
+	const userGroupID = "ug_policy_terminal"
+	createRouteTestGroup(t, h, userGroupID, targets, nil)
+	raw := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("Thread-Id", "policy-terminal-root")
+	req.Header.Set(superInstructClientChoiceHeader, "enabled")
+	req = req.WithContext(withRequestAccountGroupPolicy(req.Context(), storage.Group{
+		SuperInstructEnabled:                true,
+		SuperInstructResponseRewriteEnabled: true,
+		SuperInstructMemoryEnabled:          true,
+		SuperInstructMonitorEnabled:         true,
+	}))
+	recorder := httptest.NewRecorder()
+	attempts := 0
+	frame := "event: response.failed\n" +
+		`data: {"type":"response.failed","response":{"id":"resp_policy","status":"failed","error":{"type":"invalid_request_error","code":"cyber_policy","message":"policy terminal"}}}` + "\n\n"
+	handled := h.app.dispatchUserGroupRouteCandidates(recorder, req, raw, raw, downstreamPolicy{UserGroupID: userGroupID}, func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		for _, part := range []string{frame[:31], frame[31:]} {
+			_, _ = io.WriteString(w, part)
+		}
+	})
+	if !handled || attempts != 1 || recorder.Code != http.StatusOK || recorder.Body.String() != frame {
+		t.Fatalf("handled=%v attempts=%d code=%d body=%q", handled, attempts, recorder.Code, recorder.Body.String())
+	}
+	rows := h.app.diagnosticRouteAttempts()
+	if len(rows) != 1 {
+		t.Fatalf("route diagnostics=%+v", rows)
+	}
+	row := rows[0]
+	if row.StatusClass != "upstream_cyber_policy" || row.TerminalErrorClass != "cyber_policy" || row.EffectiveStatus != http.StatusBadRequest {
+		t.Fatalf("terminal route diagnostic=%+v", row)
+	}
+	if row.SuperInstructClientChoice != "enabled" || row.SuperInstructEffectiveModules != "M1,M4,M3,M5,M6" || row.UserGroupID != userGroupID {
+		t.Fatalf("effective request policy diagnostic=%+v", row)
+	}
+	affinity := routing.ExtractAffinityKey(req, raw)
+	if _, found, err := h.store.GetUserGroupTargetBinding(t.Context(), userGroupID, affinity.Hash, ""); err != nil || found {
+		t.Fatalf("policy terminal created successful route binding: found=%v err=%v", found, err)
+	}
+}
+
+func TestConvertedChatAttemptCarriesNativeCodexTerminalClassification(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	attempt := newUserGroupAttemptWriter(t.Context(), recorder, true, false, bodysource.CaptureOptions{}, false)
+	attempt.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(attempt, "data: {\"error\":{\"code\":\"server_error\"}}\n\n")
+	failure := leakfilter.CodexFailureFrame{EventType: "response.failed", ErrorCode: "cyber_policy", StatusCode: http.StatusBadRequest}
+	markUserGroupCodexTerminalFailure(attempt, failure)
+	if got := userGroupRouteStatusClass(attempt); got != "upstream_cyber_policy" {
+		t.Fatalf("converted chat terminal status class=%q", got)
+	}
+	got, ok := attempt.TerminalFailure()
+	if !ok || got.ErrorCode != "cyber_policy" || got.StatusCode != http.StatusBadRequest {
+		t.Fatalf("converted chat terminal=%+v ok=%v", got, ok)
 	}
 }
 

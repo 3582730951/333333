@@ -2818,6 +2818,16 @@ codexSuccess:
 			nativeRecorder := s.newCodexStreamLedgerRecorder(r.Context())
 			defer nativeRecorder.Close()
 			responsesStreamToChatSSE(w, io.TeeReader(streamBody, io.MultiWriter(uscan, nativeRecorder)), model, includeChatStreamUsage, codexScrubber)
+			nativeRecorder.finish()
+			terminalFailure, hasTerminalFailure := nativeRecorder.terminalFailure()
+			if hasTerminalFailure {
+				markUserGroupCodexTerminalFailure(w, terminalFailure)
+				terminalState := "terminal_upstream_failure"
+				if terminalFailure.ErrorCode == "cyber_policy" {
+					terminalState = "terminal_policy_failure"
+				}
+				s.recordCodexUpstreamAttempt(r.Context(), codexSessionMappingFromContext(r.Context()), lease, finalEgress, terminalState, terminalFailure.StatusCode)
+			}
 			if nativeRecorder.completedSuccessfully() {
 				responseID, responseModel, _ := nativeRecorder.metadata()
 				if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
@@ -2841,7 +2851,15 @@ codexSuccess:
 			if parsed, ok := uscan.Parsed(); ok {
 				s.recordParsedUsage(r.Context(), lease.Account.ID, affinity.Hash, parsed)
 			}
-			_ = s.settleBillingHold(r.Context(), holdID, "settled_streaming")
+			if hasTerminalFailure {
+				terminalStatus := "terminal_upstream_failure"
+				if terminalFailure.ErrorCode == "cyber_policy" {
+					terminalStatus = "terminal_policy_failure"
+				}
+				_ = s.settleBillingHold(r.Context(), holdID, terminalStatus)
+			} else {
+				_ = s.settleBillingHold(r.Context(), holdID, "settled_streaming")
+			}
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 		streamRecorder := s.newCodexStreamLedgerRecorder(r.Context())
@@ -2907,14 +2925,20 @@ codexSuccess:
 		// but keeping the same upstream UUID would trap the next retry in the same
 		// risk loop. Retire only a durable main-CLI epoch; children and prospective
 		// first turns never invalidate the root tree.
-		if failure, ok := streamRecorder.terminalFailure(); ok {
+		terminalFailure, hasTerminalFailure := streamRecorder.terminalFailure()
+		if hasTerminalFailure {
 			mapping := codexSessionMappingFromContext(r.Context())
-			if strictNativeCPA && mapping != nil && mapping.durableMainCLI() && codexMappedSessionRiskError(failure.StatusCode, failure.Body) {
+			if strictNativeCPA && mapping != nil && mapping.durableMainCLI() && codexMappedSessionRiskError(terminalFailure.StatusCode, terminalFailure.Body) {
 				if err := s.retireCodexSessionMapping(r.Context(), mapping, "late_stream_mapped_session_risk"); err != nil &&
 					!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
 					log.Printf("[CODEX-SESSION-MAPPING] late stream rotation request_id=%s: %v", requestIDFromContext(r.Context()), err)
 				}
 			}
+			terminalState := "terminal_upstream_failure"
+			if terminalFailure.ErrorCode == "cyber_policy" {
+				terminalState = "terminal_policy_failure"
+			}
+			s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, finalEgress, terminalState, terminalFailure.StatusCode)
 		}
 		streamStalled := errors.Is(streamErr, errUpstreamStreamStalled)
 		if streamStalled {
@@ -3176,7 +3200,13 @@ codexSuccess:
 		if streamRateLimits.any() {
 			s.captureCodexStreamRateLimits(lease.Account.ID, streamRateLimits)
 		}
-		if streamErr != nil || sidecarStreamInterrupted || compatContinuationFailed {
+		if hasTerminalFailure {
+			terminalStatus := "terminal_upstream_failure"
+			if terminalFailure.ErrorCode == "cyber_policy" {
+				terminalStatus = "terminal_policy_failure"
+			}
+			_ = s.settleBillingHold(r.Context(), holdID, terminalStatus)
+		} else if streamErr != nil || sidecarStreamInterrupted || compatContinuationFailed {
 			_ = s.settleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
 		} else {
 			_ = s.settleBillingHold(r.Context(), holdID, "settled_streaming")

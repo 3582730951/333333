@@ -29,6 +29,74 @@ func goalTurnForTest(alias, response, input, output string) GoalTurn {
 	}
 }
 
+func TestGoalPolicyDefaultMigrationUpgradesOnlyInheritedLegacyValues(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name                string
+		explicitStorage     string
+		explicitDualWrite   string
+		wantStorage         string
+		wantDualWrite       string
+		wantStorageUpgraded bool
+		wantDualDisabled    bool
+		wantAudits          int
+	}{
+		{name: "inherited legacy defaults", wantStorage: "1024", wantDualWrite: "false", wantStorageUpgraded: true, wantDualDisabled: true, wantAudits: 1},
+		{name: "explicit runtime values win", explicitStorage: "256", explicitDualWrite: "true", wantStorage: "256", wantDualWrite: "true"},
+		{name: "blank rows are not explicit", explicitStorage: " ", explicitDualWrite: " ", wantStorage: "1024", wantDualWrite: "false", wantStorageUpgraded: true, wantDualDisabled: true, wantAudits: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := OpenInMemory()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if err = store.Init(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if tc.explicitStorage != "" {
+				if err = store.SetSetting(ctx, "goal_storage_max_mb", tc.explicitStorage); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.explicitDualWrite != "" {
+				if err = store.SetSetting(ctx, "goal_legacy_journal_dual_write", tc.explicitDualWrite); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := store.MigrateGoalPolicyDefaults(ctx, 256, 256, 1024, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.StorageDefaultUpgraded != tc.wantStorageUpgraded || result.LegacyDualWriteDisabled != tc.wantDualDisabled {
+				t.Fatalf("migration result=%+v", result)
+			}
+			storageValue, storageOK, err := store.GetSetting(ctx, "goal_storage_max_mb")
+			if err != nil || !storageOK || storageValue != tc.wantStorage {
+				t.Fatalf("storage setting=%q present=%t err=%v, want %q", storageValue, storageOK, err, tc.wantStorage)
+			}
+			dualValue, dualOK, err := store.GetSetting(ctx, "goal_legacy_journal_dual_write")
+			if err != nil || !dualOK || dualValue != tc.wantDualWrite {
+				t.Fatalf("dual-write setting=%q present=%t err=%v, want %q", dualValue, dualOK, err, tc.wantDualWrite)
+			}
+			var marker, audits int
+			if err = store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key=?`, goalPolicyDefaultsMigrationMarker).Scan(&marker); err != nil {
+				t.Fatal(err)
+			}
+			if err = store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log WHERE action='goal_policy_defaults_migrated'`).Scan(&audits); err != nil {
+				t.Fatal(err)
+			}
+			if marker != 1 || audits != tc.wantAudits {
+				t.Fatalf("marker/audits=%d/%d, want 1/%d", marker, audits, tc.wantAudits)
+			}
+			second, err := store.MigrateGoalPolicyDefaults(ctx, 256, 256, 1024, true)
+			if err != nil || !second.AlreadyCompleted || second.StorageDefaultUpgraded || second.LegacyDualWriteDisabled {
+				t.Fatalf("idempotent migration=%+v err=%v", second, err)
+			}
+		})
+	}
+}
+
 func TestGoalContinuityEncryptedReplaySurvivesRestart(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir() + "/goals.sqlite3"

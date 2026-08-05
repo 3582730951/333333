@@ -541,8 +541,17 @@ func (p *CodexInstructionPlan) apply(raw []byte) []byte {
 	}
 	if p.LocalM1 {
 		instructions := joinInstructionParts(p.Bridge, p.GroupPrompt, p.Administrator, p.SuperInstruct)
-		if updated, _, err := superinstruct.InjectSystem(raw, instructions); err == nil {
-			return updated
+		if updated, injected, err := superinstruct.InjectSystem(raw, instructions); err == nil {
+			if injected {
+				return updated
+			}
+			// A native Responses continuation may use the compact string form
+			// {"input":"..."} and omit every system carrier. M1 still belongs to
+			// the immutable CPA tree, so add the classic top-level carrier instead
+			// of letting upstream normalization synthesize a generic instruction.
+			if updated, setErr := sjson.SetBytes(raw, "instructions", instructions); setErr == nil {
+				return updated
+			}
 		}
 		return raw
 	}

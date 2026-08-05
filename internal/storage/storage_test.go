@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -349,6 +350,94 @@ VALUES('deferred-after', 'after', 'gpt-test', 30, 1, 31, '{"input_tokens":30,"ou
 	}
 	if total != 0 {
 		t.Fatalf("completed one-time migration rescanned new row: total=%d", total)
+	}
+}
+
+func TestCodexNestedCachedTokensPopulateCacheDiagnostics(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.InsertUsageRecordWithDiagnostics(ctx, "codex-cache-hit", "route-hit", "", "", "gpt-5.6-sol",
+		165770, 215, 165985, 165632, 165632, 0,
+		json.RawMessage(`{"usage":{"input_tokens":165770,"output_tokens":215,"total_tokens":165985,"input_tokens_details":{"cached_tokens":165632}}}`),
+		UsageDiagnostics{UsageProvider: "codex", UsageSource: "upstream"}); err != nil {
+		t.Fatal(err)
+	}
+	var present int
+	var capability, missReason string
+	var possible, miss, total int64
+	if err := store.DB().QueryRowContext(ctx, `SELECT cache_read_present,cache_capability,max_possible_cache_read_tokens,
+diagnostics_miss_reason,cache_miss_tokens,cache_total_input_tokens FROM usage_records WHERE account_id='codex-cache-hit'`).Scan(
+		&present, &capability, &possible, &missReason, &miss, &total); err != nil {
+		t.Fatal(err)
+	}
+	if present != 1 || capability != "hit_observed" || possible != 165770 || missReason != "" || miss != 138 || total != 165770 {
+		t.Fatalf("Codex hit diagnostics present=%d capability=%q possible=%d reason=%q miss/total=%d/%d",
+			present, capability, possible, missReason, miss, total)
+	}
+
+	if err := store.InsertUsageRecordWithDiagnostics(ctx, "codex-cache-miss", "route-miss", "", "", "gpt-5.6-sol",
+		4096, 12, 4108, 0, 0, 0,
+		json.RawMessage(`{"usage":{"input_tokens":4096,"output_tokens":12,"total_tokens":4108,"input_tokens_details":{"cached_tokens":0}}}`),
+		UsageDiagnostics{UsageProvider: "codex", UsageSource: "upstream"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `SELECT cache_read_present,cache_capability,max_possible_cache_read_tokens,
+diagnostics_miss_reason FROM usage_records WHERE account_id='codex-cache-miss'`).Scan(
+		&present, &capability, &possible, &missReason); err != nil {
+		t.Fatal(err)
+	}
+	if present != 1 || capability != "reported" || possible != 4096 || missReason != "upstream_reported_zero_cache_read" {
+		t.Fatalf("Codex miss diagnostics present=%d capability=%q possible=%d reason=%q",
+			present, capability, possible, missReason)
+	}
+}
+
+func TestDeferredOpenAICacheDiagnosticsBackfillsV3MarkedRowsOnce(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		usageCacheDiagnosticsMigrationMarker, "1", Now()); err != nil {
+		t.Fatal(err)
+	}
+	insert := func(account, route string, prompt, cached int64) {
+		t.Helper()
+		raw := fmt.Sprintf(`{"usage":{"input_tokens":%d,"output_tokens":1,"total_tokens":%d,"input_tokens_details":{"cached_tokens":%d}}}`,
+			prompt, prompt+1, cached)
+		if _, err := store.DB().ExecContext(ctx, `INSERT INTO usage_records(account_id,route_key_hash,model,prompt_tokens,completion_tokens,total_tokens,
+cached_tokens,cache_read_tokens,usage_provider,usage_source,raw_usage_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+			account, route, "gpt-5.6-sol", prompt, 1, prompt+1, cached, cached, "codex", "upstream", raw, Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert("legacy-codex-cache", "legacy", 32768, 28672)
+	if err := store.RunDeferredMigrations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var present, marker int
+	var capability string
+	var possible int64
+	if err := store.DB().QueryRowContext(ctx, `SELECT cache_read_present,cache_capability,max_possible_cache_read_tokens
+FROM usage_records WHERE account_id='legacy-codex-cache'`).Scan(&present, &capability, &possible); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key=?`, openAICacheDiagnosticsMigrationMarker).Scan(&marker); err != nil {
+		t.Fatal(err)
+	}
+	if present != 1 || capability != "hit_observed" || possible != 32768 || marker != 1 {
+		t.Fatalf("v4 backfill present=%d capability=%q possible=%d marker=%d", present, capability, possible, marker)
+	}
+
+	// The durable marker makes later startups constant-time and leaves new rows to
+	// the corrected normal insert path rather than repeatedly rescanning history.
+	insert("post-v4-manual-row", "post", 8192, 4096)
+	if err := store.RunDeferredMigrations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `SELECT cache_read_present FROM usage_records WHERE account_id='post-v4-manual-row'`).Scan(&present); err != nil {
+		t.Fatal(err)
+	}
+	if present != 0 {
+		t.Fatalf("completed v4 migration rescanned a later manual row: present=%d", present)
 	}
 }
 

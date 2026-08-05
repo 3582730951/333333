@@ -302,6 +302,25 @@ func TestParseCodexFailureFrameRecognizesStructuredContextLengthExceeded(t *test
 	}
 }
 
+func TestParseCodexFailureFramePromotesStatuslessCyberPolicyWithoutRetry(t *testing.T) {
+	frame := []byte("event: response.failed\n" +
+		`data: {"type":"response.failed","response":{"id":"resp_policy","status":"failed","error":{"type":"invalid_request_error","code":"cyber_policy","message":"policy terminal; try a different model"}}}` + "\n\n")
+	failure, ok := ParseCodexFailureFrame(frame)
+	if !ok || failure.ErrorCode != "cyber_policy" || failure.StatusCode != http.StatusBadRequest {
+		t.Fatalf("statusless cyber_policy failure=%+v ok=%v", failure, ok)
+	}
+	if failure.BuiltinRetryable || failure.RequestError != ResponsesRequestErrorNone || failure.ContextError != ResponsesContextErrorNone {
+		t.Fatalf("cyber_policy entered account retry/context recovery: %+v", failure)
+	}
+	if retryable, retryOK := ParseRetryableCodexFailureFrame(frame); retryOK {
+		t.Fatalf("cyber_policy became retryable: %+v", retryable)
+	}
+	got := runSSE(t, "codex", string(frame), 3)
+	if !strings.Contains(got, `"code":"cyber_policy"`) || !strings.Contains(got, "try a different model") {
+		t.Fatalf("cyber_policy terminal was altered: %q", got)
+	}
+}
+
 func TestParseCodexFailureFrameContextLengthCodeMustBeExactAndStructured(t *testing.T) {
 	frames := []string{
 		"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"context_length_exceeded\"}}}\n\n",

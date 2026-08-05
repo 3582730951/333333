@@ -33,10 +33,10 @@ import (
 // Current official client versions. Kept here so a single edit updates the
 // fingerprint everywhere. These should track the real shipping clients.
 // Refreshed 2026-07-29 from the shipping Claude Code 2.1.220 binary and the
-// official Codex rust-v0.146.0 source/release. Claude's shipping tuple remains
+// official Codex rust-v0.146.1 source/release. Claude's shipping tuple remains
 // Node v26.3.0 with Stainless package 0.94.0.
 const (
-	CodexCLIVersion  = "0.146.0"
+	CodexCLIVersion  = "0.146.1"
 	ClaudeCLIVersion = "2.1.220"
 	// CodexOriginator is the interactive Codex CLI entrypoint id; CodexOriginatorExec
 	// is the `codex exec` (non-interactive) entrypoint. The official client sends one

@@ -9460,6 +9460,10 @@ func firstNonEmptyStorage(values ...string) string {
 
 func finalizeUsageDiagnostics(model string, prompt, cached, cacheRead, cacheCreation int64, raw json.RawMessage, diag UsageDiagnostics) UsageDiagnostics {
 	usageMap := rawUsageMap(raw)
+	_, openAICacheReadReported := nestedUsageIntPresent(usageMap, "input_tokens_details", "cached_tokens")
+	if !openAICacheReadReported {
+		_, openAICacheReadReported = nestedUsageIntPresent(usageMap, "prompt_tokens_details", "cached_tokens")
+	}
 	if diag.LatestUserTailCacheControl || diag.LatestUserToolResultCacheControl {
 		diag.LatestUserCacheControl = true
 	}
@@ -9470,6 +9474,14 @@ func finalizeUsageDiagnostics(model string, prompt, cached, cacheRead, cacheCrea
 		diag.UsageProvider = usageProvider(model, usageMap, cacheCreation)
 	}
 	if _, ok := usageMap["cache_read_input_tokens"]; ok {
+		diag.CacheReadPresent = true
+	}
+	// OpenAI Responses reports cache reads under
+	// usage.input_tokens_details.cached_tokens (chat-compatible responses may use
+	// prompt_tokens_details).  The token parser has always populated cached_tokens,
+	// but diagnostics previously looked only for Anthropic's top-level spelling,
+	// leaving every Codex row marked as cache-unreported despite the raw evidence.
+	if openAICacheReadReported || cacheRead > 0 || cached > 0 {
 		diag.CacheReadPresent = true
 	}
 	if _, ok := usageMap["cache_creation_input_tokens"]; ok {
@@ -9484,6 +9496,26 @@ func finalizeUsageDiagnostics(model string, prompt, cached, cacheRead, cacheCrea
 		} else {
 			diag.UsageSource = "upstream"
 		}
+	}
+	if diag.CacheCapability == "" || diag.CacheCapability == "unknown" {
+		switch {
+		case diag.CacheReadPresent && (cacheRead > 0 || cached > 0):
+			diag.CacheCapability = "hit_observed"
+		case diag.CacheReadPresent || diag.CacheCreationPresent:
+			diag.CacheCapability = "reported"
+		case strings.EqualFold(diag.UsageProvider, "codex") || strings.EqualFold(diag.UsageProvider, "openai"):
+			diag.CacheCapability = "unreported"
+		}
+	}
+	if !diag.Estimated && diag.CacheReadPresent && cacheRead <= 0 && cached <= 0 && diag.DiagnosticsMissReason == "" {
+		diag.DiagnosticsMissReason = "upstream_reported_zero_cache_read"
+	}
+	if diag.MaxPossibleCacheReadTokens <= 0 && prompt > 0 && diag.CacheReadPresent &&
+		(strings.EqualFold(diag.UsageProvider, "codex") || strings.EqualFold(diag.UsageProvider, "openai")) {
+		// Codex does not expose Anthropic-style breakpoint metadata.  Its reported
+		// input total is therefore the only lossless upper bound available for the
+		// same request and is strictly >= the observed cached-token count.
+		diag.MaxPossibleCacheReadTokens = prompt
 	}
 	if diag.CacheCreation5mTokens == 0 {
 		diag.CacheCreation5mTokens = nestedUsageInt(usageMap, "cache_creation", "ephemeral_5m_input_tokens")
@@ -9585,13 +9617,23 @@ func usageInt(m map[string]interface{}, keys ...string) int64 {
 }
 
 func nestedUsageInt(m map[string]interface{}, parent, child string) int64 {
-	if detail, ok := m[parent].(map[string]interface{}); ok {
-		return usageInt(detail, child)
+	value, _ := nestedUsageIntPresent(m, parent, child)
+	return value
+}
+
+func nestedUsageIntPresent(m map[string]interface{}, parent, child string) (int64, bool) {
+	detail, ok := m[parent].(map[string]interface{})
+	if !ok {
+		return 0, false
 	}
-	return 0
+	if _, present := detail[child]; !present {
+		return 0, false
+	}
+	return usageInt(detail, child), true
 }
 
 const usageCacheDiagnosticsMigrationMarker = "usage_cache_diagnostics_v3_backfilled"
+const openAICacheDiagnosticsMigrationMarker = "usage_cache_diagnostics_v4_openai_nested_cache_backfilled"
 
 // RunDeferredMigrations performs historical repairs after the HTTP listener is
 // available. Schema and billing-integrity migrations remain synchronous; these
@@ -9615,7 +9657,101 @@ func (s *Store) RunDeferredMigrations(ctx context.Context) error {
 			return err
 		}
 	}
+	completed = 0
+	if err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key=?`, openAICacheDiagnosticsMigrationMarker).Scan(&completed); err != nil {
+		return err
+	}
+	if completed == 0 {
+		if err := s.backfillOpenAICacheDiagnostics(ctx); err != nil {
+			return err
+		}
+		now := Now()
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO NOTHING`, openAICacheDiagnosticsMigrationMarker, "1", now); err != nil {
+			return err
+		}
+	}
 	return s.migrateStoredContextCompression(ctx)
+}
+
+// backfillOpenAICacheDiagnostics repairs already-durable Codex/OpenAI rows whose
+// raw usage contains input_tokens_details.cached_tokens.  It is deliberately
+// bounded and restartable; the marker is written only after all batches commit.
+func (s *Store) backfillOpenAICacheDiagnostics(ctx context.Context) error {
+	const batchSize = 500
+	type row struct {
+		id                                                    int64
+		model, provider, source, capability, missReason, raw  string
+		prompt, cached, cacheRead, cacheCreation, maxPossible int64
+		cacheReadPresent, cacheCreationPresent, estimated     int
+	}
+	var afterID int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rows, err := s.rdb.QueryContext(ctx, `
+SELECT id,model,usage_provider,usage_source,cache_capability,diagnostics_miss_reason,raw_usage_json,
+       prompt_tokens,cached_tokens,cache_read_tokens,cache_creation_tokens,max_possible_cache_read_tokens,
+       cache_read_present,cache_creation_present,estimated
+FROM usage_records
+WHERE id>? AND (lower(trim(usage_provider)) IN ('codex','openai')
+  OR raw_usage_json LIKE '%"input_tokens_details"%' OR raw_usage_json LIKE '%"prompt_tokens_details"%')
+  AND (cache_read_present=0 OR cache_capability='' OR cache_capability='unknown'
+       OR max_possible_cache_read_tokens=0
+       OR (diagnostics_miss_reason='' AND cached_tokens=0 AND cache_read_tokens=0))
+ORDER BY id LIMIT ?`, afterID, batchSize)
+		if err != nil {
+			return err
+		}
+		items := make([]row, 0, batchSize)
+		for rows.Next() {
+			var item row
+			if err = rows.Scan(&item.id, &item.model, &item.provider, &item.source, &item.capability, &item.missReason, &item.raw,
+				&item.prompt, &item.cached, &item.cacheRead, &item.cacheCreation, &item.maxPossible,
+				&item.cacheReadPresent, &item.cacheCreationPresent, &item.estimated); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			afterID = item.id
+			items = append(items, item)
+		}
+		if err = rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err = rows.Close(); err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			return nil
+		}
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		for _, item := range items {
+			diag := finalizeUsageDiagnostics(item.model, item.prompt, item.cached, item.cacheRead, item.cacheCreation,
+				json.RawMessage(item.raw), UsageDiagnostics{
+					UsageProvider: item.provider, UsageSource: item.source, CacheCapability: item.capability,
+					DiagnosticsMissReason: item.missReason, MaxPossibleCacheReadTokens: item.maxPossible,
+					CacheReadPresent: item.cacheReadPresent != 0, CacheCreationPresent: item.cacheCreationPresent != 0,
+					Estimated: item.estimated != 0,
+				})
+			if _, err = tx.ExecContext(ctx, `UPDATE usage_records SET cache_read_present=?,cache_creation_present=?,
+cache_capability=?,cache_miss_tokens=?,cache_total_input_tokens=?,max_possible_cache_read_tokens=?,diagnostics_miss_reason=? WHERE id=?`,
+				boolInt(diag.CacheReadPresent), boolInt(diag.CacheCreationPresent), diag.CacheCapability,
+				diag.CacheMissTokens, diag.CacheTotalInputTokens, diag.MaxPossibleCacheReadTokens, diag.DiagnosticsMissReason, item.id); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+		if len(items) < batchSize {
+			return nil
+		}
+	}
 }
 
 func (s *Store) backfillUsageCacheDiagnostics(ctx context.Context) error {

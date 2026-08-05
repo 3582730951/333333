@@ -131,7 +131,13 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	if err := h.store.SettleBillingHold(ctx, holdID, "failed_upstream"); err != nil {
 		t.Fatal(err)
 	}
-	h.app.recordRouteAttempt("req-diagnostic", 2, "account_pool_group:cyber", "fair", "upstream_503", "account_pool_group:standby")
+	h.app.recordRouteAttempt("req-diagnostic", 2, "account_pool_group:cyber", "fair", "upstream_cyber_policy", "user_group:ug-secret-runtime", diagnosticRouteDetail{
+		TerminalErrorClass:            "cyber_policy",
+		EffectiveStatus:               http.StatusBadRequest,
+		SuperInstructClientChoice:     "disabled",
+		SuperInstructEffectiveModules: "none",
+		UserGroupID:                   "ug-secret-runtime",
+	})
 	h.app.recordProviderAttempt("req-diagnostic", account.ID, "antigravity", "inference", http.StatusServiceUnavailable, "transient_resource_exhausted", "sha256:0123456789abcdef", "2")
 	h.app.recordHTTPRequest("REQ-89C6735FD8ABC561", http.MethodGet, "admin.email-pool", http.StatusOK, 0, 84, 12*time.Millisecond)
 	h.app.recordBodyStorageRejection(&bodysource.BodyStorageError{Class: bodysource.BodyStorageDiskReserve, Cause: bodysource.ErrDiskReserve})
@@ -272,10 +278,13 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	}
 
 	routeCSV := files["route_attempts.csv"]
-	for _, want := range []string{"request_id,tier,target,selection_type,status_class,fallback_target,created_at", "req-diagnostic", "account_pool_group:cyber", "upstream_503", "account_pool_group:standby"} {
+	for _, want := range []string{"request_id,tier,target,selection_type,status_class,fallback_target,terminal_error_class,effective_status,super_instruct_client_choice,super_instruct_effective_modules,user_group_alias,created_at", "req-diagnostic", "account_pool_group:cyber", "upstream_cyber_policy", "user_group:UG-", "cyber_policy,400,disabled,none,UG-"} {
 		if !strings.Contains(routeCSV, want) {
 			t.Fatalf("route_attempts.csv missing %q:\n%s", want, routeCSV)
 		}
+	}
+	if strings.Contains(routeCSV, "ug-secret-runtime") {
+		t.Fatalf("route_attempts.csv leaked raw user-group id:\n%s", routeCSV)
 	}
 	providerCSV := files["provider_attempts.csv"]
 	for _, want := range []string{"request_id,account_code,provider,phase,status,error_class,body_hash,retry_after,created_at", "req-diagnostic", accountAlias, "antigravity", "transient_resource_exhausted", "sha256:0123456789abcdef"} {

@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/datadir"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
@@ -111,6 +112,13 @@ func (s *Server) startDiskGuard(ctx context.Context) {
 }
 
 func (s *Server) runDiskGuard(ctx context.Context) {
+	policyMigration, policyMigrationErr := s.store.MigrateGoalPolicyDefaults(ctx,
+		s.cfg.GoalStorageMaxMB, config.LegacyDefaultGoalStorageMaxMB, config.DefaultGoalStorageMaxMB,
+		s.cfg.GoalLegacyJournalDualWrite)
+	if policyMigrationErr == nil && (policyMigration.StorageDefaultUpgraded || policyMigration.LegacyDualWriteDisabled) {
+		log.Printf("[GOAL-CONTINUITY] migrated inherited defaults storage_1gib=%t legacy_dual_write_disabled=%t",
+			policyMigration.StorageDefaultUpgraded, policyMigration.LegacyDualWriteDisabled)
+	}
 	previous := s.diskGuardSnapshot()
 	probes, probeCodes := s.probeDiskFilesystems(previous.Level)
 	snap := DiskGuardSnapshot{
@@ -131,6 +139,9 @@ func (s *Server) runDiskGuard(ctx context.Context) {
 	snap.Filesystems, snap.Level, snap.FreePercent, snap.FreeBytes = summarizeFilesystemProbes(probes)
 	if len(probeCodes) > 0 {
 		snap.LastError = strings.Join(probeCodes, ",")
+	}
+	if policyMigrationErr != nil {
+		snap.LastError = appendDiskGuardCode(snap.LastError, "goal_policy_default_migration_failed")
 	}
 	if snap.Level == "unknown" && previous.Level != "" {
 		snap.Level = previous.Level

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/bodysource"
+	"codex-account-pool/internal/config"
 	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
@@ -97,9 +98,17 @@ func (s *Server) goalRetention(ctx context.Context) time.Duration {
 }
 
 func (s *Server) goalStorageMaxBytes(ctx context.Context) int64 {
+	_, explicitRuntime := s.runtimeSetting(ctx, "goal_storage_max_mb")
 	mb := s.settingInt(ctx, "goal_storage_max_mb", s.cfg.GoalStorageMaxMB)
 	if mb <= 0 {
-		mb = 256
+		mb = config.DefaultGoalStorageMaxMB
+	}
+	// The disk-guard startup migration persists this override and audit marker.
+	// Keep admission race-free during the few milliseconds before that worker's
+	// first pass: inherited legacy bootstrap defaults get the new floor, while an
+	// explicit runtime value (including 256) remains authoritative.
+	if !explicitRuntime && mb == config.LegacyDefaultGoalStorageMaxMB {
+		mb = config.DefaultGoalStorageMaxMB
 	}
 	return int64(mb) << 20
 }

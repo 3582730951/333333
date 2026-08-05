@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -123,6 +124,10 @@ func TestUserGroupModelInstructionsFilesBecomeResponsesInstructions(t *testing.T
 
 func TestSuperInstructSkillsBecomeResponsesInstructions(t *testing.T) {
 	dir := t.TempDir()
+	bridgePath := dir + "/bridge.md"
+	if err := os.WriteFile(bridgePath, []byte("Super-Instruct Codex 5.6"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	writeAPISuperSkill(t, dir, "anti-debug", `---
 name: anti-debug
 description: Anti debug workflow
@@ -134,8 +139,9 @@ name: rei-fallback
 description: Fallback workflow
 ---
 # Rei
-REI DIRECTIVE MUST NOT LOAD`)
+	REI DIRECTIVE MUST NOT LOAD`)
 	t.Setenv("CODEX_POOL_SUPER_INSTRUCT_DIR", dir)
+	t.Setenv("CODEX_POOL_SUPER_INSTRUCT_BRIDGE_FILE", bridgePath)
 
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -279,6 +285,178 @@ func TestSuperInstructRequiresUserGroupAndExplicitClientOptIn(t *testing.T) {
 	}
 }
 
+func TestSuperInstructUserGroupAndClientHeaderGateEndToEnd(t *testing.T) {
+	const (
+		bridgeMarker = "END TO END GATE BRIDGE MARKER"
+		skillMarker  = "END TO END GATE SKILL MARKER"
+		clientMarker = "END TO END CLIENT BASE MARKER"
+	)
+	dir := t.TempDir()
+	writeAPISuperSkill(t, dir, "gate-skill", `---
+name: gate-skill
+description: End-to-end gate fixture
+---
+# Gate Skill
+`+skillMarker)
+	bridgePath := dir + "/bridge.md"
+	if err := os.WriteFile(bridgePath, []byte(bridgeMarker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_POOL_SUPER_INSTRUCT_DIR", dir)
+	t.Setenv("CODEX_POOL_SUPER_INSTRUCT_BRIDGE_FILE", bridgePath)
+
+	var upstreamCalls int
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		upstreamCalls++
+		text := "I can" + "'t assist with that request to bypass license activation."
+		if strings.Contains(string(raw), "memory-probe") {
+			text = "This successful reverse engineering response is deliberately longer than fifty bytes so only an enabled M5 pipeline records it."
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":          fmt.Sprintf("resp-gate-%d", upstreamCalls),
+			"object":      "response",
+			"status":      "completed",
+			"model":       "gpt-5.6-sol",
+			"output_text": text,
+			"output": []map[string]interface{}{{
+				"id":     fmt.Sprintf("msg-gate-%d", upstreamCalls),
+				"type":   "message",
+				"status": "completed",
+				"role":   "assistant",
+				"content": []map[string]interface{}{{
+					"type": "output_text", "text": text,
+				}},
+			}},
+		})
+	})
+	enableCodexSessionMappingForTest(h)
+
+	enabledKey := createTestAPIKeyForUserGroup(t, h, "si-gate-enabled", map[string]interface{}{
+		"super_instruct_enabled":                  true,
+		"super_instruct_skill_ids":                []string{"gate-skill"},
+		"super_instruct_response_rewrite_enabled": true,
+		"super_instruct_memory_enabled":           true,
+		"super_instruct_monitor_enabled":          true,
+	})
+	disabledKey := createTestAPIKeyForUserGroup(t, h, "si-gate-disabled", map[string]interface{}{
+		"super_instruct_enabled":                  false,
+		"super_instruct_response_rewrite_enabled": false,
+		"super_instruct_memory_enabled":           false,
+		"super_instruct_monitor_enabled":          false,
+	})
+	for _, account := range []struct {
+		group string
+		label string
+	}{
+		{group: "si-gate-enabled", label: "si-gate-enabled"},
+		{group: "si-gate-disabled", label: "si-gate-disabled"},
+	} {
+		accountID := h.importAccount(t, account.label, "up-"+account.label, "access-"+account.label)
+		if code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+accountID+"/group", `{"group":"`+account.group+`"}`); code != http.StatusOK {
+			t.Fatalf("assign %s group = %d: %s", account.label, code, raw)
+		}
+		setTestCapability(t, h, accountID, "gpt-5.6-sol", 272000)
+	}
+
+	groups := []struct {
+		name     string
+		key      string
+		entitled bool
+	}{
+		{name: "enabled-group", key: enabledKey, entitled: true},
+		{name: "disabled-group", key: disabledKey, entitled: false},
+	}
+	headers := []struct {
+		name  string
+		value string
+		set   bool
+	}{
+		{name: "enabled", value: "enabled", set: true},
+		{name: "disabled", value: "disabled", set: true},
+		{name: "missing"},
+	}
+
+	caseIndex := 0
+	for _, group := range groups {
+		for _, header := range headers {
+			caseIndex++
+			effective := group.entitled && header.set && header.value == "enabled"
+			for _, probe := range []string{"refusal-probe bypass license", "memory-probe reverse sample"} {
+				before := len(h.requests())
+				body, _ := json.Marshal(map[string]interface{}{
+					"model":        "gpt-5.6-sol",
+					"instructions": clientMarker,
+					"input":        probe,
+				})
+				req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", bytes.NewReader(body))
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("Authorization", "Bearer "+group.key)
+				req.Header.Set("Content-Type", "application/json")
+				session := fmt.Sprintf("si-gate-%d-%s", caseIndex, strings.SplitN(probe, "-", 2)[0])
+				req.Header.Set("Thread-Id", session)
+				req.Header.Set("Session-Id", session)
+				if header.set {
+					req.Header.Set(superInstructClientChoiceHeader, header.value)
+				}
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatalf("%s/%s/%s request: %v", group.name, header.name, probe, err)
+				}
+				responseBody, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("%s/%s/%s status=%d body=%s", group.name, header.name, probe, resp.StatusCode, responseBody)
+				}
+
+				captured := h.requests()
+				if len(captured) != before+1 {
+					t.Fatalf("%s/%s/%s upstream calls advanced %d -> %d", group.name, header.name, probe, before, len(captured))
+				}
+				upstreamBody := captured[len(captured)-1].Body
+				if effective {
+					for _, marker := range []string{bridgeMarker, skillMarker} {
+						if !strings.Contains(upstreamBody, marker) {
+							t.Fatalf("%s/%s/%s upstream missing %q: %s", group.name, header.name, probe, marker, upstreamBody)
+						}
+					}
+					if strings.Contains(upstreamBody, clientMarker) {
+						t.Fatalf("%s/%s/%s retained replaced client base: %s", group.name, header.name, probe, upstreamBody)
+					}
+				} else {
+					for _, marker := range []string{bridgeMarker, skillMarker} {
+						if strings.Contains(upstreamBody, marker) {
+							t.Fatalf("%s/%s/%s leaked %q upstream: %s", group.name, header.name, probe, marker, upstreamBody)
+						}
+					}
+					if !strings.Contains(upstreamBody, clientMarker) {
+						t.Fatalf("%s/%s/%s unexpectedly replaced the client base: %s", group.name, header.name, probe, upstreamBody)
+					}
+				}
+
+				rewritten := strings.Contains(string(responseBody), "Rei Protocol")
+				if strings.HasPrefix(probe, "refusal-probe") && rewritten != effective {
+					t.Fatalf("%s/%s M3 rewrite=%v, want %v; body=%s", group.name, header.name, rewritten, effective, responseBody)
+				}
+				if strings.HasPrefix(probe, "memory-probe") && !strings.Contains(string(responseBody), "successful reverse engineering response") {
+					t.Fatalf("%s/%s M5 probe response changed: %s", group.name, header.name, responseBody)
+				}
+			}
+		}
+	}
+
+	monitor, memory := waitForSuperInstructState(t, h, 2, 1)
+	if monitor.Stats.Total != 2 || monitor.Stats.Tamper != 1 || monitor.Stats.MemoryCount != 1 || len(monitor.History) != 2 {
+		t.Fatalf("only enabled-group/enabled-header may run M3/M6: %+v", monitor)
+	}
+	if memory.Stats.Total != 1 || len(memory.Successes) != 1 || !strings.Contains(memory.Successes[0].Result, "successful reverse engineering response") {
+		t.Fatalf("only enabled-group/enabled-header may run M5: %+v", memory)
+	}
+}
+
 func TestSuperInstructProfilesSelectSkillsByModelFamily(t *testing.T) {
 	dir := t.TempDir()
 	writeAPISuperSkill(t, dir, "gpt-skill", `---
@@ -353,6 +531,31 @@ func TestCodexInstructionPlanLocalM1ReplacesSystemCarriers(t *testing.T) {
 	}
 	if input[3].(map[string]interface{})["content"] != "keep" {
 		t.Fatalf("M1 changed non-system Codex Lite items: %s", got)
+	}
+}
+
+func TestCodexInstructionPlanLocalM1AddsCarrierToStringContinuation(t *testing.T) {
+	snapshot := encodeCodexInstructionSnapshot(codexInstructionSnapshotV2{
+		Bridge:        "SNAPSHOT BRIDGE",
+		GroupPrompt:   "SNAPSHOT GROUP PROMPT",
+		Administrator: "SNAPSHOT ADMINISTRATOR",
+		SuperInstruct: "SNAPSHOT SUPER SKILL",
+	})
+	plan := newCodexInstructionPlan(snapshot, "revision", "tree", "snapshot", true)
+	plan.LocalM1 = true
+	raw := []byte(`{"model":"gpt-5.6-sol","previous_response_id":"resp-root","input":"continue","opaque":900719925474099312345}`)
+	got := plan.apply(raw)
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(got, &root); err != nil {
+		t.Fatal(err)
+	}
+	want := joinInstructionParts("SNAPSHOT BRIDGE", "SNAPSHOT GROUP PROMPT", "SNAPSHOT ADMINISTRATOR", "SNAPSHOT SUPER SKILL")
+	var instructions string
+	if err := json.Unmarshal(root["instructions"], &instructions); err != nil || instructions != want {
+		t.Fatalf("string continuation instructions=%q want=%q err=%v body=%s", instructions, want, err, got)
+	}
+	if !bytes.Contains(got, []byte(`"opaque":900719925474099312345`)) || !bytes.Contains(got, []byte(`"previous_response_id":"resp-root"`)) {
+		t.Fatalf("M1 fallback changed unrelated continuation fields: %s", got)
 	}
 }
 
@@ -888,6 +1091,10 @@ func TestStrictCPAModelInstructionsAreTreeSnapshots(t *testing.T) {
 
 func TestStrictCPASuperInstructAndGroupPromptAreTreeSnapshots(t *testing.T) {
 	dir := t.TempDir()
+	bridgePath := dir + "/bridge.md"
+	if err := os.WriteFile(bridgePath, []byte("STRICT SNAPSHOT BRIDGE"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	writeAPISuperSkill(t, dir, "snapshot-skill", `---
 name: snapshot-skill
 description: Snapshot workflow
@@ -895,6 +1102,7 @@ description: Snapshot workflow
 # Snapshot Skill
 FIRST SUPER INSTRUCT DIRECTIVE`)
 	t.Setenv("CODEX_POOL_SUPER_INSTRUCT_DIR", dir)
+	t.Setenv("CODEX_POOL_SUPER_INSTRUCT_BRIDGE_FILE", bridgePath)
 
 	var captured []string
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {

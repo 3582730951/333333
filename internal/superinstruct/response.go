@@ -179,6 +179,15 @@ func ExtractUserSource(raw []byte) string {
 	if json.Unmarshal(raw, &data) != nil || data == nil {
 		return ""
 	}
+	// Responses accepts a plain string as its shortest input form. Treat it as
+	// the current user turn before falling back to the structured input/messages
+	// forms below; otherwise M5/M6 lose both the source text and its category.
+	if input, ok := data["input"].(string); ok {
+		if !isEnvContext(input) {
+			return input
+		}
+		return ""
+	}
 	items, ok := data["input"].([]interface{})
 	if !ok {
 		items, _ = data["messages"].([]interface{})

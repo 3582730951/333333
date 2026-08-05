@@ -70,6 +70,9 @@ func TestCodexConfigScript(t *testing.T) {
 		`model_reasoning_effort =`,
 		`approval_policy =`,
 		`sandbox_mode =`,
+		"super-instruct",
+		"super_instruct",
+		superInstructClientChoiceHeader,
 	} {
 		if strings.Contains(s, forbidden) {
 			t.Fatalf("Codex branch exceeded the requested configuration allowlist; found %q\n---\n%s", forbidden, s)
@@ -78,6 +81,43 @@ func TestCodexConfigScript(t *testing.T) {
 	// chat wire_api was removed upstream — never emit it.
 	if strings.Contains(s, `wire_api = "chat"`) {
 		t.Fatalf("script must not use the removed chat wire_api")
+	}
+}
+
+func TestCodexSetupScriptsPassBashSyntaxForEntitledAndUnentitledKeys(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	for _, codexOnly := range []bool{false, true} {
+		for _, entitled := range []bool{false, true} {
+			name := "combined"
+			if codexOnly {
+				name = "codex-only"
+			}
+			if entitled {
+				name += "-entitled"
+			} else {
+				name += "-unentitled"
+			}
+			t.Run(name, func(t *testing.T) {
+				policy := CodexSuperInstructInstallPolicy{}
+				if entitled {
+					policy = CodexSuperInstructInstallPolicy{
+						GroupName: "syntax-team", Assigned: true, Entitled: true,
+						Capabilities: "指令与分组 skills、响应改写、Memory、Monitor",
+					}
+				}
+				script := buildCodexConfigScript(
+					"https://pool.example", "cap_syntax", "gpt-5.6-sol", "", "", "",
+					CodexSetupScriptOptions{CodexOnly: codexOnly, SuperInstruct: policy},
+				)
+				cmd := exec.Command("bash", "-n")
+				cmd.Stdin = strings.NewReader(script)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("generated script syntax failed: %v\n%s\n--- script ---\n%s", err, output, script)
+				}
+			})
+		}
 	}
 }
 
@@ -114,6 +154,7 @@ func TestCodexOnlyConfigScriptEndpointContainsNoOtherInstallerBranches(t *testin
 		"select_client", "configure_claude", "gateway", "claude", "rtk",
 		"curl ", "models_cache.json", "pool-token", "pool-client-id",
 		"X-Pool-Client-ID", "mcp_servers", "plugins.",
+		"super-instruct", "super_instruct", "X-Pool-Super-Instruct", "skills",
 		`goals = true`, `model_reasoning_effort =`, `approval_policy =`, `sandbox_mode =`,
 	} {
 		if strings.Contains(strings.ToLower(script), strings.ToLower(forbidden)) {
@@ -159,7 +200,6 @@ func TestCodexConfigScriptCarriesReadOnlyUserGroupSuperInstructEntitlement(t *te
 	body, _ := io.ReadAll(resp.Body)
 	script := string(body)
 	for _, want := range []string{
-		"SUPER_INSTRUCT_ALLOWED=1",
 		"SUPER_INSTRUCT_GROUP='Codex 团队'",
 		"指令与 2 个分组 skills、响应改写、Memory、Monitor",
 		"POOL_SUPER_INSTRUCT=enabled|disabled",
@@ -227,7 +267,55 @@ func TestCodexOnlySuperInstructChoiceWritesExplicitProviderHeader(t *testing.T) 
 	}
 }
 
-func TestCodexOnlySuperInstructCannotExceedUserGroupEntitlement(t *testing.T) {
+func TestCombinedCodexHeaderRequiresEntitlementAndClientChoice(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	entitled := CodexSuperInstructInstallPolicy{
+		GroupName: "team-super", Assigned: true, Entitled: true,
+		Capabilities: "指令与分组允许的 skills",
+	}
+	for _, tc := range []struct {
+		name   string
+		policy CodexSuperInstructInstallPolicy
+		choice string
+		want   string
+	}{
+		{name: "unentitled ignores forced environment", choice: "enabled"},
+		{name: "entitled disabled", policy: entitled, choice: "disabled", want: `http_headers = { "X-Pool-Super-Instruct" = "disabled" }`},
+		{name: "entitled enabled", policy: entitled, choice: "enabled", want: `http_headers = { "X-Pool-Super-Instruct" = "enabled" }`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			script := buildCodexConfigScript(
+				"https://pool.example", "cap_combined", "gpt-5.6-sol", "", "", "",
+				CodexSetupScriptOptions{SuperInstruct: tc.policy},
+			)
+			path := filepath.Join(t.TempDir(), "setup.sh")
+			if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", path)
+			cmd.Env = append(os.Environ(), "CODEX_HOME="+home, "POOL_CLIENT=codex", "POOL_SUPER_INSTRUCT="+tc.choice)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("combined Codex setup failed: %v\n%s", err, output)
+			}
+			config, err := os.ReadFile(filepath.Join(home, "config.toml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.want == "" {
+				if strings.Contains(string(config), "http_headers") || strings.Contains(string(config), superInstructClientChoiceHeader) {
+					t.Fatalf("unentitled combined installer wrote a client-choice header:\n%s", config)
+				}
+			} else if strings.Count(string(config), tc.want) != 1 {
+				t.Fatalf("combined installer header mismatch; want %q\n---\n%s", tc.want, config)
+			}
+		})
+	}
+}
+
+func TestCodexOnlyUnentitledScriptHasNoSuperInstructSurface(t *testing.T) {
 	home := t.TempDir()
 	options := CodexSetupScriptOptions{
 		CodexOnly: true,
@@ -244,11 +332,23 @@ func TestCodexOnlySuperInstructCannotExceedUserGroupEntitlement(t *testing.T) {
 	cmd := exec.Command("bash", path)
 	cmd.Env = append(os.Environ(), "CODEX_HOME="+home, "POOL_SUPER_INSTRUCT=enabled")
 	output, err := cmd.CombinedOutput()
-	if err == nil || !strings.Contains(string(output), "用户分组未授权") {
-		t.Fatalf("unentitled enabled choice should fail clearly: err=%v output=%s", err, output)
+	if err != nil {
+		t.Fatalf("unentitled installer should silently force the absent header path: err=%v output=%s", err, output)
 	}
-	if _, statErr := os.Stat(filepath.Join(home, "config.toml")); !os.IsNotExist(statErr) {
-		t.Fatalf("rejected choice must not write Codex config: %v", statErr)
+	for _, leaked := range []string{
+		"team-standard", "该分组未为 Codex 启用 Super-Instruct", "Super-Instruct",
+		"SUPER_INSTRUCT", "POOL_SUPER_INSTRUCT", superInstructClientChoiceHeader, "skills",
+	} {
+		if strings.Contains(script, leaked) || strings.Contains(string(output), leaked) {
+			t.Fatalf("unentitled installer disclosed %q\n--- script ---\n%s\n--- output ---\n%s", leaked, script, output)
+		}
+	}
+	config, readErr := os.ReadFile(filepath.Join(home, "config.toml"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Contains(string(config), "http_headers") || strings.Contains(string(config), superInstructClientChoiceHeader) {
+		t.Fatalf("unentitled installer must omit the client-choice header entirely:\n%s", config)
 	}
 }
 
@@ -327,6 +427,54 @@ base_url = "https://client.invalid/v1"
 	if strings.Contains(got, "client-model") || strings.Contains(got, `model_provider = "client-provider"`) ||
 		strings.Contains(got, "stale pool") || strings.Count(got, "[model_providers.poolserver]") != 1 {
 		t.Fatalf("stale Pool provider table survived merge:\n%s", got)
+	}
+}
+
+func TestCodexOnlyConfigMergeRemovesOnlyLegacyPoolInstructionsBinding(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, "config.toml")
+	existing := `model = "old"
+model_provider = "old"
+model_instructions_file = "/root/.codex/gpt-5.6-sol-unrestricted-v42.md" # old Pool binding
+personality = "pragmatic"
+
+[features]
+skills = true
+
+[model_providers.client]
+name = "client provider"
+`
+	if err := os.WriteFile(configPath, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runCodexSetupScript(t, home, buildCodexConfigScript(
+		"https://pool.example", "cap_cleanup", "gpt-5.6-sol", "", "", "",
+		CodexSetupScriptOptions{CodexOnly: true},
+	))
+	gotBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(gotBytes)
+	if strings.Contains(got, "gpt-5.6-sol-unrestricted-v42.md") || strings.Contains(got, "model_instructions_file") {
+		t.Fatalf("legacy Pool instructions binding survived merge:\n%s", got)
+	}
+	for _, preserved := range []string{
+		`personality = "pragmatic"`,
+		"[features]\nskills = true",
+		"[model_providers.client]\nname = \"client provider\"",
+	} {
+		if !strings.Contains(got, preserved) {
+			t.Fatalf("unrelated client setting disappeared: missing %q\n---\n%s", preserved, got)
+		}
+	}
+	backups, err := filepath.Glob(configPath + ".bak.*")
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("expected one rollback backup, backups=%v err=%v", backups, err)
+	}
+	backup, err := os.ReadFile(backups[0])
+	if err != nil || !strings.Contains(string(backup), "gpt-5.6-sol-unrestricted-v42.md") {
+		t.Fatalf("backup did not preserve the pre-merge binding: err=%v backup=%s", err, backup)
 	}
 }
 

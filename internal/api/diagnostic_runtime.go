@@ -39,13 +39,30 @@ type diagnosticRuntime struct {
 }
 
 type diagnosticRouteAttempt struct {
-	RequestID      string
-	Tier           int
-	Target         string
-	SelectionType  string
-	StatusClass    string
-	FallbackTarget string
-	CreatedAt      int64
+	RequestID                     string
+	Tier                          int
+	Target                        string
+	SelectionType                 string
+	StatusClass                   string
+	FallbackTarget                string
+	TerminalErrorClass            string
+	EffectiveStatus               int
+	SuperInstructClientChoice     string
+	SuperInstructEffectiveModules string
+	UserGroupID                   string
+	CreatedAt                     int64
+}
+
+// diagnosticRouteDetail is a closed, metadata-only vocabulary for the extra
+// request policy and semantic-terminal facts needed to diagnose an HTTP-200 SSE
+// failure. Raw headers, error messages, prompts, and user-group IDs never leave
+// the runtime recorder; the exporter HMAC-aliases UserGroupID.
+type diagnosticRouteDetail struct {
+	TerminalErrorClass            string
+	EffectiveStatus               int
+	SuperInstructClientChoice     string
+	SuperInstructEffectiveModules string
+	UserGroupID                   string
 }
 
 type diagnosticProviderAttempt struct {
@@ -131,15 +148,23 @@ func snapshotBounded[T any](rows []T, head int) []T {
 // recordRouteAttempt records one UserGroup target decision or result. Callers
 // pass only route metadata: request bodies, prompts, and raw affinity keys never
 // enter this recorder.
-func (s *Server) recordRouteAttempt(requestID string, tier int, target, selectionType, statusClass, fallbackTarget string) {
+func (s *Server) recordRouteAttempt(requestID string, tier int, target, selectionType, statusClass, fallbackTarget string, details ...diagnosticRouteDetail) {
 	if s == nil {
 		return
+	}
+	var detail diagnosticRouteDetail
+	if len(details) > 0 {
+		detail = details[0]
 	}
 	row := diagnosticRouteAttempt{
 		RequestID: strings.TrimSpace(requestID), Tier: tier,
 		Target: strings.TrimSpace(target), SelectionType: strings.TrimSpace(selectionType),
 		StatusClass: strings.TrimSpace(statusClass), FallbackTarget: strings.TrimSpace(fallbackTarget),
-		CreatedAt: storage.Now(),
+		TerminalErrorClass: strings.TrimSpace(detail.TerminalErrorClass), EffectiveStatus: detail.EffectiveStatus,
+		SuperInstructClientChoice:     strings.TrimSpace(detail.SuperInstructClientChoice),
+		SuperInstructEffectiveModules: strings.TrimSpace(detail.SuperInstructEffectiveModules),
+		UserGroupID:                   strings.TrimSpace(detail.UserGroupID),
+		CreatedAt:                     storage.Now(),
 	}
 	s.diagnostics.mu.Lock()
 	s.diagnostics.routeAttempts = appendBounded(s.diagnostics.routeAttempts, &s.diagnostics.routeAttemptHead, row)
@@ -219,15 +244,35 @@ func (s *Server) recordBodyStorageRejection(err error) {
 	}
 }
 
-func routeAttemptRows(rows []diagnosticRouteAttempt) [][]string {
+func routeAttemptRows(rows []diagnosticRouteAttempt, codebook diagnosticCodebook) [][]string {
 	out := make([][]string, 0, len(rows))
 	for _, row := range rows {
+		userGroupAlias := ""
+		if strings.TrimSpace(row.UserGroupID) != "" {
+			userGroupAlias = diagnosticAlias(codebook.aliasKey, "UG", "user-group", row.UserGroupID)
+		}
 		out = append(out, []string{
-			row.RequestID, strconv.Itoa(row.Tier), row.Target, row.SelectionType,
-			row.StatusClass, row.FallbackTarget, strconv.FormatInt(row.CreatedAt, 10),
+			row.RequestID, strconv.Itoa(row.Tier), diagnosticRouteTarget(row.Target, codebook), row.SelectionType,
+			row.StatusClass, diagnosticRouteTarget(row.FallbackTarget, codebook), row.TerminalErrorClass,
+			strconv.Itoa(row.EffectiveStatus), row.SuperInstructClientChoice,
+			row.SuperInstructEffectiveModules, userGroupAlias,
+			strconv.FormatInt(row.CreatedAt, 10),
 		})
 	}
 	return out
+}
+
+func diagnosticRouteTarget(target string, codebook diagnosticCodebook) string {
+	target = strings.TrimSpace(target)
+	const userGroupPrefix = "user_group:"
+	if !strings.HasPrefix(target, userGroupPrefix) {
+		return target
+	}
+	rawID := strings.TrimSpace(strings.TrimPrefix(target, userGroupPrefix))
+	if rawID == "" {
+		return userGroupPrefix
+	}
+	return userGroupPrefix + diagnosticAlias(codebook.aliasKey, "UG", "user-group", rawID)
 }
 
 func providerAttemptRows(rows []diagnosticProviderAttempt, codebook diagnosticCodebook) [][]string {

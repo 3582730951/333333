@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/bodysource"
+	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
@@ -612,8 +613,15 @@ func (s *Server) dispatchUserGroupTrafficFallback(
 		}
 
 		status := attempt.Status()
+		if _, terminalFailure := attempt.TerminalFailure(); terminalFailure {
+			detail := userGroupRouteDiagnosticDetail(r, resolvedRaw, fallback.UserGroupID, attempt)
+			s.recordRouteAttempt(requestIDFromContext(r.Context()), -1, "user_group:"+fallback.UserGroupID, "traffic_fallback", userGroupRouteStatusClass(attempt), "", detail)
+			attempt.Commit()
+			return true
+		}
 		if status < http.StatusBadRequest || attempt.Committed() {
-			s.recordRouteAttempt(requestIDFromContext(r.Context()), -1, "user_group:"+fallback.UserGroupID, "traffic_fallback", "success", "")
+			detail := userGroupRouteDiagnosticDetail(r, resolvedRaw, fallback.UserGroupID, attempt)
+			s.recordRouteAttempt(requestIDFromContext(r.Context()), -1, "user_group:"+fallback.UserGroupID, "traffic_fallback", "success", "", detail)
 			attempt.Commit()
 			return true
 		}
@@ -622,7 +630,8 @@ func (s *Server) dispatchUserGroupTrafficFallback(
 		if retryable && index+1 < len(candidates) {
 			next = "user_group:" + candidates[index+1].UserGroupID
 		}
-		s.recordRouteAttempt(requestIDFromContext(r.Context()), -1, "user_group:"+fallback.UserGroupID, "traffic_fallback", userGroupRouteStatusClass(attempt), next)
+		detail := userGroupRouteDiagnosticDetail(r, resolvedRaw, fallback.UserGroupID, attempt)
+		s.recordRouteAttempt(requestIDFromContext(r.Context()), -1, "user_group:"+fallback.UserGroupID, "traffic_fallback", userGroupRouteStatusClass(attempt), next, detail)
 		if !retryable {
 			attempt.Commit()
 			return true
@@ -774,6 +783,12 @@ retryUserGroupRoute:
 			}
 		}
 		status := attempt.Status()
+		if _, terminalFailure := attempt.TerminalFailure(); terminalFailure {
+			detail := userGroupRouteDiagnosticDetail(r, resolvedRaw, pol.UserGroupID, attempt)
+			s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, userGroupRouteStatusClass(attempt), "", detail)
+			attempt.Commit()
+			return true
+		}
 		if status < http.StatusBadRequest {
 			// The client may close immediately after receiving the terminal frame.
 			// Route/response bindings are durability work for the *next* turn, so
@@ -816,12 +831,14 @@ retryUserGroupRoute:
 				}
 			}
 			bindingCancel()
-			s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, "success", "")
+			detail := userGroupRouteDiagnosticDetail(r, resolvedRaw, pol.UserGroupID, attempt)
+			s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, "success", "", detail)
 			attempt.Commit()
 			return true
 		}
 		if attempt.Committed() {
-			s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, userGroupRouteStatusClass(attempt), "")
+			detail := userGroupRouteDiagnosticDetail(r, resolvedRaw, pol.UserGroupID, attempt)
+			s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, userGroupRouteStatusClass(attempt), "", detail)
 			_ = attempt.Close()
 			return true
 		}
@@ -840,7 +857,8 @@ retryUserGroupRoute:
 		if moreUnits && retryable && replaySafe {
 			fallbackName = userGroupTargetDiagnosticName(units[index+1].Targets[0])
 		}
-		s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, userGroupRouteStatusClass(attempt), fallbackName)
+		detail := userGroupRouteDiagnosticDetail(r, resolvedRaw, pol.UserGroupID, attempt)
+		s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, userGroupRouteStatusClass(attempt), fallbackName, detail)
 		if !moreUnits || !replaySafe || !retryable {
 			if !moreUnits && replaySafe && retryable {
 				if s.dispatchUserGroupTrafficFallback(w, r, originalRaw, resolvedRaw, pol, dispatch) {
@@ -950,7 +968,56 @@ func userGroupTargetDiagnosticName(target storage.TargetRef) string {
 	return target.Kind + ":" + target.ID
 }
 
+func userGroupRouteDiagnosticDetail(r *http.Request, resolvedRaw []byte, userGroupID string, attempt *userGroupAttemptWriter) diagnosticRouteDetail {
+	detail := diagnosticRouteDetail{
+		TerminalErrorClass:            "none",
+		EffectiveStatus:               attempt.Status(),
+		SuperInstructClientChoice:     superInstructClientChoiceClass(r),
+		SuperInstructEffectiveModules: "none",
+		UserGroupID:                   strings.TrimSpace(userGroupID),
+	}
+	if r != nil {
+		detail.SuperInstructEffectiveModules = superInstructEffectiveModules(requestUserGroupPolicy(r.Context()), routing.Model(resolvedRaw))
+	}
+	if failure, ok := attempt.TerminalFailure(); ok {
+		if failure.StatusCode > 0 {
+			detail.EffectiveStatus = failure.StatusCode
+		}
+		detail.TerminalErrorClass = safeTerminalErrorClass(failure)
+	}
+	return detail
+}
+
+func safeTerminalErrorClass(failure leakfilter.CodexFailureFrame) string {
+	switch failure.ErrorCode {
+	case "cyber_policy":
+		return "cyber_policy"
+	case string(leakfilter.ResponsesRequestErrorContextLengthExceeded):
+		return "context_length_exceeded"
+	}
+	if failure.ContextError != leakfilter.ResponsesContextErrorNone {
+		switch failure.ContextError {
+		case leakfilter.ResponsesContextErrorOrphanedToolOutput:
+			return "orphaned_tool_output"
+		case leakfilter.ResponsesContextErrorEncryptedFunctionOutput:
+			return "encrypted_function_output"
+		case leakfilter.ResponsesContextErrorPreviousResponseNotFound:
+			return "previous_response_not_found"
+		}
+	}
+	if failure.BuiltinRetryable {
+		return "retryable_terminal"
+	}
+	return "other_terminal"
+}
+
 func userGroupRouteStatusClass(attempt *userGroupAttemptWriter) string {
+	if failure, ok := attempt.TerminalFailure(); ok {
+		if failure.ErrorCode == "cyber_policy" {
+			return "upstream_cyber_policy"
+		}
+		return "upstream_terminal_failure"
+	}
 	status := attempt.Status()
 	if attempt.bodyErr != nil {
 		return "local_response_storage"
@@ -1035,6 +1102,7 @@ type userGroupAttemptWriter struct {
 	committed      bool
 	stream         bool
 	responses      *responsesRouteAliasTracker
+	terminal       *leakfilter.CodexFailureFrame
 }
 
 func newUserGroupAttemptWriter(ctx context.Context, downstream http.ResponseWriter, stream, trackResponses bool, options bodysource.CaptureOptions, speculative ...bool) *userGroupAttemptWriter {
@@ -1276,6 +1344,40 @@ func (w *userGroupAttemptWriter) CompletedResponseID() string {
 	return strings.TrimSpace(id)
 }
 
+func (w *userGroupAttemptWriter) TerminalFailure() (leakfilter.CodexFailureFrame, bool) {
+	if w == nil {
+		return leakfilter.CodexFailureFrame{}, false
+	}
+	if w.terminal != nil {
+		copy := *w.terminal
+		copy.Header = w.terminal.Header.Clone()
+		copy.Body = append([]byte(nil), w.terminal.Body...)
+		return copy, true
+	}
+	if w.responses == nil {
+		return leakfilter.CodexFailureFrame{}, false
+	}
+	return w.responses.TerminalFailure()
+}
+
+func (w *userGroupAttemptWriter) markCodexTerminalFailure(failure leakfilter.CodexFailureFrame) {
+	if w == nil {
+		return
+	}
+	copy := failure
+	copy.Header = failure.Header.Clone()
+	copy.Body = append([]byte(nil), failure.Body...)
+	w.terminal = &copy
+}
+
+func markUserGroupCodexTerminalFailure(w http.ResponseWriter, failure leakfilter.CodexFailureFrame) {
+	if marker, ok := w.(interface {
+		markCodexTerminalFailure(leakfilter.CodexFailureFrame)
+	}); ok {
+		marker.markCodexTerminalFailure(failure)
+	}
+}
+
 func (w *userGroupAttemptWriter) Commit() {
 	if w.committed {
 		return
@@ -1356,6 +1458,7 @@ type responsesRouteAliasTracker struct {
 	pending     []byte
 	createdID   string
 	completedID string
+	failure     *leakfilter.CodexFailureFrame
 }
 
 func (t *responsesRouteAliasTracker) Write(payload []byte) (int, error) {
@@ -1383,6 +1486,10 @@ func (t *responsesRouteAliasTracker) Finish() {
 }
 
 func (t *responsesRouteAliasTracker) observe(frame []byte) {
+	if failure, ok := leakfilter.ParseCodexFailureFrame(frame); ok {
+		copy := failure
+		t.failure = &copy
+	}
 	eventType, data := sseFrameEventData(frame)
 	if len(data) == 0 || bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
 		return
@@ -1411,6 +1518,20 @@ func (t *responsesRouteAliasTracker) observe(frame []byte) {
 
 func (t *responsesRouteAliasTracker) CompletedResponseID() string {
 	return strings.TrimSpace(t.completedID)
+}
+
+func (t *responsesRouteAliasTracker) TerminalFailure() (leakfilter.CodexFailureFrame, bool) {
+	if t == nil {
+		return leakfilter.CodexFailureFrame{}, false
+	}
+	t.Finish()
+	if t.failure == nil {
+		return leakfilter.CodexFailureFrame{}, false
+	}
+	copy := *t.failure
+	copy.Header = t.failure.Header.Clone()
+	copy.Body = append([]byte(nil), t.failure.Body...)
+	return copy, true
 }
 
 func retryableUserGroupTargetStatus(status int) bool {
