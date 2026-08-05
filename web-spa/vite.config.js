@@ -11,17 +11,6 @@ export default defineConfig({
     outDir: '../internal/console/dist',
     emptyOutDir: true,
     chunkSizeWarningLimit: 1500,
-    rollupOptions: {
-      output: {
-        manualChunks(id) {
-          if (!id.includes('node_modules')) return undefined;
-          if (id.includes('/react/') || id.includes('/react-dom/') || id.includes('/react-router-dom/') || id.includes('/scheduler/')) return 'vendor-react';
-          if (id.includes('/recharts/') || id.includes('/d3-')) return 'vendor-charts';
-          if (id.includes('/axios/')) return 'vendor-axios';
-          return undefined;
-        },
-      },
-    },
   },
   server: {
     port: 5188,

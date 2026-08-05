@@ -56,24 +56,22 @@ function Content({ children, className, ...props }) {
 export const Layout = Object.assign(LayoutRoot, { Header, Sider, Content });
 
 function NavItem({ item, selected, collapsed, onClick }) {
+  const groupLabelId = React.useId();
   if (item.items?.length) {
+    const label = <>{item.icon}<span className="pool-nav-text">{item.text}</span></>;
     return (
-      <div className="pool-nav-section">
-        <button
-          type="button"
-          className="pool-nav-group-label"
-          title={collapsed ? item.text : undefined}
-          onClick={() => onClick?.({ itemKey: item.itemKey, group: true })}
-        >
-          {item.icon}
-          <span className="pool-nav-text">{item.text}</span>
-        </button>
-        <div className="pool-nav-children">
+      <section className="pool-nav-section" aria-labelledby={groupLabelId}>
+        {collapsed ? (
+          <button id={groupLabelId} type="button" className="pool-nav-group-label" title={item.text} onClick={() => onClick?.({ itemKey: item.itemKey, group: true })}>
+            {label}
+          </button>
+        ) : <h2 id={groupLabelId} className="pool-nav-group-label pool-nav-group-label--static">{label}</h2>}
+        <div className="pool-nav-children" role="group" aria-labelledby={groupLabelId}>
           {item.items.map((child) => (
             <NavItem key={child.itemKey} item={child} selected={selected} collapsed={collapsed} onClick={onClick} />
           ))}
         </div>
-      </div>
+      </section>
     );
   }
   const current = selected.includes(item.itemKey);

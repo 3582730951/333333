@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -588,6 +589,242 @@ func goalEncryptedPayloadBytes(t *testing.T, store *Store) int64 {
 		t.Fatal(err)
 	}
 	return stored
+}
+
+func goalPressurePayload(seed uint32, size int) string {
+	raw := make([]byte, size)
+	for index := range raw {
+		seed = seed*1664525 + 1013904223
+		raw[index] = byte(seed >> 24)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func TestGoalStoragePressureReclaimsColdGoalsAndRetriesCurrentCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var cold []GoalSession
+	for index := 0; index < 3; index++ {
+		payload := goalPressurePayload(uint32(index+1), 80<<10)
+		turn := goalTurnForTest(fmt.Sprintf("pressure-cold-%d", index), fmt.Sprintf("pressure-cold-response-%d", index), payload, payload)
+		turn.DownstreamKeyHash = fmt.Sprintf("pressure-cold-key-%d", index)
+		turn.WorkspaceHash = fmt.Sprintf("pressure-cold-workspace-%d", index)
+		turn.InitialGoalHash = fmt.Sprintf("pressure-cold-initial-%d", index)
+		goal, commitErr := store.CommitGoalTurn(ctx, turn)
+		if commitErr != nil {
+			t.Fatal(commitErr)
+		}
+		if _, updateErr := store.DB().ExecContext(ctx, `UPDATE goal_session SET state='completed',updated_at=? WHERE id=?`, Now()-100-int64(index), goal.ID); updateErr != nil {
+			t.Fatal(updateErr)
+		}
+		cold = append(cold, goal)
+	}
+
+	current, err := store.CommitGoalTurn(ctx, goalTurnForTest("pressure-current", "pressure-current-r1", "current", "current-output"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.AcquireGoalRun(ctx, current.ID, "pressure-current-owner", "running", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	awaitingTurn := goalTurnForTest("pressure-awaiting", "pressure-awaiting-r1", "awaiting", "tool-call")
+	awaitingTurn.DownstreamKeyHash = "pressure-awaiting-key"
+	awaitingTurn.WorkspaceHash = "pressure-awaiting-workspace"
+	awaitingTurn.InitialGoalHash = "pressure-awaiting-initial"
+	awaitingTurn.AwaitingTool = true
+	awaiting, err := store.CommitGoalTurn(ctx, awaitingTurn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var currentBytes, awaitingBytes, used int64
+	if err = store.DB().QueryRowContext(ctx, `SELECT storage_bytes FROM goal_session WHERE id=?`, current.ID).Scan(&currentBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.DB().QueryRowContext(ctx, `SELECT storage_bytes FROM goal_session WHERE id=?`, awaiting.ID).Scan(&awaitingBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.DB().QueryRowContext(ctx, `SELECT SUM(storage_bytes) FROM goal_session`).Scan(&used); err != nil {
+		t.Fatal(err)
+	}
+
+	appendTurn := goalTurnForTest("pressure-current", "pressure-current-r2", goalPressurePayload(99, 96<<10), "continued-checkpoint")
+	appendTurn.StorageMaxBytes = used + 1
+	_, err = store.CommitGoalTurn(ctx, appendTurn)
+	var probe *GoalStorageBudgetError
+	if !errors.As(err, &probe) || probe.AdditionalBytes <= 0 || probe.GoalID != current.ID {
+		t.Fatalf("budget probe error=%v structured=%+v, want current goal %s", err, probe, current.ID)
+	}
+
+	// The hard limit is intentionally tiny: it fits the protected current goal,
+	// awaiting-tool goal, and one more current checkpoint, but not the three cold
+	// goals. This reproduces a saturated store without increasing its configured cap.
+	appendTurn.StorageMaxBytes = currentBytes + awaitingBytes + probe.AdditionalBytes + 1024
+	_, err = store.CommitGoalTurn(ctx, appendTurn)
+	var budget *GoalStorageBudgetError
+	if !errors.As(err, &budget) || budget.GoalID != current.ID {
+		t.Fatalf("pressure commit error=%v structured=%+v", err, budget)
+	}
+	reclaimed, err := store.ReclaimGoalStorageHeadroom(ctx, budget.ReclaimTarget(), budget.GoalID, 16)
+	if err != nil || !reclaimed.Progressed || reclaimed.Goals != int64(len(cold)) {
+		t.Fatalf("bounded reclaim=%+v err=%v, want %d cold goals", reclaimed, err, len(cold))
+	}
+	continued, err := store.CommitGoalTurn(ctx, appendTurn)
+	if err != nil || continued.ID != current.ID {
+		t.Fatalf("current checkpoint retry goal=%+v err=%v, want %s", continued, err, current.ID)
+	}
+	for _, old := range cold {
+		if _, err = store.GetGoalSession(ctx, old.ID); !errors.Is(err, ErrGoalNotFound) {
+			t.Fatalf("cold goal %s remained visible after reclaim: %v", old.ID, err)
+		}
+	}
+	if _, err = store.GetGoalSession(ctx, current.ID); err != nil {
+		t.Fatalf("protected live current goal was reclaimed: %v", err)
+	}
+	if got, getErr := store.GetGoalSession(ctx, awaiting.ID); getErr != nil || got.State != "awaiting_tool_result" {
+		t.Fatalf("awaiting-tool goal=%+v err=%v", got, getErr)
+	}
+	replay, _, err := store.BuildGoalReplay(ctx, current.ID)
+	if err != nil || !strings.Contains(string(replay), "continued-checkpoint") {
+		t.Fatalf("continued checkpoint was not durable replay=%s err=%v", replay, err)
+	}
+}
+
+func TestGoalStorageTargetReservesCapacityForExistingGoal(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.CommitGoalTurn(ctx, goalTurnForTest("reserve-current", "reserve-r1", "first", "first-output"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	used := goalEncryptedPayloadBytes(t, store)
+	newGoal := goalTurnForTest("reserve-new", "reserve-new-r1", goalPressurePayload(7, 16<<10), "new-output")
+	newGoal.DownstreamKeyHash = "reserve-new-key"
+	newGoal.WorkspaceHash = "reserve-new-workspace"
+	newGoal.InitialGoalHash = "reserve-new-initial"
+	newGoal.StorageMaxBytes = used + 1<<20
+	newGoal.StorageTargetBytes = used + 1
+	_, err = store.CommitGoalTurn(ctx, newGoal)
+	var budget *GoalStorageBudgetError
+	if !errors.As(err, &budget) || budget.LimitBytes != newGoal.StorageTargetBytes || budget.GoalID != "" {
+		t.Fatalf("new-goal reserve error=%v structured=%+v", err, budget)
+	}
+	existing := goalTurnForTest("reserve-current", "reserve-r2", "second", "second-output")
+	existing.StorageMaxBytes = newGoal.StorageMaxBytes
+	existing.StorageTargetBytes = newGoal.StorageTargetBytes
+	updated, err := store.CommitGoalTurn(ctx, existing)
+	if err != nil || updated.ID != current.ID {
+		t.Fatalf("existing goal could not consume reserved capacity goal=%+v err=%v", updated, err)
+	}
+}
+
+func TestReclaimGoalStorageHeadroomStopsImmediatelyWithoutEligibleGoal(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	goal, err := store.CommitGoalTurn(ctx, goalTurnForTest("bounded-live", "bounded-live-r1", "live", "output"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.AcquireGoalRun(ctx, goal.ID, "bounded-live-owner", "running", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.ReclaimGoalStorageHeadroom(ctx, 0, goal.ID, 1_000_000)
+	if err != nil || result.Progressed || result.BytesFreed != 0 || result.Goals != 0 {
+		t.Fatalf("no-eligible bounded reclaim=%+v err=%v", result, err)
+	}
+}
+
+func TestGoalReplaySnapshotFenceRejectsConcurrentAppendWithoutLosingSegments(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	goal, err := store.CommitGoalTurn(ctx, goalTurnForTest("snapshot-race", "snapshot-r1", "first-marker", "first-output"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	middle := goalTurnForTest("snapshot-race", "snapshot-r2", "middle-marker", "middle-output")
+	if _, err = store.CommitGoalTurn(ctx, middle); err != nil {
+		t.Fatal(err)
+	}
+	staleReplay, _, version, err := store.BuildGoalReplaySnapshot(ctx, goal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	concurrent := goalTurnForTest("snapshot-race", "snapshot-r3", "concurrent-marker", "concurrent-output")
+	if _, err = store.CommitGoalTurn(ctx, concurrent); err != nil {
+		t.Fatal(err)
+	}
+	replacement := goalTurnForTest("snapshot-race", "snapshot-r4", "stale-replacement-marker", "stale-output")
+	replacement.ReplaceHistory = true
+	replacement.CheckpointPayload = string(staleReplay)
+	replacement.ExpectedCurrentCheckpoint = version.CurrentCheckpoint
+	replacement.ExpectedLastSegmentSequence = version.LastSegmentSequence
+	if _, err = store.CommitGoalTurn(ctx, replacement); !errors.Is(err, ErrGoalInProgress) {
+		t.Fatalf("stale exact replay commit error=%v, want %v", err, ErrGoalInProgress)
+	}
+	replay, _, err := store.BuildGoalReplay(ctx, goal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{"first-marker", "middle-marker", "concurrent-marker"} {
+		if !strings.Contains(string(replay), marker) {
+			t.Fatalf("concurrent CAS lost %s replay=%s", marker, replay)
+		}
+	}
+	if strings.Contains(string(replay), "stale-replacement-marker") {
+		t.Fatalf("rejected stale replacement mutated replay=%s", replay)
+	}
+
+	staleCheckpointReplay, _, checkpointVersion, err := store.BuildGoalReplaySnapshot(ctx, goal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpointConcurrent := goalTurnForTest("snapshot-race", "snapshot-r5", "checkpoint-concurrent-marker", "checkpoint-concurrent-output")
+	checkpointConcurrent.ReplaceHistory = true
+	checkpointConcurrent.CheckpointPayload = string(staleCheckpointReplay)
+	if _, err = store.CommitGoalTurn(ctx, checkpointConcurrent); err != nil {
+		t.Fatal(err)
+	}
+	staleCheckpoint := goalTurnForTest("snapshot-race", "snapshot-r6", "stale-checkpoint-marker", "stale-checkpoint-output")
+	staleCheckpoint.ReplaceHistory = true
+	staleCheckpoint.CheckpointPayload = string(staleCheckpointReplay)
+	staleCheckpoint.ExpectedCurrentCheckpoint = checkpointVersion.CurrentCheckpoint
+	staleCheckpoint.ExpectedLastSegmentSequence = checkpointVersion.LastSegmentSequence
+	if _, err = store.CommitGoalTurn(ctx, staleCheckpoint); !errors.Is(err, ErrGoalInProgress) {
+		t.Fatalf("stale checkpoint commit error=%v, want %v", err, ErrGoalInProgress)
+	}
+	replay, _, err = store.BuildGoalReplay(ctx, goal.ID)
+	if err != nil || !strings.Contains(string(replay), "checkpoint-concurrent-marker") || strings.Contains(string(replay), "stale-checkpoint-marker") {
+		t.Fatalf("checkpoint CAS replay=%s err=%v", replay, err)
+	}
 }
 
 func TestGoalStorageBudgetDefersInactiveReclaimToMaintenance(t *testing.T) {

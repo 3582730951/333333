@@ -118,9 +118,25 @@ resolve_db_path() {
 # operator choice (LISTEN_ADDR env or --listen-addr flag) always wins; otherwise we
 # bind all interfaces, keeping whatever port is already in use (default 8787).
 resolve_listen_addr() {
-  local a cur port
-  for a in "$@"; do
-    case "$a" in --listen-addr|--listen-addr=*) return 0 ;; esac
+  local cur port
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --listen-addr)
+        shift
+        [[ $# -gt 0 && -n "$1" && "$1" != -* ]] ||
+          die "--listen-addr requires a non-empty value"
+        LISTEN_ADDR="$1"
+        export LISTEN_ADDR
+        return 0
+        ;;
+      --listen-addr=*)
+        LISTEN_ADDR="${1#*=}"
+        [[ -n "$LISTEN_ADDR" ]] || die "--listen-addr requires a non-empty value"
+        export LISTEN_ADDR
+        return 0
+        ;;
+    esac
+    shift
   done
   if [[ -n "${LISTEN_ADDR:-}" ]]; then export LISTEN_ADDR; return 0; fi
   cur="$(discover_listen_from_systemd || true)"

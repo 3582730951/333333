@@ -4,6 +4,8 @@ import (
 	"codex-account-pool/internal/registry"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/thinking"
+	_ "codex-account-pool/internal/thinking/provider/claude"
+	_ "codex-account-pool/internal/thinking/provider/codex"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -18,12 +20,13 @@ import (
 //
 // On error, returns the original body (graceful degradation).
 func (c *Client) applyThinkingConfig(body []byte, provider, model string, account storage.Account) []byte {
-	if !c.cfg.ThinkingEnabled {
+	cfg := c.cfgSnapshot()
+	if !cfg.ThinkingEnabled {
 		return body
 	}
 
 	// 1. Resolve configuration from all sources
-	config := thinking.ResolveConfig(c.cfg, provider, model)
+	config := thinking.ResolveConfig(*cfg, provider, model)
 
 	// 2. Look up model information
 	modelInfo := registry.LookupModelInfo(model, provider)

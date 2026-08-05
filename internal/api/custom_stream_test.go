@@ -406,6 +406,46 @@ func TestChatStreamToResponsesSSEUsesBridgePlanForStableTools(t *testing.T) {
 	}
 }
 
+func TestChatStreamToResponsesSSEPreservesLegacyFunctionCall(t *testing.T) {
+	plan := prompt.NewResponsesToolBridgePlan()
+	alias := plan.EnsureChatName(prompt.ResponsesToolIdentity{Kind: prompt.ResponsesToolCustom, Name: "apply_patch"})
+	stream := "data: " + `{"id":"legacy-stream","choices":[{"delta":{"function_call":{"name":"` + alias + `","arguments":""}}}]}` + "\n\n" +
+		"data: " + `{"id":"legacy-stream","choices":[{"delta":{"function_call":{"arguments":"{\"input\":\"*** Begin Patch\"}"}},"finish_reason":"function_call"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	recorder := httptest.NewRecorder()
+	chatStreamToResponsesSSE(recorder, strings.NewReader(stream), "chat-model", streamrewrite.New(nil), plan)
+	got := recorder.Body.String()
+	for _, want := range []string{`"type":"custom_tool_call"`, `"name":"apply_patch"`, `"input":"*** Begin Patch"`, "response.completed"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("legacy streaming function call missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestChatStreamToAnthropicSSESerializesInterleavedTools(t *testing.T) {
+	stream := "data: " + `{"id":"parallel-tools","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"Bash","arguments":"{\"cmd\":\"ec"}}]}}]}` + "\n\n" +
+		"data: " + `{"id":"parallel-tools","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"Write","arguments":"{\"path\":\"a"}}]}}]}` + "\n\n" +
+		"data: " + `{"id":"parallel-tools","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ho\"}"}},{"index":1,"function":{"arguments":".txt\"}"}}]},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	recorder := httptest.NewRecorder()
+	chatStreamToAnthropicSSE(recorder, strings.NewReader(stream), "relay-model", streamrewrite.New(nil))
+	got := recorder.Body.String()
+	for _, want := range []string{`"name":"Bash"`, `"partial_json":"{\"cmd\":\"echo\"}"`, `"name":"Write"`, `"partial_json":"{\"path\":\"a.txt\"}"`, `"stop_reason":"tool_use"`, "event: message_stop"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("serialized tool stream missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Count(got, "event: content_block_start") != 2 || strings.Count(got, "event: content_block_stop") != 2 {
+		t.Fatalf("interleaved tools produced invalid block lifecycle:\n%s", got)
+	}
+	firstStart := strings.Index(got, `"name":"Bash"`)
+	firstStop := strings.Index(got, `event: content_block_stop`)
+	secondStart := strings.Index(got, `"name":"Write"`)
+	if firstStart < 0 || firstStop < firstStart || secondStart < firstStop {
+		t.Fatalf("tool blocks were not serialized contiguously:\n%s", got)
+	}
+}
+
 func TestChatStreamToResponsesSSEPreservesTerminalChatError(t *testing.T) {
 	stream := "data: " + `{"id":"chat-err","choices":[{"delta":{"role":"assistant","content":"partial"}}]}` + "\n\n" +
 		"data: " + `{"error":{"type":"api_error","message":"Kiro stream failed"}}` + "\n\n"

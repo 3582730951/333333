@@ -13,11 +13,11 @@ export default function ModelNameList({ endpoint, title, subtitle }: { endpoint:
   return <div>
     <PageHeader title={title} subtitle={subtitle} actions={null} />
     <LoadErrorBanner error={error} onRetry={reload} />
-    <div className="pool-panel" style={{ maxWidth: 760 }}>
-      {loading && models.length === 0 ? <div className="pool-muted">读取中...</div> : null}
-      {!loading && models.length === 0 ? <div className="pool-muted">暂无可用模型</div> : null}
-      <div style={{ display: 'grid', gap: 8 }}>
-        {models.map((model) => <div key={model} className="pool-mono" style={{ padding: '10px 12px', borderBottom: '1px solid var(--semi-color-border)' }}>{model}</div>)}
+    <div className="pool-panel pool-model-directory">
+      {loading && models.length === 0 ? <div className="pool-model-directory__state pool-muted">读取中...</div> : null}
+      {!loading && models.length === 0 ? <div className="pool-model-directory__state pool-muted">暂无可用模型</div> : null}
+      <div className="pool-model-directory__list">
+        {models.map((model) => <div key={model} className="pool-model-directory__item"><span aria-hidden="true" /><code>{model}</code></div>)}
       </div>
     </div>
   </div>;

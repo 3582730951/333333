@@ -4,6 +4,7 @@ import { IconCopy, IconDelete, IconEdit, IconGlobe, IconPlus, IconRefresh } from
 import PageHeader from '../components/PageHeader.jsx';
 import { del, get, post, put } from '../api.js';
 import { showErrorToast } from '../components/ErrorToast.jsx';
+import { openExternalURL } from '../lib/browserNavigation.js';
 import { writeClipboard } from '../lib/browserClipboard.js';
 
 const ROUTE_USER_GROUP = 'user_group';
@@ -269,7 +270,7 @@ export default function PublicChat() {
                 </div>
                 <div className="public-chat-row__actions">
                   <Button size="small" icon={<IconCopy />} onClick={() => copy(link.public_url || `/chat/${link.slug}`)}>复制</Button>
-                  <Button size="small" icon={<IconGlobe />} onClick={() => window.open(link.public_url || `/chat/${link.slug}`, '_blank', 'noopener,noreferrer')}>打开</Button>
+                  <Button size="small" icon={<IconGlobe />} onClick={() => openExternalURL(link.public_url || `/chat/${link.slug}`)}>打开</Button>
                   <Button size="small" icon={<IconEdit />} onClick={() => editLink(link)}>编辑</Button>
                   <Button size="small" onClick={() => toggle(link)}>{link.enabled ? '关闭' : '启用'}</Button>
                   <Button size="small" type="danger" icon={<IconDelete />} onClick={() => remove(link)}>删除</Button>

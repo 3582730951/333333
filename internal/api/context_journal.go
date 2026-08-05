@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -12,6 +13,8 @@ import (
 
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/storage"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // journalReplayBody creates the stateless Responses body used when account-local
@@ -151,6 +154,73 @@ func ensureEncryptedReasoningInclude(body []byte) []byte {
 
 func degradedResponsesReplay(body []byte) []byte {
 	return degradedResponsesReplayForContextError(body, leakfilter.ResponsesContextErrorNone)
+}
+
+// stripAgentMessageEncryptedContent removes only encrypted_content blocks nested
+// in an agent_message's content array. Those blocks are private to the subagent
+// response that produced them; a fresh root has no upstream response state capable
+// of decrypting them. Ordinary input text, user history, tool items, and reasoning
+// ciphertext are intentionally untouched.
+//
+// Deletions run from the end of each array so indexes remain stable. sjson edits
+// only the selected fragments, preserving the byte representation of unrelated
+// history (including large JSON numbers) instead of re-marshalling a large turn.
+func stripAgentMessageEncryptedContent(body []byte) ([]byte, int) {
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return body, 0
+	}
+	type removal struct {
+		inputIndex   int
+		contentIndex int
+		dropItem     bool
+	}
+	removals := make([]removal, 0)
+	removedBlocks := 0
+	for inputIndex, rawItem := range input.Array() {
+		if rawItem.Get("type").String() != "agent_message" {
+			continue
+		}
+		content := rawItem.Get("content")
+		if !content.IsArray() {
+			continue
+		}
+		blocks := content.Array()
+		itemRemovals := make([]removal, 0)
+		for contentIndex, block := range blocks {
+			if block.Get("type").String() != "encrypted_content" {
+				continue
+			}
+			itemRemovals = append(itemRemovals, removal{inputIndex: inputIndex, contentIndex: contentIndex})
+			removedBlocks++
+		}
+		if len(itemRemovals) == 0 {
+			continue
+		}
+		if len(itemRemovals) == len(blocks) {
+			removals = append(removals, removal{inputIndex: inputIndex, dropItem: true})
+			continue
+		}
+		removals = append(removals, itemRemovals...)
+	}
+	if removedBlocks == 0 {
+		return body, 0
+	}
+
+	out := append([]byte(nil), body...)
+	for index := len(removals) - 1; index >= 0; index-- {
+		remove := removals[index]
+		path := fmt.Sprintf("input.%d.content.%d", remove.inputIndex, remove.contentIndex)
+		if remove.dropItem {
+			path = fmt.Sprintf("input.%d", remove.inputIndex)
+		}
+		var err error
+		out, err = sjson.DeleteBytes(out, path)
+		if err != nil {
+			return body, 0
+		}
+	}
+	return out, removedBlocks
 }
 
 func degradedResponsesReplayForContextError(body []byte, contextError leakfilter.ResponsesContextErrorKind) []byte {

@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import { ActionMenu, Banner, Button, Toast, Modal, Form, Tag } from '../components/pool/index.jsx';
 import { IconPlus, IconRefresh, IconEdit, IconKey, IconDelete, IconPlay } from '../components/pool/icons.jsx';
 import { get, post, del } from '../api.js';
@@ -143,9 +143,27 @@ export const providerRoutesPayload = (routes) => (Array.isArray(routes) ? routes
   }))
   .filter((route) => route.downstream_path);
 
-function ProviderEditor({ editor, egressOptions, saving, onCancel, onSave }) {
+export function ProviderEditor({ editor, egressOptions, saving, onCancel, onSave }) {
   const [values, setValues] = useState(() => editor?.values || providerFormValues());
+  const transportProfileRefs = useRef([]);
   const setValue = (key, value) => setValues((current) => ({ ...current, [key]: value }));
+  const activeTransportProfileIndex = Math.max(0, TRANSPORT_PROFILES.findIndex((profile) => profile.value === values.transport_profile));
+  const selectTransportProfile = (profile) => setValues((current) => ({
+    ...current,
+    transport_profile: profile.value,
+    upstream_protocol: profile.protocol,
+  }));
+  const moveTransportProfileFocus = (event, index) => {
+    let nextIndex = index;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') nextIndex = (index + TRANSPORT_PROFILES.length - 1) % TRANSPORT_PROFILES.length;
+    else if (event.key === 'ArrowRight' || event.key === 'ArrowDown') nextIndex = (index + 1) % TRANSPORT_PROFILES.length;
+    else if (event.key === 'Home') nextIndex = 0;
+    else if (event.key === 'End') nextIndex = TRANSPORT_PROFILES.length - 1;
+    else return;
+    event.preventDefault();
+    selectTransportProfile(TRANSPORT_PROFILES[nextIndex]);
+    transportProfileRefs.current[nextIndex]?.focus();
+  };
   const updateRoute = (index, patch) => setValues((current) => ({
     ...current,
     routes: (current.routes || []).map((route, routeIndex) => routeIndex === index ? { ...route, ...patch } : route),
@@ -170,14 +188,18 @@ function ProviderEditor({ editor, egressOptions, saving, onCancel, onSave }) {
         <div className="pool-provider-profile-cards" role="radiogroup" aria-label="客户端传输画像">
           {TRANSPORT_PROFILES.map((profile) => {
             const active = values.transport_profile === profile.value;
+            const profileIndex = TRANSPORT_PROFILES.indexOf(profile);
             return (
               <button
                 type="button"
                 role="radio"
                 aria-checked={active}
+                tabIndex={profileIndex === activeTransportProfileIndex ? 0 : -1}
                 className={active ? 'is-active' : ''}
                 key={profile.value}
-                onClick={() => setValues((current) => ({ ...current, transport_profile: profile.value, upstream_protocol: profile.protocol }))}
+                ref={(node) => { transportProfileRefs.current[profileIndex] = node; }}
+                onClick={() => selectTransportProfile(profile)}
+                onKeyDown={(event) => moveTransportProfileFocus(event, profileIndex)}
               >
                 <strong>{profile.label}</strong>
                 <span>{profile.description}</span>

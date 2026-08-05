@@ -158,6 +158,29 @@ func TestCustomClaudeProviderMappingRoutesToRelayAndAdminTest(t *testing.T) {
 	}
 }
 
+func TestCustomNativeAnthropicToolsUseExplicitAutoChoice(t *testing.T) {
+	const model = "native-anthropic-tool-model"
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var request map[string]interface{}
+		if err := json.Unmarshal(raw, &request); err != nil {
+			t.Fatal(err)
+		}
+		choice, _ := request["tool_choice"].(map[string]interface{})
+		if choice["type"] != "auto" {
+			t.Fatalf("native relay request omitted explicit auto tool choice: %s", raw)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg_tool","type":"message","role":"assistant","model":"`+model+`","content":[{"type":"tool_use","id":"toolu_write","name":"write_file","input":{"path":"a.txt"}}],"stop_reason":"tool_use","usage":{"input_tokens":4,"output_tokens":2}}`)
+	})
+	setupProtocolMatrixProvider(t, h, model, storage.CustomProviderProtocolAnthropicMessages, model)
+	body := `{"model":"` + model + `","max_tokens":64,"messages":[{"role":"user","content":"write it"}],"tools":[{"name":"write_file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]}`
+	resp, raw := postJSONForTest(t, h.pool.URL+"/v1/messages", json.RawMessage(body))
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(raw, []byte(`"type":"tool_use"`)) || !bytes.Contains(raw, []byte(`"name":"write_file"`)) {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, raw)
+	}
+}
+
 func TestCustomClaudeAutoDiscoveryProbesMaintainedModelTable(t *testing.T) {
 	var mu sync.Mutex
 	var probed []string

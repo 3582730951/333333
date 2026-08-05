@@ -37,6 +37,175 @@ async def read_chunked_body(reader):
 
 
 class AsyncSidecarIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_header_idle_timeout_returns_408_without_using_inflight(self):
+        sidecar = load_sidecar()
+        sidecar.HEADER_IDLE_TIMEOUT = 0.05
+        sidecar_server = await asyncio.start_server(sidecar.client, "127.0.0.1", 0)
+        sidecar_port = sidecar_server.sockets[0].getsockname()[1]
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", sidecar_port)
+        writer.write(b"POST /proxy HTTP/1.1\r\nhost: local\r\n")
+        await writer.drain()
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2)
+        body = await reader.read()
+
+        self.assertIn(b"408 Request Timeout", head)
+        self.assertIn(b"x-sidecar-error-code: sidecar_header_idle_timeout", head.lower())
+        self.assertEqual(json.loads(body)["error"]["phase"], "preflight")
+        self.assertEqual(sidecar._inflight, 0)
+
+        writer.close()
+        await writer.wait_closed()
+        sidecar_server.close()
+        await sidecar_server.wait_closed()
+
+    async def test_body_idle_timeout_releases_single_inflight_slot(self):
+        sidecar = load_sidecar()
+        sidecar.MAX_INFLIGHT = 1
+        sidecar.BODY_IDLE_TIMEOUT = 0.5
+        admitted = []
+
+        async def fake_proxy(writer, payload, body):
+            body.rewind()
+            admitted.append((payload, body.file.read()))
+            await sidecar.send(writer, 200, {"content-type": "text/plain"}, b"ok")
+
+        sidecar.proxy = fake_proxy
+        with tempfile.TemporaryDirectory() as spool_dir:
+            sidecar.SPOOL_DIR = spool_dir
+            sidecar.SPOOL_RESERVE_BYTES = 0
+            sidecar_server = await asyncio.start_server(sidecar.client, "127.0.0.1", 0)
+            sidecar_port = sidecar_server.sockets[0].getsockname()[1]
+            meta = base64.b64encode(json.dumps({"method": "POST", "url": "http://local/"}).encode()).decode()
+
+            slow_reader, slow_writer = await asyncio.open_connection("127.0.0.1", sidecar_port)
+            slow_writer.write(f"POST /proxy HTTP/1.1\r\nx-sidecar-meta: {meta}\r\ncontent-length: 4\r\n\r\nx".encode())
+            await slow_writer.drain()
+            for _ in range(200):
+                if sidecar._inflight == 1 and sidecar._spool_bytes == 4:
+                    break
+                await asyncio.sleep(0.005)
+            self.assertEqual(sidecar._inflight, 1)
+            self.assertEqual(sidecar._spool_bytes, 4)
+
+            timeout_head = await asyncio.wait_for(slow_reader.readuntil(b"\r\n\r\n"), timeout=2)
+            timeout_body = await slow_reader.read()
+            self.assertIn(b"408 Request Timeout", timeout_head)
+            self.assertIn(b"x-sidecar-error-code: sidecar_body_idle_timeout", timeout_head.lower())
+            self.assertEqual(json.loads(timeout_body)["error"]["phase"], "preflight")
+            self.assertEqual(sidecar._inflight, 0)
+            self.assertEqual(sidecar._spool_bytes, 0)
+            self.assertEqual(list(pathlib.Path(spool_dir).iterdir()), [])
+
+            good_reader, good_writer = await asyncio.open_connection("127.0.0.1", sidecar_port)
+            good_writer.write(f"POST /proxy HTTP/1.1\r\nx-sidecar-meta: {meta}\r\ncontent-length: 2\r\n\r\nok".encode())
+            await good_writer.drain()
+            good_head = await asyncio.wait_for(good_reader.readuntil(b"\r\n\r\n"), timeout=2)
+            good_body = await good_reader.read()
+            self.assertIn(b"200 OK", good_head)
+            self.assertEqual(good_body, b"ok")
+            self.assertEqual(len(admitted), 1)
+            self.assertEqual(admitted[0][1], b"ok")
+            self.assertEqual(sidecar._inflight, 0)
+            self.assertEqual(sidecar._spool_bytes, 0)
+
+            slow_writer.close(); good_writer.close()
+            await slow_writer.wait_closed(); await good_writer.wait_closed()
+            sidecar_server.close()
+            await sidecar_server.wait_closed()
+
+    async def test_inflight_capacity_rejects_before_spooling_body(self):
+        sidecar = load_sidecar()
+        sidecar.IMPERSONATE = "chrome"
+        sidecar.MAX_INFLIGHT = 1
+        held = asyncio.Event()
+        release = asyncio.Event()
+
+        async def upstream(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            held.set()
+            await release.wait()
+            writer.write(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        with tempfile.TemporaryDirectory() as spool_dir:
+            sidecar.SPOOL_DIR = spool_dir
+            sidecar.SPOOL_RESERVE_BYTES = 0
+            upstream_server = await asyncio.start_server(upstream, "127.0.0.1", 0)
+            upstream_port = upstream_server.sockets[0].getsockname()[1]
+            sidecar_server = await asyncio.start_server(sidecar.client, "127.0.0.1", 0)
+            sidecar_port = sidecar_server.sockets[0].getsockname()[1]
+            meta = base64.b64encode(json.dumps({"method": "GET", "url": f"http://127.0.0.1:{upstream_port}/", "cookie_jar_key": "capacity"}).encode()).decode()
+
+            first_reader, first_writer = await asyncio.open_connection("127.0.0.1", sidecar_port)
+            first_writer.write(f"POST /proxy HTTP/1.1\r\nx-sidecar-meta: {meta}\r\ncontent-length: 0\r\n\r\n".encode())
+            await first_writer.drain()
+            await asyncio.wait_for(held.wait(), timeout=10)
+
+            metrics_reader, metrics_writer = await asyncio.open_connection("127.0.0.1", sidecar_port)
+            metrics_writer.write(b"GET /metrics HTTP/1.1\r\ncontent-length: 0\r\n\r\n")
+            await metrics_writer.drain()
+            metrics_head = await metrics_reader.readuntil(b"\r\n\r\n")
+            metrics_body = await metrics_reader.read()
+            self.assertIn(b"200 OK", metrics_head)
+            self.assertEqual(json.loads(metrics_body)["inflight"], 1)
+            metrics_writer.close()
+            await metrics_writer.wait_closed()
+
+            second_reader, second_writer = await asyncio.open_connection("127.0.0.1", sidecar_port)
+            # Do not send these claimed bytes: a capacity rejection must arrive
+            # after headers, before the body reader/spool is entered.
+            second_writer.write(f"POST /proxy HTTP/1.1\r\nx-sidecar-meta: {meta}\r\ncontent-length: {8 << 20}\r\n\r\n".encode())
+            await second_writer.drain()
+            rejected_head = await asyncio.wait_for(second_reader.readuntil(b"\r\n\r\n"), timeout=2)
+            rejected_body = await second_reader.read()
+            self.assertIn(b"503 Service Unavailable", rejected_head)
+            self.assertIn(b"retry-after: 1", rejected_head.lower())
+            self.assertIn(b"x-sidecar-error-code: sidecar_capacity_exhausted", rejected_head.lower())
+            self.assertEqual(json.loads(rejected_body)["error"]["phase"], "preflight")
+            self.assertEqual(sidecar.metrics()["rejected_capacity"], 1)
+            self.assertEqual(sidecar.metrics()["limit"], 1)
+            self.assertEqual(list(pathlib.Path(spool_dir).iterdir()), [])
+
+            release.set()
+            await first_reader.readuntil(b"\r\n\r\n")
+            await first_reader.read()
+            first_writer.close(); second_writer.close()
+            await first_writer.wait_closed(); await second_writer.wait_closed()
+            sidecar_server.close(); upstream_server.close()
+            await sidecar_server.wait_closed(); await upstream_server.wait_closed()
+            for session, _ in list(sidecar._sessions.values()):
+                await session.close()
+
+    async def test_session_pool_never_exceeds_active_limit_and_evicts_lru_idle(self):
+        sidecar = load_sidecar()
+        sidecar.IMPERSONATE = "chrome"
+        sidecar.MAX_BUCKETS = 2
+        one = ("", "", "", "one")
+        two = ("", "", "", "two")
+        three = ("", "", "", "three")
+        await sidecar.session_for(one)
+        await sidecar.session_for(two)
+        with self.assertRaises(sidecar.SidecarCapacityError) as raised:
+            await sidecar.session_for(three)
+        self.assertEqual(raised.exception.code, "sidecar_session_capacity")
+        self.assertEqual(len(sidecar._sessions), 2)
+        self.assertEqual(set(sidecar._sessions), {one, two})
+        self.assertNotIn(three, sidecar._session_active)
+
+        await sidecar.release_session(one)
+        await sidecar.release_session(two)
+        await sidecar.session_for(three)
+        self.assertEqual(len(sidecar._sessions), 2)
+        self.assertNotIn(one, sidecar._sessions)
+        self.assertIn(two, sidecar._sessions)
+        self.assertIn(three, sidecar._sessions)
+        await sidecar.release_session(three)
+        for session, _ in list(sidecar._sessions.values()):
+            await session.close()
+
     async def test_v2_request_body_spools_and_uploads_from_file(self):
         sidecar = load_sidecar()
         sidecar.IMPERSONATE = "chrome"

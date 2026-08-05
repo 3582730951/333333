@@ -11,7 +11,7 @@ import { COLORS, modelColor } from '../lib/chartTheme.js';
 import { fmtTokens, fmtInt } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
 import {
-  DASHBOARD_REFRESH_MS, useDashboardCoreData, useDashboardSecondaryData,
+  DASHBOARD_REFRESH_MS, invalidateDashboardUsageSnapshot, useDashboardCoreData, useDashboardSecondaryData,
 } from '../features/observability/queries/dashboard';
 
 const { Tag, Button, LoadingState } = PoolUI as any;
@@ -61,6 +61,7 @@ export default function Dashboard() {
   const [countdown, setCountdown] = useState(DASHBOARD_REFRESH_MS / 1000);
 
   const reload = useCallback(async () => {
+    invalidateDashboardUsageSnapshot();
     const [coreResult] = await Promise.all([coreQuery.reload(), secondaryQuery.reload()]);
     return coreResult;
   }, [coreQuery.reload, secondaryQuery.reload]);

@@ -180,6 +180,28 @@ func TestRuleSSECopyInterceptKeepsResponseCompleted(t *testing.T) {
 	}
 }
 
+func TestRuleSSECopySpoolsFramesBeyondPartialMemoryLimit(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		suffix string
+	}{
+		{name: "unterminated"},
+		{name: "complete", suffix: "\n\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stream := "data: " + strings.Repeat("x", streamLedgerMaxPartialFrame+1) + test.suffix
+			recorder := httptest.NewRecorder()
+			err := newRuleSSECopyWithHeartbeat(context.Background(), recorder, strings.NewReader(stream), nil, false, nil, "codex", 0)
+			if err != nil {
+				t.Fatalf("large frame error = %v", err)
+			}
+			if got := recorder.Body.String(); got != stream {
+				t.Fatalf("large frame changed: got=%d want=%d", len(got), len(stream))
+			}
+		})
+	}
+}
+
 func TestRuleSSECopyKeepsSafetyBufferedStreamAlive(t *testing.T) {
 	reader, writer := io.Pipe()
 	rec := httptest.NewRecorder()

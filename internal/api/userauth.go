@@ -44,40 +44,60 @@ func (s *Server) hasAdminUser(ctx context.Context) bool {
 // ── login throttle (per-IP) ──
 
 type loginThrottle struct {
-	mu   sync.Mutex
-	hits map[string]*loginAttempt
+	mu          sync.Mutex
+	hits        map[string]*loginAttempt
+	nextCleanup int64
+	now         func() int64
 }
 
 type loginAttempt struct {
 	count        int
 	blockedUntil int64
+	lastSeen     int64
 }
 
 const (
-	loginMaxFailures = 10
-	loginBlockSecs   = 15 * 60
+	loginMaxFailures        = 10
+	loginBlockSecs          = 15 * 60
+	loginThrottleTTLSeconds = 30 * 60
+	loginThrottleSweepSecs  = 60
+	loginThrottleMaxEntries = 8192
 )
 
-func newLoginThrottle() *loginThrottle { return &loginThrottle{hits: map[string]*loginAttempt{}} }
+func newLoginThrottle() *loginThrottle {
+	return &loginThrottle{hits: map[string]*loginAttempt{}, now: storage.Now}
+}
 
 func (l *loginThrottle) allow(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.currentTime()
+	l.cleanupExpired(now)
 	a := l.hits[ip]
-	return a == nil || a.blockedUntil <= storage.Now()
+	if a == nil {
+		return len(l.hits) < loginThrottleMaxEntries || l.evictOldestInactive(now)
+	}
+	a.lastSeen = now
+	return a.blockedUntil <= now
 }
 
 func (l *loginThrottle) fail(ip string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.currentTime()
+	l.cleanupExpired(now)
 	a := l.hits[ip]
 	if a == nil {
-		a = &loginAttempt{}
+		if len(l.hits) >= loginThrottleMaxEntries && !l.evictOldestInactive(now) {
+			return
+		}
+		a = &loginAttempt{lastSeen: now}
 		l.hits[ip] = a
 	}
+	a.lastSeen = now
 	a.count++
 	if a.count >= loginMaxFailures {
-		a.blockedUntil = storage.Now() + loginBlockSecs
+		a.blockedUntil = now + loginBlockSecs
 		a.count = 0
 	}
 }
@@ -86,6 +106,55 @@ func (l *loginThrottle) reset(ip string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.hits, ip)
+}
+
+func (l *loginThrottle) currentTime() int64 {
+	if l.now != nil {
+		return l.now()
+	}
+	return storage.Now()
+}
+
+// cleanupExpired is called with l.mu held. It runs at most once per sweep interval
+// and never removes an active block, so TTL cleanup preserves the 15-minute ban.
+func (l *loginThrottle) cleanupExpired(now int64) {
+	if now < l.nextCleanup {
+		return
+	}
+	for ip, attempt := range l.hits {
+		if attempt == nil || (attempt.blockedUntil <= now && now-attempt.lastSeen >= loginThrottleTTLSeconds) {
+			delete(l.hits, ip)
+		}
+	}
+	l.nextCleanup = now + loginThrottleSweepSecs
+}
+
+// evictOldestInactive is called with l.mu held. Active blocks are never eligible:
+// capacity pressure may forget an old partial failure count, but it must not shorten
+// an established ban. It returns whether one slot was reclaimed.
+func (l *loginThrottle) evictOldestInactive(now int64) bool {
+	oldestIP := ""
+	oldestSeen := int64(0)
+	found := false
+	for ip, attempt := range l.hits {
+		if attempt == nil {
+			delete(l.hits, ip)
+			return true
+		}
+		if attempt.blockedUntil > now {
+			continue
+		}
+		if !found || attempt.lastSeen < oldestSeen || (attempt.lastSeen == oldestSeen && ip < oldestIP) {
+			oldestIP = ip
+			oldestSeen = attempt.lastSeen
+			found = true
+		}
+	}
+	if !found {
+		return false
+	}
+	delete(l.hits, oldestIP)
+	return true
 }
 
 // ── helpers ──
@@ -112,7 +181,16 @@ func (s *Server) clientIP(r *http.Request) string {
 	if !s.isTrustedProxyIP(remote) {
 		return remote.String()
 	}
-	values := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	forwardedFor := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
+	if forwardedFor == "" {
+		for _, header := range []string{"CF-Connecting-IP", "X-Real-IP"} {
+			if ip := net.ParseIP(strings.TrimSpace(r.Header.Get(header))); ip != nil {
+				return ip.String()
+			}
+		}
+		return remote.String()
+	}
+	values := strings.Split(forwardedFor, ",")
 	candidate := remote
 	for i := len(values) - 1; i >= 0; i-- {
 		ip := net.ParseIP(strings.TrimSpace(values[i]))

@@ -770,18 +770,52 @@ func (s *Server) adminAccountsAssignGroup(w http.ResponseWriter, r *http.Request
 		return
 	}
 	updated := 0
-	for _, id := range req.IDs {
-		if id = strings.TrimSpace(id); id == "" {
+	for _, batch := range accountGroupAssignmentBatches(req.IDs) {
+		updatedIDs, err := s.store.SetAccountsGroup(r.Context(), batch, group)
+		if err != nil {
+			// Keep the endpoint's established best-effort contract: a failure that
+			// affects one row must not discard successful assignments in the chunk.
+			for _, id := range batch {
+				if err := s.store.SetAccountGroup(r.Context(), id, group); err == nil {
+					updated++
+				}
+			}
 			continue
 		}
-		if err := s.store.SetAccountGroup(r.Context(), id, group); err == nil {
-			updated++
+		succeeded := make(map[string]struct{}, len(updatedIDs))
+		for _, id := range updatedIDs {
+			succeeded[id] = struct{}{}
+		}
+		// Count successful input occurrences, rather than unique rows, matching
+		// the previous per-ID loop when callers send duplicate IDs.
+		for _, id := range batch {
+			if _, ok := succeeded[id]; ok {
+				updated++
+			}
 		}
 	}
 	if updated > 0 && s.scheduler != nil {
 		s.scheduler.InvalidateAccountCache()
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"group": group, "accounts_updated": updated})
+}
+
+func accountGroupAssignmentBatches(accountIDs []string) [][]string {
+	ids := make([]string, 0, len(accountIDs))
+	for _, id := range accountIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	batches := make([][]string, 0, (len(ids)+storage.AccountGroupBatchSize-1)/storage.AccountGroupBatchSize)
+	for start := 0; start < len(ids); start += storage.AccountGroupBatchSize {
+		end := start + storage.AccountGroupBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batches = append(batches, ids[start:end])
+	}
+	return batches
 }
 
 func (s *Server) adminSetAccountStatus(w http.ResponseWriter, r *http.Request, accountID, status string) {

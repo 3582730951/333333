@@ -24,6 +24,8 @@ import (
 	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 	"codex-account-pool/internal/usage"
 	"codex-account-pool/internal/virtual"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // chat_custom.go serves a request from a custom OpenAI-compatible provider
@@ -995,7 +997,10 @@ func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request,
 		w.WriteHeader(http.StatusOK)
 		uscan := usage.NewStreamScanner("openai_chat")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "claude_messages", model, cc.resp.StatusCode), provider.ID)
-		chatStreamToAnthropicSSE(rw, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber)
+		chatStreamToAnthropicSSEWithOptions(r.Context(), rw, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber, bodysource.CaptureOptions{
+			MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
+			Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver,
+		})
 		s.settleStreamUsage(r, cc, uscan)
 		return
 	}
@@ -1021,6 +1026,7 @@ func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request,
 // natively speaks the Anthropic Messages API. The raw request body is forwarded unchanged
 // to the provider's base_url + /messages endpoint; the response passes through as-is.
 func (s *Server) handleNativeAnthropicMessagesViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
+	raw = withExplicitAnthropicAutoToolChoice(raw)
 	stream := isStreamRequest(raw)
 	// A bare URL+API-key client is allowed to omit Anthropic-Version. The official
 	// Messages API and most compatible relays require it, so supply the protocol
@@ -1059,6 +1065,21 @@ func (s *Server) handleNativeAnthropicMessagesViaCustom(w http.ResponseWriter, r
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(cc.resp.StatusCode)
 	_, _ = w.Write(clean)
+}
+
+func withExplicitAnthropicAutoToolChoice(raw []byte) []byte {
+	if gjson.GetBytes(raw, "tool_choice").Exists() {
+		return raw
+	}
+	tools := gjson.GetBytes(raw, "tools")
+	if !tools.IsArray() || len(tools.Array()) == 0 {
+		return raw
+	}
+	updated, err := sjson.SetRawBytes(raw, "tool_choice", []byte(`{"type":"auto"}`))
+	if err != nil {
+		return raw
+	}
+	return updated
 }
 
 func validateProtocolTopLevel(raw []byte, protocol string, allowed map[string]bool) (map[string]interface{}, error) {

@@ -1,4 +1,4 @@
-import { useMemo, useState, type Key, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type Key, type ReactNode } from 'react';
 import * as PoolUI from './pool/index.jsx';
 import ResourceTable from './ResourceTable.jsx';
 import type { ResponsiveDataView as ResponsiveDataViewModel } from '../model/contracts';
@@ -31,12 +31,22 @@ export default function ResponsiveDataView<T>({
   onRetry,
   emptyTitle = '暂无数据',
 }: ResponsiveDataViewProps<T>) {
-  const [selected, setSelected] = useState<T | null>(null);
+  const [selectedKey, setSelectedKey] = useState<Key | null>(null);
   const mobileActions = useMemo(() => allowedResponsiveActions(definition, true), [definition]);
+  const selectedIndex = useMemo(() => {
+    if (selectedKey === null) return -1;
+    return rows.findIndex((row, index) => rowKey(row, index) === selectedKey);
+  }, [rowKey, rows, selectedKey]);
+  const hasSelection = selectedIndex >= 0;
+  const selected = hasSelection ? rows[selectedIndex] : undefined;
 
-  const mobileRenderer = (row: T): ReactNode => (
+  useEffect(() => {
+    if (selectedKey !== null && !hasSelection) setSelectedKey(null);
+  }, [hasSelection, selectedKey]);
+
+  const mobileRenderer = (row: T, context: { key: Key }): ReactNode => (
     <div className="pool-responsive-summary">
-      <button type="button" className="pool-responsive-summary__open" onClick={() => setSelected(row)}>
+      <button type="button" className="pool-responsive-summary__open" onClick={() => setSelectedKey(context.key)}>
         {definition.mobileSummary(row)}
       </button>
       {mobileActions.length ? (
@@ -68,8 +78,8 @@ export default function ResponsiveDataView<T>({
         mobileRenderer={mobileRenderer}
         emptyTitle={emptyTitle}
       />
-      <Drawer visible={Boolean(selected)} onCancel={() => setSelected(null)} title="详情" footer={null}>
-        {selected ? definition.details(selected) : null}
+      <Drawer visible={hasSelection} onCancel={() => setSelectedKey(null)} title="详情" footer={null}>
+        {hasSelection ? definition.details(selected as T) : null}
       </Drawer>
     </>
   );

@@ -42,6 +42,49 @@ EOF
   [[ "$(tail -1 "$log")" == update:* ]] || fail "--update override was ignored"
 }
 
+test_explicit_listen_addr_resolution() {
+  # Source update helpers without executing main. Explicit CLI values must be
+  # exported because scripts/install.sh and the no-systemd summary both consume
+  # LISTEN_ADDR after the friendly wrapper dispatches into update.sh.
+  # shellcheck disable=SC1090
+  source "$ROOT/update.sh"
+
+  local actual summary
+  unset LISTEN_ADDR
+  resolve_listen_addr --minimal --listen-addr 127.0.0.1:19001 --no-systemd
+  actual="$(bash -c 'printf %s "$LISTEN_ADDR"')"
+  [[ "$actual" == "127.0.0.1:19001" ]] ||
+    fail "--listen-addr VALUE was not normalized and exported"
+
+  unset LISTEN_ADDR
+  resolve_listen_addr --listen-addr=127.0.0.1:19002 --minimal
+  actual="$(bash -c 'printf %s "$LISTEN_ADDR"')"
+  [[ "$actual" == "127.0.0.1:19002" ]] ||
+    fail "--listen-addr=VALUE was not normalized and exported"
+
+  if (unset LISTEN_ADDR; resolve_listen_addr --listen-addr --no-systemd) \
+      >/dev/null 2>&1; then
+    fail "--listen-addr accepted the next option as its address"
+  fi
+  if (unset LISTEN_ADDR; resolve_listen_addr --listen-addr=) >/dev/null 2>&1; then
+    fail "empty --listen-addr= value was accepted"
+  fi
+
+  # Force the no-systemd path and prove the printed health/frontend target uses
+  # the explicit loopback address instead of the zero-config public fallback.
+  discover_listen_from_systemd() { return 1; }
+  DB="${TMP}/listen-summary.sqlite3"
+  BACKUP=""
+  BEFORE=""
+  AFTER=""
+  summary="$(print_summary)"
+  grep -Fq '监听 Listen:        127.0.0.1:19002' <<<"$summary" ||
+    fail "no-systemd summary ignored the explicit listen target"
+  if grep -Fq '0.0.0.0:8787' <<<"$summary"; then
+    fail "no-systemd summary leaked the default listen target"
+  fi
+}
+
 test_backup_rotation() {
   local fixture="${TMP}/backups" db="${TMP}/pool.sqlite3"
   mkdir -p "$fixture"
@@ -107,7 +150,20 @@ test_managed_source_pruning() {
   [[ -f "$fixture/internal/api/optout.go" ]] || fail "PRUNE_MANAGED_SOURCE=0 was ignored"
 }
 
+test_managed_source_manifest_current() {
+  local generated="${TMP}/managed-source-manifest.generated.txt"
+  LC_ALL=C sort -c -u "$ROOT/scripts/managed-source-manifest.txt" ||
+    fail "managed source manifest is not sorted and unique"
+  bash "$ROOT/scripts/generate-managed-source-manifest.sh" "$generated" >/dev/null
+  if ! cmp -s "$ROOT/scripts/managed-source-manifest.txt" "$generated"; then
+    diff -u "$ROOT/scripts/managed-source-manifest.txt" "$generated" >&2 || true
+    fail "managed source manifest is stale; regenerate it before packaging"
+  fi
+}
+
 test_install_dispatch
+test_explicit_listen_addr_resolution
 test_backup_rotation
 test_managed_source_pruning
-printf 'PASS: install dispatch, bounded backups, and managed-source convergence\n'
+test_managed_source_manifest_current
+printf 'PASS: install dispatch, bounded backups, managed-source convergence, and release manifest freshness\n'

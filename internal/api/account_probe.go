@@ -361,6 +361,20 @@ func (s *Server) existingOrStaticCodexModels(ctx context.Context, accountID stri
 	return s.upsertStaticCodexModels(ctx, accountID)
 }
 
+func claudeModelProbeShouldRefresh(status int, header http.Header, body []byte) bool {
+	if status != http.StatusUnauthorized && status != http.StatusForbidden {
+		return false
+	}
+	verdict := ban.Classify(false, status, header, body)
+	if verdict.State != ban.AuthExpired {
+		return false
+	}
+	// Anthropic can deny model listing to an otherwise valid OAuth grant. A bare
+	// 403 is therefore endpoint-scoped; only an explicit expiry signal justifies
+	// entering the token-refresh retry path.
+	return status != http.StatusForbidden || verdict.Reason != "http_403"
+}
+
 // probeClaudeModels populates a Claude account's model capabilities. It first
 // asks Anthropic's GET /v1/models through the account (so the advertised set
 // reflects what the account can actually use), and falls back to unverified static
@@ -393,7 +407,7 @@ func (s *Server) probeClaudeModels(ctx context.Context, account storage.Account,
 		case derr != nil:
 			log.Printf("claude model probe %s: read body: %v; using static model set", account.ID, derr)
 		case resp.StatusCode >= 400:
-			if claudeAuthError(resp.StatusCode, resp.Header, raw) && claudeTokenCanRefresh(token) {
+			if claudeModelProbeShouldRefresh(resp.StatusCode, resp.Header, raw) && claudeTokenCanRefresh(token) {
 				if refreshed, rerr := s.forceRefreshClaudeToken(ctx, account, "auth_error"); rerr == nil {
 					token = refreshed
 					if retryResp, retryErr := s.upstream.Do(ctx, requestForToken(token)); retryErr == nil {

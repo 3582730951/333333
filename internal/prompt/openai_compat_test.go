@@ -223,6 +223,23 @@ func TestResponsesStableToolBridgePlanRoundTrip(t *testing.T) {
 	}
 	customAlias, _ := converted.Plan.ChatName(ResponsesToolCustom, "", "apply_patch")
 	searchAlias, _ := converted.Plan.ChatName(ResponsesToolSearch, "", "tool_search")
+	var customFunction map[string]interface{}
+	for _, rawTool := range tools {
+		function := rawTool.(map[string]interface{})["function"].(map[string]interface{})
+		if function["name"] == customAlias {
+			customFunction = function
+			break
+		}
+	}
+	if customFunction == nil || !strings.Contains(customFunction["description"].(string), "exactly one string field named input") {
+		t.Fatalf("custom freeform transport contract missing: %v", customFunction)
+	}
+	parameters := customFunction["parameters"].(map[string]interface{})
+	properties := parameters["properties"].(map[string]interface{})
+	inputDescription := properties["input"].(map[string]interface{})["description"].(string)
+	if !strings.Contains(inputDescription, `"syntax":"lark"`) || !strings.Contains(inputDescription, "start: /.+/") {
+		t.Fatalf("custom freeform grammar missing from bridged schema: %s", inputDescription)
+	}
 	choice := root["tool_choice"].(map[string]interface{})["function"].(map[string]interface{})["name"]
 	if choice != customAlias {
 		t.Fatalf("custom tool choice = %v, want %q", choice, customAlias)
@@ -260,12 +277,36 @@ func TestResponsesStableToolBridgePlanRoundTrip(t *testing.T) {
 	}
 }
 
+func TestChatCompletionLegacyFunctionCallRestoresCustomToolIdentity(t *testing.T) {
+	request, err := ResponsesRequestToChatCompletionBridge([]byte(`{
+	  "model":"chat-model","input":"edit",
+	  "tools":[{"type":"custom","name":"apply_patch"}]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias, ok := request.Plan.ChatName(ResponsesToolCustom, "", "apply_patch")
+	if !ok {
+		t.Fatal("custom alias missing")
+	}
+	response := []byte(`{"id":"legacy-call","choices":[{"message":{"role":"assistant","function_call":{"name":"` + alias + `","arguments":"{\"input\":\"*** Begin Patch\"}"}},"finish_reason":"function_call"}]}`)
+	converted, err := ChatCompletionToResponsesResponse(response, "chat-model", request.Plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := mustUnmarshal(t, converted)
+	item := root["output"].([]interface{})[0].(map[string]interface{})
+	if item["type"] != "custom_tool_call" || item["name"] != "apply_patch" || item["input"] != "*** Begin Patch" {
+		t.Fatalf("legacy custom call was lost: %s", converted)
+	}
+}
+
 func TestResponsesLiteToolSearchAddsDiscoveredTools(t *testing.T) {
 	in := []byte(`{
 	  "model":"chat-model",
 	  "tools":[{"type":"tool_search","execution":"client","parameters":{"type":"object"}}],
 	  "input":[
-	    {"type":"additional_tools","tools":[{"type":"function","name":"lite_tool","parameters":{"type":"object"}}]},
+	    {"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"lite_tool","parameters":{"type":"object"}}]},
 	    {"type":"tool_search_call","call_id":"search_1","execution":"client","arguments":{"query":"calendar"}},
 	    {"type":"tool_search_output","call_id":"search_1","status":"completed","execution":"client","tools":[
 	      {"type":"custom","name":"freeform"},
@@ -293,6 +334,59 @@ func TestResponsesLiteToolSearchAddsDiscoveredTools(t *testing.T) {
 	}
 	if got := strings.Join(converted.CompatibilityLosses, ","); got != LossResponsesStructuredToolOutputJSON {
 		t.Fatalf("compatibility losses = %q", got)
+	}
+}
+
+func TestResponsesLiteAdditionalToolsSurviveEarlierInjectedSystemItem(t *testing.T) {
+	converted, err := ResponsesRequestToChatCompletionBridge([]byte(`{
+	  "model":"chat-model",
+	  "input":[
+	    {"type":"message","role":"system","content":[{"type":"input_text","text":"injected"}]},
+	    {"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"apply_patch"}]},
+	    {"type":"message","role":"user","content":[{"type":"input_text","text":"edit"}]}
+	  ]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := mustUnmarshal(t, converted.Body)
+	tools, ok := root["tools"].([]interface{})
+	if !ok || len(tools) != 1 {
+		t.Fatalf("Lite additional_tools marker was not extracted: %s", converted.Body)
+	}
+	function := tools[0].(map[string]interface{})["function"].(map[string]interface{})
+	if function["name"] != "apply_patch" {
+		t.Fatalf("wrong bridged tool: %v", function)
+	}
+	for _, message := range root["messages"].([]interface{}) {
+		encoded, err := json.Marshal(message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(encoded), "additional_tools") {
+			t.Fatalf("additional_tools leaked into chat messages: %s", converted.Body)
+		}
+	}
+}
+
+func TestResponsesLiteEmptyAdditionalToolsMarkerDoesNotBecomeUserHistory(t *testing.T) {
+	converted, err := ResponsesRequestToChatCompletionBridge([]byte(`{
+	  "model":"chat-model",
+	  "input":[
+	    {"type":"message","role":"system","content":"injected"},
+	    {"type":"additional_tools","role":"developer","tools":[]},
+	    {"type":"message","role":"user","content":"answer"}
+	  ]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(converted.Body), "additional_tools") {
+		t.Fatalf("empty Lite tool marker leaked into model history: %s", converted.Body)
+	}
+	root := mustUnmarshal(t, converted.Body)
+	if messages := root["messages"].([]interface{}); len(messages) != 2 {
+		t.Fatalf("bridged messages = %v, want system and user only", messages)
 	}
 }
 

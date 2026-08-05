@@ -25,23 +25,30 @@ import (
 
 // chatChunk is one OpenAI `chat.completion.chunk` SSE frame. Pointers distinguish
 // "absent" from zero/empty so a content-only or finish-only frame is handled correctly.
+type chatFunctionCallDelta struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type chatToolCallDelta struct {
+	Index    int                   `json:"index"`
+	ID       string                `json:"id"`
+	Function chatFunctionCallDelta `json:"function"`
+}
+
+type chatChunkDelta struct {
+	Content      *string                `json:"content"`
+	ToolCalls    []chatToolCallDelta    `json:"tool_calls"`
+	FunctionCall *chatFunctionCallDelta `json:"function_call"`
+	// reasoning_content (deepseek-reasoner CoT) is intentionally ignored — only
+	// the final answer in `content` is surfaced.
+}
+
 type chatChunk struct {
 	ID      string `json:"id"`
 	Choices []struct {
-		Delta struct {
-			Content   *string `json:"content"`
-			ToolCalls []struct {
-				Index    int    `json:"index"`
-				ID       string `json:"id"`
-				Function struct {
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
-				} `json:"function"`
-			} `json:"tool_calls"`
-			// reasoning_content (deepseek-reasoner CoT) is intentionally ignored — only
-			// the final answer in `content` is surfaced.
-		} `json:"delta"`
-		FinishReason *string `json:"finish_reason"`
+		Delta        chatChunkDelta `json:"delta"`
+		FinishReason *string        `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *struct {
 		PromptTokens          int64 `json:"prompt_tokens"`
@@ -53,6 +60,15 @@ type chatChunk struct {
 			CachedTokens int64 `json:"cached_tokens"`
 		} `json:"prompt_tokens_details"`
 	} `json:"usage"`
+}
+
+func normalizedChatToolCallDeltas(delta chatChunkDelta) []chatToolCallDelta {
+	if len(delta.ToolCalls) > 0 || delta.FunctionCall == nil {
+		return delta.ToolCalls
+	}
+	return []chatToolCallDelta{{
+		Index: 0, ID: "call_legacy_function", Function: *delta.FunctionCall,
+	}}
 }
 
 func newChatSSEScanner(body io.Reader) *bufio.Scanner {
@@ -494,7 +510,7 @@ scanLoop:
 					"output_index": msgOutputIndex, "content_index": 0, "delta": txt,
 				})
 			}
-			for _, tc := range choice.Delta.ToolCalls {
+			for _, tc := range normalizedChatToolCallDeltas(choice.Delta) {
 				acc := tools[tc.Index]
 				if acc == nil {
 					acc = &toolAcc{outputIndex: nextOutputIndex, args: newStreamAccumulator(ctx, options, "codex-pool-chat-tool-args-*")}
@@ -671,6 +687,10 @@ func decodeJSONAny(raw string) interface{} {
 // chatStreamToAnthropicSSE rewrites a Chat Completions SSE stream into an Anthropic
 // Messages SSE stream (message_start → content_block_* → message_delta → message_stop).
 func chatStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, model string, scrubber *streamrewrite.Matcher) map[string]interface{} {
+	return chatStreamToAnthropicSSEWithOptions(context.Background(), w, body, model, scrubber, bodysource.CaptureOptions{})
+}
+
+func chatStreamToAnthropicSSEWithOptions(ctx context.Context, w http.ResponseWriter, body io.Reader, model string, scrubber *streamrewrite.Matcher, options bodysource.CaptureOptions) map[string]interface{} {
 	flusher, _ := w.(http.Flusher)
 	emit := func(event string, payload map[string]interface{}) {
 		payload["type"] = event
@@ -693,11 +713,14 @@ func chatStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, model strin
 		blockIndex int
 		id         string
 		name       string
+		args       *streamAccumulator
 	}
 	toolBlocks := map[int]*toolBlock{}
+	toolOrder := make([]int, 0, 4)
 	finish := ""
 	var usage map[string]interface{}
 	sawDone := false
+	var accumulationErr error
 
 	ensureStarted := func(id string) {
 		if started {
@@ -772,33 +795,43 @@ func chatStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, model strin
 				txt := scrubber.ReplaceString(*choice.Delta.Content)
 				emit("content_block_delta", map[string]interface{}{"index": textBlock, "delta": map[string]interface{}{"type": "text_delta", "text": txt}})
 			}
-			for _, tc := range choice.Delta.ToolCalls {
+			for _, tc := range normalizedChatToolCallDeltas(choice.Delta) {
 				tb := toolBlocks[tc.Index]
 				if tb == nil {
-					closeOpen()
-					tb = &toolBlock{blockIndex: nextBlock}
-					nextBlock++
+					tb = &toolBlock{blockIndex: -1, args: newStreamAccumulator(ctx, options, "codex-pool-chat-anthropic-tool-args-*")}
+					defer tb.args.Close()
 					toolBlocks[tc.Index] = tb
+					toolOrder = append(toolOrder, tc.Index)
 					if tc.ID != "" {
 						tb.id = tc.ID
 					}
 					if tc.Function.Name != "" {
 						tb.name = tc.Function.Name
 					}
-					emit("content_block_start", map[string]interface{}{"index": tb.blockIndex, "content_block": map[string]interface{}{"type": "tool_use", "id": tb.id, "name": tb.name, "input": map[string]interface{}{}}})
-					openBlock = tb.blockIndex
-				} else if openBlock != tb.blockIndex {
-					closeOpen()
-					openBlock = tb.blockIndex
+				} else {
+					if tc.ID != "" {
+						tb.id = tc.ID
+					}
+					if tc.Function.Name != "" {
+						tb.name = tc.Function.Name
+					}
 				}
 				if tc.Function.Arguments != "" {
 					arg := scrubber.ReplaceString(tc.Function.Arguments)
-					emit("content_block_delta", map[string]interface{}{"index": tb.blockIndex, "delta": map[string]interface{}{"type": "input_json_delta", "partial_json": arg}})
+					if accumulationErr = tb.args.WriteString(arg); accumulationErr != nil {
+						break
+					}
 				}
 			}
+			if accumulationErr != nil {
+				break
+			}
+		}
+		if accumulationErr != nil {
+			break
 		}
 	}
-	if sc.Err() != nil || !sawDone {
+	if sc.Err() != nil || accumulationErr != nil || !sawDone {
 		emit("error", map[string]interface{}{"error": map[string]interface{}{
 			"type": "api_error", "code": "server_error", "message": publicRetryMessage,
 		}})
@@ -807,6 +840,30 @@ func chatStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, model strin
 
 	ensureStarted("")
 	closeOpen()
+	for _, index := range toolOrder {
+		tb := toolBlocks[index]
+		tb.blockIndex = nextBlock
+		nextBlock++
+		if tb.id == "" {
+			tb.id = "call_" + strconv.Itoa(index)
+		}
+		arguments, err := tb.args.String()
+		if err != nil {
+			emit("error", map[string]interface{}{"error": map[string]interface{}{
+				"type": "api_error", "code": "server_error", "message": publicRetryMessage,
+			}})
+			return usage
+		}
+		emit("content_block_start", map[string]interface{}{"index": tb.blockIndex, "content_block": map[string]interface{}{
+			"type": "tool_use", "id": tb.id, "name": tb.name, "input": map[string]interface{}{},
+		}})
+		if arguments != "" {
+			emit("content_block_delta", map[string]interface{}{"index": tb.blockIndex, "delta": map[string]interface{}{
+				"type": "input_json_delta", "partial_json": arguments,
+			}})
+		}
+		emit("content_block_stop", map[string]interface{}{"index": tb.blockIndex})
+	}
 	hasTools := len(toolBlocks) > 0
 	delta := map[string]interface{}{"stop_reason": prompt.FinishToStopReason(finish, hasTools), "stop_sequence": nil}
 	msgDelta := map[string]interface{}{"delta": delta}

@@ -21,6 +21,15 @@ while IFS= read -r -d '' tracked; do
     continue
   fi
 
+  if [[ -d "$tracked" ]]; then
+    if [[ "$(git ls-files --stage -- "$tracked")" == 160000\ * ]]; then
+      continue
+    fi
+    echo "tracked path is unexpectedly a directory: $tracked" >&2
+    failed=1
+    continue
+  fi
+
   size="$(wc -c < "$tracked")"
   if (( size > max_bytes )); then
     echo "tracked file exceeds ${max_bytes} bytes: $tracked ($size bytes)" >&2

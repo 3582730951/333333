@@ -14,6 +14,7 @@ import (
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream"
+	"codex-account-pool/internal/virtual"
 )
 
 // handleCustomProviderPassthrough relays an opaque auxiliary endpoint through
@@ -26,6 +27,20 @@ func (s *Server) handleCustomProviderPassthrough(
 	r *http.Request,
 	providerID string,
 	policy downstreamPolicy,
+) {
+	s.handleCustomProviderPassthroughWithModel(w, r, providerID, policy, "", nil)
+}
+
+// handleCustomProviderPassthroughWithModel is the model-aware form used by
+// standalone search. The resolved model participates in both account selection
+// and diagnostics while every non-model auxiliary endpoint keeps the old path.
+func (s *Server) handleCustomProviderPassthroughWithModel(
+	w http.ResponseWriter,
+	r *http.Request,
+	providerID string,
+	policy downstreamPolicy,
+	routeModel string,
+	raw []byte,
 ) {
 	switch r.Method {
 	case http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodPut, http.MethodPatch, http.MethodHead:
@@ -49,19 +64,26 @@ func (s *Server) handleCustomProviderPassthrough(
 		return
 	}
 	provider, _ = storage.ResolveCustomProviderRoute(provider, r.URL.Path)
+	if isStandaloneSearchPath(r.URL.Path) &&
+		provider.UpstreamProtocol != storage.CustomProviderProtocolResponses {
+		s.writeSearchCapabilityUnavailable(w, "custom:"+provider.ID, routeModel)
+		return
+	}
 
 	body := bodySourceFromContext(r.Context())
-	var raw []byte
 	if body == nil && r.Body != nil {
-		value, err := readLimited(r.Body, s.cfg.MaxBodyBytes)
-		if err != nil {
-			writeError(w, http.StatusRequestEntityTooLarge, err)
-			return
+		if raw == nil {
+			value, err := readLimited(r.Body, s.cfg.MaxBodyBytes)
+			if err != nil {
+				writeError(w, http.StatusRequestEntityTooLarge, err)
+				return
+			}
+			raw = value
 		}
-		raw = value
 		body = bodysource.Bytes(raw)
 		defer body.Close()
 	}
+	routeModel = strings.TrimSpace(routeModel)
 
 	r = r.WithContext(withDownstreamKey(r.Context(), policy))
 
@@ -82,6 +104,8 @@ func (s *Server) handleCustomProviderPassthrough(
 		Group:              policy.Group,
 		Provider:           provider.ID,
 		PreferredEgressIDs: provider.EgressIDs,
+		Model:              routeModel,
+		EstimatedTokens:    virtual.EstimateTokensJSON(raw),
 		Affinity:           affinity,
 		ImmutableAffinity:  immutableResource,
 		SkipWait:           userGroupFallbackProbe(r.Context()),
@@ -92,7 +116,7 @@ func (s *Server) handleCustomProviderPassthrough(
 			return
 		}
 		status, _ := noAccountHTTPStatus(err)
-		s.writePublicNoAccountError(r.Context(), w, status, policy.Group, provider.ID, "", err)
+		s.writePublicNoAccountError(r.Context(), w, status, policy.Group, provider.ID, routeModel, err)
 		return
 	}
 	defer lease.Release()
@@ -112,6 +136,7 @@ func (s *Server) handleCustomProviderPassthrough(
 		DownstreamPath:   customProviderPassthroughPath(provider.BaseURL, r.URL),
 		Headers:          r.Header.Clone(),
 		Body:             body,
+		Model:            routeModel,
 		Account:          lease.Account,
 		Token:            token,
 		Egress:           lease.Egress,
@@ -136,7 +161,7 @@ func (s *Server) handleCustomProviderPassthrough(
 	}
 
 	s.guardRateLimitForAccount(r.Context(), lease.Account, response.Header)
-	s.captureQuota(r.Context(), lease.Account.ID, provider.ID, "", response.Header)
+	s.captureQuota(r.Context(), lease.Account.ID, provider.ID, routeModel, response.Header)
 	if resourceAffinity.Hash != "" {
 		s.persistCustomProviderResourceBinding(r.Context(), provider.ID, resourceAffinity, resourceKind, lease)
 	}

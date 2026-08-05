@@ -48,6 +48,7 @@ func TestCodexConfigScript(t *testing.T) {
 		`model = "$MODEL"`,
 		`model_provider = "$PROVIDER_ID"`,
 		`wire_api = "responses"`,
+		`supports_websockets = true`,
 		`API_KEY='` + plain + `'`,
 		`MODEL='gpt-5.6-sol'`,
 		`name = "OpenAI"`,
@@ -64,7 +65,6 @@ func TestCodexConfigScript(t *testing.T) {
 		`http_headers = { "X-Pool-Client-ID"`,
 		"pool-client-id",
 		"pool-token",
-		"supports_websockets =",
 		"rtk init --codex",
 		`goals = true`,
 		`model_reasoning_effort =`,
@@ -103,6 +103,7 @@ func TestCodexOnlyConfigScriptEndpointContainsNoOtherInstallerBranches(t *testin
 	for _, want := range []string{
 		`model = "$MODEL"`,
 		`base_url = "$ORIGIN/v1"`,
+		`supports_websockets = true`,
 		`experimental_bearer_token = "$API_KEY"`,
 	} {
 		if !strings.Contains(script, want) {

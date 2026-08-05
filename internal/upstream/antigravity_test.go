@@ -137,6 +137,38 @@ func TestAnthropicToAntigravityPreservesStructuredMessages(t *testing.T) {
 	}
 }
 
+func TestAnthropicToAntigravityHoistsSystemRoleMessages(t *testing.T) {
+	body := []byte(`{
+		"model":"gemini-3-flash","max_tokens":256,
+		"system":"top-level system",
+		"messages":[
+			{"role":"user","content":"first question"},
+			{"role":"system","content":[{"type":"text","text":"injected policy"}]},
+			{"role":"assistant","content":"answer"},
+			{"role":"user","content":"next question"}
+		]
+	}`)
+	out, err := anthropicToAntigravity(body, "gemini-3-flash", "project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := map[string]string{
+		"request.systemInstruction.parts.0.text": "top-level system",
+		"request.systemInstruction.parts.1.text": "injected policy",
+		"request.contents.0.role":                "user",
+		"request.contents.1.role":                "model",
+		"request.contents.2.role":                "user",
+	}
+	for path, want := range checks {
+		if got := gjson.GetBytes(out, path).String(); got != want {
+			t.Fatalf("%s = %q, want %q; body=%s", path, got, want, out)
+		}
+	}
+	if got := len(gjson.GetBytes(out, "request.contents").Array()); got != 3 {
+		t.Fatalf("system role remained in contents: %s", out)
+	}
+}
+
 func TestAntigravityFinalWireIdentitySafetyAndCatalogLimit(t *testing.T) {
 	body := []byte(`{"max_tokens":4096,"messages":[{"role":"user","content":"same conversation"}]}`)
 	one, err := anthropicToAntigravityForAccount(body, "gemini-3.1-pro", "project", "account-a", 1024)

@@ -1402,6 +1402,147 @@ func TestRecheckPendingAccountIsNotSelected(t *testing.T) {
 	lease.Release()
 }
 
+func TestCodexGoalQuotaGraceSkipsOnlyLocalQuotaTelemetryGates(t *testing.T) {
+	insertAccount := func(t *testing.T, store *storage.Store, id, provider string) {
+		t.Helper()
+		if err := store.UpsertAccount(context.Background(), storage.Account{
+			ID: id, Label: id, GroupName: "cyber", Provider: provider, Status: "active",
+		}, storage.AccountToken{AccessToken: "test-token"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	goalRoute := func(accountID string) Route {
+		return Route{
+			Group: "cyber", Provider: "codex", RequiredAccountID: accountID,
+			AllowCodexGoalQuotaGrace: true, SkipWait: true,
+		}
+	}
+
+	t.Run("bound_account_quota_snapshot", func(t *testing.T) {
+		store := testStore(t)
+		ctx := context.Background()
+		const accountID = "goal-quota-snapshot"
+		insertAccount(t, store, accountID, "codex")
+		if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+			AccountID: accountID, Provider: "codex", LimiterType: "tokens", Source: "telemetry",
+			RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1,
+			ResetAt: storage.Now() + 3600, Status: "rejected",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		s := New(store, config.Default())
+		route := goalRoute(accountID)
+		route.AllowCodexGoalQuotaGrace = false
+		if _, reason, ok := s.tryLeaseAccountDetailed(ctx, accountID, route, nil); ok || reason != leaseBlockRateLimitCooldown {
+			t.Fatalf("without Goal grace = ok:%v reason:%s, want rate-limit cooldown", ok, reason)
+		}
+		route.AllowCodexGoalQuotaGrace = true
+		lease, reason, ok := s.tryLeaseAccountDetailed(ctx, accountID, route, nil)
+		if !ok || reason != leaseBlockNone || lease.Account.ID != accountID {
+			t.Fatalf("with Goal grace = lease:%+v ok:%v reason:%s", lease.Account, ok, reason)
+		}
+		lease.Release()
+	})
+
+	t.Run("bound_account_plain_telemetry_cooldown", func(t *testing.T) {
+		store := testStore(t)
+		ctx := context.Background()
+		const accountID = "goal-plain-cooldown"
+		insertAccount(t, store, accountID, "codex")
+		if err := store.SetBindingCooldown(ctx, accountID, storage.Now()+3600); err != nil {
+			t.Fatal(err)
+		}
+		s := New(store, config.Default())
+		route := goalRoute(accountID)
+		route.AllowCodexGoalQuotaGrace = false
+		if _, reason, ok := s.tryLeaseAccountDetailed(ctx, accountID, route, nil); ok || reason != leaseBlockEgressCooldown {
+			t.Fatalf("without Goal grace = ok:%v reason:%s, want egress cooldown", ok, reason)
+		}
+		route.AllowCodexGoalQuotaGrace = true
+		lease, reason, ok := s.tryLeaseAccountDetailed(ctx, accountID, route, nil)
+		if !ok || reason != leaseBlockNone || lease.Account.ID != accountID {
+			t.Fatalf("with Goal grace = lease:%+v ok:%v reason:%s", lease.Account, ok, reason)
+		}
+		lease.Release()
+	})
+
+	t.Run("fresh_index_quota_and_plain_cooldown", func(t *testing.T) {
+		store := testStore(t)
+		ctx := context.Background()
+		const accountID = "goal-fresh-index"
+		insertAccount(t, store, accountID, "codex")
+		if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+			AccountID: accountID, Provider: "codex", LimiterType: "tokens", Source: "telemetry",
+			RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1,
+			ResetAt: storage.Now() + 3600, Status: "rejected",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SetBindingCooldown(ctx, accountID, storage.Now()+3600); err != nil {
+			t.Fatal(err)
+		}
+		s := New(store, config.Default())
+		lease, err := s.Select(ctx, Route{
+			Group: "cyber", Provider: "codex", AllowCodexGoalQuotaGrace: true, SkipWait: true,
+		})
+		if err != nil {
+			t.Fatalf("fresh Goal route should ignore local quota telemetry gates: %v", err)
+		}
+		if lease.Account.ID != accountID {
+			t.Fatalf("fresh Goal route selected %q, want %q", lease.Account.ID, accountID)
+		}
+		lease.Release()
+	})
+
+	t.Run("quarantine_is_still_hard", func(t *testing.T) {
+		store := testStore(t)
+		ctx := context.Background()
+		const accountID = "goal-quarantined"
+		insertAccount(t, store, accountID, "codex")
+		if err := store.SetAccountQuarantine(ctx, accountID, storage.Now()+3600, "test quarantine"); err != nil {
+			t.Fatal(err)
+		}
+		s := New(store, config.Default())
+		if _, reason, ok := s.tryLeaseAccountDetailed(ctx, accountID, goalRoute(accountID), nil); ok || reason != leaseBlockQuarantined {
+			t.Fatalf("Goal grace bypassed quarantine: ok:%v reason:%s", ok, reason)
+		}
+	})
+
+	t.Run("recheck_pending_is_still_hard", func(t *testing.T) {
+		store := testStore(t)
+		ctx := context.Background()
+		const accountID = "goal-recheck-pending"
+		insertAccount(t, store, accountID, "codex")
+		if err := store.BenchBindingForRecheck(ctx, accountID, storage.Now()+3600); err != nil {
+			t.Fatal(err)
+		}
+		s := New(store, config.Default())
+		if _, reason, ok := s.tryLeaseAccountDetailed(ctx, accountID, goalRoute(accountID), nil); ok || reason != leaseBlockRecheckPending {
+			t.Fatalf("Goal grace bypassed recheck-pending: ok:%v reason:%s", ok, reason)
+		}
+	})
+
+	t.Run("non_codex_provider_does_not_receive_grace", func(t *testing.T) {
+		store := testStore(t)
+		ctx := context.Background()
+		const accountID = "goal-grace-claude"
+		insertAccount(t, store, accountID, "claude")
+		if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+			AccountID: accountID, Provider: "claude", LimiterType: "tokens", Source: "telemetry",
+			RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1,
+			ResetAt: storage.Now() + 3600, Status: "rejected",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		s := New(store, config.Default())
+		route := goalRoute(accountID)
+		route.Provider = "claude"
+		if _, reason, ok := s.tryLeaseAccountDetailed(ctx, accountID, route, nil); ok || reason != leaseBlockRateLimitCooldown {
+			t.Fatalf("Goal grace widened to non-Codex provider: ok:%v reason:%s", ok, reason)
+		}
+	})
+}
+
 func TestIgnoreRateLimitControlsKeepsOnlyThatAccountEligible(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()

@@ -4527,6 +4527,122 @@ func (s *Store) SetAccountGroup(ctx context.Context, accountID, group string) er
 	return tx.Commit()
 }
 
+// AccountGroupBatchSize keeps dynamic IN clauses below the parameter limits of
+// every supported SQLite and PostgreSQL deployment.
+const AccountGroupBatchSize = 500
+
+type accountGroupBatchQueries struct {
+	existing          string
+	updateAccounts    string
+	demoteMemberships string
+	upsertMemberships string
+}
+
+func buildAccountGroupBatchQueries(accountCount int) accountGroupBatchQueries {
+	ids := sqlPlaceholders(accountCount)
+	return accountGroupBatchQueries{
+		existing:          `SELECT id FROM accounts WHERE id IN (` + ids + `)`,
+		updateAccounts:    `UPDATE accounts SET group_name = ?, updated_at = ? WHERE id IN (` + ids + `)`,
+		demoteMemberships: `UPDATE account_group_memberships SET is_primary = 0 WHERE account_id IN (` + ids + `) AND is_primary = 1`,
+		upsertMemberships: `INSERT INTO account_group_memberships(account_id, group_name, is_primary, created_at)
+			SELECT id, ?, 1, ? FROM accounts WHERE id IN (` + ids + `)
+			ON CONFLICT(account_id, group_name) DO UPDATE SET is_primary = 1`,
+	}
+}
+
+// SetAccountsGroup reassigns one bounded batch and returns the IDs that existed
+// and were updated. Input IDs are trimmed and deduplicated for SQL execution; the
+// caller can use the returned IDs to retain occurrence-based accounting.
+//
+// The three writes execute in one transaction so accounts.group_name and primary
+// memberships cannot diverge. Callers handling larger lists should use batches of
+// AccountGroupBatchSize and may fall back to SetAccountGroup if a batch fails.
+func (s *Store) SetAccountsGroup(ctx context.Context, accountIDs []string, group string) ([]string, error) {
+	ids := make([]string, 0, len(accountIDs))
+	seen := make(map[string]struct{}, len(accountIDs))
+	for _, id := range accountIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return []string{}, nil
+	}
+	if len(ids) > AccountGroupBatchSize {
+		return nil, fmt.Errorf("account group batch has %d unique IDs; maximum is %d", len(ids), AccountGroupBatchSize)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	queries := buildAccountGroupBatchQueries(len(ids))
+	rows, err := tx.QueryContext(ctx, queries.existing, stringArgs(ids)...)
+	if err != nil {
+		return nil, err
+	}
+	existing := make([]string, 0, len(ids))
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		existing = append(existing, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if len(existing) == 0 {
+		return []string{}, nil
+	}
+
+	queries = buildAccountGroupBatchQueries(len(existing))
+	group = strings.TrimSpace(group)
+	now := Now()
+	accountArgs := make([]interface{}, 0, len(existing)+2)
+	accountArgs = append(accountArgs, group, now)
+	accountArgs = append(accountArgs, stringArgs(existing)...)
+	result, err := tx.ExecContext(ctx, queries.updateAccounts, accountArgs...)
+	if err != nil {
+		return nil, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if affected != int64(len(existing)) {
+		return nil, fmt.Errorf("account group batch updated %d of %d existing accounts", affected, len(existing))
+	}
+	if _, err := tx.ExecContext(ctx, queries.demoteMemberships, stringArgs(existing)...); err != nil {
+		return nil, err
+	}
+	if group != "" {
+		membershipArgs := make([]interface{}, 0, len(existing)+2)
+		membershipArgs = append(membershipArgs, group, now)
+		membershipArgs = append(membershipArgs, stringArgs(existing)...)
+		if _, err := tx.ExecContext(ctx, queries.upsertMemberships, membershipArgs...); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return existing, nil
+}
+
 // AddAccountToGroup adds account to an extra (non-primary) group membership so the
 // scheduler can select the account when routing requests for that group.
 func (s *Store) AddAccountToGroup(ctx context.Context, accountID, group string) error {

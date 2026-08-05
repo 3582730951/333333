@@ -679,7 +679,7 @@ export default function Accounts() {
           <Input prefix={<IconSearch />} value={searchInput} onChange={setSearchInput}
             onEnterPress={doSearch} style={{ width: responsive.isMobile ? 210 : 220 }} placeholder="搜索 标签/邮箱/分组" showClear onClear={doSearch} />
           <Button icon={<IconSearch />} onClick={doSearch}>搜索</Button>
-          {!responsive.isMobile ? <Button icon={<IconDownload />} onClick={exportCSV}>导出 CSV</Button> : null}
+          <Button icon={<IconDownload />} onClick={exportCSV}>导出 CSV</Button>
           <Button icon={<IconDownload />} loading={accountExportRunning} disabled={accountImportRunning} onClick={() => exportAccountBackup([])}>一键导出全部</Button>
           <Button icon={<IconDownload />} loading={accountExportRunning} disabled={!selected.length || accountImportRunning} onClick={() => exportAccountBackup([...selected])}>一键导出所选{selected.length ? `(${selected.length})` : ''}</Button>
           <Button icon={<IconFile />} disabled={accountExportRunning || accountImportRunning} onClick={() => setArchiveImportOpen(true)}>一键导入账号池</Button>

@@ -1,8 +1,13 @@
 import { useQuery } from '@tanstack/react-query';
-import { fetchDashboardCore, fetchDashboardSecondary } from '../api/dashboard';
+import {
+  DASHBOARD_REFRESH_MS,
+  fetchDashboardCore,
+  fetchDashboardSecondary,
+  invalidateDashboardUsageSnapshot,
+} from '../api/dashboard';
 import { queryKeys, useQueryView } from '../../shared/queries';
 
-export const DASHBOARD_REFRESH_MS = 15_000;
+export { DASHBOARD_REFRESH_MS, invalidateDashboardUsageSnapshot };
 
 export const dashboardQueryKeys = {
   all: queryKeys.domain('dashboard'),

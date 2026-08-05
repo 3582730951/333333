@@ -67,8 +67,8 @@ if (!/UsageModelAreaChart/.test(usage) || !/cacheCompositionSegments/.test(usage
 const dashboard = read('pages/Dashboard.tsx');
 const dashboardApi = read('features/observability/api/dashboard.ts');
 const dashboardSurface = `${dashboard}\n${dashboardApi}`;
-if (!/\/admin\/usage\/cache/.test(dashboardSurface) || !/fields:\s*'summary,by_account,by_provider,by_provider_model'/.test(dashboardSurface)) {
-  problems.push('Dashboard cache modules must request Provider + Model, account, and completeness fields.');
+if (!/\/admin\/usage\/(?:dashboard|cache)/.test(dashboardSurface) || !/fields:\s*'summary,by_account,by_provider,by_provider_model'/.test(dashboardSurface)) {
+  problems.push('Dashboard aggregate must request Provider + Model, account, and completeness fields.');
 }
 if (!/series_dimension:\s*'provider_model'/.test(dashboardSurface) || !/dimension:\s*'provider_model'/.test(dashboardSurface)) {
   problems.push('Dashboard trends and summaries must use Provider + Model dimensions.');

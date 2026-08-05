@@ -138,6 +138,77 @@ func TestHeadlessLocalResponsePipelineRunsM4M3M5M6Once(t *testing.T) {
 	}
 }
 
+func TestHeadlessLocalResponsePipelinePreservesExecutableToolOutput(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		requestRaw []byte
+		response   []byte
+	}{
+		{
+			name:     "non-stream custom call",
+			response: []byte(`{"id":"resp_tool","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I can't assist with that request."}]},{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n+fixed\n*** End Patch"}]}`),
+		},
+		{
+			name:     "non-stream code interpreter call",
+			response: []byte(`{"id":"resp_code","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I can't assist with that request."}]},{"type":"code_interpreter_call","id":"code_1","code":"print(1)"}]}`),
+		},
+		{
+			name:       "stream custom call delta",
+			requestRaw: []byte(`{"stream":true}`),
+			response: []byte("event: response.output_item.added\n" +
+				`data: {"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":""}}` + "\n\n" +
+				"event: response.custom_tool_call_input.delta\n" +
+				`data: {"type":"response.custom_tool_call_input.delta","delta":"I can't assist\\n*** Begin Patch"}` + "\n\n" +
+				"event: response.completed\n" +
+				`data: {"type":"response.completed","response":{"id":"resp_tool","status":"completed"}}` + "\n\n"),
+		},
+		{
+			name:       "stream multiline tool search call",
+			requestRaw: []byte(`{"stream":true}`),
+			response: []byte("event: response.output_item.added\r\n" +
+				`data: {"type":"response.output_item.added",` + "\r\n" +
+				`data: "item":{"type":"tool_search_call","id":"search_1"}}` + "\r\n\r\n" +
+				"event: response.output_text.delta\r\n" +
+				`data: {"type":"response.output_text.delta","delta":"I can't assist with that request."}` + "\r\n\r\n"),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := &Server{
+				cfg:          config.Config{SuperInstructLocalEnabled: true, DataDir: t.TempDir()},
+				superMemory:  superinstruct.NewMemoryKernel(""),
+				superMonitor: superinstruct.NewMonitorPanel(),
+			}
+			recorder := httptest.NewRecorder()
+			buffered := newSuperInstructBufferingResponseWriter(recorder)
+			buffered.bufferStreams = len(test.requestRaw) > 0
+			_, _ = buffered.Write(test.response)
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			s.finishSuperInstructResponsePipeline(buffered, req, test.requestRaw, "gpt-5.6-sol", superinstruct.RequestMeta{
+				UserMessage: "edit the file", Timestamp: time.Unix(203, 0).UTC(),
+			}, superinstruct.ProcessOptions{ResponseRewriteEnabled: true, MemoryEnabled: true, MonitorEnabled: true}, time.Millisecond)
+			if !bytes.Equal(recorder.Body.Bytes(), test.response) {
+				t.Fatalf("executable tool output was rewritten:\nwant %s\n got %s", test.response, recorder.Body.Bytes())
+			}
+			if snapshot := s.superMonitor.Snapshot(s.superMemory.SuccessCount()); snapshot.Stats.Tamper != 0 {
+				t.Fatalf("tool output was classified as rewritten: %+v", snapshot)
+			}
+		})
+	}
+}
+
+func TestSuperInstructStructuredOutputRecognizesSupportedControlItems(t *testing.T) {
+	for _, kind := range []string{
+		"local_shell_call", "local_shell_call_output", "computer_call", "computer_call_output",
+		"web_search_call", "file_search_call", "tool_search_call", "tool_search_output",
+		"image_generation_call", "code_interpreter_call", "mcp_call", "mcp_list_tools", "compaction_summary",
+	} {
+		raw := []byte(`{"output":[{"type":"` + kind + `"}]}`)
+		if !superInstructResponseHasStructuredOutput(raw) {
+			t.Errorf("structured output type %q was treated as prose", kind)
+		}
+	}
+}
+
 func readSuperInstructTestEvent(t *testing.T, reader *bufio.Reader) (string, string) {
 	t.Helper()
 	event, data := "", ""

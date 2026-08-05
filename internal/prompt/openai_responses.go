@@ -262,12 +262,22 @@ func responsesLiteAdditionalTools(input interface{}) (interface{}, []interface{}
 	if !ok || len(items) == 0 {
 		return input, nil
 	}
-	first, _ := items[0].(map[string]interface{})
-	if first == nil || stringOr(first["type"], "") != "additional_tools" {
+	remaining := make([]interface{}, 0, len(items))
+	var tools []interface{}
+	foundAdditionalTools := false
+	for _, rawItem := range items {
+		item, _ := rawItem.(map[string]interface{})
+		if item != nil && stringOr(item["type"], "") == "additional_tools" && stringOr(item["role"], "") == "developer" {
+			foundAdditionalTools = true
+			tools = append(tools, responseToolSlice(item["tools"])...)
+			continue
+		}
+		remaining = append(remaining, rawItem)
+	}
+	if !foundAdditionalTools {
 		return input, nil
 	}
-	remaining := append([]interface{}(nil), items[1:]...)
-	return remaining, responseToolSlice(first["tools"])
+	return remaining, tools
 }
 
 func discoveredToolSearchTools(input interface{}) []interface{} {
@@ -518,13 +528,35 @@ func responsesToolsToChatBridge(arr []interface{}, plan *ResponsesToolBridgePlan
 		case "custom":
 			name := stringOr(tm["name"], "")
 			if name != "" {
+				source := make(map[string]interface{}, len(tm)+1)
+				for key, value := range tm {
+					source[key] = value
+				}
+				transport := "Compatibility transport: call this bridged freeform tool with one JSON object containing exactly one string field named input. The input string is passed to the tool verbatim."
+				if description := strings.TrimSpace(stringOr(tm["description"], "")); description != "" {
+					transport += "\n\n" + description
+				}
+				source["description"] = transport
+				inputDescription := "The exact freeform tool payload, without additional quoting or transformation."
+				if format, ok := tm["format"].(map[string]interface{}); ok {
+					if encoded, err := json.Marshal(format); err == nil {
+						const maxFormatDescriptionBytes = 16 << 10
+						if len(encoded) > maxFormatDescriptionBytes {
+							encoded = []byte(strings.ToValidUTF8(string(encoded[:maxFormatDescriptionBytes]), ""))
+							encoded = append(encoded, []byte(`..."truncated"`)...)
+						}
+						inputDescription += " Responses freeform format: " + string(encoded)
+					}
+				}
 				parameters := map[string]interface{}{
-					"type":                 "object",
-					"properties":           map[string]interface{}{"input": map[string]interface{}{"type": "string"}},
+					"type": "object",
+					"properties": map[string]interface{}{"input": map[string]interface{}{
+						"type": "string", "description": inputDescription,
+					}},
 					"required":             []interface{}{"input"},
 					"additionalProperties": false,
 				}
-				appendFunction(ResponsesToolIdentity{Kind: ResponsesToolCustom, Name: name}, tm, parameters)
+				appendFunction(ResponsesToolIdentity{Kind: ResponsesToolCustom, Name: name}, source, parameters)
 			}
 		case "tool_search":
 			if !strings.EqualFold(stringOr(tm["execution"], ""), "client") {
@@ -694,6 +726,13 @@ func chatChoiceTextAndToolCalls(root map[string]interface{}) (string, []interfac
 	}
 	text := chatContentToText(msg["content"])
 	toolCalls, _ := msg["tool_calls"].([]interface{})
+	if len(toolCalls) == 0 {
+		if legacy, ok := msg["function_call"].(map[string]interface{}); ok {
+			toolCalls = []interface{}{map[string]interface{}{
+				"id": "call_legacy_function", "type": "function", "function": legacy,
+			}}
+		}
+	}
 	return text, toolCalls
 }
 

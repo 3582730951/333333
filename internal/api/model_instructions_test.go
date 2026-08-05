@@ -13,7 +13,9 @@ import (
 	"testing"
 
 	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/upstream"
 )
 
 func TestUserGroupModelInstructionsFilesBecomeResponsesInstructions(t *testing.T) {
@@ -244,6 +246,27 @@ func TestHeadlessLocalSuperInstructEnablesFullFallbackAndRespectsProfiles(t *tes
 	if input[0].(map[string]interface{})["content"] != wantM1 || input[1].(map[string]interface{})["content"] != "keep me" {
 		t.Fatalf("M1 system carrier replacement mismatch: %s", injected)
 	}
+	messageRaw := []byte(`{"model":"gemini-3-flash","system":"OLD ANTHROPIC SYSTEM","messages":[{"role":"user","content":"first"},{"role":"system","content":"OLD MESSAGE SYSTEM"},{"role":"assistant","content":"answer"},{"role":"user","content":"next"}]}`)
+	messageInjected, err := s.applyModelInstructionsForEntrypoint(t.Context(), effective, "gemini-3-flash", "/v1/messages", messageRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var messageEnvelope map[string]interface{}
+	if err := json.Unmarshal(messageInjected, &messageEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	messageSystem, _ := messageEnvelope["system"].(string)
+	if !strings.Contains(messageSystem, "LOCAL M1 BRIDGE") || strings.Contains(messageSystem, "OLD ANTHROPIC SYSTEM") {
+		t.Fatalf("M1 Anthropic top-level system replacement mismatch: %s", messageInjected)
+	}
+	for index, value := range messageEnvelope["messages"].([]interface{}) {
+		if value.(map[string]interface{})["role"] == "system" {
+			t.Fatalf("M1 inserted unsupported messages[%d] system role: %s", index, messageInjected)
+		}
+	}
+	if strings.Contains(string(messageInjected), "OLD MESSAGE SYSTEM") || len(messageEnvelope["messages"].([]interface{})) != 3 {
+		t.Fatalf("M1 retained a replaced Anthropic message system carrier: %s", messageInjected)
+	}
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	attached, ok := s.attachUserGroupPolicy(httptest.NewRecorder(), req, downstreamPolicy{})
 	if !ok {
@@ -335,12 +358,50 @@ func TestCodexInstructionPlanLocalM1ReplacesSystemCarriers(t *testing.T) {
 		t.Fatalf("M1 top-level replacement = %#v, want %#v", root["instructions"], want)
 	}
 	input := root["input"].([]interface{})
-	if len(input) != 4 || input[0].(map[string]interface{})["role"] != "system" ||
-		input[0].(map[string]interface{})["content"].([]interface{})[0].(map[string]interface{})["text"] != want {
+	if len(input) != 4 || input[0].(map[string]interface{})["type"] != "additional_tools" ||
+		input[1].(map[string]interface{})["role"] != "system" ||
+		input[1].(map[string]interface{})["content"].([]interface{})[0].(map[string]interface{})["text"] != want {
 		t.Fatalf("M1 did not insert the source-compatible Responses system carrier: %s", got)
 	}
-	if input[1].(map[string]interface{})["type"] != "additional_tools" || input[3].(map[string]interface{})["content"] != "keep" {
+	if input[3].(map[string]interface{})["content"] != "keep" {
 		t.Fatalf("M1 changed non-system Codex Lite items: %s", got)
+	}
+}
+
+func TestCodexInstructionPlanLocalM1KeepsLiteToolsThroughCustomBridge(t *testing.T) {
+	raw, err := os.ReadFile("testdata/codex_lite_initial_plan.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := newCodexInstructionPlan("BRIDGE", "revision", "tree", "snapshot", true)
+	plan.LocalM1 = true
+	got := plan.apply(raw)
+	if !upstream.CodexRequestUsesResponsesLite(got) {
+		t.Fatalf("M1 changed the request out of the Responses Lite envelope: %s", got)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(got, &root); err != nil {
+		t.Fatal(err)
+	}
+	input := root["input"].([]interface{})
+	if input[0].(map[string]interface{})["type"] != "additional_tools" || input[1].(map[string]interface{})["role"] != "system" {
+		t.Fatalf("Lite tool/system ordering changed: %s", got)
+	}
+	converted, err := prompt.ResponsesRequestToChatCompletionBridge(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat map[string]interface{}
+	if err := json.Unmarshal(converted.Body, &chat); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, value := range chat["tools"].([]interface{}) {
+		function := value.(map[string]interface{})["function"].(map[string]interface{})
+		seen[function["name"].(string)] = true
+	}
+	if !seen["exec"] || !seen["request_user_input"] {
+		t.Fatalf("Lite tools disappeared in Responses-to-custom bridge: %s", converted.Body)
 	}
 }
 

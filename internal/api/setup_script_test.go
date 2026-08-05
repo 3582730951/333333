@@ -35,6 +35,7 @@ func TestSetupScriptBashSyntaxAndContents(t *testing.T) {
 		`approval_policy = "never"`, // auto-approve all
 		`sandbox_mode = "danger-full-access"`,
 		`experimental_bearer_token = "$API_KEY"`,
+		`supports_websockets = true`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("setup script missing %q", want)
@@ -75,7 +76,6 @@ func TestSetupScriptCodexUsesOnlyRequestedConfigurationAllowlist(t *testing.T) {
 	for _, forbidden := range []string{
 		"model_context_window =",
 		"model_auto_compact_token_limit =",
-		"supports_websockets =",
 		"pool-token",
 		"pool-client-id",
 		"X-Pool-Client-ID",
@@ -255,6 +255,7 @@ func TestSetupScriptCodexBranchIsIsolatedFromClaudeGateway(t *testing.T) {
 		`CONFIG="$CODEX_HOME/config.toml"`,
 		`base_url = "$ORIGIN/v1"`,
 		`wire_api = "responses"`,
+		`supports_websockets = true`,
 		`experimental_bearer_token = "$API_KEY"`,
 	} {
 		if !strings.Contains(codexBranch, want) {
@@ -266,7 +267,6 @@ func TestSetupScriptCodexBranchIsIsolatedFromClaudeGateway(t *testing.T) {
 		".claude/settings.json",
 		"ANTHROPIC_BASE_URL",
 		"install-wrapper",
-		"supports_websockets",
 		"pool-token",
 		"models_cache.json",
 		"rtk ",

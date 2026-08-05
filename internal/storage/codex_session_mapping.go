@@ -128,9 +128,16 @@ type CodexSessionBinding struct {
 	ParentThreadID     string
 	ForkedFromThreadID string
 	WindowGeneration   int64
-	CreatedAt          int64
-	UpdatedAt          int64
-	ExpiresAt          int64
+	// GoalModeActive and GoalTurnID are encrypted with the rest of the native
+	// identity. They latch only an observed Codex Goal continuation turn; merely
+	// exposing the Goal tools never sets them. Keeping the downstream turn id lets
+	// tool-output requests in that same turn retain quota grace without allowing an
+	// old Goal marker in full history to affect a later ordinary user turn.
+	GoalModeActive bool
+	GoalTurnID     string
+	CreatedAt      int64
+	UpdatedAt      int64
+	ExpiresAt      int64
 }
 
 // CodexSessionCommit atomically creates/refreshes a mapping and attaches aliases
@@ -195,6 +202,8 @@ type codexSessionIdentityPayload struct {
 	ParentThreadID     string `json:"parent_thread_id,omitempty"`
 	ForkedFromThreadID string `json:"forked_from_thread_id,omitempty"`
 	WindowGeneration   int64  `json:"window_generation"`
+	GoalModeActive     bool   `json:"goal_mode_active,omitempty"`
+	GoalTurnID         string `json:"goal_turn_id,omitempty"`
 }
 
 func normalizedCodexSessionAliases(in []CodexSessionAlias) []CodexSessionAlias {
@@ -309,6 +318,8 @@ func (s *Store) sealCodexSessionIdentity(binding CodexSessionBinding) (string, e
 		ParentThreadID:     binding.ParentThreadID,
 		ForkedFromThreadID: binding.ForkedFromThreadID,
 		WindowGeneration:   binding.WindowGeneration,
+		GoalModeActive:     binding.GoalModeActive,
+		GoalTurnID:         binding.GoalTurnID,
 	})
 	if err != nil {
 		return "", err
@@ -333,6 +344,8 @@ func (s *Store) openCodexSessionIdentity(value string, binding *CodexSessionBind
 	binding.ParentThreadID = strings.TrimSpace(payload.ParentThreadID)
 	binding.ForkedFromThreadID = strings.TrimSpace(payload.ForkedFromThreadID)
 	binding.WindowGeneration = payload.WindowGeneration
+	binding.GoalModeActive = payload.GoalModeActive
+	binding.GoalTurnID = strings.TrimSpace(payload.GoalTurnID)
 	if binding.RootSessionID == "" || binding.ThreadID == "" {
 		return errors.New("codex session mapping identity incomplete")
 	}

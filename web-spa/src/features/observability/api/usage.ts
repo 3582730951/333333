@@ -117,6 +117,7 @@ export const usageDashboardSchema = z.object({
   model_series: optionalUsageRowsSchema,
   series: z.preprocess((value) => (value === null ? undefined : value), z.array(seriesDescriptorSchema).optional()),
   cache: usageCacheSchema.optional(),
+  unavailable_sections: z.array(z.string()).optional(),
   window: windowSchema.optional(),
   effective_start_at: z.coerce.number().optional(),
   effective_until_at: z.coerce.number().optional(),

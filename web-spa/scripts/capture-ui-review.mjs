@@ -9,6 +9,7 @@ import puppeteer from 'puppeteer';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const workspaceRoot = path.resolve(root, '..');
+const distRoot = path.join(workspaceRoot, 'internal', 'console', 'dist');
 const outDir = path.join(workspaceRoot, '.run', 'ui-review');
 const screenshotRoot = path.join(outDir, 'screenshots');
 const downloadRoot = path.join(outDir, 'downloads');
@@ -18,10 +19,12 @@ const serverReadyPattern = /Local:\s+http:\/\/127\.0\.0\.1:/;
 const seed = 'ui-review-v6.1-fixed-seed';
 const recordOnly = process.env.UI_REVIEW_RECORD_ONLY === '1';
 const skipStates = process.env.UI_REVIEW_SKIP_STATES === '1';
+const staticMode = process.env.UI_REVIEW_STATIC === '1';
 
 const viewports = [
   { name: '1440x900', width: 1440, height: 900 },
   { name: '1280x720', width: 1280, height: 720 },
+  { name: '820x1180', width: 820, height: 1180 },
   { name: '390x844', width: 390, height: 844, mobile: true },
   { name: '360x800', width: 360, height: 800, mobile: true },
 ];
@@ -32,6 +35,7 @@ const adminPages = [
   ['Groups', '/groups'],
   ['Providers', '/providers'],
   ['Models', '/models'],
+  ['PublicChat', '/public-chat'],
   ['Egress', '/egress'],
   ['UpstreamErrors', '/upstream-error-rules'],
   ['Registration', '/registration'],
@@ -169,7 +173,7 @@ function mkdirs() {
   fs.mkdirSync(screenshotRoot, { recursive: true });
   fs.mkdirSync(downloadRoot, { recursive: true });
   fs.mkdirSync(userDataDir, { recursive: true });
-  fs.copyFileSync(fileURLToPath(import.meta.url), path.join(outDir, 'browser-script.mjs'));
+  fs.writeFileSync(path.join(outDir, 'browser-script.mjs'), fs.readFileSync(fileURLToPath(import.meta.url)));
   fs.writeFileSync(path.join(outDir, 'fixtures.json'), `${JSON.stringify(fixtures, null, 2)}\n`);
 }
 
@@ -406,6 +410,9 @@ async function handleAPI(req) {
     await delay(900);
     return req.respond(json({ error: { message: 'fixture invalid admin token' } }, 403));
   }
+  if (p.startsWith('/admin/') && role !== 'admin') {
+    return req.respond(json({ error: { message: 'admin role required' } }, 403));
+  }
   if (p === '/admin/config' && url.searchParams.get('placement') === 'ai_settings') {
     const domain = url.searchParams.get('domain') || 'chatgpt';
     return req.respond(json([
@@ -414,9 +421,6 @@ async function handleAPI(req) {
       { key: `${domain}_enabled`, label: '启用客户端配置', category: '运行', type: 'bool', effect: 'hot', help: '关闭后回退到全局配置。', placement: 'ai_settings', domain, scope: 'global', section: 'runtime', order: 30, value: true },
       { key: `${domain}_request_timeout`, label: '请求超时（秒）', category: '运行', type: 'int', effect: 'restart', help: '长推理请求的上限。', placement: 'ai_settings', domain, scope: 'global', section: 'runtime', order: 40, value: 120 },
     ]));
-  }
-  if (p.startsWith('/admin/') && role !== 'admin') {
-    return req.respond(json({ error: { message: 'admin role required' } }, 403));
   }
   if (p === '/admin/config') return req.respond(json(fixtures.configFields));
   if (p === '/admin/settings') return req.respond(json({ conversation_isolation: true, claude_cache_control_inject: true, require_downstream_key: true }));
@@ -581,6 +585,22 @@ async function installMocks(page) {
   await page.setRequestInterception(true);
   page.on('request', async (req) => {
     try {
+      if (staticMode) {
+        const url = new URL(req.url());
+        if (url.pathname.startsWith('/console/assets/')) {
+          const relative = url.pathname.slice('/console/'.length);
+          const file = path.resolve(distRoot, relative);
+          const withinDist = path.relative(distRoot, file);
+          if (withinDist.startsWith('..') || path.isAbsolute(withinDist) || !fs.existsSync(file)) return req.respond({ status: 404, body: '' });
+          const contentType = file.endsWith('.js') ? 'text/javascript; charset=utf-8'
+            : file.endsWith('.css') ? 'text/css; charset=utf-8'
+              : 'application/octet-stream';
+          return req.respond({ status: 200, contentType, body: fs.readFileSync(file) });
+        }
+        if (url.pathname === '/console' || url.pathname === '/console/' || url.pathname.startsWith('/console/')) {
+          return req.respond({ status: 200, contentType: 'text/html; charset=utf-8', body: fs.readFileSync(path.join(distRoot, 'index.html')) });
+        }
+      }
       await handleAPI(req);
     } catch (error) {
       log('mock_error', { url: req.url(), message: error.message });
@@ -637,11 +657,14 @@ async function gotoApp(page, baseURL, route) {
   }, { timeout: 45000 });
   await page.waitForNetworkIdle({ idleTime: 250, timeout: 5000 }).catch(() => {});
   await page.waitForFunction(() => {
+    const portalShell = document.querySelector('.pool-portal-shell');
     const sider = document.querySelector('.pool-shell-sider')?.getBoundingClientRect();
     const main = document.querySelector('.pool-main-layout')?.getBoundingClientRect();
-    if (!sider || !main) return false;
+    if (!main) return false;
+    if (portalShell) return !sider && Math.abs(main.x) <= 1 && Math.abs(main.width - innerWidth) <= 1;
+    if (!sider) return false;
     if (innerWidth < 768) return Math.abs(main.x) <= 1 && Math.abs(main.width - innerWidth) <= 1;
-    const expected = innerWidth < 1024 ? 68 : 248;
+    const expected = innerWidth < 1360 ? 68 : 248;
     return Math.abs(sider.width - expected) <= 1 && Math.abs(main.x - expected) <= 1 && Math.abs(main.width - (innerWidth - expected)) <= 1;
   }, { timeout: 10000 });
   await page.bringToFront();
@@ -862,6 +885,7 @@ async function assertPageContent(page, name, label) {
     Groups: ['分组'],
     Providers: ['模型提供商'],
     Models: ['模型列表'],
+    PublicChat: ['在线聊天'],
     Egress: ['出口 / 代理'],
     UpstreamErrors: ['上游错误规则'],
     Usage: ['用量分析', 'Top 账号', 'Provider + Model 用量与缓存诊断'],
@@ -942,6 +966,7 @@ async function launchReviewBrowser() {
     args: [
       '--no-sandbox', '--disable-dev-shm-usage', '--disable-background-timer-throttling',
       '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
+      '--disable-breakpad', '--disable-crashpad', '--disable-crash-reporter', '--no-crash-upload',
     ],
   });
 }
@@ -1211,12 +1236,12 @@ async function captureStates(browser, baseURL) {
 
 async function main() {
   mkdirs();
-  const port = await findPort(Number(process.env.UI_REVIEW_PORT || 5192));
-  const baseURL = `http://127.0.0.1:${port}/console`;
-  const server = startServer(port);
-  log('server_start', { port, baseURL });
+  const port = staticMode ? null : await findPort(Number(process.env.UI_REVIEW_PORT || 5192));
+  const baseURL = staticMode ? 'http://ui-review.local/console' : `http://127.0.0.1:${port}/console`;
+  const server = staticMode ? null : startServer(port);
+  log('server_start', { port, baseURL, static_mode: staticMode });
   try {
-    await waitForServer(server);
+    if (server) await waitForServer(server);
     const { browser, sessionReused } = await loginAndVerifyReuse(baseURL);
     try {
       const failures = [];
@@ -1258,7 +1283,7 @@ async function main() {
       await browser.close();
     }
   } finally {
-    await stopServer(server);
+    if (server) await stopServer(server);
     fs.writeFileSync(path.join(outDir, 'operation-log.json'), `${JSON.stringify(operationLog, null, 2)}\n`);
   }
   console.log(`UI review capture written to ${path.relative(workspaceRoot, outDir)}`);

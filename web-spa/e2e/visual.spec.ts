@@ -178,7 +178,12 @@ async function mockBackend(page: Page, role: Role, state: FixtureState = 'ready'
           actual_total_tokens: total, combined_total_tokens: total,
         }],
         timeseries: [{ bucket: 1_700_000_000, requests: 12, prompt_tokens: total - 234, completion_tokens: 234, total_tokens: total, cache_read_tokens: 400, cache_creation_tokens: 100 }],
-        models: [{ model: 'gpt-5', model_key: 'gpt-5', model_label: 'GPT-5', requests: 12, prompt_tokens: total - 234, total_tokens: total, cache_input_tokens: 500, cache_read_tokens: 400 }],
+        models: url.searchParams.has('since')
+          ? [{ model: 'gpt-5', model_key: 'gpt-5', model_label: 'GPT-5', requests: 12, prompt_tokens: total - 234, total_tokens: total, cache_input_tokens: 500, cache_read_tokens: 400 }]
+          : [
+            { model: 'gpt-5.5', model_key: 'gpt-5.5', model_label: 'GPT-5.5', requests: 10, prompt_tokens: 2_800_000_000, total_tokens: 3_000_000_000, cache_input_tokens: 500, cache_read_tokens: 400 },
+            { model: 'claude-opus-4-8', model_key: 'claude-opus-4-8', model_label: 'Claude Opus 4.8', requests: 2, prompt_tokens: 200_000_000, total_tokens: 220_000_000, cache_input_tokens: 0, cache_read_tokens: 0 },
+          ],
         model_series: [{ bucket: 1_700_000_000, series_key: 'gpt-5', series_label: 'GPT-5', requests: 12, prompt_tokens: total - 234, completion_tokens: 234, total_tokens: total, cache_read_tokens: 400 }],
         series: [{ series_dimension: 'model', series_key: 'gpt-5', series_label: 'GPT-5' }],
         cache: {
@@ -240,10 +245,21 @@ async function expectHealthyRender(page: Page, issues: string[], context: string
   expect(issues, `${context} emitted browser runtime errors:\n${issues.join('\n')}`).toEqual([]);
 }
 
+async function setVisualTheme(page: Page, theme: 'light' | 'dark') {
+  const root = page.locator('html');
+  const themeButton = page.locator('.pool-topbar-actions button[title]');
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (await root.getAttribute('data-theme') === theme) return;
+    const previousPreference = await root.getAttribute('data-theme-preference');
+    await themeButton.evaluate((node: HTMLButtonElement) => node.click());
+    await expect.poll(() => root.getAttribute('data-theme-preference')).not.toBe(previousPreference);
+  }
+  await expect(root).toHaveAttribute('data-theme', theme);
+}
+
 async function capture(page: Page, routePath: string, viewport: { name: string; width: number; height: number }, theme: 'light' | 'dark', outputPath: (name: string) => string) {
   await page.setViewportSize(viewport);
-  await page.addInitScript((selectedTheme) => localStorage.setItem('pool_theme', selectedTheme), theme);
-  await page.goto(`/console${routePath}`, { waitUntil: 'domcontentloaded' });
+  await setVisualTheme(page, theme);
   await expect(page.locator('[data-page-ready="true"]')).toBeVisible();
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.screenshot({ path: outputPath(`${slug(routePath)}-${viewport.name}-${theme}.png`), fullPage: true, animations: 'disabled' });
@@ -255,6 +271,10 @@ for (const entry of [...adminVisualRoutes, ...portalVisualRoutes]) {
     const runtimeIssues = watchRuntimeIssues(page);
     await mockBackend(page, role);
     const viewports = extendedPaths.has(entry.path) ? [...baseViewports, ...extraViewports] : baseViewports;
+    await page.setViewportSize(viewports[0]);
+    await page.addInitScript(() => localStorage.setItem('pool_theme', 'light'));
+    await page.goto(`/console${entry.path}`, { waitUntil: 'domcontentloaded' });
+    await expect(page.locator('[data-page-ready="true"]')).toBeVisible();
     for (const viewport of viewports) {
       for (const theme of themes) {
         await capture(page, entry.path, viewport, theme, testInfo.outputPath.bind(testInfo));
@@ -375,6 +395,60 @@ test('account import provider marks stay bounded and model donut has one readabl
   await dashboardPage.goto('/console/');
   await expect(dashboardPage.getByText('3.22B', { exact: true })).toHaveCount(1);
   await dashboardPage.close();
+});
+
+test('Apple responsive controls retain focus, touch targets, tablet labels, and balanced sheets', async ({ browser }) => {
+  const adminPage = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  await adminPage.emulateMedia({ reducedMotion: 'reduce' });
+  await mockBackend(adminPage, 'admin', 'interactive');
+  await adminPage.goto('/console/accounts');
+  await expect(adminPage.locator('[data-page-ready="true"]')).toBeVisible();
+
+  const menuButton = adminPage.getByRole('button', { name: '打开或关闭导航' });
+  for (let index = 0; index < 5 && !(await menuButton.evaluate((node) => document.activeElement === node)); index += 1) {
+    await adminPage.keyboard.press('Tab');
+  }
+  const menuMetrics = await menuButton.evaluate((node) => {
+    const box = node.getBoundingClientRect();
+    return {
+      focusVisible: node.matches(':focus-visible'),
+      boxShadow: getComputedStyle(node).boxShadow,
+      height: box.height,
+    };
+  });
+  expect(menuMetrics.focusVisible).toBe(true);
+  expect(menuMetrics.boxShadow).not.toBe('none');
+  expect(menuMetrics.height).toBeGreaterThanOrEqual(44);
+
+  await expect(adminPage.getByRole('button', { name: '导出 CSV', exact: true })).toBeVisible();
+  await adminPage.getByRole('button', { name: '添加账号', exact: true }).click();
+  const dialog = adminPage.getByRole('dialog', { name: '添加账号' });
+  await expect(dialog).toBeVisible();
+  const sheetInsets = await dialog.evaluate((node) => {
+    const box = node.getBoundingClientRect();
+    return {
+      left: box.left,
+      right: window.innerWidth - box.right,
+      bottom: window.innerHeight - box.bottom,
+    };
+  });
+  expect(Math.abs(sheetInsets.left - sheetInsets.right)).toBeLessThanOrEqual(1);
+  expect(sheetInsets.left).toBeGreaterThanOrEqual(9);
+  expect(sheetInsets.bottom).toBeGreaterThanOrEqual(9);
+  await adminPage.close();
+
+  const portalPage = await browser.newPage({ viewport: { width: 820, height: 1180 } });
+  await mockBackend(portalPage, 'user');
+  await portalPage.goto('/console/portal');
+  await expect(portalPage.locator('[data-page-ready="true"]')).toBeVisible();
+  const labels = await portalPage.locator('.pool-portal-nav__item span').evaluateAll((nodes) => nodes.map((node) => ({
+    text: node.textContent?.trim() || '',
+    visible: getComputedStyle(node).display !== 'none' && node.getBoundingClientRect().width > 0,
+  })));
+  expect(labels).toHaveLength(4);
+  expect(labels.every((label) => label.text !== '' && label.visible)).toBe(true);
+  await expect.poll(() => portalPage.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await portalPage.close();
 });
 
 test('access and audit pages switch locale without remounting', async ({ browser }) => {

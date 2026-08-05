@@ -73,6 +73,63 @@ func TestCodexSessionMappingEncryptsIdentityAndRetiresWholeTree(t *testing.T) {
 	}
 }
 
+func TestCodexSessionMappingGoalStateEncryptedRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	const goalTurnID = "goal-turn-private-019f0000"
+	committed, err := store.CommitCodexSessionBinding(ctx, CodexSessionCommit{
+		Namespace: "key:goal-state-roundtrip",
+		Binding: CodexSessionBinding{
+			ID: "binding-goal-state", TreeID: "tree-goal-state", AccountID: "account-a", EgressID: "direct", State: "active",
+			RootSessionID: "root-goal-state", ThreadID: "thread-goal-state",
+			GoalModeActive: true, GoalTurnID: goalTurnID,
+		},
+		Aliases:   []CodexSessionAlias{{Type: "root", Value: "root-goal-state"}, {Type: "response", Value: "resp-goal-state"}},
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !committed.GoalModeActive || committed.GoalTurnID != goalTurnID {
+		t.Fatalf("committed goal state = active:%v turn:%q", committed.GoalModeActive, committed.GoalTurnID)
+	}
+
+	resolved, err := store.ResolveCodexSessionAliases(ctx, "key:goal-state-roundtrip", []CodexSessionAlias{{Type: "response", Value: "resp-goal-state"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resolved.GoalModeActive || resolved.GoalTurnID != goalTurnID {
+		t.Fatalf("resolved goal state = active:%v turn:%q", resolved.GoalModeActive, resolved.GoalTurnID)
+	}
+	var encryptedIdentity string
+	if err := store.DB().QueryRowContext(ctx, `SELECT encrypted_identity FROM codex_session_binding WHERE id=?`, committed.ID).Scan(&encryptedIdentity); err != nil {
+		t.Fatal(err)
+	}
+	for _, plaintext := range []string{goalTurnID, "goal_mode_active", "goal_turn_id"} {
+		if strings.Contains(encryptedIdentity, plaintext) {
+			t.Fatalf("goal identity plaintext leaked into mapping storage: %q", plaintext)
+		}
+	}
+
+	committed.GoalModeActive = false
+	committed.GoalTurnID = ""
+	if _, err := store.CommitCodexSessionBinding(ctx, CodexSessionCommit{
+		Namespace: "key:goal-state-roundtrip",
+		Binding:   committed,
+		Aliases:   []CodexSessionAlias{{Type: "response", Value: "resp-goal-state"}},
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cleared, err := store.ResolveCodexSessionAliases(ctx, "key:goal-state-roundtrip", []CodexSessionAlias{{Type: "response", Value: "resp-goal-state"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.GoalModeActive || cleared.GoalTurnID != "" {
+		t.Fatalf("cleared goal state = active:%v turn:%q", cleared.GoalModeActive, cleared.GoalTurnID)
+	}
+}
+
 func TestCodexSessionMappingCompactionAdvancesGenerationOnce(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

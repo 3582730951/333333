@@ -10,21 +10,28 @@ import (
 	"errors"
 	"html"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/storage"
 )
 
-const publicChatJSONLimit = 1 << 20
+const (
+	publicChatJSONLimit       = 1 << 20
+	publicChatLimiterCapacity = 8192
+)
 
 type publicChatRateWindow struct {
-	Minute int64
-	Count  int
+	Minute   int64
+	Count    int
+	Sequence uint64
+	Blocked  bool
 }
+
+var publicChatLimiterSequence atomic.Uint64
 
 type publicChatAdminView struct {
 	storage.PublicChatLink
@@ -250,7 +257,7 @@ func parsePublicChatAPIPath(path string) (slug, action string, ok bool) {
 }
 
 func (s *Server) publicChatMessages(w http.ResponseWriter, r *http.Request, link storage.PublicChatLink) {
-	if !s.publicChatRateAllowed(link, publicChatClientIP(r)) {
+	if !s.publicChatRateAllowed(link, s.clientIP(r)) {
 		writeError(w, http.StatusTooManyRequests, errors.New("public chat rate limit exceeded"))
 		return
 	}
@@ -367,25 +374,11 @@ func publicChatKeyHash(linkID string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func publicChatClientIP(r *http.Request) string {
-	for _, header := range []string{"CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"} {
-		value := strings.TrimSpace(r.Header.Get(header))
-		if value == "" {
-			continue
-		}
-		candidate := strings.TrimSpace(strings.Split(value, ",")[0])
-		if net.ParseIP(candidate) != nil {
-			return candidate
-		}
-	}
-	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
-	if err == nil && host != "" {
-		return host
-	}
-	return strings.TrimSpace(r.RemoteAddr)
+func (s *Server) publicChatRateAllowed(link storage.PublicChatLink, ip string) bool {
+	return s.publicChatRateAllowedAt(link, ip, storage.Now()/60)
 }
 
-func (s *Server) publicChatRateAllowed(link storage.PublicChatLink, ip string) bool {
+func (s *Server) publicChatRateAllowedAt(link storage.PublicChatLink, ip string, nowMinute int64) bool {
 	limit := link.RateLimitPerMinute
 	if limit <= 0 {
 		limit = storage.DefaultPublicChatRateLimit
@@ -393,31 +386,68 @@ func (s *Server) publicChatRateAllowed(link storage.PublicChatLink, ip string) b
 	if limit > storage.MaxPublicChatRateLimit {
 		limit = storage.MaxPublicChatRateLimit
 	}
-	nowMinute := storage.Now() / 60
 	key := link.ID + "\x00" + ip
 	s.publicChatLimiterMu.Lock()
 	defer s.publicChatLimiterMu.Unlock()
 	if s.publicChatLimiter == nil {
 		s.publicChatLimiter = map[string]publicChatRateWindow{}
 	}
-	if len(s.publicChatLimiter) > 8192 {
+	// Sweep at most once per minute. If the current minute still fills the bounded
+	// table, the oldest surviving window is reclaimed below for a new identity.
+	if s.publicChatLastMinute != nowMinute {
 		for k, window := range s.publicChatLimiter {
 			if window.Minute < nowMinute {
 				delete(s.publicChatLimiter, k)
 			}
 		}
+		s.publicChatLastMinute = nowMinute
 	}
-	window := s.publicChatLimiter[key]
-	if window.Minute != nowMinute {
-		window = publicChatRateWindow{Minute: nowMinute}
+	window, exists := s.publicChatLimiter[key]
+	if !exists {
+		if len(s.publicChatLimiter) >= publicChatLimiterCapacity {
+			if !s.evictOldestPublicChatRateWindow() {
+				return false
+			}
+		}
+		window = publicChatRateWindow{Minute: nowMinute, Sequence: publicChatLimiterSequence.Add(1)}
+	} else if window.Minute != nowMinute {
+		window = publicChatRateWindow{Minute: nowMinute, Sequence: publicChatLimiterSequence.Add(1)}
 	}
 	if window.Count >= limit {
+		window.Blocked = true
 		s.publicChatLimiter[key] = window
 		return false
 	}
 	window.Count++
+	window.Blocked = window.Count >= limit
 	s.publicChatLimiter[key] = window
 	return true
+}
+
+// evictOldestPublicChatRateWindow is called with publicChatLimiterMu held. Sequence
+// records admission order within a minute; exhausted windows are active rate-limit
+// decisions and cannot be evicted to let a rotating identity reset its allowance.
+// Minute and key provide deterministic ordering for legacy zero-sequence entries.
+func (s *Server) evictOldestPublicChatRateWindow() bool {
+	oldestKey := ""
+	oldest := publicChatRateWindow{}
+	found := false
+	for key, window := range s.publicChatLimiter {
+		if window.Blocked {
+			continue
+		}
+		if !found || window.Sequence < oldest.Sequence ||
+			(window.Sequence == oldest.Sequence && (window.Minute < oldest.Minute ||
+				(window.Minute == oldest.Minute && key < oldestKey))) {
+			oldestKey = key
+			oldest = window
+			found = true
+		}
+	}
+	if found {
+		delete(s.publicChatLimiter, oldestKey)
+	}
+	return found
 }
 
 func publicChatHTML(link storage.PublicChatLink) string {

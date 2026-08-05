@@ -213,7 +213,7 @@ func applyOpenAICompatHeaders(dst http.Header, spec Request, stream bool) {
 // semantics (multipart boundary, beta/version selection, range and conditional
 // resource headers) survive verbatim, and account auth is installed afterward.
 func applyOpenAICompatPassthroughHeaders(dst http.Header, spec Request, stream bool) {
-	copyOpenAICompatPassthroughHeaders(dst, spec, []string{
+	semanticHeaders := []string{
 		"Accept",
 		"Anthropic-Beta",
 		"Anthropic-Version",
@@ -228,7 +228,15 @@ func applyOpenAICompatPassthroughHeaders(dst http.Header, spec Request, stream b
 		"OpenAI-Beta",
 		"Prefer",
 		"Range",
-	})
+	}
+	semanticPath := strings.TrimSuffix(strings.ToLower(strings.SplitN(spec.DownstreamPath, "?", 2)[0]), "/")
+	if strings.HasSuffix(semanticPath, "/alpha/search") {
+		// The standalone-search client attaches these two request-scoped fields.
+		// Preserve them only for that endpoint; credentials and pool headers remain
+		// excluded by the fixed passthrough allowlist.
+		semanticHeaders = append(semanticHeaders, "Originator", "X-Codex-Turn-Metadata")
+	}
+	copyOpenAICompatPassthroughHeaders(dst, spec, semanticHeaders)
 
 	credential := accountprovider.Credential(spec.Account.Provider, spec.Token)
 	if credential != "" {

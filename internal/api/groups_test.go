@@ -144,8 +144,8 @@ func TestGroupsExposeAccountCountsAndGroupMovesInvalidateSchedulerCache(t *testi
 	source := string(raw)
 	for _, fn := range []string{"adminSetAccountGroup", "adminAccountsAssignGroup"} {
 		body := functionBody(t, source, fn)
-		if !strings.Contains(body, ".InvalidateAccountCache()") {
-			t.Fatalf("%s must call scheduler.InvalidateAccountCache after group changes", fn)
+		if got := strings.Count(body, ".InvalidateAccountCache()"); got != 1 {
+			t.Fatalf("%s scheduler invalidations = %d, want exactly one after group changes", fn, got)
 		}
 	}
 }

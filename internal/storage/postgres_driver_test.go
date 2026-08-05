@@ -66,6 +66,18 @@ func TestPostgresIntegrationInitAndCoreRoundTrip(t *testing.T) {
 	if err != nil || roundTrip.Provider != account.Provider {
 		t.Fatalf("round-trip account=%+v err=%v", roundTrip, err)
 	}
+	updatedAccounts, err := store.SetAccountsGroup(ctx, []string{account.ID, "postgres-missing-account", account.ID}, "cyber")
+	if err != nil || len(updatedAccounts) != 1 || updatedAccounts[0] != account.ID {
+		t.Fatalf("batch group assignment updated=%v err=%v", updatedAccounts, err)
+	}
+	memberships, err := store.GetAccountGroups(ctx, account.ID)
+	hasPrimaryGroup := false
+	for _, membership := range memberships {
+		hasPrimaryGroup = hasPrimaryGroup || membership == "cyber"
+	}
+	if err != nil || !hasPrimaryGroup {
+		t.Fatalf("batch group memberships=%v err=%v", memberships, err)
+	}
 	if _, err = store.UpsertAffinityBindingResult(ctx, AffinityBinding{
 		RouteKeyHash: "postgres-integration-route", RouteKey: "route", Source: "session",
 		AccountID: account.ID, Provider: "codex", Model: "gpt-5", EgressID: DefaultDirectEgressID,

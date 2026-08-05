@@ -31,6 +31,23 @@ import (
 // an ordinary Codex account login. Multipart bodies are replayable BodySources;
 // no JSON normalization or identity text rewriting is performed.
 func (s *Server) handleCodexPassthrough(w http.ResponseWriter, r *http.Request) {
+	policy, ok := s.resolveDownstreamPolicy(w, r)
+	if !ok {
+		return
+	}
+	s.handleCodexPassthroughWithPolicy(w, r, policy, "", nil)
+}
+
+// handleCodexPassthroughWithPolicy preserves a provider/group decision already
+// made by a model-aware dispatcher. Auxiliary endpoints normally have no model,
+// while standalone search supplies one for exact account capability selection.
+func (s *Server) handleCodexPassthroughWithPolicy(
+	w http.ResponseWriter,
+	r *http.Request,
+	policy downstreamPolicy,
+	routeModel string,
+	raw []byte,
+) {
 	switch r.Method {
 	case http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodPut, http.MethodPatch:
 	default:
@@ -39,22 +56,20 @@ func (s *Server) handleCodexPassthrough(w http.ResponseWriter, r *http.Request) 
 	}
 
 	body := bodySourceFromContext(r.Context())
-	var raw []byte
 	if body == nil && r.Body != nil {
-		value, err := readLimited(r.Body, s.cfg.MaxBodyBytes)
-		if err != nil {
-			writeError(w, http.StatusRequestEntityTooLarge, err)
-			return
+		if raw == nil {
+			value, err := readLimited(r.Body, s.cfg.MaxBodyBytes)
+			if err != nil {
+				writeError(w, http.StatusRequestEntityTooLarge, err)
+				return
+			}
+			raw = value
 		}
-		raw = value
 		body = bodysource.Bytes(raw)
 		defer body.Close()
 	}
 
-	policy, ok := s.resolveDownstreamPolicy(w, r)
-	if !ok {
-		return
-	}
+	routeModel = strings.TrimSpace(routeModel)
 	hint := normalizeProviderHintLoose(r.Header.Get("X-Pool-Provider"))
 	if strings.TrimSpace(r.Header.Get("X-Pool-Provider")) == "" {
 		hint = normalizeProviderHintLoose(policy.ProviderHint)
@@ -87,6 +102,7 @@ func (s *Server) handleCodexPassthrough(w http.ResponseWriter, r *http.Request) 
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
 		Group:             policy.Group,
 		Provider:          "codex",
+		Model:             routeModel,
 		Affinity:          affinity,
 		ImmutableAffinity: immutableResource,
 		SkipWait:          userGroupFallbackProbe(r.Context()),
@@ -96,7 +112,7 @@ func (s *Server) handleCodexPassthrough(w http.ResponseWriter, r *http.Request) 
 			writePoolCodeError(w, http.StatusConflict, "bound_account_unavailable", "the account bound to this Codex resource is unavailable")
 			return
 		}
-		s.writePublicNoAccountError(r.Context(), w, http.StatusServiceUnavailable, policy.Group, "codex", "", err)
+		s.writePublicNoAccountError(r.Context(), w, http.StatusServiceUnavailable, policy.Group, "codex", routeModel, err)
 		return
 	}
 	defer lease.Release()
@@ -113,6 +129,7 @@ func (s *Server) handleCodexPassthrough(w http.ResponseWriter, r *http.Request) 
 			DownstreamPath: pathWithQuery(r.URL.Path, r.URL.RawQuery),
 			Headers:        r.Header.Clone(),
 			Body:           body,
+			Model:          routeModel,
 			Account:        lease.Account,
 			Token:          current,
 			Egress:         lease.Egress,
@@ -156,7 +173,7 @@ func (s *Server) handleCodexPassthrough(w http.ResponseWriter, r *http.Request) 
 
 passthroughSuccess:
 	s.guardRateLimitForAccount(r.Context(), lease.Account, response.Header)
-	s.captureQuota(r.Context(), lease.Account.ID, "codex", "", response.Header)
+	s.captureQuota(r.Context(), lease.Account.ID, "codex", routeModel, response.Header)
 	if resourceAffinity.Hash != "" {
 		s.persistCodexResourceBinding(r.Context(), resourceAffinity, resourceKind, lease)
 	}

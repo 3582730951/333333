@@ -53,6 +53,11 @@
   color: var(--pool-text);
 }
 
+.pool-mobile-drawer-close {
+  display: none;
+  margin-left: auto;
+}
+
 .pool-sidebar-collapse {
   height: 48px;
   display: flex;
@@ -541,6 +546,14 @@
     width: min(86vw, 304px) !important;
     min-width: min(86vw, 304px);
     max-width: min(86vw, 304px);
+  }
+
+  .pool-shell-sider[aria-hidden="true"] {
+    pointer-events: none;
+  }
+
+  .pool-mobile-drawer-close {
+    display: inline-flex;
   }
 
   .pool-main-layout { width: 100vw; margin-left: 0 !important; }

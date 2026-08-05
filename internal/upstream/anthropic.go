@@ -85,7 +85,7 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 	// 1. Not in passthrough mode (passthrough = opaque body, no thinking injection)
 	// 2. Thinking is enabled in config
 	// 3. Path is a messages endpoint (not files/skills/agents)
-	if !spec.PassThrough && !spec.MinimalProbe && c.cfg.ThinkingEnabled && strings.Contains(path, "/v1/messages") {
+	if !spec.PassThrough && !spec.MinimalProbe && c.cfgSnapshot().ThinkingEnabled && strings.Contains(path, "/v1/messages") {
 		setRequestBody(&spec, c.applyThinkingConfig(requestBody(spec), "claude", spec.Model, spec.Account))
 	}
 	if !spec.PassThrough && !spec.MinimalProbe && strings.Contains(path, "/v1/messages") {

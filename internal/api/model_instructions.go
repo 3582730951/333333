@@ -20,6 +20,7 @@ import (
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/superinstruct"
 	"codex-account-pool/internal/upstream"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -487,6 +488,18 @@ func (s *Server) applyModelInstructionsForEntrypoint(ctx context.Context, group 
 		// group supplies every appended block: group prompt, administrator files,
 		// and that group's model-family Super-Instruct skill selection.
 		instructions := joinInstructionParts(bridge, groupPrompt, components.Administrator, components.SuperInstruct)
+		if path == "/v1/messages" || path == "/v1/messages/count_tokens" {
+			// Anthropic Messages carries system instructions at the top level;
+			// a Chat-style messages[].role=system item is rejected by Antigravity
+			// and strict Anthropic-compatible relays. M1 replacement semantics
+			// intentionally discard every previous system carrier first.
+			withoutSystem, deleteErr := stripAnthropicSystemCarriers(raw)
+			if deleteErr != nil {
+				return raw, deleteErr
+			}
+			updated, _, injectErr := prompt.InjectAnthropicSystemPrompt(withoutSystem, instructions)
+			return updated, injectErr
+		}
 		updated, _, injectErr := superinstruct.InjectSystem(raw, instructions)
 		return updated, injectErr
 	}
@@ -504,6 +517,28 @@ func (s *Server) applyModelInstructionsForEntrypoint(ctx context.Context, group 
 	default:
 		return setResponsesInstructionParts(raw, groupPrompt, components.Administrator, components.SuperInstruct), nil
 	}
+}
+
+func stripAnthropicSystemCarriers(raw []byte) ([]byte, error) {
+	updated, err := sjson.DeleteBytes(raw, "system")
+	if err != nil {
+		return nil, err
+	}
+	messages := gjson.GetBytes(updated, "messages")
+	if !messages.IsArray() {
+		return updated, nil
+	}
+	items := messages.Array()
+	for index := len(items) - 1; index >= 0; index-- {
+		if strings.TrimSpace(items[index].Get("role").String()) != "system" {
+			continue
+		}
+		updated, err = sjson.DeleteBytes(updated, fmt.Sprintf("messages.%d", index))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return updated, nil
 }
 
 // CodexInstructionPlan is fixed once at the gateway entrance and then reused by

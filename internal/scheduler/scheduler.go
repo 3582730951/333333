@@ -293,6 +293,12 @@ type Route struct {
 	// session. RequiredEgressID completes that same identity boundary.
 	RequiredAccountID string
 	RequiredEgressID  string
+	// AllowCodexGoalQuotaGrace lets an observed, active Codex Goal turn probe an
+	// account despite local quota snapshots. It never bypasses inactive/quarantined
+	// accounts, recheck-pending upstream failures, unhealthy egress, concurrency, or
+	// token budgets. A plain cooldown may be ignored only when no recheck is pending,
+	// which covers success-header quota telemetry rather than an upstream rejection.
+	AllowCodexGoalQuotaGrace bool
 	// PreferredEgressIDs is an ordered provider-level override. The first outlet
 	// is primary and the remaining outlets are attempted before another account.
 	// Account bindings remain operational metadata and are not rewritten.
@@ -1557,6 +1563,7 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 		return Lease{}, leaseBlockProviderMismatch, false
 	}
 	candidateRoute := routeForProviderModel(route, accountProvider)
+	goalQuotaGrace := route.AllowCodexGoalQuotaGrace && accountProvider == "codex"
 	resolvedModel := candidateRoute.Model
 	if accountProvider == "kiro" && capabilityRouteModel(candidateRoute.Model) {
 		var ok bool
@@ -1589,7 +1596,7 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	rateRows, rateErr := s.rateLimitsSnapshot(ctx, route.Group, []string{accountID})
 	provider := providerForRoute(s, ctx, account, route)
 	if rateErr == nil {
-		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateRows[accountID], provider, candidateRoute.Model, now); limited && !account.IgnoreRateLimitControls {
+		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateRows[accountID], provider, candidateRoute.Model, now); limited && !account.IgnoreRateLimitControls && !goalQuotaGrace {
 			return Lease{}, leaseBlockRateLimitCooldown, false
 		}
 	}
@@ -1613,20 +1620,21 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	if binding.RecheckPending && !account.IgnoreRateLimitControls {
 		return Lease{}, leaseBlockRecheckPending, false
 	}
+	ignoreTelemetryCooldown := account.IgnoreRateLimitControls || (goalQuotaGrace && !binding.RecheckPending)
 	var egress storage.EgressProfile
 	var ok bool
 	if route.RequiredEgressID != "" {
 		egress, err = s.egressProfile(ctx, route.RequiredEgressID, egressCache)
-		ok = err == nil && EgressHealthy(egress, now) && (account.IgnoreRateLimitControls || binding.CooldownUntil <= now)
+		ok = err == nil && EgressHealthy(egress, now) && (ignoreTelemetryCooldown || binding.CooldownUntil <= now)
 	} else {
-		if snapshot.Egress.ID == binding.PrimaryEgressID && (account.IgnoreRateLimitControls || binding.CooldownUntil <= now) && EgressHealthy(snapshot.Egress, now) {
+		if snapshot.Egress.ID == binding.PrimaryEgressID && (ignoreTelemetryCooldown || binding.CooldownUntil <= now) && EgressHealthy(snapshot.Egress, now) {
 			egress, ok = snapshot.Egress, true
 		} else {
-			egress, ok = s.selectEgress(ctx, binding, now, egressCache, account.IgnoreRateLimitControls)
+			egress, ok = s.selectEgress(ctx, binding, now, egressCache, ignoreTelemetryCooldown)
 		}
 	}
 	if !ok {
-		if s.egressTemporarilyUnavailable(ctx, binding, now, account.IgnoreRateLimitControls) {
+		if s.egressTemporarilyUnavailable(ctx, binding, now, ignoreTelemetryCooldown) {
 			return Lease{}, leaseBlockEgressCooldown, false
 		}
 		return Lease{}, leaseBlockEgressUnavailable, false

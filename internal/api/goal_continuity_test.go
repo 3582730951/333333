@@ -2,10 +2,13 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,6 +45,191 @@ func TestIncrementalGoalRequestStoresOnlyDurableHistorySuffix(t *testing.T) {
 	trimmed, replace := incrementalGoalRequestWithMode(compacted, durable)
 	if !replace || string(trimmed) != string(compacted) {
 		t.Fatalf("full Claude replacement snapshot replace=%v body=%s", replace, trimmed)
+	}
+}
+
+func TestGoalPersistenceDegradedAuditIsCoalesced(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	ctx := context.Background()
+	const terminal = "codex_terminal_pressure_test"
+	err := storage.ErrGoalStorageBudget
+	for index := 0; index < 100; index++ {
+		h.app.auditGoalPersistenceDegraded(ctx, terminal, err)
+	}
+	var rows int
+	if queryErr := h.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log WHERE action='goal_persistence_degraded' AND reason=?`, terminal).Scan(&rows); queryErr != nil || rows != 1 {
+		t.Fatalf("coalesced audit rows=%d err=%v, want 1", rows, queryErr)
+	}
+	key := fmt.Sprintf("%p\x00%s\x00%s", h.app.store, terminal, goalPersistenceErrorCode(err))
+	value, ok := goalPersistenceAuditBuckets.Load(key)
+	if !ok {
+		t.Fatal("coalescing bucket was not retained")
+	}
+	bucket := value.(*goalPersistenceAuditBucket)
+	bucket.mu.Lock()
+	bucket.last = time.Now().Add(-goalPersistenceAuditWindow)
+	bucket.mu.Unlock()
+	h.app.auditGoalPersistenceDegraded(ctx, terminal, err)
+	if queryErr := h.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log WHERE action='goal_persistence_degraded' AND reason=?`, terminal).Scan(&rows); queryErr != nil || rows != 2 {
+		t.Fatalf("coalesced audit flush rows=%d err=%v, want 2", rows, queryErr)
+	}
+	var detail string
+	if queryErr := h.store.DB().QueryRowContext(ctx, `SELECT detail FROM audit_log WHERE action='goal_persistence_degraded' AND reason=? ORDER BY id DESC LIMIT 1`, terminal).Scan(&detail); queryErr != nil || detail != "error_code=storage_budget suppressed=99" {
+		t.Fatalf("coalesced audit detail=%q err=%v", detail, queryErr)
+	}
+	goalPersistenceAuditBuckets.Delete(key)
+}
+
+func TestCommitGoalTurnWithStorageRecoveryRetriesExactlyOnceAfterColdReclaim(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	ctx := context.Background()
+	payload := func(seed uint32, size int) string {
+		raw := make([]byte, size)
+		for index := range raw {
+			seed = seed*1664525 + 1013904223
+			raw[index] = byte(seed >> 24)
+		}
+		return base64.StdEncoding.EncodeToString(raw)
+	}
+	turn := func(alias, response, input string) storage.GoalTurn {
+		return storage.GoalTurn{
+			Protocol: "codex", DownstreamKeyHash: "key-" + alias, WorkspaceHash: "workspace-" + alias,
+			InitialGoalHash: "initial-" + alias, ResponseID: response,
+			Aliases:           []storage.GoalAlias{{Type: "codex_root_thread", Value: alias}},
+			CheckpointPayload: `{"model":"gpt-test","input":[]}`,
+			SegmentPayload:    `{"input":"` + input + `","output":"ok"}`,
+			ExpiresAt:         storage.Now() + 86400,
+		}
+	}
+	var cold []storage.GoalSession
+	for index := 0; index < 2; index++ {
+		created, err := h.store.CommitGoalTurn(ctx, turn(fmt.Sprintf("api-cold-%d", index), fmt.Sprintf("api-cold-r%d", index), payload(uint32(index+1), 80<<10)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = h.store.DB().ExecContext(ctx, `UPDATE goal_session SET state='completed',updated_at=? WHERE id=?`, storage.Now()-100-int64(index), created.ID); err != nil {
+			t.Fatal(err)
+		}
+		cold = append(cold, created)
+	}
+	current, err := h.store.CommitGoalTurn(ctx, turn("api-current", "api-current-r1", "first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h.store.AcquireGoalRun(ctx, current.ID, "api-current-owner", "running", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	var used, currentBytes int64
+	if err = h.store.DB().QueryRowContext(ctx, `SELECT SUM(storage_bytes) FROM goal_session`).Scan(&used); err != nil {
+		t.Fatal(err)
+	}
+	if err = h.store.DB().QueryRowContext(ctx, `SELECT storage_bytes FROM goal_session WHERE id=?`, current.ID).Scan(&currentBytes); err != nil {
+		t.Fatal(err)
+	}
+	appendTurn := turn("api-current", "api-current-r2", payload(77, 96<<10))
+	appendTurn.StorageMaxBytes = used + 1
+	_, err = h.store.CommitGoalTurn(ctx, appendTurn)
+	var probe *storage.GoalStorageBudgetError
+	if !errors.As(err, &probe) {
+		t.Fatalf("budget probe error=%v", err)
+	}
+	appendTurn.StorageMaxBytes = currentBytes + probe.AdditionalBytes + 1024
+	updated, err := h.app.commitGoalTurnWithStorageRecovery(ctx, appendTurn, appendTurn.StorageMaxBytes)
+	if err != nil || updated.ID != current.ID {
+		t.Fatalf("recovered commit=%+v err=%v, want current %s", updated, err, current.ID)
+	}
+	for _, goal := range cold {
+		if _, err = h.store.GetGoalSession(ctx, goal.ID); !errors.Is(err, storage.ErrGoalNotFound) {
+			t.Fatalf("cold goal %s survived recovery: %v", goal.ID, err)
+		}
+	}
+	var recoveredAudits int
+	if err = h.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log WHERE action='goal_storage_commit_recovered'`).Scan(&recoveredAudits); err != nil || recoveredAudits != 1 {
+		t.Fatalf("recovery audit count=%d err=%v", recoveredAudits, err)
+	}
+}
+
+func TestCommitGoalTurnWithStorageRecoveryConsolidatesOnlyLiveGoalExactly(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	ctx := context.Background()
+	turn := func(response, marker string) storage.GoalTurn {
+		return storage.GoalTurn{
+			Protocol: "codex", DownstreamKeyHash: "only-live-key", WorkspaceHash: "only-live-workspace",
+			InitialGoalHash: "only-live-initial", ResponseID: response,
+			Aliases:           []storage.GoalAlias{{Type: "codex_root_thread", Value: "only-live-root"}},
+			CheckpointPayload: `{"model":"gpt-test","input":[]}`,
+			SegmentPayload:    `{"history_key":"input","input":[{"role":"user","content":"` + marker + `"}],"output":[{"type":"message","content":"output-` + marker + `"}]}`,
+			WorkingState:      `{"marker":"` + marker + `"}`,
+			ExpiresAt:         storage.Now() + 86400,
+		}
+	}
+	first := turn("only-live-r0", "first-marker")
+	goal, err := h.store.CommitGoalTurn(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 1; index <= 24; index++ {
+		marker := fmt.Sprintf("middle-marker-%02d-%s", index, strings.Repeat("repeatable-context-", 12))
+		next := turn(fmt.Sprintf("only-live-r%d", index), marker)
+		if index == 24 {
+			next.AwaitingTool = true
+			next.SegmentPayload = `{"history_key":"input","input":[{"type":"custom_tool_call","call_id":"pending-call","name":"tool","arguments":"{}"}],"output":[{"type":"message","content":"pending-tool-marker"}]}`
+		}
+		if _, err = h.store.CommitGoalTurn(ctx, next); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = h.store.AcquireGoalRun(ctx, goal.ID, "only-live-owner", "running", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	beforeReplay, beforeSession, err := h.store.BuildGoalReplay(ctx, goal.ID)
+	if err != nil || beforeSession.State != "awaiting_tool_result" {
+		t.Fatalf("before consolidation session=%+v err=%v", beforeSession, err)
+	}
+	var beforeBytes int64
+	if err = h.store.DB().QueryRowContext(ctx, `SELECT storage_bytes FROM goal_session WHERE id=?`, goal.ID).Scan(&beforeBytes); err != nil {
+		t.Fatal(err)
+	}
+	appendTurn := turn("only-live-final", "after-tool-marker")
+	appendTurn.SegmentPayload = `{"history_key":"input","input":[{"type":"custom_tool_call_output","call_id":"pending-call","output":"after-tool-marker"}],"output":[{"type":"message","content":"latest-marker"}]}`
+	appendTurn.StorageMaxBytes = beforeBytes - 1
+	updated, err := h.app.commitGoalTurnWithStorageRecovery(ctx, appendTurn, appendTurn.StorageMaxBytes)
+	if err != nil || updated.ID != goal.ID {
+		t.Fatalf("only-live exact consolidation goal=%+v err=%v", updated, err)
+	}
+	afterReplay, _, err := h.store.BuildGoalReplay(ctx, goal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{"first-marker", "middle-marker-12", "pending-tool-marker", "pending-call", "after-tool-marker", "latest-marker"} {
+		if !strings.Contains(string(afterReplay), marker) {
+			t.Fatalf("exact consolidation lost %s replay=%s", marker, afterReplay)
+		}
+	}
+	// Every item from the prior replay remains represented; the rewritten checkpoint
+	// only removes physical segment fragmentation before appending the final turn.
+	var beforeRoot, afterRoot map[string]interface{}
+	if err = json.Unmarshal(beforeReplay, &beforeRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(afterReplay, &afterRoot); err != nil {
+		t.Fatal(err)
+	}
+	beforeInput, _ := beforeRoot["input"].([]interface{})
+	afterInput, _ := afterRoot["input"].([]interface{})
+	if len(afterInput) <= len(beforeInput) || !reflect.DeepEqual(beforeInput, afterInput[:len(beforeInput)]) {
+		t.Fatalf("exact consolidation changed prior history before=%d after=%d", len(beforeInput), len(afterInput))
+	}
+	var afterBytes int64
+	if err = h.store.DB().QueryRowContext(ctx, `SELECT storage_bytes FROM goal_session WHERE id=?`, goal.ID).Scan(&afterBytes); err != nil {
+		t.Fatal(err)
+	}
+	if afterBytes >= beforeBytes {
+		t.Fatalf("exact consolidation storage before/after=%d/%d, want physical reduction", beforeBytes, afterBytes)
+	}
+	var recovered int
+	if err = h.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log WHERE action='goal_storage_commit_recovered' AND reason='bounded_reclaim_exact_current_consolidation'`).Scan(&recovered); err != nil || recovered != 1 {
+		t.Fatalf("exact consolidation audit=%d err=%v", recovered, err)
 	}
 }
 

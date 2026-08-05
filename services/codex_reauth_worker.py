@@ -19,7 +19,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 
 class WorkerError(Exception):
@@ -203,7 +203,55 @@ class ReauthHTTPServer(ThreadingHTTPServer):
 
     def __init__(self, server_address: Tuple[str, int], RequestHandlerClass, concurrency: int = 1):
         super().__init__(server_address, RequestHandlerClass)
-        self.semaphore = threading.BoundedSemaphore(max(1, int(concurrency or 1)))
+        reauth_concurrency = max(1, int(concurrency or 1))
+        request_threads = max(8, reauth_concurrency + 4)
+        self.request_thread_limit = request_threads
+        self.header_idle_timeout = float(os.environ.get("CODEX_REAUTH_HEADER_IDLE_TIMEOUT_SECONDS") or "10")
+        self.body_idle_timeout = float(os.environ.get("CODEX_REAUTH_BODY_IDLE_TIMEOUT_SECONDS") or "30")
+        self.reauth_slots = threading.BoundedSemaphore(reauth_concurrency)
+        self.thread_slots = threading.BoundedSemaphore(request_threads)
+        self._worker_count_lock = threading.Lock()
+        self.active_workers = 0
+
+    def process_request(self, request: Any, client_address: Tuple[str, int]) -> None:
+        # Reserve capacity before ThreadingHTTPServer spawns a handler. Acquiring
+        # inside do_POST would still create one waiting thread per connection.
+        if not self.thread_slots.acquire(blocking=False):
+            body = b'{"status":"failed","code":"busy","error":"worker is busy"}'
+            response = (
+                b"HTTP/1.1 429 Too Many Requests\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode()
+                + b"Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
+                b"Retry-After: 1\r\nConnection: close\r\n\r\n"
+                + body
+            )
+            try:
+                request.settimeout(1)
+                request.sendall(response)
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            # A connection that has consumed a request-thread slot must not be
+            # able to hold it forever by leaving its request headers partial.
+            request.settimeout(self.header_idle_timeout)
+            super().process_request(request, client_address)
+        except Exception:
+            self.thread_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Tuple[str, int]) -> None:
+        with self._worker_count_lock:
+            self.active_workers += 1
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._worker_count_lock:
+                self.active_workers -= 1
+            self.thread_slots.release()
 
 
 class ReauthHandler(BaseHTTPRequestHandler):
@@ -223,8 +271,8 @@ class ReauthHandler(BaseHTTPRequestHandler):
         if self.path != "/v1/codex/reauth":
             self.write_json(404, {"status": "failed", "code": "not_found", "error": "not found"})
             return
-        if not self.server.semaphore.acquire(timeout=1):
-            self.write_json(429, {"status": "failed", "code": "busy", "error": "worker is busy"})
+        if not self.server.reauth_slots.acquire(blocking=False):
+            self.write_json(429, {"status": "failed", "code": "busy", "error": "worker is busy"}, {"Retry-After": "1"})
             return
         try:
             payload = self.read_json()
@@ -237,7 +285,7 @@ class ReauthHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.write_json(500, {"status": "failed", "code": "internal_error", "error": str(exc)})
         finally:
-            self.server.semaphore.release()
+            self.server.reauth_slots.release()
 
     def read_json(self) -> Dict[str, Any]:
         n = int(self.headers.get("Content-Length") or "0")
@@ -245,6 +293,9 @@ class ReauthHandler(BaseHTTPRequestHandler):
             return {}
         if n > 1 << 20:
             raise WorkerError("request_too_large", "request body too large", 413)
+        # Header parsing uses the server's header idle timeout. Switch phases
+        # only when a body read is actually required.
+        self.connection.settimeout(self.server.body_idle_timeout)
         raw = self.rfile.read(n)
         try:
             payload = json.loads(raw.decode())
@@ -254,13 +305,15 @@ class ReauthHandler(BaseHTTPRequestHandler):
             raise WorkerError("bad_json", "request body must be a JSON object", 400)
         return payload
 
-    def write_json(self, status: int, payload: Dict[str, Any]) -> None:
+    def write_json(self, status: int, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(raw)
 

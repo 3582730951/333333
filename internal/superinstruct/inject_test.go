@@ -81,6 +81,26 @@ func TestInjectSystemInsertsMissingSystemRoles(t *testing.T) {
 	}
 }
 
+func TestInjectSystemKeepsResponsesLiteToolsAtInputZero(t *testing.T) {
+	raw := []byte(`{"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"apply_patch"}]},{"type":"message","role":"user","content":"edit the file"}]}`)
+	got, injected, err := InjectSystem(raw, "BRIDGE")
+	if err != nil || !injected {
+		t.Fatalf("InjectSystem injected=%v err=%v", injected, err)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(got, &root); err != nil {
+		t.Fatal(err)
+	}
+	input := root["input"].([]interface{})
+	first := input[0].(map[string]interface{})
+	if len(input) != 3 || first["type"] != "additional_tools" || first["role"] != "developer" {
+		t.Fatalf("Responses Lite tool envelope moved from input[0]: %s", got)
+	}
+	if input[1].(map[string]interface{})["role"] != "system" {
+		t.Fatalf("system carrier was not inserted after the Lite envelope: %s", got)
+	}
+}
+
 func TestInjectSystemLeavesUnsupportedEnvelopeUntouched(t *testing.T) {
 	raw := []byte(`{"model":"gpt-5.6-sol","opaque":{"keep":true}}`)
 	got, injected, err := InjectSystem(raw, "BRIDGE")

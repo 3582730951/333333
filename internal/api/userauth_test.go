@@ -153,6 +153,80 @@ func TestAuthConcurrentBootstrapCreatesExactlyOneAdmin(t *testing.T) {
 	}
 }
 
+func TestLoginThrottlePreservesBlockWindow(t *testing.T) {
+	now := int64(100_000)
+	throttle := newLoginThrottle()
+	throttle.now = func() int64 { return now }
+
+	for i := 0; i < loginMaxFailures; i++ {
+		if !throttle.allow("198.51.100.10") {
+			t.Fatalf("attempt %d rejected before threshold", i+1)
+		}
+		throttle.fail("198.51.100.10")
+	}
+	if throttle.allow("198.51.100.10") {
+		t.Fatal("client remained allowed after reaching failure threshold")
+	}
+	now += loginBlockSecs - 1
+	if throttle.allow("198.51.100.10") {
+		t.Fatal("client was admitted before the block window elapsed")
+	}
+	now++
+	if !throttle.allow("198.51.100.10") {
+		t.Fatal("client remained blocked after the block window elapsed")
+	}
+}
+
+func TestLoginThrottleTTLAndCapacityEviction(t *testing.T) {
+	now := int64(200_000)
+	throttle := newLoginThrottle()
+	throttle.now = func() int64 { return now }
+
+	for i := 0; i < loginThrottleMaxEntries; i++ {
+		client := fmt.Sprintf("client-%d", i)
+		if !throttle.allow(client) {
+			t.Fatalf("entry %d rejected before capacity", i)
+		}
+		throttle.fail(client)
+	}
+	if got := len(throttle.hits); got != loginThrottleMaxEntries {
+		t.Fatalf("throttle size = %d, want %d", got, loginThrottleMaxEntries)
+	}
+	// client-1 is older, but its active block makes it ineligible for eviction.
+	// client-0 is therefore the oldest reclaimable partial-failure entry.
+	throttle.hits["client-0"].lastSeen = now - 1
+	throttle.hits["client-1"].lastSeen = now - 2
+	throttle.hits["client-1"].blockedUntil = now + loginBlockSecs
+	if !throttle.allow("overflow-client") {
+		t.Fatal("new client was rejected instead of reclaiming an inactive entry")
+	}
+	throttle.fail("overflow-client")
+	if got := len(throttle.hits); got != loginThrottleMaxEntries {
+		t.Fatalf("throttle size after eviction = %d, want %d", got, loginThrottleMaxEntries)
+	}
+	if _, ok := throttle.hits["client-0"]; ok {
+		t.Fatal("oldest inactive entry survived capacity eviction")
+	}
+	if _, ok := throttle.hits["overflow-client"]; !ok {
+		t.Fatal("admitted client failure was not tracked")
+	}
+	if _, ok := throttle.hits["client-1"]; !ok || throttle.allow("client-1") {
+		t.Fatal("active block was evicted or shortened under capacity pressure")
+	}
+
+	now += loginThrottleTTLSeconds + 1
+	if !throttle.allow("after-ttl") {
+		t.Fatal("expired entries were not reclaimed after TTL")
+	}
+	throttle.fail("after-ttl")
+	if got := len(throttle.hits); got != 1 {
+		t.Fatalf("throttle size after TTL cleanup = %d, want 1", got)
+	}
+	if _, ok := throttle.hits["after-ttl"]; !ok {
+		t.Fatal("new entry missing after TTL cleanup")
+	}
+}
+
 func TestForwardedHeadersRequireTrustedImmediateProxy(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	untrusted := httptest.NewRequest(http.MethodGet, "http://internal.example/auth/me", nil)

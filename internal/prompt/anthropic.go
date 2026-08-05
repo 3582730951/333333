@@ -46,8 +46,9 @@ func ChatCompletionToAnthropic(raw []byte) ([]byte, error) {
 	if stop := toStringSlice(root["stop"]); len(stop) > 0 {
 		out["stop_sequences"] = stop
 	}
-	if tools := convertOpenAITools(root["tools"]); len(tools) > 0 {
-		out["tools"] = tools
+	convertedTools := convertOpenAITools(root["tools"])
+	if len(convertedTools) > 0 {
+		out["tools"] = convertedTools
 	}
 	if tc := convertToolChoice(root["tool_choice"]); tc != nil {
 		if choice, ok := tc.(map[string]interface{}); ok {
@@ -58,6 +59,10 @@ func ChatCompletionToAnthropic(raw []byte) ([]byte, error) {
 		out["tool_choice"] = tc
 	} else if parallel, present := root["parallel_tool_calls"].(bool); present {
 		out["tool_choice"] = map[string]interface{}{"type": "auto", "disable_parallel_tool_use": !parallel}
+	} else if len(convertedTools) > 0 {
+		// Anthropic defines omitted tool_choice as auto. Make that default
+		// explicit for compatible relays that otherwise treat tools as advisory.
+		out["tool_choice"] = map[string]interface{}{"type": "auto"}
 	}
 
 	var systemParts []string

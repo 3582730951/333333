@@ -17,6 +17,10 @@ import (
 //
 // Config shape is verified against codex-rs (codex-model-provider-info):
 //   - wire_api MUST be "responses" ("chat" was removed upstream).
+//   - supports_websockets MUST be true. Custom providers default this capability
+//     to false, while Codex's built-in OpenAI provider enables it. The pool
+//     implements the persistent Responses WebSocket protocol, including v2
+//     prewarm, incremental previous_response_id continuation, and HTTPS fallback.
 //   - experimental_bearer_token carries the one configured downstream API key
 //     without adding another credential file or auth-command configuration.
 //   - requires_openai_auth defaults false for a custom provider, so codex skips the
@@ -458,6 +462,7 @@ name = "OpenAI"
 base_url = "$ORIGIN/v1"
 wire_api = "responses"
 requires_openai_auth = false
+supports_websockets = true
 experimental_bearer_token = "$API_KEY"
 EOF
 
@@ -634,6 +639,7 @@ name = "OpenAI"
 base_url = "$ORIGIN/v1"
 wire_api = "responses"
 requires_openai_auth = false
+supports_websockets = true
 experimental_bearer_token = "$API_KEY"
 EOF
 

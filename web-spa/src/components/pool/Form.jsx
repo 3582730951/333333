@@ -620,7 +620,7 @@ export function SelectInput({ field, label, help, rules, value, onChange, option
   return <FieldShell field={field} label={label} help={help} rules={rules} controlId={controlId}>{select}</FieldShell>;
 }
 
-export function Toggle({ field, label, help, value, checked, onChange, disabled, className, initValue, ...props }) {
+export function Toggle({ field, label, help, value, checked, onChange, disabled, loading = false, className, initValue, ...props }) {
   const generatedId = useId();
   const controlId = props.id || (field ? `pool-field-${field}-${generatedId}` : generatedId);
   const form = useContext(FormContext);
@@ -642,7 +642,8 @@ export function Toggle({ field, label, help, value, checked, onChange, disabled,
       className={cx('pool-switch', className)}
       id={controlId}
       checked={!!current}
-      disabled={disabled}
+      disabled={disabled || loading}
+      aria-busy={loading || undefined}
       onCheckedChange={setCurrent}
       {...props}
     >

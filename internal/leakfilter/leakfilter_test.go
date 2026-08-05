@@ -80,6 +80,62 @@ func TestNeutralizeErrorBodyCodexUsageLimit(t *testing.T) {
 	}
 }
 
+func TestIsAuthoritativeCodexUsageLimitAcceptsOnlyFixedStructuredTerminals(t *testing.T) {
+	positives := []struct {
+		name string
+		body string
+	}{
+		{name: "http_usage_limit_reached", body: `{"error":{"type":"usage_limit_reached","message":"terminal"}}`},
+		{name: "http_usage_not_included", body: `{"error":{"type":"usage_not_included"}}`},
+		{name: "websocket_usage_limit_reached", body: `{"type":"error","error":{"type":"usage_limit_reached"},"status_code":429}`},
+		{name: "websocket_usage_not_included", body: `{"type":"error","error":{"type":"usage_not_included"},"status_code":429}`},
+		{name: "sse_insufficient_quota", body: `{"type":"response.failed","response":{"error":{"code":"insufficient_quota","message":"terminal"}}}`},
+		{name: "sse_usage_not_included", body: `{"type":"response.failed","response":{"error":{"code":"usage_not_included"}}}`},
+	}
+	for _, tc := range positives {
+		t.Run(tc.name, func(t *testing.T) {
+			if !IsAuthoritativeCodexUsageLimit(http.StatusTooManyRequests, []byte(tc.body)) {
+				t.Fatalf("fixed terminal was not recognized: %s", tc.body)
+			}
+		})
+	}
+
+	negatives := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{name: "fixed_code_at_503", status: http.StatusServiceUnavailable, body: `{"error":{"type":"usage_limit_reached"}}`},
+		{name: "fixed_code_at_200", status: http.StatusOK, body: `{"error":{"type":"usage_limit_reached"}}`},
+		{name: "generic_http_rate_limit", status: http.StatusTooManyRequests, body: `{"error":{"type":"rate_limit_exceeded"}}`},
+		{name: "generic_sse_rate_limit", status: http.StatusTooManyRequests, body: `{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}`},
+		{name: "message_pseudo_match", status: http.StatusTooManyRequests, body: `{"error":{"type":"server_error","message":"usage_limit_reached"}}`},
+		{name: "nested_json_string_pseudo_match", status: http.StatusTooManyRequests, body: `{"error":{"message":"{\"error\":{\"type\":\"usage_limit_reached\"}}"}}`},
+		{name: "http_wrong_code_field", status: http.StatusTooManyRequests, body: `{"error":{"code":"usage_limit_reached"}}`},
+		{name: "http_insufficient_quota_is_not_fixed_type", status: http.StatusTooManyRequests, body: `{"error":{"type":"insufficient_quota"}}`},
+		{name: "sse_wrong_type_field", status: http.StatusTooManyRequests, body: `{"type":"response.failed","response":{"error":{"type":"usage_not_included"}}}`},
+		{name: "sse_usage_limit_reached_is_not_fixed_code", status: http.StatusTooManyRequests, body: `{"type":"response.failed","response":{"error":{"code":"usage_limit_reached"}}}`},
+		{name: "wrong_outer_event", status: http.StatusTooManyRequests, body: `{"type":"response.error","response":{"error":{"code":"insufficient_quota"}}}`},
+		{name: "root_lookalike", status: http.StatusTooManyRequests, body: `{"type":"usage_limit_reached"}`},
+		{name: "case_changed_code", status: http.StatusTooManyRequests, body: `{"error":{"type":"USAGE_LIMIT_REACHED"}}`},
+		{name: "trailing_json", status: http.StatusTooManyRequests, body: `{"error":{"type":"usage_limit_reached"}} {}`},
+		{name: "invalid_json", status: http.StatusTooManyRequests, body: `{"error":`},
+	}
+	for _, tc := range negatives {
+		t.Run(tc.name, func(t *testing.T) {
+			if IsAuthoritativeCodexUsageLimit(tc.status, []byte(tc.body)) {
+				t.Fatalf("non-authoritative signal was accepted: status=%d body=%s", tc.status, tc.body)
+			}
+		})
+	}
+
+	oversized := append([]byte(`{"error":{"type":"usage_limit_reached"},"padding":"`), bytes.Repeat([]byte("x"), 64<<10)...)
+	oversized = append(oversized, []byte(`"}`)...)
+	if IsAuthoritativeCodexUsageLimit(http.StatusTooManyRequests, oversized) {
+		t.Fatal("oversized terminal envelope must not become an account-switch trigger")
+	}
+}
+
 func TestNeutralizeErrorBodyClaudeOverloaded(t *testing.T) {
 	body := []byte(`{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)
 	status, out, changed := NeutralizeErrorBody("claude", 529, body)

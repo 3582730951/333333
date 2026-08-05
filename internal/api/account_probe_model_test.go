@@ -2,12 +2,35 @@ package api
 
 import (
 	"context"
+	"net/http"
 	"path/filepath"
 	"testing"
 
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/storage"
 )
+
+func TestClaudeModelProbeRefreshPolicyDistinguishesEndpointForbidden(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{name: "bare unauthorized", status: http.StatusUnauthorized, body: `{"error":"unauthorized"}`, want: true},
+		{name: "endpoint forbidden", status: http.StatusForbidden, body: `{"error":{"type":"forbidden","message":"not allowed"}}`},
+		{name: "expired forbidden", status: http.StatusForbidden, body: `{"error":"token expired"}`, want: true},
+		{name: "missing scope", status: http.StatusForbidden, body: `{"error":"insufficient permissions; missing scope"}`},
+		{name: "server error", status: http.StatusServiceUnavailable, body: `{"error":"overloaded"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := claudeModelProbeShouldRefresh(test.status, nil, []byte(test.body)); got != test.want {
+				t.Fatalf("refresh policy = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
 
 func TestProbeModelCodexDefaultsToGPT56Sol(t *testing.T) {
 	store := apiTestStore(t)

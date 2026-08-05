@@ -200,7 +200,8 @@ func (s *Scheduler) evaluateIndexedCandidate(indexed indexedCandidate, evaluatio
 		return candidate{}, false
 	}
 	candidateRoute := routeForProviderModel(evaluation.route, indexed.provider)
-	if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(evaluation.rateLimits[account.ID], indexed.provider, candidateRoute.Model, evaluation.now); limited && !account.IgnoreRateLimitControls {
+	goalQuotaGrace := evaluation.route.AllowCodexGoalQuotaGrace && indexed.provider == "codex"
+	if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(evaluation.rateLimits[account.ID], indexed.provider, candidateRoute.Model, evaluation.now); limited && !account.IgnoreRateLimitControls && !goalQuotaGrace {
 		counters.RateLimitCooldown++
 		return candidate{}, false
 	}
@@ -209,6 +210,7 @@ func (s *Scheduler) evaluateIndexedCandidate(indexed indexedCandidate, evaluatio
 		counters.RecheckPending++
 		return candidate{}, false
 	}
+	ignoreTelemetryCooldown := account.IgnoreRateLimitControls || (goalQuotaGrace && !binding.RecheckPending)
 	var egress storage.EgressProfile
 	var egressLoad, sidecarLoad int
 	var ok bool
@@ -217,11 +219,11 @@ func (s *Scheduler) evaluateIndexedCandidate(indexed indexedCandidate, evaluatio
 			evaluation.egressOutcomes = s.recentCodexEgressOutcomes(evaluation.ctx)
 		}
 		var capacityBlocked bool
-		egress, egressLoad, sidecarLoad, capacityBlocked, ok = s.selectFreshEgressWithCache(evaluation.ctx, binding, evaluation.now, account.IgnoreRateLimitControls, &evaluation.requestEgress, evaluation.egressCacheMutex, evaluation.egressOutcomes)
+		egress, egressLoad, sidecarLoad, capacityBlocked, ok = s.selectFreshEgressWithCache(evaluation.ctx, binding, evaluation.now, ignoreTelemetryCooldown, &evaluation.requestEgress, evaluation.egressCacheMutex, evaluation.egressOutcomes)
 		if !ok {
 			if capacityBlocked {
 				counters.Concurrency++
-			} else if s.egressTemporarilyUnavailable(evaluation.ctx, binding, evaluation.now, account.IgnoreRateLimitControls) {
+			} else if s.egressTemporarilyUnavailable(evaluation.ctx, binding, evaluation.now, ignoreTelemetryCooldown) {
 				counters.EgressCooldown++
 			} else {
 				counters.EgressUnavailable++

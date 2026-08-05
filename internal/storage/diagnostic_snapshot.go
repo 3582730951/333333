@@ -274,8 +274,16 @@ func (s *DiagnosticSnapshot) Close() error {
 	var resetErr error
 	if s.driver != "postgres" {
 		_, resetErr = s.conn.ExecContext(ctx, "PRAGMA query_only=OFF")
+		if errors.Is(resetErr, sql.ErrConnDone) {
+			resetErr = nil
+		}
 	}
 	closeErr := s.conn.Close()
+	if errors.Is(closeErr, sql.ErrConnDone) {
+		// A transaction bound to a cancelled context may already have returned
+		// its dedicated connection. The reader and WAL pin are released in that state.
+		closeErr = nil
+	}
 	s.conn = nil
 	return errors.Join(commitErr, resetErr, closeErr)
 }

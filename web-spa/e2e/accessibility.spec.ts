@@ -13,10 +13,11 @@ const cases = [
   { path: '/thinking', role: 'admin', viewport: { width: 390, height: 844 } },
   { path: '/', role: 'admin', viewport: { width: 1440, height: 900 } },
   { path: '/portal', role: 'user', viewport: { width: 390, height: 844 } },
+  { path: '/portal', role: 'user', viewport: { width: 800, height: 900 } },
 ] as const;
 
 for (const entry of cases) {
-  test(`${entry.path} has no WCAG A/AA violations`, async ({ page }) => {
+  test(`${entry.path} at ${entry.viewport.width}x${entry.viewport.height} has no WCAG A/AA violations`, async ({ page }) => {
     await page.setViewportSize(entry.viewport);
     await page.route('**/*', async (route) => {
       const url = new URL(route.request().url());
@@ -110,5 +111,14 @@ for (const entry of cases) {
     await expect(page.locator('[data-page-ready="true"]')).toBeVisible();
     const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze();
     expect(results.violations, results.violations.map((violation) => `${violation.id}: ${violation.help}`).join('\n')).toEqual([]);
+    if (entry.path === '/cf-events') {
+      const trigger = page.getByRole('button', { name: '打开或关闭导航' });
+      await trigger.click();
+      await expect(page.getByRole('dialog', { name: '导航' })).toBeVisible();
+      const openDrawerResults = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze();
+      expect(openDrawerResults.violations, openDrawerResults.violations.map((violation) => `${violation.id}: ${violation.help}`).join('\n')).toEqual([]);
+      await page.keyboard.press('Escape');
+      await expect(trigger).toBeFocused();
+    }
   });
 }

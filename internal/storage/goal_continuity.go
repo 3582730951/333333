@@ -117,6 +117,38 @@ var (
 	ErrGoalActiveCannotBePurged = errors.New("active goal cannot be purged")
 )
 
+// GoalStorageBudgetError carries the exact, aggregate-only headroom required by a
+// rejected commit.  Callers can run one bounded cold-goal reclamation pass and retry
+// the same atomic commit without guessing from plaintext payload sizes.  GoalID is
+// empty for a new goal and identifies only the already-durable goal for an append.
+type GoalStorageBudgetError struct {
+	UsedBytes       int64
+	ProjectedBytes  int64
+	LimitBytes      int64
+	AdditionalBytes int64
+	GoalID          string
+}
+
+func (e *GoalStorageBudgetError) Error() string {
+	if e == nil {
+		return ErrGoalStorageBudget.Error()
+	}
+	return fmt.Sprintf("%s: used=%d projected=%d limit=%d additional=%d",
+		ErrGoalStorageBudget, e.UsedBytes, e.ProjectedBytes, e.LimitBytes, e.AdditionalBytes)
+}
+
+func (e *GoalStorageBudgetError) Unwrap() error { return ErrGoalStorageBudget }
+
+// ReclaimTarget is the maximum aggregate storage that leaves enough space for the
+// rejected commit. A negative result means the turn itself is larger than its
+// configured budget and reclamation would be futile.
+func (e *GoalStorageBudgetError) ReclaimTarget() int64 {
+	if e == nil {
+		return -1
+	}
+	return e.LimitBytes - e.AdditionalBytes
+}
+
 // GoalAlias is intentionally accepted in plaintext at the storage boundary but is
 // immediately hashed.  Callers must not log Value.
 type GoalAlias struct {
@@ -294,12 +326,21 @@ type GoalTurn struct {
 	// authoritative compaction/edit boundary. The commit atomically swaps the
 	// prior checkpoint/segments for this self-contained turn, allowing official
 	// client compaction to reclaim storage even when the global budget is full.
-	ReplaceHistory    bool
-	WorkingState      string
-	AwaitingTool      bool
-	ExpiresAt         int64
-	StorageMaxBytes   int64
-	CompressionStages int
+	ReplaceHistory bool
+	// ExpectedCurrentCheckpoint/ExpectedLastSegmentSequence fence an exact replay
+	// consolidation. Commit checks both after taking the parent-row write lock, so a
+	// snapshot built before a concurrent append can never erase that newer segment.
+	ExpectedCurrentCheckpoint   string
+	ExpectedLastSegmentSequence int64
+	WorkingState                string
+	AwaitingTool                bool
+	ExpiresAt                   int64
+	StorageMaxBytes             int64
+	// StorageTargetBytes is the steady-state watermark used only when admitting a
+	// new goal. Existing goals may consume the reserved gap up to StorageMaxBytes,
+	// so a cold/new conversation cannot strand the next checkpoint of a live one.
+	StorageTargetBytes int64
+	CompressionStages  int
 }
 
 type GoalResolution struct {
@@ -625,11 +666,15 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 	var session GoalSession
 	var nextSegment int64
 	created := errors.Is(resolveErr, ErrGoalNotFound)
+	if created && strings.TrimSpace(turn.ExpectedCurrentCheckpoint) != "" {
+		return GoalSession{}, ErrGoalInProgress
+	}
 	segmentEstimatedBytes := s.estimateGoalChunkStorage(turn.SegmentPayload)
 	var checkpointEstimatedBytes int64
 	if created || turn.ReplaceHistory {
 		checkpointEstimatedBytes = s.estimateGoalChunkStorage(turn.CheckpointPayload)
-	} else {
+	}
+	if !created {
 		// Serialize this foreground append with the maintenance CAS that changes a
 		// goal to reclaiming. The no-op update takes the parent-row write lock on
 		// both SQLite and PostgreSQL without changing its LRU timestamp.
@@ -640,9 +685,16 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 		if affected, _ := locked.RowsAffected(); affected != 1 {
 			return GoalSession{}, ErrGoalNotFound
 		}
-		if err := tx.QueryRowContext(ctx, `SELECT current_checkpoint_id,storage_bytes,updated_at FROM goal_session WHERE id=? AND state<>'reclaiming'`, resolution.Session.ID).Scan(
-			&resolution.Session.CurrentCheckpoint, &resolution.Session.StorageBytes, &resolution.Session.UpdatedAt); err != nil {
+		var currentLastSegment int64
+		if err := tx.QueryRowContext(ctx, `SELECT current_checkpoint_id,storage_bytes,updated_at,
+COALESCE((SELECT MAX(sequence) FROM goal_segment WHERE goal_id=goal_session.id),0)
+FROM goal_session WHERE id=? AND state<>'reclaiming'`, resolution.Session.ID).Scan(
+			&resolution.Session.CurrentCheckpoint, &resolution.Session.StorageBytes, &resolution.Session.UpdatedAt, &currentLastSegment); err != nil {
 			return GoalSession{}, err
+		}
+		if expected := strings.TrimSpace(turn.ExpectedCurrentCheckpoint); expected != "" &&
+			(expected != resolution.Session.CurrentCheckpoint || turn.ExpectedLastSegmentSequence != currentLastSegment) {
+			return GoalSession{}, ErrGoalInProgress
 		}
 	}
 	if turn.StorageMaxBytes > 0 {
@@ -663,11 +715,27 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 			// maintenance worker can then continue converging other inactive goals.
 			replacementShrinks = estimate < resolution.Session.StorageBytes
 		}
-		if projected > turn.StorageMaxBytes && !replacementShrinks {
+		limit := turn.StorageMaxBytes
+		if created && turn.StorageTargetBytes > 0 && turn.StorageTargetBytes < limit {
+			limit = turn.StorageTargetBytes
+		}
+		if projected > limit && !replacementShrinks {
 			// Physical reclamation is deliberately maintenance-only. A foreground
-			// turn never cascades through a multi-gigabyte goal while holding its
-			// successful-terminal transaction.
-			return GoalSession{}, ErrGoalStorageBudget
+			// commit never cascades through a multi-gigabyte goal while holding its
+			// successful-terminal transaction. The caller may reclaim in separate,
+			// bounded transactions and retry this commit exactly once.
+			goalID := ""
+			if !created {
+				goalID = resolution.Session.ID
+			}
+			additional := projected - used
+			if additional < 0 {
+				additional = 0
+			}
+			return GoalSession{}, &GoalStorageBudgetError{
+				UsedBytes: used, ProjectedBytes: projected, LimitBytes: limit,
+				AdditionalBytes: additional, GoalID: goalID,
+			}
 		}
 	}
 	if created {
@@ -877,15 +945,16 @@ WHERE id=? AND state<>'reclaiming'
 	return affected == 1, err
 }
 
-func (s *Store) markNextBudgetGoalReclaiming(ctx context.Context, tx *sql.Tx, now int64) (string, error) {
+func (s *Store) markNextBudgetGoalReclaiming(ctx context.Context, tx *sql.Tx, now int64, protectedGoalID string) (string, error) {
 	var goalID string
 	var storageBytes, updatedAt int64
 	err := tx.QueryRowContext(ctx, `SELECT s.id,s.storage_bytes,s.updated_at FROM goal_session s
 WHERE s.state<>'reclaiming'
-  AND s.state IN ('ready','retryable','completed','failed')
-  AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=s.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)
+	  AND s.id<>?
+	  AND s.state IN ('ready','retryable','completed','failed')
+	  AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=s.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)
 ORDER BY CASE s.state WHEN 'completed' THEN 0 WHEN 'failed' THEN 1 WHEN 'ready' THEN 2 ELSE 3 END,
-         s.updated_at ASC,s.id ASC LIMIT 1`, now).Scan(&goalID, &storageBytes, &updatedAt)
+	         s.updated_at ASC,s.id ASC LIMIT 1`, strings.TrimSpace(protectedGoalID), now).Scan(&goalID, &storageBytes, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -894,8 +963,9 @@ ORDER BY CASE s.state WHEN 'completed' THEN 0 WHEN 'failed' THEN 1 WHEN 'ready' 
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE goal_session SET state='reclaiming',updated_at=?
 WHERE id=? AND state IN ('ready','retryable','completed','failed') AND storage_bytes=? AND updated_at=?
-  AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=goal_session.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)`,
-		now, goalID, storageBytes, updatedAt, now)
+	  AND id<>?
+	  AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=goal_session.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)`,
+		now, goalID, storageBytes, updatedAt, strings.TrimSpace(protectedGoalID), now)
 	if err != nil {
 		return "", err
 	}
@@ -1138,6 +1208,13 @@ func (s *Store) EnforceGoalStorageBudgetStep(ctx context.Context, maxBytes int64
 	if maxBytes <= 0 {
 		return GoalStorageReclaimStep{}, nil
 	}
+	return s.enforceGoalStorageBudgetStep(ctx, maxBytes, "")
+}
+
+func (s *Store) enforceGoalStorageBudgetStep(ctx context.Context, maxBytes int64, protectedGoalID string) (GoalStorageReclaimStep, error) {
+	if maxBytes < 0 {
+		return GoalStorageReclaimStep{}, nil
+	}
 	now := Now()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1156,7 +1233,7 @@ func (s *Store) EnforceGoalStorageBudgetStep(ctx context.Context, maxBytes int64
 		if used <= maxBytes {
 			return GoalStorageReclaimStep{}, nil
 		}
-		goalID, err = s.markNextBudgetGoalReclaiming(ctx, tx, now)
+		goalID, err = s.markNextBudgetGoalReclaiming(ctx, tx, now, protectedGoalID)
 		if err != nil {
 			return GoalStorageReclaimStep{}, err
 		}
@@ -1178,6 +1255,31 @@ func (s *Store) EnforceGoalStorageBudgetStep(ctx context.Context, maxBytes int64
 		return GoalStorageReclaimStep{BytesFreed: freed, Goals: deleted, Progressed: progressed}, err
 	}
 	return GoalStorageReclaimStep{BytesFreed: freed, Goals: deleted, Progressed: progressed}, nil
+}
+
+// ReclaimGoalStorageHeadroom advances at most maxSteps bounded transactions toward
+// targetBytes. The currently committing goal is excluded from new reclamation; live
+// runs and awaiting-tool sessions retain the stricter predicates enforced by each
+// step. The hard step bound guarantees that a successful upstream terminal can never
+// enter an unbounded storage-maintenance loop.
+func (s *Store) ReclaimGoalStorageHeadroom(ctx context.Context, targetBytes int64, protectedGoalID string, maxSteps int) (GoalStorageReclaimStep, error) {
+	if targetBytes < 0 || maxSteps <= 0 {
+		return GoalStorageReclaimStep{}, nil
+	}
+	var total GoalStorageReclaimStep
+	for stepIndex := 0; stepIndex < maxSteps; stepIndex++ {
+		step, err := s.enforceGoalStorageBudgetStep(ctx, targetBytes, protectedGoalID)
+		total.BytesFreed += step.BytesFreed
+		total.Goals += step.Goals
+		total.Progressed = total.Progressed || step.Progressed
+		if err != nil {
+			return total, err
+		}
+		if !step.Progressed {
+			break
+		}
+	}
+	return total, nil
 }
 
 // GoalStorageBytes returns the transaction-writer view used by the hard budget
@@ -1252,6 +1354,49 @@ func claudeAssistantMessages(raw interface{}) []interface{} {
 func streamStringStorage(value interface{}) string {
 	text, _ := value.(string)
 	return strings.TrimSpace(text)
+}
+
+// GoalReplayVersion is an aggregate structural fence for an exact replay snapshot.
+// The checkpoint id changes on replacement/compaction and the last sequence changes
+// on an append; together they cover every writer that can alter reconstructed history.
+type GoalReplayVersion struct {
+	CurrentCheckpoint   string
+	LastSegmentSequence int64
+}
+
+func (s *Store) goalReplayVersion(ctx context.Context, goalID string) (GoalReplayVersion, error) {
+	var version GoalReplayVersion
+	err := s.rdb.QueryRowContext(ctx, `SELECT current_checkpoint_id,
+COALESCE((SELECT MAX(sequence) FROM goal_segment WHERE goal_id=goal_session.id),0)
+FROM goal_session WHERE id=? AND expires_at>? AND state<>'reclaiming'`, goalID, Now()).Scan(
+		&version.CurrentCheckpoint, &version.LastSegmentSequence,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return GoalReplayVersion{}, ErrGoalNotFound
+	}
+	return version, err
+}
+
+// BuildGoalReplaySnapshot returns a replay only when its structural version was
+// unchanged across reconstruction. A later CommitGoalTurn must still supply the
+// returned version, closing the remaining build-to-commit race under the row lock.
+func (s *Store) BuildGoalReplaySnapshot(ctx context.Context, goalID string) ([]byte, GoalSession, GoalReplayVersion, error) {
+	before, err := s.goalReplayVersion(ctx, goalID)
+	if err != nil {
+		return nil, GoalSession{}, GoalReplayVersion{}, err
+	}
+	replay, session, err := s.BuildGoalReplay(ctx, goalID)
+	if err != nil {
+		return nil, GoalSession{}, GoalReplayVersion{}, err
+	}
+	after, err := s.goalReplayVersion(ctx, goalID)
+	if err != nil {
+		return nil, GoalSession{}, GoalReplayVersion{}, err
+	}
+	if before != after {
+		return nil, GoalSession{}, GoalReplayVersion{}, ErrGoalInProgress
+	}
+	return replay, session, before, nil
 }
 
 // BuildGoalReplay reconstructs a protocol payload from the latest compacted

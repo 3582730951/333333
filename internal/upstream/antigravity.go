@@ -691,23 +691,43 @@ func anthropicToAntigravityForAccount(body []byte, model, projectID, accountID s
 }
 
 func anthropicSystemToGeminiParts(body []byte) ([]geminiPart, error) {
-	system := gjson.GetBytes(body, "system")
-	if !system.Exists() {
+	parts, err := anthropicSystemContentToGeminiParts(gjson.GetBytes(body, "system"), "system")
+	if err != nil {
+		return nil, err
+	}
+	// Some gateway/client instruction layers use Chat-style system-role
+	// messages. Antigravity has only systemInstruction, so hoist those blocks
+	// instead of rejecting an otherwise losslessly representable request.
+	for index, message := range gjson.GetBytes(body, "messages").Array() {
+		if strings.TrimSpace(message.Get("role").String()) != "system" {
+			continue
+		}
+		messageParts, partErr := anthropicSystemContentToGeminiParts(message.Get("content"), fmt.Sprintf("messages[%d].content", index))
+		if partErr != nil {
+			return nil, partErr
+		}
+		parts = append(parts, messageParts...)
+	}
+	return parts, nil
+}
+
+func anthropicSystemContentToGeminiParts(content gjson.Result, field string) ([]geminiPart, error) {
+	if !content.Exists() {
 		return nil, nil
 	}
-	if system.Type == gjson.String {
-		if system.String() == "" {
+	if content.Type == gjson.String {
+		if content.String() == "" {
 			return nil, nil
 		}
-		return []geminiPart{{Text: system.String()}}, nil
+		return []geminiPart{{Text: content.String()}}, nil
 	}
-	if !system.IsArray() {
-		return nil, antigravityConversionError("system must be a string or an array of text blocks")
+	if !content.IsArray() {
+		return nil, antigravityConversionError("%s must be a string or an array of text blocks", field)
 	}
-	parts := make([]geminiPart, 0, len(system.Array()))
-	for index, block := range system.Array() {
+	parts := make([]geminiPart, 0, len(content.Array()))
+	for index, block := range content.Array() {
 		if block.Get("type").String() != "text" {
-			return nil, antigravityConversionError("system[%d] type %q cannot be converted", index, block.Get("type").String())
+			return nil, antigravityConversionError("%s[%d] type %q cannot be converted", field, index, block.Get("type").String())
 		}
 		if text := block.Get("text").String(); text != "" {
 			parts = append(parts, geminiPart{Text: text})
@@ -742,6 +762,9 @@ func anthropicMessagesToGeminiContents(body []byte, model string) ([]geminiConte
 	toolNameByID := make(map[string]string)
 	for messageIndex, m := range msgs.Array() {
 		role := strings.TrimSpace(m.Get("role").String())
+		if role == "system" {
+			continue
+		}
 		if role != "user" && role != "assistant" {
 			return nil, antigravityConversionError("messages[%d] has unsupported role %q", messageIndex, role)
 		}

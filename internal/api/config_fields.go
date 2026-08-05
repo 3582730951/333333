@@ -541,7 +541,42 @@ func (s *Server) effectiveUpstreamConfig(ctx context.Context) config.Config {
 	c.ClaudeNodeVersion = s.settingString(ctx, "claude_node_version", c.ClaudeNodeVersion)
 	c.ClaudeStainlessVersion = s.settingString(ctx, "claude_stainless_version", c.ClaudeStainlessVersion)
 	c.ClaudeCCHSigning = s.flagEnabled(ctx, "claude_cch_signing", c.ClaudeCCHSigning)
-	return c
+	return s.effectiveThinkingConfig(ctx, c)
+}
+
+// persistAndPublishEffectiveUpstreamConfig serializes the durable setting change,
+// its resolved DB snapshot, and the live client swap as one operation. Every runtime
+// writer of an effectUpstream field (including thinking_config_v1) must use this
+// helper so an older snapshot cannot publish after a newer save.
+func (s *Server) persistAndPublishEffectiveUpstreamConfig(ctx context.Context, persist func(context.Context) error) error {
+	s.upstreamConfigPublishMu.Lock()
+	defer s.upstreamConfigPublishMu.Unlock()
+	if err := persist(ctx); err != nil {
+		return err
+	}
+	// Once persistence succeeds, request cancellation must not replace the durable
+	// value with a boot-default live snapshot.
+	s.publishEffectiveUpstreamConfigLocked(context.WithoutCancel(ctx))
+	return nil
+}
+
+func (s *Server) publishEffectiveUpstreamConfig(ctx context.Context) {
+	s.upstreamConfigPublishMu.Lock()
+	defer s.upstreamConfigPublishMu.Unlock()
+	s.publishEffectiveUpstreamConfigLocked(ctx)
+}
+
+func (s *Server) publishEffectiveUpstreamConfigLocked(ctx context.Context) {
+	if s.upstream == nil && s.upstreamConfigPublishHook == nil {
+		return
+	}
+	cfg := s.effectiveUpstreamConfig(ctx)
+	if s.upstream != nil {
+		s.upstream.UpdateConfig(cfg)
+	}
+	if s.upstreamConfigPublishHook != nil {
+		s.upstreamConfigPublishHook(cfg)
+	}
 }
 
 // effectiveSchedulerConfig builds the scheduler's live selection config from boot
@@ -648,11 +683,14 @@ func (s *Server) applySettingsPatch(ctx context.Context, body map[string]interfa
 			changedScheduler = true
 		}
 	}
-	if err := s.store.SetSettings(ctx, updates); err != nil {
-		return false, err
-	}
 	if changedUpstream {
-		s.upstream.UpdateConfig(s.effectiveUpstreamConfig(ctx))
+		if err := s.persistAndPublishEffectiveUpstreamConfig(ctx, func(ctx context.Context) error {
+			return s.store.SetSettings(ctx, updates)
+		}); err != nil {
+			return false, err
+		}
+	} else if err := s.store.SetSettings(ctx, updates); err != nil {
+		return false, err
 	}
 	if changedScheduler && s.scheduler != nil {
 		s.scheduler.UpdateConfig(s.effectiveSchedulerConfig(ctx))

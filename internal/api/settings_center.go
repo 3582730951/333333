@@ -178,12 +178,16 @@ func (s *Server) settingsCenterPost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.store.SetSettings(ctx, plan.settings); err != nil {
+	if plan.changedUpstream {
+		err = s.persistAndPublishEffectiveUpstreamConfig(ctx, func(ctx context.Context) error {
+			return s.store.SetSettings(ctx, plan.settings)
+		})
+	} else {
+		err = s.store.SetSettings(ctx, plan.settings)
+	}
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
-	}
-	if plan.changedUpstream {
-		s.upstream.UpdateConfig(s.effectiveUpstreamConfig(ctx))
 	}
 	if plan.changedScheduler && s.scheduler != nil {
 		s.scheduler.UpdateConfig(s.effectiveSchedulerConfig(ctx))
@@ -1249,12 +1253,17 @@ func (s *Server) handleSettingsCenterTemplate(w http.ResponseWriter, r *http.Req
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}
-			if err := s.store.SetSettings(r.Context(), plan.settings); err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
+			persist := func(ctx context.Context) error {
+				return s.store.SetSettings(ctx, plan.settings)
 			}
 			if plan.changedUpstream {
-				s.upstream.UpdateConfig(s.effectiveUpstreamConfig(r.Context()))
+				err = s.persistAndPublishEffectiveUpstreamConfig(r.Context(), persist)
+			} else {
+				err = persist(r.Context())
+			}
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
 			}
 			if plan.changedScheduler && s.scheduler != nil {
 				s.scheduler.UpdateConfig(s.effectiveSchedulerConfig(r.Context()))

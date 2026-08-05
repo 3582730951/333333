@@ -176,16 +176,18 @@ func (s *Scheduler) providerPressureSnapshot(ctx context.Context, route Route) (
 			continue
 		}
 		candidateRoute := routeForProviderModel(route, accountProvider)
+		goalQuotaGrace := route.AllowCodexGoalQuotaGrace && accountProvider == "codex"
 
 		if !s.pressureModelEligible(ctx, account, accountProvider, candidateRoute, capabilitiesByAccount, capable) {
 			continue
 		}
-		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], accountProvider, candidateRoute.Model, now); limited && !account.IgnoreRateLimitControls {
+		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], accountProvider, candidateRoute.Model, now); limited && !account.IgnoreRateLimitControls && !goalQuotaGrace {
 			continue
 		}
 		if binding.RecheckPending && !account.IgnoreRateLimitControls {
 			continue
 		}
+		ignoreTelemetryCooldown := account.IgnoreRateLimitControls || (goalQuotaGrace && !binding.RecheckPending)
 		binding = routeEgressBinding(binding, account.ID, route.PreferredEgressIDs)
 
 		inflight, tokens := s.currentLoad(account.ID)
@@ -197,7 +199,7 @@ func (s *Scheduler) providerPressureSnapshot(ctx context.Context, route Route) (
 			// A full primary therefore leaves the account immediately available
 			// when a standby has room, exactly as Select does.
 			_, _, _, capacityBlocked, available := s.selectFreshEgressWithCache(
-				ctx, binding, now, account.IgnoreRateLimitControls,
+				ctx, binding, now, ignoreTelemetryCooldown,
 				&requestEgress, egressCacheMutex, egressOutcomes,
 			)
 			if !available {

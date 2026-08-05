@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/responsefilter"
 	"codex-account-pool/internal/storage"
@@ -539,7 +540,6 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 	// Apply the selected rule to each complete SSE event. In particular, never
 	// discard a group of pending events together: Codex requires the terminal
 	// response.completed event even when an earlier event is intercepted.
-	buf := make([]byte, 0, 32768)
 	flusher, _ := w.(http.Flusher)
 	emit := func(p []byte) error {
 		if len(p) == 0 {
@@ -575,6 +575,80 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 			return false, err
 		}
 		return sseFrameAdvancesModel(out, provider), nil
+	}
+	frameOptions := normalizeStreamAccumulatorOptions(bodysource.CaptureOptions{
+		MaxBytes:        streamLedgerDefaultMaxBytes,
+		MemoryThreshold: streamLedgerMaxPartialFrame,
+	}, "codex-pool-rule-sse-frame-*")
+	var frame *bodysource.SpoolBuffer
+	lineNonCR := false
+	closeFrame := func() {
+		if frame != nil {
+			_ = frame.Close()
+			frame = nil
+		}
+	}
+	defer closeFrame()
+	writeFrameBytes := func(payload []byte) error {
+		if len(payload) == 0 {
+			return nil
+		}
+		if frame == nil {
+			var err error
+			frame, err = bodysource.NewSpoolBuffer(ctx, frameOptions)
+			if err != nil {
+				return err
+			}
+		}
+		_, err := frame.Write(payload)
+		return err
+	}
+	flushFrame := func() (bool, error) {
+		if frame == nil || frame.Size() == 0 {
+			closeFrame()
+			return false, nil
+		}
+		current := frame
+		frame = nil
+		defer current.Close()
+		if view, ok := bodysource.ByteView(current); ok {
+			return emitFrame(view)
+		}
+		raw, err := bodysource.ReadAll(current)
+		if err != nil {
+			return false, err
+		}
+		return emitFrame(raw)
+	}
+	consume := func(payload []byte) (bool, error) {
+		advancedAny := false
+		start := 0
+		for index, value := range payload {
+			if value != '\n' {
+				if value != '\r' {
+					lineNonCR = true
+				}
+				continue
+			}
+			boundary := !lineNonCR
+			lineNonCR = false
+			if !boundary {
+				continue
+			}
+			if err := writeFrameBytes(payload[start : index+1]); err != nil {
+				return advancedAny, err
+			}
+			start = index + 1
+			advanced, err := flushFrame()
+			if err != nil {
+				return advancedAny, err
+			}
+			advancedAny = advancedAny || advanced
+		}
+		if err := writeFrameBytes(payload[start:]); err != nil {
+			return advancedAny, err
+		}
+		return advancedAny, nil
 	}
 
 	type readResult struct {
@@ -639,38 +713,20 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 			return ctx.Err()
 		case result, ok := <-reads:
 			if !ok {
-				if len(buf) > 0 {
-					_, err := emitFrame(buf)
-					return err
-				}
-				return nil
+				_, err := flushFrame()
+				return err
 			}
-			if len(result.data) > 0 {
-				buf = append(buf, result.data...)
+			advanced, consumeErr := consume(result.data)
+			if consumeErr != nil {
+				return consumeErr
 			}
-			for {
-				boundary, separatorLen := sseFrameBoundary(buf)
-				if boundary < 0 {
-					break
-				}
-				frameEnd := boundary + separatorLen
-				frame := append([]byte(nil), buf[:frameEnd]...)
-				buf = buf[frameEnd:]
-				advanced, e := emitFrame(frame)
-				if e != nil {
-					return e
-				}
-				if advanced {
-					resetStall()
-				}
+			if advanced {
+				resetStall()
 			}
 			if result.err != nil {
 				if result.err == io.EOF {
-					if len(buf) > 0 {
-						_, err := emitFrame(buf)
-						return err
-					}
-					return nil
+					_, err := flushFrame()
+					return err
 				}
 				return result.err
 			}

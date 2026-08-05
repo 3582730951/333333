@@ -626,6 +626,62 @@ func structuredErrorMessages(root map[string]interface{}) []string {
 	return messages
 }
 
+// IsAuthoritativeCodexUsageLimit recognizes only the machine-readable terminal
+// envelopes that stable Codex maps to CodexErrorInfo::UsageLimitExceeded. A local
+// quota snapshot, a generic 429/rate_limit_exceeded, overload, or error-message
+// wording is deliberately insufficient: Goal turns keep their bound account until
+// one of these exact upstream fields is observed.
+func IsAuthoritativeCodexUsageLimit(status int, body []byte) bool {
+	if status != http.StatusTooManyRequests || len(body) == 0 || len(body) > 64<<10 {
+		return false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var root map[string]interface{}
+	if decoder.Decode(&root) != nil {
+		return false
+	}
+	var trailing interface{}
+	if decoder.Decode(&trailing) != io.EOF {
+		return false
+	}
+	exactString := func(object map[string]interface{}, field string, accepted ...string) bool {
+		value, ok := object[field].(string)
+		if !ok {
+			return false
+		}
+		for _, candidate := range accepted {
+			if value == candidate {
+				return true
+			}
+		}
+		return false
+	}
+
+	// HTTP Responses errors and WebSocket event:error frames both carry the fixed
+	// terminal code in error.type. The outer type is absent for HTTP and "error"
+	// for WebSocket; any other outer event shape is handled below as SSE.
+	outerType, _ := root["type"].(string)
+	if outerType == "" || outerType == "error" {
+		if detail, _ := root["error"].(map[string]interface{}); exactString(detail, "type", "usage_limit_reached", "usage_not_included") {
+			return true
+		}
+	}
+
+	// A Responses SSE terminal instead carries the fixed code at
+	// response.failed.response.error.code. Requiring the exact outer event type and
+	// field path prevents a message string or look-alike nested JSON from becoming an
+	// account-switch trigger.
+	if outerType == "response.failed" {
+		if response, _ := root["response"].(map[string]interface{}); response != nil {
+			if detail, _ := response["error"].(map[string]interface{}); exactString(detail, "code", "insufficient_quota", "usage_not_included") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func isUnsupportedPreviousResponseIDMessage(message string) bool {
 	// Fields collapses the newline emitted by one observed backend wrapper:
 	// "Unsupported parameter:\nprevious_response_id".

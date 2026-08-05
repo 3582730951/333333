@@ -11,6 +11,9 @@ IMPERSONATE=os.getenv("CODEX_POOL_SIDECAR_IMPERSONATE","chrome120")
 TIMEOUT=int(os.getenv("CODEX_POOL_SIDECAR_TIMEOUT","120")); DRAIN_SECONDS=int(os.getenv("CODEX_POOL_SIDECAR_DRAIN_SECONDS","20"))
 MAX_BUCKETS=int(os.getenv("CODEX_POOL_SIDECAR_POOL_MAX_KEYS","4096")); SESSION_TTL=int(os.getenv("CODEX_POOL_SIDECAR_SESSION_TTL","900"))
 MAX_CLIENTS=int(os.getenv("CODEX_POOL_SIDECAR_MAX_CLIENTS","512"))
+MAX_INFLIGHT=int(os.getenv("CODEX_POOL_SIDECAR_MAX_INFLIGHT","512"))
+HEADER_IDLE_TIMEOUT=float(os.getenv("CODEX_POOL_SIDECAR_HEADER_IDLE_TIMEOUT","10"))
+BODY_IDLE_TIMEOUT=float(os.getenv("CODEX_POOL_SIDECAR_BODY_IDLE_TIMEOUT","30"))
 ACCEPT_ENCODING=os.getenv("CODEX_POOL_SIDECAR_ACCEPT_ENCODING","gzip, deflate")
 COOKIE_FLUSH=float(os.getenv("CODEX_POOL_SIDECAR_COOKIE_FLUSH_SECONDS","0.25"))
 SPOOL_DIR=os.getenv("CODEX_POOL_SIDECAR_SPOOL_DIR",tempfile.gettempdir())
@@ -18,7 +21,8 @@ MAX_BODY_BYTES=int(os.getenv("CODEX_POOL_SIDECAR_MAX_BODY_BYTES",str(1<<30)))
 LEGACY_BODY_MAX_BYTES=int(os.getenv("CODEX_POOL_SIDECAR_LEGACY_BODY_MAX_BYTES",str(64<<20)))
 SPOOL_MAX_BYTES=int(os.getenv("CODEX_POOL_SIDECAR_SPOOL_MAX_BYTES",str(32<<30)))
 SPOOL_RESERVE_BYTES=int(os.getenv("CODEX_POOL_SIDECAR_SPOOL_RESERVE_BYTES",str(10<<30)))
-_sessions:OrderedDict[tuple,tuple[AsyncSession,float]]=OrderedDict();_session_active:dict[tuple,int]={};_cookies:dict[str,dict[str,str]]={};_dirty:set[str]=set();_inflight=0;_handles=0;_spool_bytes=0;_stopping=False
+_sessions:OrderedDict[tuple,tuple[AsyncSession,float]]=OrderedDict();_session_active:dict[tuple,int]={};_cookies:dict[str,dict[str,str]]={};_dirty:set[str]=set();_inflight=0;_rejected_capacity=0;_handles=0;_spool_bytes=0;_stopping=False
+_inflight_lock=asyncio.Lock();_session_lock=asyncio.Lock()
 
 def safe_key(v:str)->str:return hashlib.sha256(v.encode()).hexdigest()
 def cookie_path(k:str)->str:return os.path.join(COOKIE_DIR,safe_key(k)+".json")
@@ -41,20 +45,71 @@ async def cookie_writer():
 def clean_headers(h:dict[str,Any])->dict[str,str]:
  return {k:(str(v[-1]) if isinstance(v,list) and v else str(v)) for k,v in h.items() if k.lower() not in {"host","content-length","connection","accept-encoding"}}
 async def session_for(key:tuple)->AsyncSession:
- now=time.monotonic()
- for k,(s,t) in list(_sessions.items()):
-  if now-t>SESSION_TTL and not _session_active.get(k,0):_sessions.pop(k,None);_session_active.pop(k,None);await s.close()
- if key in _sessions:
-  s,_=_sessions.pop(key);_sessions[key]=(s,now);return s
- s=AsyncSession(impersonate=IMPERSONATE,max_clients=MAX_CLIENTS);_sessions[key]=(s,now)
- while len(_sessions)>MAX_BUCKETS:
-  victim=next((k for k in _sessions if not _session_active.get(k,0)),None)
-  if victim is None:break
-  old,_=_sessions.pop(victim);_session_active.pop(victim,None);await old.close()
- return s
+ # This returns an active lease.  Reserving it under the same lock as eviction
+ # prevents a just-selected session from being closed by a competing new key.
+ async with _session_lock:
+  now=time.monotonic()
+  for k,(s,t) in list(_sessions.items()):
+   if now-t>SESSION_TTL and not _session_active.get(k,0):_sessions.pop(k,None);_session_active.pop(k,None);await s.close()
+  if key in _sessions:
+   s,_=_sessions.pop(key);_sessions[key]=(s,now)
+  else:
+   if len(_sessions)>=MAX_BUCKETS:
+    # OrderedDict is oldest-first, so this is strictly LRU among idle sessions.
+    victim=next((k for k in _sessions if not _session_active.get(k,0)),None)
+    if victim is None:raise SidecarCapacityError("sidecar_session_capacity","sidecar session capacity exhausted")
+    old,_=_sessions.pop(victim);_session_active.pop(victim,None);await old.close()
+   s=AsyncSession(impersonate=IMPERSONATE,max_clients=MAX_CLIENTS);_sessions[key]=(s,now)
+  _session_active[key]=_session_active.get(key,0)+1
+  return s
+
+async def release_session(key:tuple)->None:
+ async with _session_lock:
+  if key not in _session_active:return
+  _session_active[key]=max(0,_session_active[key]-1)
+
+async def acquire_inflight()->bool:
+ global _inflight,_rejected_capacity
+ async with _inflight_lock:
+  if _inflight>=MAX_INFLIGHT:
+   _rejected_capacity+=1;return False
+  _inflight+=1;return True
+
+async def release_inflight()->None:
+ global _inflight
+ async with _inflight_lock:_inflight=max(0,_inflight-1)
 
 class SidecarBodyError(Exception):
  def __init__(self,code:str,status:int,retryable:bool,message:str):super().__init__(message);self.code=code;self.status=status;self.retryable=retryable
+class SidecarCapacityError(SidecarBodyError):
+ def __init__(self,code:str,message:str):super().__init__(code,503,True,message)
+class SidecarIdleTimeoutError(SidecarBodyError):
+ def __init__(self,phase:str):super().__init__(f"sidecar_{phase}_idle_timeout",408,True,f"request {phase} idle timeout")
+
+async def read_idle_chunk(reader:asyncio.StreamReader,size:int,timeout:float,phase:str)->bytes:
+ try:
+  # StreamReader.read() completes synchronously while buffered data exists. Avoid
+  # creating one wait_for task per header byte; only arm the idle timer when the
+  # next byte actually requires I/O.
+  if getattr(reader,"_buffer",None):chunk=await reader.read(size)
+  else:chunk=await asyncio.wait_for(reader.read(size),timeout=timeout)
+ except asyncio.TimeoutError:raise SidecarIdleTimeoutError(phase) from None
+ if not chunk:raise asyncio.IncompleteReadError(chunk,size)
+ return chunk
+
+async def read_idle_until(reader:asyncio.StreamReader,separator:bytes,timeout:float,phase:str)->bytes:
+ data=bytearray();limit=getattr(reader,"_limit",64<<10);overlap=len(separator)-1
+ while True:
+  buffered=getattr(reader,"_buffer",None)
+  if buffered:
+   prefix=bytes(data[-overlap:]) if overlap else b"";available=bytes(buffered);found=(prefix+available).find(separator)
+   take=found+len(separator)-len(prefix) if found>=0 else len(available)
+   data.extend(await reader.read(take))
+  else:data.extend(await read_idle_chunk(reader,1,timeout,phase))
+  if data.endswith(separator):
+   if len(data)-len(separator)>limit:raise asyncio.LimitOverrunError("request header exceeds stream limit",len(data)-len(separator))
+   return bytes(data)
+  if len(data)>limit:raise asyncio.LimitOverrunError("request header exceeds stream limit",len(data))
 
 class SpoolBody:
  def __init__(self,file,size:int):self.file=file;self.path=file.name;self.size=size;self.closed=False
@@ -81,25 +136,34 @@ async def spool_request_body(reader:asyncio.StreamReader,size:int)->SpoolBody:
  try:
   remaining=size
   while remaining:
-   chunk=await reader.readexactly(min(64<<10,remaining));file.write(chunk);remaining-=len(chunk)
+   chunk=await read_idle_chunk(reader,min(64<<10,remaining),BODY_IDLE_TIMEOUT,"body");file.write(chunk);remaining-=len(chunk)
   body.rewind();return body
  except Exception:
   body.close();raise
 
-async def read_request(reader:asyncio.StreamReader):
- head=await reader.readuntil(b"\r\n\r\n");lines=head.decode("latin1").split("\r\n");method,path,_=lines[0].split(" ",2);headers={}
+async def read_request_head(reader:asyncio.StreamReader):
+ head=await read_idle_until(reader,b"\r\n\r\n",HEADER_IDLE_TIMEOUT,"header")
+ lines=head.decode("latin1").split("\r\n");method,path,_=lines[0].split(" ",2);headers={}
  for line in lines[1:]:
   if ":" in line:k,v=line.split(":",1);headers[k.lower()]=v.strip()
  try:n=int(headers.get("content-length","0"))
  except ValueError:raise SidecarBodyError("sidecar_invalid_content_length",400,False,"invalid content-length")
  if n<0:raise SidecarBodyError("sidecar_invalid_content_length",400,False,"negative content-length")
+ return method,path,headers,n
+async def read_request_body(reader:asyncio.StreamReader,path:str,headers:dict[str,str],n:int):
  if path=="/proxy" and headers.get("x-sidecar-meta") and n:body=await spool_request_body(reader,n)
  else:
   if n>LEGACY_BODY_MAX_BYTES:raise SidecarBodyError("sidecar_legacy_body_too_large",413,False,f"legacy sidecar body exceeds {LEGACY_BODY_MAX_BYTES} bytes")
-  body=await reader.readexactly(n) if n else b""
- return method,path,headers,body
+  chunks=[];remaining=n
+  while remaining:
+   chunk=await read_idle_chunk(reader,min(64<<10,remaining),BODY_IDLE_TIMEOUT,"body");chunks.append(chunk);remaining-=len(chunk)
+  body=b"".join(chunks)
+ return body
+async def read_request(reader:asyncio.StreamReader):
+ method,path,headers,n=await read_request_head(reader)
+ return method,path,headers,await read_request_body(reader,path,headers,n)
 async def send(writer,status:int,headers:dict[str,str],body:bytes=b""):
- reason={200:"OK",400:"Bad Request",404:"Not Found",502:"Bad Gateway",503:"Service Unavailable"}.get(status,"OK");headers=dict(headers);headers.setdefault("content-length",str(len(body)));headers["connection"]="close"
+ reason={200:"OK",400:"Bad Request",404:"Not Found",408:"Request Timeout",413:"Payload Too Large",502:"Bad Gateway",503:"Service Unavailable"}.get(status,"OK");headers=dict(headers);headers.setdefault("content-length",str(len(body)));headers["connection"]="close"
  writer.write((f"HTTP/1.1 {status} {reason}\r\n"+"".join(f"{k}: {v}\r\n" for k,v in headers.items())+"\r\n").encode("latin1")+body);await writer.drain()
 async def send_chunk(writer,body:bytes):
  writer.write(f"{len(body):X}\r\n".encode("ascii")+body+b"\r\n");await writer.drain()
@@ -112,7 +176,7 @@ def structured_error(code:str,phase:str,retryable:bool,message:str)->bytes:
  return json.dumps({"error":{"code":code,"phase":phase,"retryable":retryable,"message":message}},separators=(",",":"),ensure_ascii=False).encode()
 def metrics():
  rss=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
- return {"ok":True,"inflight":_inflight,"curl_handles":_handles,"session_buckets":len(_sessions),"rss_bytes":rss*(1024 if sys.platform!="darwin" else 1),"spool_bytes":_spool_bytes,"spool_limit_bytes":SPOOL_MAX_BYTES,"impersonate":IMPERSONATE,"draining":_stopping}
+ return {"ok":True,"inflight":_inflight,"limit":MAX_INFLIGHT,"inflight_limit":MAX_INFLIGHT,"rejected_capacity":_rejected_capacity,"curl_handles":_handles,"session_buckets":len(_sessions),"rss_bytes":rss*(1024 if sys.platform!="darwin" else 1),"spool_bytes":_spool_bytes,"spool_limit_bytes":SPOOL_MAX_BYTES,"impersonate":IMPERSONATE,"draining":_stopping}
 
 # A transport error after curl has begun a request is delivery-ambiguous: the
 # upstream may already have accepted a stateful Responses turn. Only the narrow
@@ -144,10 +208,14 @@ async def proxy(writer,payload:dict[str,Any],body:Any):
   elif payload.get("default_headers") is False:kwargs["default_headers"]=False
   if akamai:kwargs["akamai"]=akamai
   if payload.get("allow_redirects") is False:kwargs["allow_redirects"]=False
+ except SidecarCapacityError:
+  if upload_session is not None:await upload_session.close()
+  if key is not None:await release_session(key)
+  raise
  except Exception as e:
   if upload_session is not None:await upload_session.close()
+  if key is not None:await release_session(key)
   raise SidecarPreflightError(str(e)) from e
- if key is not None:_session_active[key]=_session_active.get(key,0)+1
  _handles+=1;started=False
  try:
   async with session.stream(method,url,**kwargs) as resp:
@@ -172,20 +240,22 @@ async def proxy(writer,payload:dict[str,Any],body:Any):
   raise SidecarDeliveryUnknownError(str(e)) from e
  finally:
   _handles-=1
-  if key is not None:_session_active[key]=max(0,_session_active.get(key,1)-1)
+  if key is not None:await release_session(key)
   if upload_session is not None:await upload_session.close()
 
 async def client(reader,writer):
- global _inflight
- raw=None
+ raw=None;inflight_acquired=False
  try:
-  method,path,h,raw=await read_request(reader)
+  method,path,h,n=await read_request_head(reader)
   if method=="GET" and path in {"/healthz","/metrics"}:await send(writer,200,{"content-type":"application/json"},json.dumps(metrics()).encode());return
   if method!="POST" or path not in {"/proxy","/cookies"}:await send(writer,404,{"content-type":"application/json"},b'{"error":"not found"}');return
   if _stopping:await send(writer,503,{"content-type":"application/json","retry-after":"1"},b'{"error":"draining"}');return
   if path=="/cookies":
+   raw=await read_request_body(reader,path,h,n)
    p=json.loads(raw);k=str(p.get("cookie_jar_key") or "default");d=load_cookies(k);d.update({str(x):str(y) for x,y in (p.get("cookies") or {}).items()});save_cookies(k,d);await send(writer,200,{"content-type":"application/json"},json.dumps({"ok":True,"count":len(d)}).encode());return
-  _inflight+=1
+  if not await acquire_inflight():raise SidecarCapacityError("sidecar_capacity_exhausted","sidecar inflight capacity exhausted")
+  inflight_acquired=True
+  raw=await read_request_body(reader,path,h,n)
   if h.get("x-sidecar-meta"):p=json.loads(base64.b64decode(h["x-sidecar-meta"]));body=raw
   else:p=json.loads(raw);body=base64.b64decode(str(p.get("body_b64") or ""))
   await proxy(writer,p,body)
@@ -202,8 +272,8 @@ async def client(reader,writer):
   # Malformed local requests are structured for diagnosis but are never retried.
   if not writer.is_closing():await send(writer,502,{"content-type":"application/json","x-sidecar-error-code":"sidecar_request_error","x-sidecar-error-phase":"request","x-sidecar-error-retryable":"false"},structured_error("sidecar_request_error","request",False,str(e)))
  finally:
-  if 'path' in locals() and path=="/proxy":_inflight=max(0,_inflight-1)
   if isinstance(raw,SpoolBody):raw.close()
+  if inflight_acquired:await release_inflight()
   writer.close();await writer.wait_closed()
 
 async def main(addr:str):

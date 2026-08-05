@@ -246,6 +246,14 @@ func (s *Server) onUpstreamError(ctx context.Context, account storage.Account, s
 		s.recordPermissionDeniedNoQuarantine(ctx, account, v, status, body, "upstream_error")
 		return v
 	}
+	// An active official Goal turn deliberately keeps its bound account through
+	// local quota telemetry and ordinary retry-limit responses. Only the fixed,
+	// machine-readable usage terminal is allowed to bench this account and trigger
+	// a distinct-account replay.
+	if codexGoalHoldsNonAuthoritativeQuotaSignal(ctx, status, header, body) {
+		s.auditCodexGoalQuotaDecision(ctx, account.ID, "held", "non_authoritative_quota_signal", status)
+		return v
+	}
 	s.benchOnLimitForAccount(ctx, account, status, header, body)
 	return v
 }

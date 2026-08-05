@@ -17,6 +17,7 @@ import './styles/base.css';
 import './styles/layout.css';
 import './styles/components.css';
 import './styles/utilities.css';
+import './styles/apple-ui.css';
 
 try {
   const preference = getLocalItem('pool_theme', 'auto') || 'auto';

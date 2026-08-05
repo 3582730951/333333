@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"codex-account-pool/internal/bodysource"
@@ -130,6 +131,9 @@ func (s *Server) goalCompressionConcurrency(ctx context.Context) int {
 const (
 	goalCompactionForegroundBudget = 540 * time.Second
 	goalCompactionQueueDepth       = 4096
+	goalPersistenceReclaimSteps    = 16
+	goalPersistenceReclaimTimeout  = 5 * time.Second
+	goalPersistenceAuditWindow     = 30 * time.Second
 )
 
 func (s *Server) startGoalCompactionWorkers() {
@@ -1262,6 +1266,8 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 			branchHash = hashGoalFingerprint(branch)
 		}
 	}
+	storageMaxBytes := s.goalStorageMaxBytes(ctx)
+	storageTargetBytes, _ := goalStorageMaintenanceTarget(storageMaxBytes)
 	turn := storage.GoalTurn{
 		Protocol: protocol, ParentGoalID: "", BranchHash: branchHash, DownstreamKeyHash: scopedKeyHash,
 		WorkspaceHash: workspaceHash, InitialGoalHash: initialGoalHash,
@@ -1269,8 +1275,9 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 		ResolutionAliasSets: resolutionSets,
 		ReplaceHistory:      replaceInput || len(semantics.ReplacementHistory) > 0,
 		WorkingState:        goalWorkingState(requestBody), AwaitingTool: awaitingTool,
-		ExpiresAt: time.Now().Add(s.goalRetention(ctx)).Unix(), StorageMaxBytes: s.goalStorageMaxBytes(ctx),
-		CompressionStages: s.goalCompressionStages(ctx),
+		ExpiresAt: time.Now().Add(s.goalRetention(ctx)).Unix(), StorageMaxBytes: storageMaxBytes,
+		StorageTargetBytes: storageTargetBytes,
+		CompressionStages:  s.goalCompressionStages(ctx),
 	}
 	// ParentGoalID stores an opaque parent goal reference only after a root alias has
 	// already been resolved.  Keeping the thread itself out of this column avoids a
@@ -1280,7 +1287,7 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 			turn.ParentGoalID = resolved.Session.ID
 		}
 	}
-	session, err := s.store.CommitGoalTurn(ctx, turn)
+	session, err := s.commitGoalTurnWithStorageRecovery(ctx, turn, storageTargetBytes)
 	if err != nil {
 		return storage.GoalSession{}, err
 	}
@@ -1289,6 +1296,67 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 	// chain for the next resume rather than losing the successful response.
 	s.scheduleGoalCompaction(ctx, session.ID)
 	return session, nil
+}
+
+// commitGoalTurnWithStorageRecovery deliberately has one retry site. The first
+// transaction reports its ciphertext-aware headroom requirement, cold reclamation
+// advances through a fixed number of byte/row-bounded transactions, and the exact
+// same atomic turn is attempted once more. The rejected goal is protected by id in
+// addition to the run/awaiting-tool predicates in storage.
+func (s *Server) commitGoalTurnWithStorageRecovery(ctx context.Context, turn storage.GoalTurn, steadyTargetBytes int64) (storage.GoalSession, error) {
+	session, err := s.store.CommitGoalTurn(ctx, turn)
+	var budgetErr *storage.GoalStorageBudgetError
+	if !errors.As(err, &budgetErr) {
+		return session, err
+	}
+	reclaimTarget := budgetErr.ReclaimTarget()
+	if steadyTargetBytes >= 0 && steadyTargetBytes < reclaimTarget {
+		reclaimTarget = steadyTargetBytes
+	}
+	if reclaimTarget < 0 {
+		return storage.GoalSession{}, err
+	}
+	reclaimCtx, cancel := context.WithTimeout(ctx, goalPersistenceReclaimTimeout)
+	reclaimed, reclaimErr := s.store.ReclaimGoalStorageHeadroom(
+		reclaimCtx, reclaimTarget, budgetErr.GoalID, goalPersistenceReclaimSteps,
+	)
+	cancel()
+	if reclaimErr != nil {
+		return storage.GoalSession{}, err
+	}
+	// An existing current Goal may be the only protected object in the store. Build
+	// one exact, version-fenced replay checkpoint before the sole retry: this removes
+	// per-segment encryption/compression/JSON fragmentation without deleting history,
+	// live state, or an awaiting tool call. If a concurrent append changes either the
+	// checkpoint or last segment sequence, CommitGoalTurn rejects the stale rewrite.
+	recoveryTurn := turn
+	consolidated := false
+	if budgetErr.GoalID != "" && !turn.ReplaceHistory {
+		replay, _, version, snapshotErr := s.store.BuildGoalReplaySnapshot(ctx, budgetErr.GoalID)
+		if snapshotErr == nil {
+			recoveryTurn.ReplaceHistory = true
+			recoveryTurn.CheckpointPayload = string(replay)
+			recoveryTurn.ExpectedCurrentCheckpoint = version.CurrentCheckpoint
+			recoveryTurn.ExpectedLastSegmentSequence = version.LastSegmentSequence
+			consolidated = true
+		} else if errors.Is(snapshotErr, storage.ErrGoalInProgress) {
+			return storage.GoalSession{}, snapshotErr
+		}
+	}
+	// Retry once even if this process made no cold-reclaim progress: exact current
+	// consolidation or another maintenance worker may have restored headroom.
+	session, err = s.store.CommitGoalTurn(ctx, recoveryTurn)
+	if err == nil && (reclaimed.Progressed || consolidated) {
+		reason := "bounded_foreground_reclaim"
+		if consolidated {
+			reason = "bounded_reclaim_exact_current_consolidation"
+		}
+		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+			Action: "goal_storage_commit_recovered", State: session.State, Reason: reason,
+			Detail: fmt.Sprintf("goal=%s bytes=%d goals=%d steps_max=%d", session.ID, reclaimed.BytesFreed, reclaimed.Goals, goalPersistenceReclaimSteps),
+		})
+	}
+	return session, err
 }
 
 func goalPersistenceErrorCode(err error) string {
@@ -1317,10 +1385,39 @@ func goalPersistenceErrorCode(err error) string {
 	}
 }
 
+type goalPersistenceAuditBucket struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed uint64
+}
+
+var goalPersistenceAuditBuckets sync.Map
+
 func (s *Server) auditGoalPersistenceDegraded(ctx context.Context, terminal string, err error) {
+	code := goalPersistenceErrorCode(err)
+	// Store identity scopes independent test/server instances without including any
+	// account, thread, prompt, or workspace identifier in the key or audit payload.
+	key := fmt.Sprintf("%p\x00%s\x00%s", s.store, strings.TrimSpace(terminal), code)
+	value, _ := goalPersistenceAuditBuckets.LoadOrStore(key, &goalPersistenceAuditBucket{})
+	bucket := value.(*goalPersistenceAuditBucket)
+	now := time.Now()
+	bucket.mu.Lock()
+	if !bucket.last.IsZero() && now.Sub(bucket.last) < goalPersistenceAuditWindow {
+		bucket.suppressed++
+		bucket.mu.Unlock()
+		return
+	}
+	suppressed := bucket.suppressed
+	bucket.last = now
+	bucket.suppressed = 0
+	bucket.mu.Unlock()
+	detail := "error_code=" + code
+	if suppressed > 0 {
+		detail += fmt.Sprintf(" suppressed=%d", suppressed)
+	}
 	_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
 		Action: "goal_persistence_degraded", State: "retryable", Reason: terminal,
-		Detail: "error_code=" + goalPersistenceErrorCode(err),
+		Detail: detail,
 	})
 }
 

@@ -3,7 +3,7 @@ import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router'
 import { useIsFetching } from '@tanstack/react-query';
 import * as PoolUI from './components/pool/index.jsx';
 import {
-  IconChevronDown, IconExit, IconGlobe, IconHistogram, IconHome, IconKey, IconLanguage,
+  IconChevronDown, IconClose, IconExit, IconGlobe, IconHistogram, IconHome, IconKey, IconLanguage,
   IconList, IconMoon, IconPulse, IconSetting, IconSun, IconUser, IconUserGroup,
 } from './components/pool/icons.jsx';
 import AppErrorBoundary, { isChunkLoadError, notifyChunkUpdateAvailable, reportClientError } from './components/AppErrorBoundary.jsx';
@@ -34,6 +34,13 @@ const ADMIN_GROUPS = [
   { key: 'observability', labelKey: 'nav.observability', icon: IconHistogram },
   { key: 'security', labelKey: 'nav.access_control', icon: IconUserGroup },
 ] as const;
+
+type NavigationItem = {
+  itemKey: string;
+  text: string;
+  icon?: ReactNode;
+  items?: NavigationItem[];
+};
 
 function reportPrefetchError(error: unknown, route: RouteDefinition) {
   reportClientError(error, { source: 'route.prefetch', componentStack: `prefetch:${route.path}` });
@@ -90,13 +97,13 @@ function StablePageReady({ routeKey, children }: { routeKey: string; children: R
   return <div ref={contentRef} className="pool-route-content" data-page-ready={ready ? 'true' : 'false'}>{children}</div>;
 }
 
-function BootScreen() {
+function BootScreen({ portal = false }: { portal?: boolean }) {
   return (
-    <div className="pool-boot-shell" data-page-ready="false">
-      <aside className="pool-boot-sidebar">
+    <div className={`pool-boot-shell ${portal ? 'pool-boot-shell--portal' : ''}`} data-page-ready="false">
+      {!portal ? <aside className="pool-boot-sidebar">
         <div className="pool-boot-brand"><span className="pool-skel" /><span className="pool-skel" /></div>
         {Array.from({ length: 7 }).map((_, index) => <div className="pool-skel pool-boot-nav" key={index} />)}
-      </aside>
+      </aside> : null}
       <main className="pool-boot-main">
         <header className="pool-boot-header"><span className="pool-skel" /><span className="pool-skel" /></header>
         <RouteFallback />
@@ -105,9 +112,9 @@ function BootScreen() {
   );
 }
 
-function adminNavigation() {
+function adminNavigation(): NavigationItem[] {
   const overview = adminRoutes.find((route) => route.path === '/');
-  const items: any[] = overview ? [{ itemKey: '/', text: t(overview.titleKey), icon: <IconHome /> }] : [];
+  const items: NavigationItem[] = overview ? [{ itemKey: '/', text: t(overview.titleKey), icon: <IconHome /> }] : [];
   items.push({ itemKey: '/public-chat', text: t('nav.public_chat'), icon: <IconGlobe /> });
   for (const group of ADMIN_GROUPS) {
     const Icon = group.icon;
@@ -129,7 +136,7 @@ function adminNavigation() {
   return items;
 }
 
-function portalNavigation() {
+function portalNavigation(): NavigationItem[] {
   const icons: Record<string, ComponentType<any>> = {
     '/portal': IconHistogram,
     '/portal/keys': IconKey,
@@ -179,7 +186,20 @@ export default function App() {
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [aiSettingsDirty, setAISettingsDirty] = useState(false);
   const accountMenuRef = useRef<HTMLDivElement | null>(null);
+  const accountMenuButtonRef = useRef<HTMLButtonElement | null>(null);
+  const mobileMenuButtonRef = useRef<HTMLButtonElement | null>(null);
+  const wasMobileRef = useRef(responsive.isMobile);
   const isAdmin = auth.role === 'admin';
+
+  const closeMobileMenu = useCallback(() => {
+    setMobileOpen(false);
+    queueMicrotask(() => mobileMenuButtonRef.current?.focus());
+  }, []);
+
+  const closeAccountMenuAndRestoreFocus = useCallback(() => {
+    setAccountMenuOpen(false);
+    queueMicrotask(() => accountMenuButtonRef.current?.focus());
+  }, []);
 
   useEffect(() => {
     resetDocumentOverlayLocks();
@@ -190,17 +210,79 @@ export default function App() {
   useEffect(() => addWindowListener('pool-ai-settings-dirty', (event: CustomEvent<boolean>) => setAISettingsDirty(Boolean(event.detail))), []);
   useEffect(() => {
     setCollapsed(responsive.collapsedByWidth);
-    if (!responsive.isMobile) setMobileOpen(false);
-  }, [responsive.collapsedByWidth, responsive.isMobile]);
+    if (!responsive.isMobile) {
+      const crossedToDesktopWithDrawerOpen = wasMobileRef.current && mobileOpen;
+      setMobileOpen(false);
+      if (crossedToDesktopWithDrawerOpen) {
+        queueMicrotask(() => {
+          const currentNavigationItem = document.querySelector<HTMLElement>('#pool-desktop-navigation [aria-current="page"]');
+          (currentNavigationItem || accountMenuButtonRef.current)?.focus();
+        });
+      }
+    }
+    wasMobileRef.current = responsive.isMobile;
+  }, [mobileOpen, responsive.collapsedByWidth, responsive.isMobile]);
+
+  useEffect(() => {
+    if (!responsive.isMobile || !mobileOpen) return undefined;
+    const drawer = document.getElementById('pool-mobile-navigation');
+    const focusFirstDrawerControl = () => {
+      drawer?.querySelector<HTMLElement>('button:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])')?.focus();
+    };
+    queueMicrotask(focusFirstDrawerControl);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeMobileMenu();
+        return;
+      }
+      if (event.key !== 'Tab' || !drawer) return;
+      const controls = Array.from(drawer.querySelectorAll<HTMLElement>('button:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'));
+      if (!controls.length) return;
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    return addDocumentListener('keydown', closeOnEscape);
+  }, [closeMobileMenu, mobileOpen, responsive.isMobile]);
 
   useEffect(() => {
     if (!accountMenuOpen) return undefined;
+    const menu = accountMenuRef.current?.querySelector<HTMLElement>('[role="menu"]');
+    queueMicrotask(() => menu?.querySelector<HTMLElement>('[role="menuitem"]')?.focus());
     const closeOnOutside = (event: PointerEvent) => {
       if (!accountMenuRef.current?.contains(event.target as Node)) setAccountMenuOpen(false);
     };
-    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setAccountMenuOpen(false); };
+    const handleKeyboard = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setAccountMenuOpen(false);
+        queueMicrotask(() => accountMenuButtonRef.current?.focus());
+        return;
+      }
+      if (event.key === 'Tab') {
+        setAccountMenuOpen(false);
+        return;
+      }
+      if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+      const items = Array.from(menu?.querySelectorAll<HTMLElement>('[role="menuitem"]') || []);
+      if (!items.length) return;
+      event.preventDefault();
+      const current = items.indexOf(document.activeElement as HTMLElement);
+      const next = event.key === 'Home' ? 0
+        : event.key === 'End' ? items.length - 1
+          : event.key === 'ArrowDown' ? (current + 1 + items.length) % items.length
+            : (current - 1 + items.length) % items.length;
+      items[next].focus();
+    };
     const removePointer = addDocumentListener('pointerdown', closeOnOutside);
-    const removeKeyboard = addDocumentListener('keydown', closeOnEscape);
+    const removeKeyboard = addDocumentListener('keydown', handleKeyboard);
     return () => { removePointer(); removeKeyboard(); };
   }, [accountMenuOpen]);
 
@@ -228,17 +310,17 @@ export default function App() {
   const activeRoute = (isAdmin ? adminRoutes : portalRoutes).find((route) => route.path === location.pathname);
   const ident = auth.user?.email || auth.user?.name || (isAdmin ? 'admin' : 'user');
   const identInitial = String(ident).trim().charAt(0).toUpperCase();
-  const navCollapsed = responsive.isMobile ? false : collapsed;
-  const sidebarWidth = responsive.isMobile ? SIDEBAR_EXPANDED_WIDTH : navCollapsed ? SIDEBAR_COLLAPSED_WIDTH : SIDEBAR_EXPANDED_WIDTH;
+  const navCollapsed = isAdmin && !responsive.isMobile ? collapsed : false;
+  const sidebarWidth = !isAdmin ? 0 : responsive.isMobile ? SIDEBAR_EXPANDED_WIDTH : navCollapsed ? SIDEBAR_COLLAPSED_WIDTH : SIDEBAR_EXPANDED_WIDTH;
   const navigateFromShell = (target: string) => {
     if (target === `${location.pathname}${location.search}` || target === location.pathname) return;
     if (aiSettingsDirty && !window.confirm(t('ai_settings.leave_description'))) return;
     setAISettingsDirty(false);
     navigate(target);
-    setMobileOpen(false);
+    if (responsive.isMobile && isAdmin) closeMobileMenu();
   };
 
-  if (!auth.ready) return <BootScreen />;
+  if (!auth.ready) return <BootScreen portal={location.pathname.startsWith('/portal')} />;
   if (auth.error) {
     return (
       <div className="pool-auth-error">
@@ -248,21 +330,52 @@ export default function App() {
     );
   }
   if (!auth.authed) {
-    return <Suspense fallback={<BootScreen />}><LoginPage onSuccess={auth.refresh} /></Suspense>;
+    return <Suspense fallback={<BootScreen portal={location.pathname.startsWith('/portal')} />}><LoginPage onSuccess={auth.refresh} /></Suspense>;
   }
 
   const layoutStyle = { '--pool-sidebar-width': `${sidebarWidth}px` } as CSSProperties;
+  const accountMenu = (
+    <div className="pool-account-menu-wrap" ref={accountMenuRef}>
+      <Button ref={accountMenuButtonRef} className="pool-account-menu-button" theme="borderless" aria-label={t('app.account_menu')} aria-haspopup="menu" aria-controls="pool-account-menu" aria-expanded={accountMenuOpen} onClick={() => setAccountMenuOpen((value) => !value)} onKeyDown={(event: React.KeyboardEvent) => {
+        if (event.key !== 'ArrowDown') return;
+        event.preventDefault();
+        setAccountMenuOpen(true);
+      }}>
+        <Avatar size="extra-small" className="pool-account-avatar">{identInitial}</Avatar><span className="pool-account-menu-ident">{ident}</span><IconChevronDown className="pool-account-menu-caret" />
+      </Button>
+      {accountMenuOpen ? (
+        <div id="pool-account-menu" className="pool-account-menu" role="menu" aria-label={t('app.account_menu')}>
+          <div className="pool-account-menu-title"><span>{ident}</span><small>{isAdmin ? t('role.admin') : t('role.user')}</small></div>
+          <div className="pool-account-menu-divider" />
+          <button type="button" className="pool-account-menu-item" role="menuitem" tabIndex={-1} onClick={() => { switchLocale(); closeAccountMenuAndRestoreFocus(); }}><IconLanguage /><span>{locale === 'en' ? '切换到中文' : 'Switch to English'}</span></button>
+          <button type="button" className="pool-account-menu-item" role="menuitem" tabIndex={-1} onClick={() => { theme.cycle(); closeAccountMenuAndRestoreFocus(); }}>{theme.resolved === 'dark' ? <IconMoon /> : <IconSun />}<span>{t(`theme.${theme.preference}`)}</span></button>
+          <div className="pool-account-menu-divider" />
+          <button type="button" className="pool-account-menu-item" role="menuitem" tabIndex={-1} onClick={async () => { setAccountMenuOpen(false); await auth.logout(); navigate('/'); Toast.success(t('app.logged_out')); }}><IconExit /><span>{t('app.logout')}</span></button>
+        </div>
+      ) : null}
+    </div>
+  );
   return (
-    <Layout className={`pool-app-layout ${responsive.isMobile ? 'pool-app-mobile' : 'pool-app-desktop'} ${navCollapsed ? 'pool-sidebar-is-collapsed' : ''}`} style={layoutStyle}>
-      {mobileOpen ? <button className="pool-shell-drawer-overlay" aria-label={t('common.close')} onClick={() => setMobileOpen(false)} /> : null}
-      <Sider className={`pool-shell-sider ${navCollapsed ? 'pool-sider-collapsed' : 'pool-sider-expanded'}`} style={{ width: sidebarWidth, transform: responsive.isMobile ? (mobileOpen ? 'translateX(0)' : 'translateX(-100%)') : undefined }}>
-        <div className="pool-brand"><Avatar size="extra-small">P</Avatar>{!navCollapsed ? <span>{t('app.title')}</span> : null}</div>
+    <Layout className={`pool-app-layout ${responsive.isMobile ? 'pool-app-mobile' : 'pool-app-desktop'} ${isAdmin ? 'pool-admin-shell' : 'pool-portal-shell'} ${navCollapsed ? 'pool-sidebar-is-collapsed' : ''}`} style={layoutStyle}>
+      {isAdmin && responsive.isMobile && mobileOpen ? <div className="pool-shell-drawer-overlay" aria-hidden="true" onClick={closeMobileMenu} /> : null}
+      {isAdmin ? <Sider
+        id={responsive.isMobile ? 'pool-mobile-navigation' : 'pool-desktop-navigation'}
+        inert={responsive.isMobile && !mobileOpen ? true : undefined}
+        aria-hidden={responsive.isMobile ? !mobileOpen : undefined}
+        aria-label={responsive.isMobile ? t('app.navigation') : t('app.admin')}
+        aria-modal={responsive.isMobile && mobileOpen ? true : undefined}
+        role={responsive.isMobile ? 'dialog' : undefined}
+        className={`pool-shell-sider ${navCollapsed ? 'pool-sider-collapsed' : 'pool-sider-expanded'}`}
+        style={{ width: sidebarWidth, transform: responsive.isMobile ? (mobileOpen ? 'translateX(0)' : 'translateX(-100%)') : undefined }}
+      >
+        <div className="pool-brand">
+          <Avatar size="extra-small">P</Avatar>{!navCollapsed ? <span>{t('app.title')}</span> : null}
+          {responsive.isMobile ? <Button className="pool-mobile-drawer-close" theme="borderless" icon={<IconClose />} onClick={closeMobileMenu} aria-label={t('common.close')} /> : null}
+        </div>
         <Nav
           selectedKeys={[currentNavKey]}
-          defaultOpenKeys={['group:accounts', 'group:access', 'group:automation', 'group:observability', 'group:security', 'group:settings']}
           items={navigation}
           isCollapsed={navCollapsed}
-          onCollapseChange={(value: boolean) => { if (!responsive.isMobile) setCollapsed(Boolean(value)); }}
           onClick={({ itemKey, group }: { itemKey: string; group?: boolean }) => {
             if (group && navCollapsed && !responsive.isMobile) { setCollapsed(false); return; }
             if (itemKey?.startsWith('/')) navigateFromShell(itemKey);
@@ -273,34 +386,35 @@ export default function App() {
         {!responsive.isMobile ? (
           <div className="pool-sidebar-collapse"><Button theme="borderless" icon={<IconList />} onClick={() => setCollapsed((value) => !value)} aria-label={navCollapsed ? t('app.expand_sidebar') : t('app.collapse_sidebar')}>{!navCollapsed ? t('app.collapse_sidebar') : null}</Button></div>
         ) : null}
-      </Sider>
-      <Layout className="pool-main-layout" style={{ marginLeft: responsive.isMobile ? 0 : sidebarWidth }}>
-        <Header className="pool-shell-header">
-          <div className="pool-topbar-left">
-            <Button theme="borderless" icon={<IconList />} onClick={() => setMobileOpen((value) => !value)} className="pool-mobile-menu-btn" aria-label={t('app.toggle_menu')} />
-            <div className="pool-topbar-title"><span className="pool-topbar-title-main">{isAdmin ? t('app.admin') : t('app.portal')}</span>{activeRoute ? <><span className="pool-topbar-divider">/</span><span className="pool-topbar-current">{t(activeRoute.titleKey)}</span></> : null}</div>
-          </div>
+      </Sider> : null}
+      <Layout
+        className="pool-main-layout"
+        inert={isAdmin && responsive.isMobile && mobileOpen ? true : undefined}
+        aria-hidden={isAdmin && responsive.isMobile && mobileOpen ? true : undefined}
+        style={{ marginLeft: isAdmin && !responsive.isMobile ? sidebarWidth : 0 }}
+      >
+        <Header className={`pool-shell-header ${isAdmin ? 'pool-admin-header' : 'pool-portal-header'}`}>
+          {isAdmin ? <div className="pool-topbar-left">
+            {responsive.isMobile ? <Button ref={mobileMenuButtonRef} theme="borderless" icon={<IconList />} onClick={() => { setAccountMenuOpen(false); setMobileOpen((value) => !value); }} className="pool-mobile-menu-btn" aria-label={t('app.toggle_menu')} aria-expanded={mobileOpen} aria-controls="pool-mobile-navigation" /> : null}
+            <div className="pool-topbar-title"><span className="pool-topbar-title-main">{t('app.admin')}</span>{activeRoute ? <><span className="pool-topbar-divider">/</span><span className="pool-topbar-current">{t(activeRoute.titleKey)}</span></> : null}</div>
+          </div> : <>
+            <button type="button" className="pool-portal-brand" onClick={() => navigateFromShell('/portal')} aria-label={t('app.portal')}>
+              <Avatar size="extra-small">P</Avatar><span>{t('app.portal')}</span>
+            </button>
+            {!responsive.isMobile ? <nav className="pool-portal-nav" aria-label={t('app.navigation')}>
+              {navigation.map((item) => <button type="button" key={item.itemKey} className="pool-portal-nav__item" aria-label={item.text} aria-current={currentNavKey === item.itemKey ? 'page' : undefined} onClick={() => navigateFromShell(item.itemKey)}>{item.icon}<span>{item.text}</span></button>)}
+            </nav> : <div className="pool-portal-mobile-title">{activeRoute ? t(activeRoute.titleKey) : t('app.portal')}</div>}
+          </>}
           <div className="pool-topbar-actions">
             <Button className="pool-topbar-icon-button pool-desktop-only" theme="borderless" icon={<IconLanguage />} onClick={switchLocale} aria-label={t('app.language')} />
             <Button className="pool-topbar-icon-button pool-desktop-only" theme="borderless" icon={theme.resolved === 'dark' ? <IconMoon /> : <IconSun />} onClick={theme.cycle} aria-label={`${t('app.theme')}: ${t(`theme.${theme.preference}`)}`} title={`${t('app.theme')}: ${t(`theme.${theme.preference}`)}`} />
-            <div className="pool-account-menu-wrap" ref={accountMenuRef}>
-              <Button className="pool-account-menu-button" theme="borderless" aria-label={t('app.account_menu')} aria-haspopup="menu" aria-expanded={accountMenuOpen} onClick={() => setAccountMenuOpen((value) => !value)}>
-                <Avatar size="extra-small" className="pool-account-avatar">{identInitial}</Avatar><span className="pool-account-menu-ident">{ident}</span><IconChevronDown className="pool-account-menu-caret" />
-              </Button>
-              {accountMenuOpen ? (
-                <div className="pool-account-menu" role="menu">
-                  <div className="pool-account-menu-title"><span>{ident}</span><small>{isAdmin ? t('role.admin') : t('role.user')}</small></div>
-                  <div className="pool-account-menu-divider" />
-                  <button type="button" className="pool-account-menu-item" role="menuitem" onClick={() => { switchLocale(); setAccountMenuOpen(false); }}><IconLanguage /><span>{locale === 'en' ? '切换到中文' : 'Switch to English'}</span></button>
-                  <button type="button" className="pool-account-menu-item" role="menuitem" onClick={() => { theme.cycle(); setAccountMenuOpen(false); }}>{theme.resolved === 'dark' ? <IconMoon /> : <IconSun />}<span>{t(`theme.${theme.preference}`)}</span></button>
-                  <div className="pool-account-menu-divider" />
-                  <button type="button" className="pool-account-menu-item" role="menuitem" onClick={async () => { setAccountMenuOpen(false); await auth.logout(); navigate('/'); Toast.success(t('app.logged_out')); }}><IconExit /><span>{t('app.logout')}</span></button>
-                </div>
-              ) : null}
-            </div>
+            {accountMenu}
           </div>
         </Header>
         <Content className="pool-content"><div className="pool-shell"><AppRoutes admin={isAdmin} /></div></Content>
+        {!isAdmin && responsive.isMobile ? <nav className="pool-portal-tabbar" aria-label={t('app.navigation')}>
+          {navigation.map((item) => <button type="button" key={item.itemKey} className="pool-portal-tabbar__item" aria-label={item.text} aria-current={currentNavKey === item.itemKey ? 'page' : undefined} onClick={() => navigateFromShell(item.itemKey)}>{item.icon}<span>{item.text}</span></button>)}
+        </nav> : null}
       </Layout>
     </Layout>
   );

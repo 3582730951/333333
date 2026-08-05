@@ -387,7 +387,7 @@ describe('API contracts', () => {
 
 describe('routing, responsive actions, and forms', () => {
   it('keeps every management and portal screen in the visual route matrix', () => {
-    expect(adminVisualRoutes).toHaveLength(28);
+    expect(adminVisualRoutes).toHaveLength(29);
     expect(portalRoutes).toHaveLength(4);
     expect(new Set(adminRoutes.map((route) => route.path)).size).toBe(adminRoutes.length);
     expect(adminRoutes.find((route) => route.path === '/team-lifecycle')?.navGroup).toBe('automation');
@@ -399,9 +399,11 @@ describe('routing, responsive actions, and forms', () => {
     expect(legacyRedirects.find((route) => route.path === '/model-settings')?.to).toBe('/settings/ai/chatgpt');
   });
 
-  it('uses the same 768px mobile boundary for shell and data actions', () => {
+  it('uses shared mobile and compact-workspace boundaries for shell and data actions', () => {
     expect(responsiveState(767).isMobile).toBe(true);
     expect(responsiveState(768).isMobile).toBe(false);
+    expect(responsiveState(1280).collapsedByWidth).toBe(true);
+    expect(responsiveState(1360).collapsedByWidth).toBe(false);
     const definition: ResponsiveDataView<{ id: string }> = {
       desktopColumns: [], mobileSummary: () => null, details: () => null,
       actions: [

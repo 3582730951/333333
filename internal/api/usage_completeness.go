@@ -51,6 +51,28 @@ func markCacheBucketsPartial(rows []storage.CacheUsageBucket, bucketSeconds, wat
 	}
 }
 
+// scopedUsageWindowRequest lets aggregate consumers retain different time
+// windows for individual views without paying for separate HTTP requests. The
+// unscoped since/until values remain the fallback for existing callers.
+func scopedUsageWindowRequest(r *http.Request, scope string) *http.Request {
+	query := r.URL.Query()
+	changed := false
+	for _, bound := range []string{"since", "until"} {
+		if values, ok := query[scope+"_"+bound]; ok {
+			query[bound] = append([]string(nil), values...)
+			changed = true
+		}
+	}
+	if !changed {
+		return r
+	}
+	clone := r.Clone(r.Context())
+	clonedURL := *r.URL
+	clonedURL.RawQuery = query.Encode()
+	clone.URL = &clonedURL
+	return clone
+}
+
 // adminUsageDashboard returns the primary usage views from one flushed snapshot.
 // Existing endpoints remain available for compatibility.
 func (s *Server) adminUsageDashboard(w http.ResponseWriter, r *http.Request) {
@@ -77,6 +99,16 @@ func (s *Server) adminUsageDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cacheWin, err := s.resolveAdminUsageWindow(r, now, true)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	timeseriesWin, err := s.resolveAdminUsageWindow(scopedUsageWindowRequest(r, "timeseries"), now, false)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	modelsWin, err := s.resolveAdminUsageWindow(scopedUsageWindowRequest(r, "models"), now, false)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -112,7 +144,15 @@ func (s *Server) adminUsageDashboard(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	modelsUntil := win.storageUntilAt()
+	allowPartial := false
+	if raw := strings.TrimSpace(r.URL.Query().Get("allow_partial")); raw != "" {
+		allowPartial, err = strconv.ParseBool(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("allow_partial must be a boolean"))
+			return
+		}
+	}
+	modelsUntil := modelsWin.storageUntilAt()
 	if meta.UsageCompleteThroughAt < modelsUntil {
 		modelsUntil = meta.UsageCompleteThroughAt
 	}
@@ -129,6 +169,10 @@ func (s *Server) adminUsageDashboard(w http.ResponseWriter, r *http.Request) {
 	// These aggregates are independent read-only snapshots. The store has a WAL
 	// read pool, so execute them concurrently instead of serially scanning the same
 	// usage window roughly ten times before the page can render.
+	type dashboardTask struct {
+		section string
+		run     func() error
+	}
 	var (
 		accounts           []storage.UsageSummaryRow
 		timeseries         []storage.UsageBucket
@@ -138,97 +182,139 @@ func (s *Server) adminUsageDashboard(w http.ResponseWriter, r *http.Request) {
 		realtime           storage.CacheUsageReport
 		stable             storage.CacheUsageReport
 		customCacheBuckets []storage.CacheUsageBucket
-		tasks              []func() error
+		tasks              []dashboardTask
 	)
-	tasks = append(tasks,
-		func() error {
-			var queryErr error
-			accounts, queryErr = s.store.UsageSummaryWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt())
-			return queryErr
-		},
-		func() error {
-			var queryErr error
-			timeseries, queryErr = s.store.UsageTimeseriesWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt(), bucket)
-			return queryErr
-		},
-		func() error {
-			var queryErr error
-			if dimension == "provider_model" {
-				var rows []storage.ProviderModelUsageRow
-				rows, queryErr = s.store.UsageByProviderModelWindow(r.Context(), win.EffectiveStartAt, modelsUntil)
-				models = nonNilProviderModelUsageRows(rows)
-			} else {
-				var rows []storage.UserUsageRow
-				rows, queryErr = s.store.UsageByModelWindow(r.Context(), win.EffectiveStartAt, modelsUntil)
-				models = nonNilUserUsageRows(rows)
-			}
-			return queryErr
-		},
-		func() error {
-			var queryErr error
-			if seriesDimension == "provider_model" {
-				series, modelSeries, queryErr = s.store.UsageProviderModelSeriesWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt(), bucket, seriesLimit)
-			} else if seriesDimension == "model" {
-				series, modelSeries, queryErr = s.store.UsageModelSeriesWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt(), bucket, seriesLimit)
-			}
-			return queryErr
-		},
-		func() error {
-			var queryErr error
-			realtime, queryErr = s.store.CacheUsageMetricsWindowFields(r.Context(), cacheWin.EffectiveStartAt, cacheWin.storageUntilAt(), 200, cacheFields)
-			return queryErr
-		},
-		func() error {
-			var queryErr error
-			stable, queryErr = s.store.CacheUsageMetricsWindowFields(r.Context(), cacheWin.EffectiveStartAt, stableUntil, 0, stableFields)
-			return queryErr
-		},
-	)
+	addTask := func(section string, run func() error) {
+		tasks = append(tasks, dashboardTask{section: section, run: run})
+	}
+	addTask("accounts", func() error {
+		var queryErr error
+		accounts, queryErr = s.store.UsageSummaryWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt())
+		return queryErr
+	})
+	addTask("timeseries", func() error {
+		var queryErr error
+		timeseries, queryErr = s.store.UsageTimeseriesWindow(r.Context(), timeseriesWin.EffectiveStartAt, timeseriesWin.storageUntilAt(), bucket)
+		return queryErr
+	})
+	addTask("models", func() error {
+		var queryErr error
+		if dimension == "provider_model" {
+			var rows []storage.ProviderModelUsageRow
+			rows, queryErr = s.store.UsageByProviderModelWindow(r.Context(), modelsWin.EffectiveStartAt, modelsUntil)
+			models = nonNilProviderModelUsageRows(rows)
+		} else {
+			var rows []storage.UserUsageRow
+			rows, queryErr = s.store.UsageByModelWindow(r.Context(), modelsWin.EffectiveStartAt, modelsUntil)
+			models = nonNilUserUsageRows(rows)
+		}
+		return queryErr
+	})
+	addTask("timeseries", func() error {
+		var queryErr error
+		if seriesDimension == "provider_model" {
+			series, modelSeries, queryErr = s.store.UsageProviderModelSeriesWindow(r.Context(), timeseriesWin.EffectiveStartAt, timeseriesWin.storageUntilAt(), bucket, seriesLimit)
+		} else if seriesDimension == "model" {
+			series, modelSeries, queryErr = s.store.UsageModelSeriesWindow(r.Context(), timeseriesWin.EffectiveStartAt, timeseriesWin.storageUntilAt(), bucket, seriesLimit)
+		}
+		return queryErr
+	})
+	addTask("cache", func() error {
+		var queryErr error
+		realtime, queryErr = s.store.CacheUsageMetricsWindowFields(r.Context(), cacheWin.EffectiveStartAt, cacheWin.storageUntilAt(), 200, cacheFields)
+		return queryErr
+	})
+	addTask("cache", func() error {
+		var queryErr error
+		stable, queryErr = s.store.CacheUsageMetricsWindowFields(r.Context(), cacheWin.EffectiveStartAt, stableUntil, 0, stableFields)
+		return queryErr
+	})
 	if bucket != 3600 && includeCacheField("by_time_bucket") {
-		tasks = append(tasks, func() error {
+		addTask("cache", func() error {
 			var queryErr error
 			customCacheBuckets, queryErr = s.store.CacheUsageBucketsWindow(r.Context(), cacheWin.EffectiveStartAt, cacheWin.storageUntilAt(), bucket)
 			return queryErr
 		})
 	}
+	type dashboardQueryError struct {
+		section string
+		err     error
+	}
 	var wg sync.WaitGroup
-	queryErrors := make(chan error, len(tasks))
+	queryErrors := make(chan dashboardQueryError, len(tasks))
 	for _, task := range tasks {
 		wg.Add(1)
-		go func(run func() error) {
+		go func(task dashboardTask) {
 			defer wg.Done()
 			defer func() {
 				if panicValue := recover(); panicValue != nil {
 					supervisor.LogPanic("usage-dashboard-query", panicValue)
-					queryErrors <- errors.New("usage dashboard query failed")
+					queryErrors <- dashboardQueryError{section: task.section, err: errors.New("usage dashboard query failed")}
 				}
 			}()
-			if queryErr := run(); queryErr != nil {
-				queryErrors <- queryErr
+			if queryErr := task.run(); queryErr != nil {
+				queryErrors <- dashboardQueryError{section: task.section, err: queryErr}
 			}
 		}(task)
 	}
 	wg.Wait()
 	close(queryErrors)
-	if queryErr := <-queryErrors; queryErr != nil {
-		writeError(w, http.StatusInternalServerError, queryErr)
+	failedSections := make(map[string]bool)
+	var firstQueryError error
+	for queryErr := range queryErrors {
+		failedSections[queryErr.section] = true
+		if firstQueryError == nil {
+			firstQueryError = queryErr.err
+		}
+	}
+	if firstQueryError != nil && !allowPartial {
+		writeError(w, http.StatusInternalServerError, firstQueryError)
 		return
 	}
-	if customCacheBuckets != nil {
-		realtime.ByTimeBucket = customCacheBuckets
+	if firstQueryError != nil {
+		// Telemetry completeness is only one way an aggregate can be partial. If an
+		// independently queried section failed, advertise the whole response as partial
+		// as well as naming the unavailable section below.
+		meta.PartialData = true
 	}
-	markUsageBucketsPartial(timeseries, bucket, meta.UsageCompleteThroughAt)
-	markCacheBucketsPartial(realtime.ByTimeBucket, bucket, meta.UsageCompleteThroughAt)
-	cacheBody := usageDashboardCacheBody(realtime, stable.Summary, cacheFields)
-	cacheBody = mergeCompletenessFields(mergeWindowFields(cacheBody, cacheWin), meta)
 	body := map[string]interface{}{
-		"accounts": nonNilUsageSummary(accounts), "timeseries": nonNilUsageBuckets(timeseries), "models": models,
-		"cache": cacheBody, "stable_cache": stable, "summary": realtime.Summary, "stable_summary": stable.Summary,
+		"timeseries_effective_start_at": timeseriesWin.EffectiveStartAt, "timeseries_effective_until_at": timeseriesWin.EffectiveUntilAt,
+		"models_effective_start_at": modelsWin.EffectiveStartAt, "models_effective_until_at": modelsWin.EffectiveUntilAt,
 	}
-	if seriesDimension != "" {
-		body["series_dimension"] = seriesDimension
-		body["series"] = series
-		body["model_series"] = modelSeries
+	if !failedSections["accounts"] {
+		body["accounts"] = nonNilUsageSummary(accounts)
+	}
+	if !failedSections["timeseries"] {
+		markUsageBucketsPartial(timeseries, bucket, meta.UsageCompleteThroughAt)
+		body["timeseries"] = nonNilUsageBuckets(timeseries)
+		if seriesDimension != "" {
+			body["series_dimension"] = seriesDimension
+			body["series"] = series
+			body["model_series"] = modelSeries
+		}
+	}
+	if !failedSections["models"] {
+		body["models"] = models
+	}
+	if !failedSections["cache"] {
+		if customCacheBuckets != nil {
+			realtime.ByTimeBucket = customCacheBuckets
+		}
+		markCacheBucketsPartial(realtime.ByTimeBucket, bucket, meta.UsageCompleteThroughAt)
+		cacheBody := usageDashboardCacheBody(realtime, stable.Summary, cacheFields)
+		body["cache"] = mergeCompletenessFields(mergeWindowFields(cacheBody, cacheWin), meta)
+		body["stable_cache"] = stable
+		body["summary"] = realtime.Summary
+		body["stable_summary"] = stable.Summary
+	}
+	if allowPartial {
+		unavailableSections := make([]string, 0, len(failedSections))
+		for _, section := range []string{"accounts", "timeseries", "models", "cache"} {
+			if failedSections[section] {
+				unavailableSections = append(unavailableSections, section)
+			}
+		}
+		body["unavailable_sections"] = unavailableSections
 	}
 	writeJSON(w, http.StatusOK, mergeCompletenessFields(mergeWindowFields(body, win), meta))
 }

@@ -93,6 +93,22 @@ func TestChatToolsAndToolCallsConversion(t *testing.T) {
 	}
 }
 
+func TestChatCompletionToAnthropicMakesDefaultAutoToolChoiceExplicit(t *testing.T) {
+	raw := []byte(`{"model":"relay-model","tools":[{"type":"function","function":{"name":"write_file","parameters":{"type":"object"}}}],"messages":[{"role":"user","content":"write it"}]}`)
+	out, err := ChatCompletionToAnthropic(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(out, &root); err != nil {
+		t.Fatal(err)
+	}
+	choice, _ := root["tool_choice"].(map[string]interface{})
+	if choice["type"] != "auto" {
+		t.Fatalf("implicit tool choice was not normalized to auto: %s", out)
+	}
+}
+
 func TestChatCompletionToAnthropicPreservesMultimodalContent(t *testing.T) {
 	raw := []byte(`{"model":"claude-x","messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"image_url","image_url":{"url":"https://example.com/cat.jpg"}},{"type":"file","file":{"file_data":"data:application/pdf;base64,JVBERi0="}}]}]}`)
 	out, err := ChatCompletionToAnthropic(raw)

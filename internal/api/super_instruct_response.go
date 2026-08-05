@@ -189,7 +189,11 @@ func (s *Server) finishSuperInstructResponsePipeline(w *superInstructBufferingRe
 	if s.cfg.SuperInstructLocalEnabled {
 		// Source-compatible local path: one M4 parse followed by M3, M5, and M6
 		// on the same ResponseContext. A matched M3 rule returns the source Rei
-		// replacement body; streamed/passthrough responses are observed above.
+		// replacement body. Tool/reasoning envelopes are protocol control data,
+		// not assistant prose; rewriting them would erase executable calls.
+		if opts.ResponseRewriteEnabled && superInstructResponseHasStructuredOutput(original) {
+			opts.ResponseRewriteEnabled = false
+		}
 		result := s.superInstructProcessor().Process(meta, status, original, duration, opts)
 		body := result.Body
 		contentType := "application/json"
@@ -213,6 +217,101 @@ func (s *Server) finishSuperInstructResponsePipeline(w *superInstructBufferingRe
 	}
 	w.writeFinal(status, body, tampered, "application/json")
 	finishSuperInstructObservation(s.superInstructProcessor(), status, original, false, meta, opts, duration)
+}
+
+func superInstructResponseHasStructuredOutput(raw []byte) bool {
+	parse := func(data []byte) (valid, structured bool) {
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.UseNumber()
+		var value interface{}
+		if decoder.Decode(&value) != nil {
+			return false, false
+		}
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			return false, false
+		}
+		return true, superInstructStructuredValue(value, 0)
+	}
+	if valid, structured := parse(raw); valid && structured {
+		return true
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	scanner.Buffer(make([]byte, 64*1024), superInstructObservationLimit)
+	var eventData bytes.Buffer
+	flushEvent := func() bool {
+		defer eventData.Reset()
+		data := bytes.TrimSpace(eventData.Bytes())
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+			return false
+		}
+		valid, structured := parse(data)
+		return !valid || structured
+	}
+	for scanner.Scan() {
+		line := bytes.TrimSuffix(scanner.Bytes(), []byte{'\r'})
+		if len(line) == 0 {
+			if flushEvent() {
+				return true
+			}
+			continue
+		}
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimPrefix(line, []byte("data:"))
+		if len(data) > 0 && data[0] == ' ' {
+			data = data[1:]
+		}
+		if eventData.Len()+len(data)+1 > superInstructObservationLimit {
+			return true
+		}
+		if eventData.Len() > 0 {
+			eventData.WriteByte('\n')
+		}
+		_, _ = eventData.Write(data)
+	}
+	// An oversized or malformed SSE frame is not safe rewrite input. Preserve it
+	// byte-for-byte rather than risking loss of a structured event we could not inspect.
+	return scanner.Err() != nil || flushEvent()
+}
+
+func superInstructStructuredValue(value interface{}, depth int) bool {
+	if depth > 12 || value == nil {
+		return false
+	}
+	switch value := value.(type) {
+	case []interface{}:
+		for _, item := range value {
+			if superInstructStructuredValue(item, depth+1) {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		kind := strings.ToLower(strings.TrimSpace(stringValue(value["type"])))
+		if strings.HasSuffix(kind, "_call") || strings.HasSuffix(kind, "_call_output") {
+			return true
+		}
+		for _, marker := range []string{
+			"tool_use", "tool_call", "function_call", "reasoning", "thinking", "input_json",
+			"local_shell_call", "computer_call", "web_search_call", "file_search_call",
+			"tool_search", "image_generation_call", "code_interpreter_call", "mcp_", "compaction",
+		} {
+			if strings.Contains(kind, marker) {
+				return true
+			}
+		}
+		for _, key := range []string{"tool_calls", "function_call", "reasoning", "reasoning_content", "thinking", "encrypted_content"} {
+			if field, exists := value[key]; exists && field != nil {
+				return true
+			}
+		}
+		for _, key := range []string{"output", "choices", "message", "delta", "content", "content_block", "item", "response"} {
+			if superInstructStructuredValue(value[key], depth+1) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Server) superInstructProcessor() *superinstruct.Processor {

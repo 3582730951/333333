@@ -35,6 +35,7 @@ import (
 type codexSessionMappingContextKey struct{}
 type codexStrictCPAContextKey struct{}
 type codexDownstreamIdentityContextKey struct{}
+type codexGoalQuotaGraceContextKey struct{}
 
 type codexSessionGate struct {
 	semaphore chan struct{}
@@ -152,6 +153,12 @@ type codexSessionMapping struct {
 	// response id or turn-state token, so an old upstream state pointer can never
 	// become valid again through the new tree.
 	recoveryAliases []storage.CodexSessionAlias
+	// Goal quota grace is latched by the downstream turn id after observing the
+	// exact Codex Goal continuation wrapper (or a successful Goal tool result).
+	// It is copied into encrypted mapping identity so tool-output requests and a
+	// process restart cannot lose the decision mid-turn.
+	goalModeActive bool
+	goalTurnID     string
 }
 
 // codexContextMigration is a fresh, self-contained replay of a native Codex
@@ -177,6 +184,208 @@ func withCodexSessionMapping(ctx context.Context, mapping *codexSessionMapping) 
 func codexSessionMappingFromContext(ctx context.Context) *codexSessionMapping {
 	mapping, _ := ctx.Value(codexSessionMappingContextKey{}).(*codexSessionMapping)
 	return mapping
+}
+
+func withCodexGoalQuotaGrace(ctx context.Context, active bool) context.Context {
+	return context.WithValue(ctx, codexGoalQuotaGraceContextKey{}, active)
+}
+
+func codexGoalQuotaGraceFromContext(ctx context.Context) bool {
+	active, _ := ctx.Value(codexGoalQuotaGraceContextKey{}).(bool)
+	return active
+}
+
+type codexGoalTurnSignal int
+
+const (
+	codexGoalTurnUnknown codexGoalTurnSignal = iota
+	codexGoalTurnInactive
+	codexGoalTurnActive
+)
+
+func codexDownstreamTurnID(headers http.Header, body []byte) string {
+	jsonString := func(path string) string {
+		value := gjson.GetBytes(body, path)
+		if value.Type != gjson.String {
+			return ""
+		}
+		return strings.TrimSpace(value.String())
+	}
+	for _, value := range []string{
+		jsonString("client_metadata.turn_id"),
+		jsonString("turn_metadata.turn_id"),
+		jsonString("turn_id"),
+	} {
+		if value != "" {
+			return value
+		}
+	}
+	for _, raw := range []string{
+		jsonString("client_metadata.x-codex-turn-metadata"),
+		codexHeaderValue(headers, "x-codex-turn-metadata"),
+	} {
+		if value := gjson.Get(raw, "turn_id"); value.Type == gjson.String && strings.TrimSpace(value.String()) != "" {
+			return strings.TrimSpace(value.String())
+		}
+	}
+	return ""
+}
+
+func codexGoalContinuationText(text string) bool {
+	text = strings.TrimSpace(text)
+	const firstLine = "Continue working toward the active thread goal."
+	if strings.HasPrefix(text, `<codex_internal_context source="goal">`) &&
+		strings.HasSuffix(text, `</codex_internal_context>`) {
+		inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(text, `<codex_internal_context source="goal">`), `</codex_internal_context>`))
+		return inner == firstLine || strings.HasPrefix(inner, firstLine+"\n")
+	}
+	// Stable Codex still accepts the legacy wrapper when resuming an older rollout.
+	if strings.HasPrefix(text, `<goal_context>`) && strings.HasSuffix(text, `</goal_context>`) {
+		inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(text, `<goal_context>`), `</goal_context>`))
+		return inner == firstLine || strings.HasPrefix(inner, firstLine+"\n")
+	}
+	return false
+}
+
+func codexGoalStatusSignal(output interface{}) codexGoalTurnSignal {
+	var value interface{} = output
+	if text, ok := output.(string); ok {
+		decoder := json.NewDecoder(strings.NewReader(text))
+		decoder.UseNumber()
+		if decoder.Decode(&value) != nil {
+			return codexGoalTurnUnknown
+		}
+	}
+	root, ok := value.(map[string]interface{})
+	if !ok {
+		return codexGoalTurnUnknown
+	}
+	goal, _ := root["goal"].(map[string]interface{})
+	status := strings.ToLower(strings.TrimSpace(streamString(goal["status"])))
+	switch status {
+	case "active":
+		return codexGoalTurnActive
+	case "complete", "completed", "blocked", "paused", "usage_limited", "usagelimited":
+		return codexGoalTurnInactive
+	default:
+		return codexGoalTurnUnknown
+	}
+}
+
+// codexGoalSignal inspects input in order and returns the newest explicit state.
+// Looking only for a marker anywhere in the body is wrong because full-history
+// transports retain old Goal wrappers after a later ordinary user turn starts.
+func codexGoalSignal(body []byte) codexGoalTurnSignal {
+	root, err := decodeContextJSONMap(body)
+	if err != nil {
+		return codexGoalTurnUnknown
+	}
+	input, present := root["input"]
+	if !present {
+		return codexGoalTurnUnknown
+	}
+	items := appendItems(nil, input)
+	signal := codexGoalTurnUnknown
+	goalCalls := map[string]string{}
+	for _, raw := range items {
+		if text, ok := raw.(string); ok {
+			if codexGoalContinuationText(text) {
+				signal = codexGoalTurnActive
+			} else if strings.TrimSpace(text) != "" {
+				signal = codexGoalTurnInactive
+			}
+			continue
+		}
+		item, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		kind := strings.ToLower(strings.TrimSpace(streamString(item["type"])))
+		role := strings.ToLower(strings.TrimSpace(streamString(item["role"])))
+		if role == "user" && (kind == "" || kind == "message") {
+			texts := make([]string, 0, 2)
+			switch content := item["content"].(type) {
+			case string:
+				texts = append(texts, content)
+			case []interface{}:
+				for _, part := range content {
+					if object, ok := part.(map[string]interface{}); ok && strings.EqualFold(streamString(object["type"]), "input_text") {
+						texts = append(texts, streamString(object["text"]))
+					}
+				}
+			}
+			for _, text := range texts {
+				if codexGoalContinuationText(text) {
+					signal = codexGoalTurnActive
+				} else if strings.TrimSpace(text) != "" {
+					signal = codexGoalTurnInactive
+				}
+			}
+		}
+		if kind == "function_call" || kind == "custom_tool_call" {
+			name := strings.ToLower(strings.TrimSpace(streamString(item["name"])))
+			if name == "create_goal" || name == "update_goal" {
+				if callID := strings.TrimSpace(streamString(item["call_id"])); callID != "" {
+					goalCalls[callID] = name
+				}
+			}
+			continue
+		}
+		if toolOutputPairKind(item) != "" {
+			callID := strings.TrimSpace(streamString(item["call_id"]))
+			_, paired := goalCalls[callID]
+			candidate := codexGoalStatusSignal(item["output"])
+			// An incremental tool-output request may omit the preceding call because it
+			// lives behind previous_response_id. The official Goal output is still
+			// self-identifying through its {goal:{status:...}} envelope.
+			if candidate != codexGoalTurnUnknown && (paired || callID != "") {
+				signal = candidate
+			}
+		}
+	}
+	return signal
+}
+
+func (m *codexSessionMapping) observeGoalTurn(headers http.Header, body []byte) bool {
+	if m == nil || !m.enabled {
+		return false
+	}
+	turnID := codexDownstreamTurnID(headers, body)
+	signal := codexGoalSignal(body)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	binding := m.binding
+	if binding == nil {
+		binding = m.prospective
+	}
+	active, latchedTurn := m.goalModeActive, m.goalTurnID
+	if binding != nil {
+		active, latchedTurn = binding.GoalModeActive, binding.GoalTurnID
+	}
+	rootOwner := strings.TrimSpace(m.identity.ParentID) == "" && strings.TrimSpace(m.identity.ForkedFromID) == "" &&
+		(strings.TrimSpace(m.identity.ThreadID) == "" || strings.TrimSpace(m.identity.RootID) == "" || m.identity.ThreadID == m.identity.RootID)
+	if !rootOwner {
+		active, latchedTurn = false, ""
+	} else {
+		switch signal {
+		case codexGoalTurnActive:
+			active = true
+			if turnID != "" {
+				latchedTurn = turnID
+			}
+		case codexGoalTurnInactive:
+			active, latchedTurn = false, ""
+		case codexGoalTurnUnknown:
+			if active && turnID != "" && latchedTurn != "" && turnID != latchedTurn {
+				active = false
+			}
+		}
+	}
+	m.goalModeActive, m.goalTurnID = active, latchedTurn
+	if binding != nil {
+		binding.GoalModeActive, binding.GoalTurnID = active, latchedTurn
+	}
+	return active && (turnID == "" || latchedTurn == "" || turnID == latchedTurn)
 }
 
 // withCodexStrictCPA marks the narrow native Responses path on which context and
@@ -1110,6 +1319,39 @@ func (m *codexSessionMapping) durableMainCLI() bool {
 		strings.TrimSpace(binding.ForkedFromThreadID) == ""
 }
 
+// sanitizePendingRootAgentEncryptedContent removes subagent-owned ciphertext only
+// while this request is creating a prospective root. A durable continuation must
+// keep its native payload byte-for-byte because its bound upstream can decrypt the
+// original blocks; child/fork requests likewise retain their parent-owned state.
+func (m *codexSessionMapping) sanitizePendingRootAgentEncryptedContent(body []byte, header http.Header) ([]byte, int) {
+	if m == nil || !m.enabled {
+		return body, 0
+	}
+	m.mu.Lock()
+	identity := m.identity
+	prospective := m.prospective
+	anchor := m.anchor
+	// A nil anchor is an ordinary first root. A retired root anchor is also a new
+	// cryptographic epoch: it exists only to carry the next epoch number and must
+	// not make foreign agent ciphertext look decryptable. Active anchors remain
+	// excluded because they represent a real parent/child relationship.
+	retiredRootAnchor := anchor != nil && anchor.State != "active" &&
+		identity.RootID != "" && identity.ThreadID == identity.RootID
+	pendingRoot := m.binding == nil && (anchor == nil || retiredRootAnchor) && !identity.stateful() &&
+		identity.ParentID == "" && identity.ForkedFromID == "" &&
+		(identity.RootID == "" || identity.ThreadID == identity.RootID)
+	if pendingRoot && prospective != nil {
+		pendingRoot = prospective.RootSessionID != "" &&
+			prospective.ThreadID == prospective.RootSessionID &&
+			prospective.ParentThreadID == "" && prospective.ForkedFromThreadID == ""
+	}
+	m.mu.Unlock()
+	if !pendingRoot || codexDownstreamSessionIdentity(header, body).stateful() {
+		return body, 0
+	}
+	return stripAgentMessageEncryptedContent(body)
+}
+
 // codexMappedSessionRiskError identifies transport/account responses for which
 // reusing the same upstream session identity creates a repeated-risk loop. Client
 // schema/model errors are deliberately excluded because a new UUID cannot fix them.
@@ -1260,7 +1502,10 @@ func (m *codexSessionMapping) identitySnapshot(secret []byte, lease scheduler.Le
 
 	binding := m.binding
 	if binding == nil {
-		created := storage.CodexSessionBinding{AccountID: lease.Account.ID, EgressID: lease.Egress.ID, State: "active"}
+		created := storage.CodexSessionBinding{
+			AccountID: lease.Account.ID, EgressID: lease.Egress.ID, State: "active",
+			GoalModeActive: m.goalModeActive, GoalTurnID: m.goalTurnID,
+		}
 		isChild := m.anchor != nil && m.identity.ForkedFromID == "" && m.identity.ThreadID != "" &&
 			(m.identity.ThreadID != m.identity.RootID || (m.identity.ParentID != "" && m.identity.ParentID != m.identity.ThreadID))
 		if isChild {

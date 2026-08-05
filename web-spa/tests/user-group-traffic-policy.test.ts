@@ -127,7 +127,7 @@ describe('user-group cross-group traffic fallback policy', () => {
       ...blankUserGroup(),
       traffic_fallback_groups: { gpt: ['ug-backup'], claude: [], gemini: [] },
     };
-    expect(fallbackConfigurationIssues(draft)).toEqual(['GPT / Codex · ug-backup 尚未配置模型转换']);
+    expect(fallbackConfigurationIssues(draft)).toEqual(['GPT / ChatGPT / Codex · ug-backup 尚未配置模型转换']);
   });
 
   it('reports duplicate and malformed wildcard mappings before save', () => {

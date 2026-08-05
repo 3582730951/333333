@@ -1340,6 +1340,13 @@
   color: var(--pool-text);
 }
 
+.pool-nav-group-label--static,
+.pool-nav-group-label--static:hover {
+  cursor: default;
+  background: transparent;
+  color: var(--pool-text-3);
+}
+
 .pool-nav-item[aria-current='page'] {
   background: var(--pool-bg-selected);
   color: var(--pool-text);

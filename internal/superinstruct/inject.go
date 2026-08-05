@@ -69,12 +69,26 @@ func InjectSystem(raw []byte, instructions string) ([]byte, bool, error) {
 			injected = true
 		}
 		if !found {
-			root["input"] = append([]interface{}{map[string]interface{}{
+			system := map[string]interface{}{
 				"role": "system",
 				"content": []interface{}{map[string]interface{}{
 					"type": "input_text", "text": instructions,
 				}},
-			}}, input...)
+			}
+			insertAt := 0
+			if len(input) > 0 {
+				first, _ := input[0].(map[string]interface{})
+				if first != nil && first["type"] == "additional_tools" && first["role"] == "developer" {
+					// Codex Responses Lite recognizes its incremental tool envelope
+					// only at input[0]. Keep that protocol marker in place.
+					insertAt = 1
+				}
+			}
+			updated := make([]interface{}, 0, len(input)+1)
+			updated = append(updated, input[:insertAt]...)
+			updated = append(updated, system)
+			updated = append(updated, input[insertAt:]...)
+			root["input"] = updated
 			injected = true
 		}
 	}

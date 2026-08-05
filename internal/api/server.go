@@ -74,6 +74,11 @@ type Server struct {
 	incidentReporter *incident.Reporter
 	scheduler        *scheduler.Scheduler
 	upstream         *upstream.Client
+	// upstreamConfigPublishMu linearizes every persisted effectUpstream change with
+	// the DB snapshot published to the live client. Without this, an older request can
+	// resolve its snapshot, pause, and overwrite a newer request's live configuration.
+	upstreamConfigPublishMu   sync.Mutex
+	upstreamConfigPublishHook func(config.Config)
 	// upstreamDo is the single Codex/Responses call boundary. Production binds it
 	// to upstream.Client.Do during construction; focused fault-injection tests replace
 	// it to verify that a broken transport contract cannot panic an HTTP/WS request.
@@ -150,6 +155,7 @@ type Server struct {
 	superMonitor          *superinstruct.MonitorPanel
 	publicChatLimiterMu   sync.Mutex
 	publicChatLimiter     map[string]publicChatRateWindow
+	publicChatLastMinute  int64
 
 	claudeCacheFlightsMu sync.Mutex
 	claudeCacheFlights   map[string]chan struct{}
@@ -286,7 +292,7 @@ func NewServer(dep Dependencies) *Server {
 	// restart (the request-time getters already overlay the rest live).
 	if s.upstream != nil {
 		s.upstreamDo = s.upstream.Do
-		s.upstream.UpdateConfig(s.effectiveUpstreamConfig(context.Background()))
+		s.publishEffectiveUpstreamConfig(context.Background())
 	}
 	if s.scheduler != nil {
 		s.scheduler.UpdateConfig(s.effectiveSchedulerConfig(context.Background()))
@@ -379,8 +385,8 @@ func (s *Server) routes() {
 	// Auxiliary first-party Codex surfaces used by the stock CLI when the
 	// configured provider is OpenAI. Keep these on the same scheduler/account
 	// path as Responses so URL + API-key setup retains hosted tools.
+	s.mux.HandleFunc("/v1/alpha/search", s.handleSearchPassthrough)
 	for _, p := range []string{
-		"/v1/alpha/search",
 		"/v1/images/generations",
 		"/v1/images/edits",
 		"/v1/realtime/calls",
@@ -1059,7 +1065,8 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if s.tryServeAutoKiroGPT(w, r, kiroRaw, bodyMetaForView(capturedMeta, originalRaw, kiroRaw), model, affinityGroup, isChat, isCompact, pol) {
+	if codexGoalSignal(kiroRaw) != codexGoalTurnActive &&
+		s.tryServeAutoKiroGPT(w, r, kiroRaw, bodyMetaForView(capturedMeta, originalRaw, kiroRaw), model, affinityGroup, isChat, isCompact, pol) {
 		return
 	}
 	// CPA-style stateless passthrough (default). Make every native Codex turn
@@ -1214,7 +1221,9 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		if freshRootAfterContextLoss {
 			w.Header().Set("X-MiCliProxy-Context-Status", firstNonEmpty(contextRecoveryStatus, "new_root_after_context_loss"))
 		}
+		goalQuotaGrace := codexMapping.observeGoalTurn(r.Header, raw)
 		r = r.WithContext(withCodexSessionMapping(r.Context(), codexMapping))
+		r = r.WithContext(withCodexGoalQuotaGrace(r.Context(), goalQuotaGrace))
 		if s.codexCPAStrict(r.Context()) {
 			r = r.WithContext(withCodexStrictCPA(r.Context()))
 		}
@@ -1306,9 +1315,15 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	current := codexRetryRequest{Raw: raw, Header: currentHeader}
 	modelCapabilityRejected := false
 	attemptsRemaining := attempts
+	// This bounds top-level account-selection/context-recovery cycles. A cycle may
+	// still contain an explicitly bounded transport repair (for example an auth
+	// refresh), so do not describe this counter as the number of physical sends.
+	const maxCodexOuterAttempts = 3
+	outerAttempts := 0
 	contextRecoveryAttempted := false
-	for attemptsRemaining > 0 {
+	for attemptsRemaining > 0 && outerAttempts < maxCodexOuterAttempts {
 		attemptsRemaining--
+		outerAttempts++
 		headerReq := r.Clone(r.Context())
 		headerReq.Header = current.Header
 		attemptSource, attemptMeta := codexBodySourceForAttempt(r.Context(), originalRaw, current.Raw)
@@ -1322,11 +1337,12 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		if currentAffinity.Hash == "" {
 			currentAffinity = affinity
 		}
-		result := s.codexAttempt(w, r, current.Raw, attemptSource, attemptMeta, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, instructionPlan, attemptsRemaining > 0, exclude)
+		allowAnotherOuterAttempt := attemptsRemaining > 0 && outerAttempts < maxCodexOuterAttempts
+		result := s.codexAttempt(w, r, current.Raw, attemptSource, attemptMeta, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, instructionPlan, allowAnotherOuterAttempt, exclude)
 		if result.Outcome == outcomeModelRetry {
 			modelCapabilityRejected = true
 		}
-		if result.Outcome == outcomeRetry && result.WaitForCapacity && attemptsRemaining == 0 {
+		if result.Outcome == outcomeRetry && result.WaitForCapacity && attemptsRemaining == 0 && outerAttempts < maxCodexOuterAttempts {
 			// Distinct-account retries are bounded, but quota recovery is an
 			// admission wait rather than another eager upstream retry. Give the
 			// scheduler one more pass so it can select another healthy account or
@@ -1339,7 +1355,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 			// account is gone, or its upstream context has been confirmed missing,
 			// rebuild the encrypted durable history into one fresh root instead of
 			// returning a permanent 409/previous_response_not_found to the client.
-			if !contextRecoveryAttempted {
+			if !contextRecoveryAttempted && outerAttempts < maxCodexOuterAttempts {
 				contextRecoveryAttempted = true
 				migration, recovered, recoveryErr := s.recoverCodexSessionMapping(r.Context(), r, current.Raw, current.Header, pol, codexSessionMappingFromContext(r.Context()), result.RecoveryContextError, result.RecoveryReason)
 				if errors.Is(recoveryErr, errCodexToolContextUnrecoverable) {
@@ -1353,6 +1369,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 				}
 				if recovered {
 					codexMapping = migration.Mapping
+					goalQuotaGrace := codexMapping.observeGoalTurn(migration.Retry.Header, migration.Retry.Raw)
 					freshPlan, planErr := s.codexInstructionPlan(r.Context(), group, codexMapping, strictNativeCPA, routing.Model(migration.Retry.Raw), includeGroupPrompt)
 					if planErr != nil {
 						writeCodexInstructionConfigurationError(w, planErr)
@@ -1366,6 +1383,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 						current.Raw = instructionPlan.apply(current.Raw)
 					}
 					r = r.WithContext(withCodexSessionMapping(r.Context(), codexMapping))
+					r = r.WithContext(withCodexGoalQuotaGrace(r.Context(), goalQuotaGrace))
 					if s.codexCPAStrict(r.Context()) {
 						r = r.WithContext(withCodexStrictCPA(r.Context()))
 					}
@@ -1386,6 +1404,10 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 					// healthy. The exclusion set still prevents revisiting any account
 					// already failed by this downstream turn.
 					attemptsRemaining = s.codexFailoverAttempts(r.Context(), true, pol.Group, routing.Model(current.Raw), exclude)
+					remainingOuterBudget := maxCodexOuterAttempts - outerAttempts
+					if attemptsRemaining > remainingOuterBudget {
+						attemptsRemaining = remainingOuterBudget
+					}
 					continue
 				}
 			}
@@ -1410,16 +1432,23 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) codexFailoverAttempts(ctx context.Context, movable bool, group, model string, exclude map[string]bool) int {
+	const maxDistinctUpstreamAttempts = 3
 	attempts := 1
 	if s.flagEnabled(ctx, "seamless_failover", s.cfg.SeamlessFailover) && movable {
 		if attempts = s.settingInt(ctx, "failover_max_attempts", s.cfg.FailoverMaxAttempts); attempts < 1 {
 			attempts = 1
 		}
+		if attempts > maxDistinctUpstreamAttempts {
+			attempts = maxDistinctUpstreamAttempts
+		}
 	}
 	if !movable {
 		return attempts
 	}
-	candidates, err := s.scheduler.EligibleCandidateCount(ctx, scheduler.Route{Group: group, Provider: "codex", Model: model, Exclude: exclude})
+	candidates, err := s.scheduler.EligibleCandidateCount(ctx, scheduler.Route{
+		Group: group, Provider: "codex", Model: model, Exclude: exclude,
+		AllowCodexGoalQuotaGrace: codexGoalQuotaGraceFromContext(ctx),
+	})
 	if err == nil {
 		if candidates == 0 {
 			return 1
@@ -1526,19 +1555,20 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 	}
 	route := scheduler.Route{
-		Group:             routeGroup,
-		Provider:          "codex",
-		Affinity:          affinity,
-		Strict:            strict,
-		ServerSideState:   !movable,
-		ImmutableAffinity: !movable,
-		Movable:           movable,
-		Model:             model,
-		EstimatedTokens:   codexEstimatedTokensWithMeta(model, raw, replayMeta),
-		Compaction:        compactionRequestWithMeta(path, raw, replayMeta),
-		Exclude:           exclude,
-		OnWait:            onSchedulerWait,
-		SkipWait:          userGroupFallbackProbe(r.Context()),
+		Group:                    routeGroup,
+		Provider:                 "codex",
+		Affinity:                 affinity,
+		Strict:                   strict,
+		ServerSideState:          !movable,
+		ImmutableAffinity:        !movable,
+		Movable:                  movable,
+		Model:                    model,
+		EstimatedTokens:          codexEstimatedTokensWithMeta(model, raw, replayMeta),
+		Compaction:               compactionRequestWithMeta(path, raw, replayMeta),
+		Exclude:                  exclude,
+		OnWait:                   onSchedulerWait,
+		SkipWait:                 userGroupFallbackProbe(r.Context()),
+		AllowCodexGoalQuotaGrace: codexGoalQuotaGraceFromContext(r.Context()),
 	}
 	route = codexMappingRequiredRoute(codexSessionMappingFromContext(r.Context()), route)
 	lease, err := s.scheduler.Select(r.Context(), route)
@@ -1709,6 +1739,18 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			if routing.PromptCacheKey(updated) != "" {
 				body = updated
 				promptCacheKeySource = "auto_stable_prefix"
+			}
+		}
+	}
+	if strictNativeCPA {
+		if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil {
+			if sanitized, removed := mapping.sanitizePendingRootAgentEncryptedContent(body, baseHeader); removed > 0 {
+				body = sanitized
+				_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+					AccountID: lease.Account.ID, AccountLabel: lease.Account.Label,
+					Action: "codex_agent_message_ciphertext_stripped", State: "sanitized",
+					Reason: "prospective_root_foreign_ciphertext", Detail: fmt.Sprintf("removed_blocks=%d", removed),
+				})
 			}
 		}
 	}
@@ -2056,7 +2098,12 @@ codexResponse:
 		if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error"); ok {
 			return handled
 		}
-		if lease.Account.IgnoreRateLimitControls && codexIgnoredRateLimitResponse(resp.StatusCode, errorBody) {
+		// Goal's fixed machine terminal is the one signal that must leave the
+		// same-account override immediately. Otherwise an opted-in account loops in
+		// retryCodexSameAccountAfterRateLimit forever and the Goal never reaches the
+		// account-switch boundary.
+		if lease.Account.IgnoreRateLimitControls && codexIgnoredRateLimitResponse(resp.StatusCode, errorBody) &&
+			!codexGoalAuthoritativeUsageLimit(r.Context(), resp.StatusCode, errorBody) {
 			_ = resp.Body.Close()
 			resp, finalEgress, err = s.retryCodexSameAccountAfterRateLimit(r.Context(), lease, func() upstream.Request {
 				return requestForToken(token)
@@ -2154,6 +2201,8 @@ codexResponse:
 			detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
 			v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
 		}
+		goalQuotaHeld := codexGoalHoldsNonAuthoritativeQuotaSignal(r.Context(), resp.StatusCode, resp.Header, errorBody)
+		goalQuotaTerminal := codexGoalAuthoritativeUsageLimit(r.Context(), resp.StatusCode, errorBody)
 		// A movable turn with another healthy account already available must switch
 		// before probing quota/reset-credit endpoints. Those auxiliary endpoints use
 		// their own upstream timeout and can otherwise add ~30s after the first 429,
@@ -2161,7 +2210,7 @@ codexResponse:
 		distinctFailoverReady := allowRetry && movable &&
 			retryableForFailover(v, resp.StatusCode) &&
 			s.hasCodexFailoverCandidate(r.Context(), routeGroup, model, lease.Account.ID)
-		if !distinctFailoverReady && !codexResetRetried && codexResetTriggerAllowed(resp.StatusCode, errorBody) &&
+		if !goalQuotaHeld && !goalQuotaTerminal && !distinctFailoverReady && !codexResetRetried && codexResetTriggerAllowed(resp.StatusCode, errorBody) &&
 			!upstream.AccountUsesAPIKey(token) &&
 			!isAgentIdentityToken(token) &&
 			s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, resp.StatusCode, resp.Header, errorBody, "http_error") {
@@ -2184,6 +2233,9 @@ codexResponse:
 				v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
 			}
 		}
+		// A reset-credit retry may have replaced both the status and body.
+		goalQuotaHeld = codexGoalHoldsNonAuthoritativeQuotaSignal(r.Context(), resp.StatusCode, resp.Header, errorBody)
+		goalQuotaTerminal = codexGoalAuthoritativeUsageLimit(r.Context(), resp.StatusCode, errorBody)
 		if isModelNotFoundError(resp.StatusCode, errorBody) {
 			s.rejectAccountModel(r.Context(), lease.Account, model, resp.StatusCode)
 			_ = s.settleBillingHold(r.Context(), holdID, "failed_upstream")
@@ -2233,7 +2285,7 @@ codexResponse:
 		if rotationAllowed && strictNativeCPA && mapping != nil && mapping.mainCLI() && codexMappedSessionRiskError(resp.StatusCode, errorBody) {
 			hasFailoverCandidate = s.hasCodexFailoverCandidate(r.Context(), routeGroup, model, lease.Account.ID)
 		}
-		if rotationAllowed && strictNativeCPA && mapping != nil && mapping.mainCLI() &&
+		if rotationAllowed && !goalQuotaHeld && (!goalQuotaTerminal || (mapping.durableMainCLI() && hasFailoverCandidate)) && strictNativeCPA && mapping != nil && mapping.mainCLI() &&
 			codexMappedSessionRotationRequired(resp.StatusCode, resp.Header, errorBody, movable, hasFailoverCandidate) {
 			// Once the request is rebuilt as a fresh root it is safe to move accounts.
 			// Prefer that boundary when one exists so a session-risk response cannot
@@ -2247,6 +2299,9 @@ codexResponse:
 				Action: "codex_mapped_session_rotation", State: "requested",
 				Reason: fmt.Sprintf("http_%d", resp.StatusCode), Detail: "main_cli_new_upstream_uuid",
 			})
+			if goalQuotaTerminal {
+				s.auditCodexGoalQuotaDecision(r.Context(), lease.Account.ID, "switching", "authoritative_usage_limit", resp.StatusCode)
+			}
 			return codexAttemptResult{
 				Outcome:              outcomeContextRecovery,
 				RecoveryReason:       "mapped_session_risk",
@@ -2284,6 +2339,21 @@ codexResponse:
 				return result
 			}
 		}
+		if goalQuotaHeld {
+			_ = s.settleBillingHold(r.Context(), holdID, "goal_quota_signal_held")
+			s.writeFilteredError(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber)
+			return codexAttemptResult{Outcome: outcomeDone}
+		}
+		if goalQuotaTerminal {
+			_ = s.settleBillingHold(r.Context(), holdID, "goal_usage_limit_terminal")
+			if allowRetry && movable {
+				s.auditCodexGoalQuotaDecision(r.Context(), lease.Account.ID, "switching", "authoritative_usage_limit", resp.StatusCode)
+				return retry()
+			}
+			s.auditCodexGoalQuotaDecision(r.Context(), lease.Account.ID, "terminal", "authoritative_usage_limit_no_candidate", resp.StatusCode)
+			writeCodexGoalUsageLimitTerminal(w, errorBody, false)
+			return codexAttemptResult{Outcome: outcomeDone}
+		}
 		if movable && retryableForFailover(v, resp.StatusCode) {
 			if v.State == ban.RateLimited || resp.StatusCode == http.StatusTooManyRequests {
 				if allowRetry {
@@ -2308,11 +2378,12 @@ codexResponse:
 codexSuccess:
 	s.verifyAccountModel(r.Context(), lease.Account, model, "")
 	normalizeCodexStreamContentType(resp.Header, streamRequestWithMeta(body, forwardMeta))
+	goalQuotaGrace := codexGoalQuotaGraceFromContext(r.Context())
 	resetHeaderExhaustion := false
-	if !codexResetRetried && !upstream.AccountUsesAPIKey(token) && !isAgentIdentityToken(token) && exhaustedCooldown(resp.Header, storage.Now()) > 0 {
+	if !goalQuotaGrace && !codexResetRetried && !upstream.AccountUsesAPIKey(token) && !isAgentIdentityToken(token) && exhaustedCooldown(resp.Header, storage.Now()) > 0 {
 		resetHeaderExhaustion = s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, resp.StatusCode, resp.Header, nil, "success_header_exhaustion")
 	}
-	if !resetHeaderExhaustion {
+	if !goalQuotaGrace && !resetHeaderExhaustion {
 		s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header)
 	}
 	s.captureQuota(r.Context(), lease.Account.ID, "codex", model, resp.Header)
@@ -2331,7 +2402,11 @@ codexSuccess:
 		// body (ChatGPT backend-api may return usage_limit_exceeded with HTTP 200
 		// instead of 429). When detected, cool the account and fail over to a fresh
 		// one so the downstream never sees the error.
-		if cd := usageLimitCooldown(200, responseBody); cd > 0 {
+		goalSoftQuotaHeld := codexGoalHoldsNonAuthoritativeQuotaSignal(r.Context(), http.StatusOK, resp.Header, responseBody)
+		if goalSoftQuotaHeld {
+			s.auditCodexGoalQuotaDecision(r.Context(), lease.Account.ID, "held", "non_authoritative_soft_quota_signal", http.StatusOK)
+		}
+		if cd := usageLimitCooldown(200, responseBody); cd > 0 && !goalSoftQuotaHeld {
 			if lease.Account.IgnoreRateLimitControls {
 				_ = resp.Body.Close()
 				resp, finalEgress, err = s.retryCodexSameAccountAfterRateLimit(r.Context(), lease, func() upstream.Request {
@@ -2459,7 +2534,7 @@ codexSuccess:
 		// traffic always uses the existing bounded probe. Strict CPA uses it only
 		// when an administrator has a scope-compatible terminal rule; otherwise it
 		// retains the immediate native relay for long-running sessions.
-		if !strictNativeCPA || (strictNativeCPA && !movable) || lease.Account.IgnoreRateLimitControls || s.hasPotentialTerminalResponseRule(r.Context(), "codex", entrypoint, model) {
+		if !strictNativeCPA || (strictNativeCPA && !movable) || codexGoalQuotaGraceFromContext(r.Context()) || lease.Account.IgnoreRateLimitControls || s.hasPotentialTerminalResponseRule(r.Context(), "codex", entrypoint, model) {
 			// Hold back only a bounded early prefix so a retryable failure frame can still
 			// fail over before any downstream bytes are committed. As soon as real content
 			// appears (or the 64KiB/8-frame probe budget is reached), stream live. The old
@@ -2514,6 +2589,8 @@ codexSuccess:
 				}
 				failureStatus := streamFailure.StatusCode
 				failureBody := streamFailure.Body
+				goalQuotaHeld := codexGoalHoldsNonAuthoritativeQuotaSignal(r.Context(), failureStatus, failureHeader, failureBody)
+				goalQuotaTerminal := codexGoalAuthoritativeUsageLimit(r.Context(), failureStatus, failureBody)
 				decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
 					Provider:   "codex",
 					Entrypoint: entrypoint,
@@ -2570,7 +2647,7 @@ codexSuccess:
 					writeRaw(w, failureStatus, failureHeader, failureBody)
 					return codexAttemptResult{Outcome: outcomeDone}
 				}
-				if lease.Account.IgnoreRateLimitControls && codexIgnoredRateLimitResponse(failureStatus, failureBody) {
+				if lease.Account.IgnoreRateLimitControls && codexIgnoredRateLimitResponse(failureStatus, failureBody) && !goalQuotaTerminal {
 					_ = resp.Body.Close()
 					resp, finalEgress, err = s.retryCodexSameAccountAfterRateLimit(r.Context(), lease, func() upstream.Request {
 						return requestForToken(token)
@@ -2615,7 +2692,7 @@ codexSuccess:
 					if rotationAllowed && strictNativeCPA && mapping != nil && mapping.mainCLI() && codexMappedSessionRiskError(failureStatus, failureBody) {
 						hasFailoverCandidate = s.hasCodexFailoverCandidate(r.Context(), routeGroup, model, lease.Account.ID)
 					}
-					if rotationAllowed && strictNativeCPA && mapping != nil && mapping.mainCLI() &&
+					if rotationAllowed && !goalQuotaHeld && (!goalQuotaTerminal || (mapping.durableMainCLI() && hasFailoverCandidate)) && strictNativeCPA && mapping != nil && mapping.mainCLI() &&
 						codexMappedSessionRotationRequired(failureStatus, failureHeader, failureBody, movable, hasFailoverCandidate) {
 						failureVerdict := ban.Classify(false, failureStatus, failureHeader, failureBody)
 						if hasFailoverCandidate && (retryableForFailover(failureVerdict, failureStatus) || codexExplicitSessionRisk(failureBody)) {
@@ -2633,6 +2710,9 @@ codexSuccess:
 							Action: "codex_mapped_session_rotation", State: "requested",
 							Reason: fmt.Sprintf("stream_%d", failureStatus), Detail: "main_cli_new_upstream_uuid",
 						})
+						if goalQuotaTerminal {
+							s.auditCodexGoalQuotaDecision(r.Context(), lease.Account.ID, "switching", "authoritative_usage_limit", failureStatus)
+						}
 						return codexAttemptResult{
 							Outcome:              outcomeContextRecovery,
 							RecoveryReason:       "mapped_session_risk",
@@ -2650,7 +2730,7 @@ codexSuccess:
 					// mapped rotation is available.
 					distinctFailoverReady := shouldRetry && allowRetry && movable &&
 						s.hasCodexFailoverCandidate(r.Context(), routeGroup, model, lease.Account.ID)
-					if !distinctFailoverReady && shouldRetry && !codexResetRetried && !isAgentIdentityToken(token) && codexResetTriggerAllowed(failureStatus, failureBody) &&
+					if !goalQuotaHeld && !goalQuotaTerminal && !distinctFailoverReady && shouldRetry && !codexResetRetried && !isAgentIdentityToken(token) && codexResetTriggerAllowed(failureStatus, failureBody) &&
 						s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, failureStatus, failureHeader, failureBody, "stream_retryable_limit") {
 						codexResetRetried = true
 						if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
@@ -2700,6 +2780,21 @@ codexSuccess:
 						}
 					}
 					_ = resp.Body.Close()
+					if goalQuotaHeld {
+						_ = s.settleBillingHold(r.Context(), holdID, "goal_quota_signal_held")
+						s.writeFilteredError(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber)
+						return codexAttemptResult{Outcome: outcomeDone}
+					}
+					if goalQuotaTerminal {
+						_ = s.settleBillingHold(r.Context(), holdID, "goal_usage_limit_terminal")
+						if allowRetry && movable {
+							s.auditCodexGoalQuotaDecision(r.Context(), lease.Account.ID, "switching", "authoritative_usage_limit", failureStatus)
+							return retry()
+						}
+						s.auditCodexGoalQuotaDecision(r.Context(), lease.Account.ID, "terminal", "authoritative_usage_limit_no_candidate", failureStatus)
+						writeCodexGoalUsageLimitTerminal(w, failureBody, true)
+						return codexAttemptResult{Outcome: outcomeDone}
+					}
 					if movable && failureVerdict.State == ban.RateLimited {
 						if allowRetry {
 							return retry()
@@ -3137,7 +3232,11 @@ codexSuccess:
 	// Session 33: Success-path body scan for rate-limit signals in 200 response.
 	// Same logic as the isChat non-streaming path above: when the upstream returns
 	// a soft limit error in a 200 body, cool the account and fail over.
-	if cd := usageLimitCooldown(200, responseBody); cd > 0 {
+	goalSoftQuotaHeld := codexGoalHoldsNonAuthoritativeQuotaSignal(r.Context(), http.StatusOK, resp.Header, responseBody)
+	if goalSoftQuotaHeld {
+		s.auditCodexGoalQuotaDecision(r.Context(), lease.Account.ID, "held", "non_authoritative_soft_quota_signal", http.StatusOK)
+	}
+	if cd := usageLimitCooldown(200, responseBody); cd > 0 && !goalSoftQuotaHeld {
 		if lease.Account.IgnoreRateLimitControls {
 			_ = resp.Body.Close()
 			resp, finalEgress, err = s.retryCodexSameAccountAfterRateLimit(r.Context(), lease, func() upstream.Request {
@@ -3549,6 +3648,13 @@ func (s *Server) retryCodexSameAccountAfterRateLimit(ctx context.Context, lease 
 			return resp, egress, nil
 		}
 		nextBody := readUpstreamErrorBody(resp.Body)
+		if codexGoalAuthoritativeUsageLimit(ctx, resp.StatusCode, nextBody) {
+			// Hand the fixed Goal terminal back to the ordinary response state
+			// machine. It will rotate accounts (or emit the sanitized final fixed
+			// terminal) without issuing another same-account retry.
+			resp.Body = io.NopCloser(bytes.NewReader(nextBody))
+			return resp, egress, nil
+		}
 		if !codexIgnoredRateLimitResponse(resp.StatusCode, nextBody) {
 			resp.Body = io.NopCloser(bytes.NewReader(nextBody))
 			return resp, egress, nil
@@ -3756,7 +3862,10 @@ func (s *Server) hasCodexFailoverCandidate(ctx context.Context, groupName, model
 	// updates may have occurred since the request's first lease, so force the same
 	// fresh snapshot Select would use on its stale-cache retry path.
 	s.scheduler.InvalidateAccountCache()
-	count, err := s.scheduler.EligibleCandidateCount(ctx, scheduler.Route{Group: groupName, Provider: "codex", Model: model, Exclude: excluded})
+	count, err := s.scheduler.EligibleCandidateCount(ctx, scheduler.Route{
+		Group: groupName, Provider: "codex", Model: model, Exclude: excluded,
+		AllowCodexGoalQuotaGrace: codexGoalQuotaGraceFromContext(ctx),
+	})
 	return err == nil && count > 0
 }
 
