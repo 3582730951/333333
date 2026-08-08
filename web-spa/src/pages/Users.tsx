@@ -46,11 +46,17 @@ export default function Users() {
     lastRefresh,
     reload: load,
   } = useUsersData();
+  const adminCount = rows.filter((row) => row.role === 'admin').length;
+  const activeCount = rows.filter((row) => row.status === 'active').length;
+  const disabledCount = rows.filter((row) => row.status && row.status !== 'active').length;
+  // Each of these is a slice of the user count, so the rail can show the proportion
+  // rather than leaving the reader to divide four numbers in their head.
+  const share = (part: number) => (rows.length ? part / rows.length : 0);
   const userMetrics = [
     { label: t('users.total'), value: rows.length },
-    { label: t('users.admins'), value: rows.filter((row) => row.role === 'admin').length },
-    { label: t('users.active'), value: rows.filter((row) => row.status === 'active').length, tone: 'success' },
-    { label: t('users.disabled'), value: rows.filter((row) => row.status && row.status !== 'active').length, tone: rows.some((row) => row.status && row.status !== 'active') ? 'warning' : undefined },
+    { label: t('users.admins'), value: adminCount, share: share(adminCount), tone: 'info' },
+    { label: t('users.active'), value: activeCount, share: share(activeCount), tone: 'success' },
+    { label: t('users.disabled'), value: disabledCount, share: share(disabledCount), tone: disabledCount ? 'warning' : undefined },
   ];
 
   const createMutation = useCreateUserMutation();
@@ -161,7 +167,6 @@ export default function Users() {
           rowKey="id"
           pagination={{ pageSize: 15 }}
           className="pool-mobile-table pool-users-table"
-          layout="fit"
           mobileColumns={mobileColumns}
           mobileScroll={false}
           emptyTitle={t('users.empty')}

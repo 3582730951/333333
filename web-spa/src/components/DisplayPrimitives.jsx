@@ -6,6 +6,24 @@ function textTitle(value) {
   return undefined;
 }
 
+/**
+ * Truncates to the real edge of its box rather than at a character count, so a value is
+ * only ever abbreviated when it genuinely does not fit.
+ *
+ * The annotations are what let .tsx callers use this without an `as any` alias: inferred
+ * from the destructuring alone, every prop without a default would come out required.
+ *
+ * @param {object} props
+ * @param {React.ReactNode} [props.children]
+ * @param {number} [props.lines]
+ * @param {string} [props.className]
+ * @param {number|string} [props.maxWidth]
+ * @param {string} [props.title]
+ * @param {string} [props.ariaLabel]
+ * @param {boolean} [props.strong]
+ * @param {boolean} [props.muted]
+ * @param {(event: React.MouseEvent) => void} [props.onClick]
+ */
 export function TextClamp({
   children,
   lines = 1,
@@ -73,18 +91,39 @@ export function ActionGroup({ children, className = '', minWidth, compact = fals
   );
 }
 
-export function MetricRail({ items = [], className = '' }) {
+// A rail of counts is the weakest thing a console can show: four numbers with no
+// sense of scale. `share` (0..1) turns an entry into a proportional track, so a rail
+// whose entries are parts of a whole reads as a small chart. Entries without a share
+// stay plain numbers — a total has nothing to be a fraction of.
+export function MetricRail({ items = [], className = '', label = '指标摘要' }) {
   const list = Array.isArray(items) ? items.filter(Boolean) : [];
   if (!list.length) return null;
   return (
-    <div className={['pool-metric-rail', className].filter(Boolean).join(' ')} role="complementary" aria-label="指标摘要">
-      {list.map((item) => (
-        <dl key={item.key || item.label} className={['pool-metric-card', item.tone ? `pool-metric-card--${item.tone}` : ''].filter(Boolean).join(' ')}>
-          <dt className="pool-metric-card__label">{item.label}</dt>
-          <dd className="pool-metric-card__value"><strong>{item.value}</strong></dd>
-          {item.detail ? <dd className="pool-metric-card__detail">{item.detail}</dd> : null}
-        </dl>
-      ))}
+    <div className={['pool-metric-rail', className].filter(Boolean).join(' ')} role="complementary" aria-label={label}>
+      {list.map((item) => {
+        const share = Number(item.share);
+        const hasShare = Number.isFinite(share);
+        const pct = hasShare ? Math.max(0, Math.min(100, Math.round(share * 100))) : 0;
+        return (
+          <dl
+            key={item.key || item.label}
+            className={[
+              'pool-metric-card',
+              item.tone ? `pool-metric-card--${item.tone}` : '',
+              hasShare ? 'pool-metric-card--tracked' : '',
+            ].filter(Boolean).join(' ')}
+          >
+            <dt className="pool-metric-card__label">{item.label}</dt>
+            <dd className="pool-metric-card__value"><strong>{item.value}</strong></dd>
+            {hasShare ? (
+              <dd className="pool-metric-card__track">
+                <span style={{ width: `${pct}%` }} />
+              </dd>
+            ) : null}
+            {item.detail ? <dd className="pool-metric-card__detail">{item.detail}</dd> : null}
+          </dl>
+        );
+      })}
     </div>
   );
 }

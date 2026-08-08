@@ -44,15 +44,50 @@ const (
 var whamUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 
 // whamUsageResponse mirrors the JSON shape returned by /backend-api/wham/usage.
+// Field names follow the codex-backend OpenAPI models (RateLimitStatusPayload):
+// rate_limit, credits, spend_control and additional_rate_limits are siblings.
 type whamUsageResponse struct {
 	PlanType  string `json:"plan_type"`
 	RateLimit struct {
+		Allowed         bool       `json:"allowed"`
 		LimitReached    bool       `json:"limit_reached"`
 		PrimaryWindow   whamWindow `json:"primary_window"`
 		SecondaryWindow whamWindow `json:"secondary_window"`
 	} `json:"rate_limit"`
+	// Extra paid balance beyond the plan's included windows. Distinct from
+	// rate_limit_reset_credits, which counts discrete rate-limit resets.
+	Credits      *whamCredits      `json:"credits"`
+	SpendControl *whamSpendControl `json:"spend_control"`
+
 	RateLimitResetCredits      map[string]interface{} `json:"rate_limit_reset_credits"`
 	RateLimitResetCreditsCamel map[string]interface{} `json:"rateLimitResetCredits"`
+}
+
+// whamCredits mirrors CreditStatusDetails. `balance` is a preformatted string
+// upstream (it may be hidden even when credits exist), so it is carried verbatim
+// rather than coerced to a number.
+type whamCredits struct {
+	HasCredits bool    `json:"has_credits"`
+	Unlimited  bool    `json:"unlimited"`
+	Balance    *string `json:"balance"`
+}
+
+// whamSpendControl mirrors SpendControlStatusDetails.
+type whamSpendControl struct {
+	Reached         bool                   `json:"reached"`
+	IndividualLimit *whamSpendControlLimit `json:"individual_limit"`
+}
+
+// whamSpendControlLimit mirrors SpendControlLimitDetails.
+type whamSpendControlLimit struct {
+	Source            string  `json:"source"`
+	Limit             string  `json:"limit"`
+	Used              string  `json:"used"`
+	Remaining         string  `json:"remaining"`
+	UsedPercent       float64 `json:"used_percent"`
+	RemainingPercent  float64 `json:"remaining_percent"`
+	ResetAfterSeconds int64   `json:"reset_after_seconds"`
+	ResetAt           int64   `json:"reset_at"`
 }
 
 type whamWindow struct {
@@ -632,7 +667,76 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 		credits.UpdatedAt = now
 		s.upsertCodexResetCreditsSnapshot(ctx, acc.ID, credits)
 	}
+	s.upsertCodexCreditsSnapshot(ctx, acc.ID, wham, now)
 	return nil
+}
+
+// upsertCodexCreditsSnapshot persists the account's extra paid balance (the
+// `credits` / `spend_control` blocks of /wham/usage) as its own limiter row so the
+// admin quota surface can show it next to the 5h/7d windows. Accounts on plans that
+// do not expose credits simply never get a row, which is what lets the UI hide the
+// panel instead of rendering a permanently empty card.
+func (s *Server) upsertCodexCreditsSnapshot(ctx context.Context, accountID string, wham whamUsageResponse, now int64) {
+	if wham.Credits == nil && wham.SpendControl == nil {
+		return
+	}
+	detail := map[string]interface{}{}
+	usedPercent := float64(-1)
+	resetAt := int64(0)
+	status := "ok"
+
+	if wham.Credits != nil {
+		detail["has_credits"] = wham.Credits.HasCredits
+		detail["unlimited"] = wham.Credits.Unlimited
+		if wham.Credits.Balance != nil {
+			detail["balance"] = strings.TrimSpace(*wham.Credits.Balance)
+		}
+		if wham.Credits.Unlimited {
+			status = "unlimited"
+		} else if !wham.Credits.HasCredits {
+			status = "depleted"
+		}
+	}
+	if wham.SpendControl != nil {
+		detail["spend_control_reached"] = wham.SpendControl.Reached
+		if wham.SpendControl.Reached {
+			status = "spend_limit_reached"
+		}
+		if limit := wham.SpendControl.IndividualLimit; limit != nil {
+			detail["source"] = strings.TrimSpace(limit.Source)
+			detail["limit"] = strings.TrimSpace(limit.Limit)
+			detail["used"] = strings.TrimSpace(limit.Used)
+			detail["remaining"] = strings.TrimSpace(limit.Remaining)
+			detail["used_percent"] = limit.UsedPercent
+			detail["remaining_percent"] = limit.RemainingPercent
+			usedPercent = limit.UsedPercent
+			if limit.ResetAt > 0 {
+				resetAt = limit.ResetAt
+			} else if limit.ResetAfterSeconds > 0 {
+				resetAt = now + limit.ResetAfterSeconds
+			}
+		}
+	}
+
+	raw, err := json.Marshal(detail)
+	if err != nil {
+		return
+	}
+	_ = s.store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+		AccountID:         accountID,
+		Provider:          "codex",
+		LimiterType:       codexCreditsLimiterType,
+		Source:            "wham_usage_credits",
+		UsedPercent:       usedPercent,
+		LimitTokens:       -1,
+		RemainingTokens:   -1,
+		LimitRequests:     -1,
+		RemainingRequests: -1,
+		ResetAt:           resetAt,
+		Status:            status,
+		Raw:               string(raw),
+		UpdatedAt:         now,
+	})
 }
 
 type claudeOAuthUsageParsed struct {

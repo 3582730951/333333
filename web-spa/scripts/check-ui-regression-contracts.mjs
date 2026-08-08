@@ -73,8 +73,8 @@ if (!/\/admin\/usage\/(?:dashboard|cache)/.test(dashboardSurface) || !/fields:\s
 if (!/series_dimension:\s*'provider_model'/.test(dashboardSurface) || !/dimension:\s*'provider_model'/.test(dashboardSurface)) {
   problems.push('Dashboard trends and summaries must use Provider + Model dimensions.');
 }
-if (!/modelTokenFormatter/.test(dashboard) || !/(?:DonutChart|Donut)[^>]*valueFormatter=\{modelTokenFormatter\}/.test(dashboard)) {
-  problems.push('Dashboard model token donut must use a local token formatter instead of changing fmtTokens globally.');
+if (!/modelTokenFormatter/.test(dashboard) || !/(?:DonutChart|Donut|RankedBars)[^>]*valueFormatter=\{modelTokenFormatter\}/.test(dashboard)) {
+  problems.push('Dashboard model token breakdown must use a local token formatter instead of changing fmtTokens globally.');
 }
 
 const accounts = read('pages/Accounts.jsx');

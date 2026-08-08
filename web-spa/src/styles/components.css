@@ -349,15 +349,6 @@
   height: 100%;
   border-radius: inherit;
 }
-
-.pool-dashboard-command {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(260px, 340px);
-  gap: 14px;
-}
-
-.pool-dashboard-command__main,
-.pool-dashboard-command__side,
 .pool-cache-breakdown {
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-md);
@@ -365,13 +356,6 @@
   box-shadow: var(--pool-shadow-sm);
   padding: 16px;
 }
-
-.pool-dashboard-command__main {
-  display: grid;
-  gap: 14px;
-}
-
-.pool-dashboard-command__eyebrow,
 .pool-cache-breakdown__legend {
   display: flex;
   align-items: center;
@@ -380,62 +364,6 @@
   color: var(--pool-text-3);
   font-size: 12px;
 }
-
-.pool-dashboard-command__metric {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-}
-
-.pool-dashboard-command__metric strong {
-  font-size: 42px;
-  line-height: 1;
-  color: var(--pool-text);
-}
-
-.pool-dashboard-command__metric span {
-  color: var(--pool-text-2);
-  font-weight: 600;
-}
-
-.pool-dashboard-command__subgrid,
-.pool-attention-list {
-  display: grid;
-  gap: 8px;
-}
-
-.pool-dashboard-command__subgrid {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-}
-
-.pool-dashboard-command__subgrid div,
-.pool-attention-list div {
-  min-width: 0;
-  padding: 10px;
-  border: 1px solid var(--pool-border);
-  border-radius: var(--pool-radius-sm);
-  background: var(--pool-bg-surface-2);
-}
-
-.pool-dashboard-command__subgrid span,
-.pool-attention-list span {
-  display: block;
-  color: var(--pool-text-3);
-  font-size: 12px;
-  margin-bottom: 4px;
-}
-
-.pool-dashboard-command__subgrid b,
-.pool-attention-list b {
-  color: var(--pool-text);
-  font-size: 16px;
-}
-
-.pool-dashboard-command__side {
-  display: grid;
-  gap: 12px;
-}
-
 .pool-cache-breakdown {
   display: grid;
   gap: 12px;
@@ -944,8 +872,7 @@
   max-width: 100%;
 }
 
-.pool-audit-table .pool-tag,
-.pool-audit-detail {
+.pool-audit-table .pool-tag {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1165,7 +1092,8 @@
 }
 
 /* Provider marks must never inherit an SVG's intrinsic canvas size. Some vendor
-   assets (notably Kiro) use a 1200×1200 source viewBox, so the mark owns the size
+   assets (notably Kiro) use a 1200×1200 source viewBox,
+so the mark owns the size
    and clips the image instead of allowing it to expand a tab or modal. */
 .pool-vendor-logo {
   display: inline-flex;
@@ -1498,19 +1426,41 @@
   min-width: 0;
 }
 
+/* `display: block` is what makes the clamp work at all: overflow has no effect on an
+   inline box, so without it the ellipsis never appears and the text just runs past its
+   cell. Call sites used to each re-declare this; it belongs on the primitive. */
 .pool-text-clamp {
+  display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+  max-width: 100%;
 }
 
-.pool-table .pool-text-clamp,
-.pool-table .pool-audit-detail {
-  overflow: visible;
-  text-overflow: clip;
+/* `lines` on TextClamp had no styles behind it, so a two-line clamp silently rendered as
+   one. Line clamping needs the whole -webkit- trio; nowrap from the base rule would
+   otherwise keep it to a single line whatever the count says. */
+.pool-text-clamp--multi {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--pool-clamp-lines, 2);
+  line-clamp: var(--pool-clamp-lines, 2);
   white-space: normal;
   overflow-wrap: anywhere;
+}
+
+/* Same omission as `lines`: 22 call sites pass strong/muted to mark which value in a cell
+   is the one being identified and which is supporting detail, and both rendered identically
+   because neither class had a rule. The row identifier is what the eye should land on. */
+.pool-text-clamp--strong {
+  color: var(--pool-text-1);
+  font-weight: 600;
+  letter-spacing: -.006em;
+}
+
+.pool-text-clamp--muted {
+  color: var(--pool-text-3);
 }
 
 .pool-table .pool-tag {
@@ -2188,10 +2138,6 @@
   margin-top: 13px;
 }
 
-.pool-registration-quickstart .pool-copy-code textarea {
-  min-height: 148px;
-}
-
 .pool-egress-template-grid,
 .pool-egress-form-grid {
   display: grid;
@@ -2380,20 +2326,15 @@
 }
 
 @media (max-width: 1000px) {
-  .pool-dashboard-command,
   .pool-grid.cols-3,
-  .pool-grid.cols-2 {
+.pool-grid.cols-2 {
     grid-template-columns: 1fr;
-  }
-
-  .pool-dashboard-command__subgrid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
 @media (max-width: 640px) {
   .pool-egress-template-grid,
-  .pool-egress-form-grid {
+.pool-egress-form-grid {
     grid-template-columns: 1fr;
   }
 
@@ -2414,15 +2355,6 @@
   .pool-stat-grid {
     grid-template-columns: 1fr;
   }
-
-  .pool-dashboard-command__metric strong {
-    font-size: 34px;
-  }
-
-  .pool-dashboard-command__subgrid {
-    grid-template-columns: 1fr;
-  }
-
   .pool-account-menu-ident {
     display: none;
   }
@@ -2449,8 +2381,8 @@
   }
 
   .pool-registration-start-layout,
-  .pool-registration-start-form,
-  .pool-registration-strategy-row {
+.pool-registration-start-form,
+.pool-registration-strategy-row {
     grid-template-columns: 1fr;
   }
 
@@ -2542,7 +2474,7 @@
   }
 
   .pool-task-detail__grid,
-  .pool-kv-grid {
+.pool-kv-grid {
     grid-template-columns: 1fr;
   }
 }
@@ -2553,14 +2485,6 @@
   gap: 18px;
 }
 
-.upstream-rule-overview {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 0;
-  border-block: 1px solid var(--pool-border);
-}
-
-.upstream-rule-overview > div,
 .upstream-rule-card,
 .upstream-rule-test-panel {
   border: 0;
@@ -2571,20 +2495,6 @@
   backdrop-filter: none;
 }
 
-.upstream-rule-overview > div {
-  min-height: 104px;
-  padding: 18px;
-  border-top: 0;
-  border-inline-start: 1px solid var(--pool-border);
-  display: grid;
-  align-content: space-between;
-}
-
-.upstream-rule-overview > div:first-child {
-  border-inline-start: 0;
-}
-
-.upstream-rule-overview span,
 .upstream-rule-meta,
 .upstream-rule-condition span,
 .upstream-rule-section-head p,
@@ -2593,13 +2503,6 @@
   color: var(--pool-text-2);
   font-size: 12px;
   line-height: 1.55;
-}
-
-.upstream-rule-overview strong {
-  color: var(--pool-text);
-  font-size: 30px;
-  line-height: 1;
-  letter-spacing: -0.03em;
 }
 
 .upstream-rule-list {
@@ -2720,12 +2623,25 @@
   margin-top: 14px;
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr)) auto;
-  gap: 10px;
-  align-items: start;
+  gap: 12px 10px;
+  /* Labels make the fields two rows tall, so the run button aligns to the bottom of
+     its row rather than floating level with the labels. */
+  align-items: end;
+}
+
+.upstream-rule-test-grid label {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  color: var(--pool-text-2);
+  font-size: 12px;
+}
+
+.upstream-rule-test-body {
+  grid-column: span 4;
 }
 
 .upstream-rule-test-grid textarea {
-  grid-column: span 4;
   min-height: 78px;
 }
 
@@ -2813,33 +2729,74 @@
   color: var(--pool-text-2);
 }
 
+.upstream-rule-note > summary {
+  color: var(--pool-text);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.55;
+  cursor: pointer;
+  /* The default triangle sits on the text baseline and collides with the rule above at
+     small sizes; a marker of our own keeps its own column. */
+  list-style: none;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.upstream-rule-note > summary::-webkit-details-marker {
+  display: none;
+}
+
+.upstream-rule-note > summary::before {
+  content: '';
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  margin-top: 5px;
+  border-inline-end: 1.5px solid var(--pool-text-3);
+  border-block-end: 1.5px solid var(--pool-text-3);
+  transform: rotate(-45deg);
+  transition: transform var(--pool-motion-fast) var(--pool-motion-ease);
+}
+
+.upstream-rule-note[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+.upstream-rule-note > summary:focus-visible {
+  outline: 2px solid var(--pool-accent);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+.upstream-rule-note > p {
+  margin: 9px 0 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .upstream-rule-note > summary::before {
+    transition: none;
+  }
+}
+
 @media (max-width: 1100px) {
   .upstream-rule-row,
-  .upstream-rule-test-grid,
-  .upstream-rule-form-grid,
-  .upstream-rule-cascade {
+.upstream-rule-test-grid,
+.upstream-rule-form-grid,
+.upstream-rule-cascade {
     grid-template-columns: 1fr;
   }
-  .upstream-rule-test-grid textarea {
+  .upstream-rule-test-body {
     grid-column: auto;
   }
 }
 
 @media (max-width: 767px) {
   .pool-egress-quickstart,
-  .pool-registration-quickstart .pool-card-body {
+.pool-registration-quickstart .pool-card-body {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .upstream-rule-overview {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-  .upstream-rule-overview > div:nth-child(odd) {
-    border-inline-start: 0;
-  }
-  .upstream-rule-overview > div:nth-child(n + 3) {
-    border-top: 1px solid var(--pool-border);
-  }
   .upstream-rule-row {
     gap: 10px;
   }
@@ -2937,8 +2894,6 @@
 .pool-stat,
 .pool-data-card,
 .pool-metric-card,
-.pool-dashboard-command__main,
-.pool-dashboard-command__side,
 .pool-cache-breakdown {
   background: transparent;
   border: 0;
@@ -3132,8 +3087,9 @@
   text-align: right;
 }
 
-.pool-table .pool-text-clamp,
-.pool-table .pool-audit-detail {
+/* A table cell is the one place a clamp must hold: the column width is fixed, so text
+   that refuses to clip pushes the whole row. Multi-line clamps keep their own rules. */
+.pool-table .pool-text-clamp:not(.pool-text-clamp--multi) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3253,12 +3209,15 @@
   border-block: 1px solid var(--pool-border);
 }
 
+/* Label pairs with its value on one line; the track and the detail each get a full
+   line below. A flex row would lay label, value and detail out as three peers, which
+   reads as three unrelated columns rather than one measurement. */
 .pool-metric-card {
   min-width: 0;
   margin: 0;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: baseline;
-  justify-content: space-between;
   gap: 6px 10px;
   padding: 14px 16px;
   border: 0;
@@ -3272,6 +3231,51 @@
   border-inline-start: 0;
 }
 
+.pool-metric-card__label {
+  grid-column: 1;
+}
+
+.pool-metric-card__value {
+  grid-column: 2;
+  justify-self: end;
+}
+
+.pool-metric-card__track,
+.pool-metric-card__detail {
+  grid-column: 1 / -1;
+}
+
+.pool-metric-card__track {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--pool-border);
+  overflow: hidden;
+}
+
+.pool-metric-card__track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--pool-accent);
+  transition: width var(--pool-motion-normal) var(--pool-motion-ease);
+}
+
+.pool-metric-card--success .pool-metric-card__track > span {
+  background: var(--pool-success);
+}
+
+.pool-metric-card--warning .pool-metric-card__track > span {
+  background: var(--pool-warning);
+}
+
+.pool-metric-card--danger .pool-metric-card__track > span {
+  background: var(--pool-danger);
+}
+
+.pool-metric-card--info .pool-metric-card__track > span {
+  background: var(--pool-info);
+}
+
 .pool-metric-card__label,
 .pool-metric-card__detail {
   min-width: 0;
@@ -3279,9 +3283,67 @@
   overflow-wrap: anywhere;
 }
 
+/* A rail spanning the full page width has room to give each measurement its own
+   block: caption, figure, then qualifier. The paired layout above is for the narrow
+   rail beside a table, where a stacked figure would waste the column. */
+.pool-metric-rail--band .pool-metric-card {
+  align-content: start;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  min-height: 88px;
+}
+
+.pool-metric-rail--band .pool-metric-card__value {
+  grid-column: 1;
+  justify-self: start;
+}
+
+.pool-metric-rail--band .pool-metric-card__value strong {
+  color: var(--pool-text);
+  font-size: 24px;
+  line-height: 1;
+  letter-spacing: -0.035em;
+}
+
+.pool-metric-rail--band .pool-metric-card--success .pool-metric-card__value strong {
+  color: var(--pool-success);
+}
+
+.pool-metric-rail--band .pool-metric-card--warning .pool-metric-card__value strong {
+  color: var(--pool-warning);
+}
+
+.pool-metric-rail--band .pool-metric-card--danger .pool-metric-card__value strong {
+  color: var(--pool-danger);
+}
+
+.pool-metric-rail--band .pool-metric-card--info .pool-metric-card__value strong {
+  color: var(--pool-info);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pool-metric-card__track > span {
+    transition: none;
+  }
+}
+
 .pool-page__filters,
 .pool-page__summary {
   margin-bottom: var(--pool-space-4);
+}
+
+/* Every page's main region. Without min-width: 0 a wide table inside it can set the
+   section's floor and push the whole page into a horizontal scroll, which is how a table
+   ends up overlapping the layout instead of scrolling inside its own wrapper. */
+.pool-page__content {
+  min-width: 0;
+}
+
+/* Named for exactly one job and previously had no rule behind it, so the balances, relative
+   times and "3 / 5" attempt counts it wraps broke across lines in narrow columns. */
+.pool-nowrap {
+  white-space: nowrap;
 }
 
 .pool-responsive-summary {
@@ -3327,9 +3389,6 @@
 }
 
 .pool-email-metrics .pool-metric-card {
-  align-items: start;
-  display: grid;
-  min-height: 88px;
   padding: 14px 16px;
   border: 0;
   border-inline-start: 1px solid var(--pool-border);
@@ -3342,42 +3401,27 @@
   border-inline-start: 0;
 }
 
-.pool-email-metrics .pool-metric-card strong {
-  color: var(--pool-text);
-  font-size: 24px;
-  line-height: 1;
-  letter-spacing: -0.035em;
-}
-
-.pool-email-metrics .pool-metric-card--success strong {
-  color: var(--pool-success);
-}
-
-.pool-email-metrics .pool-metric-card--info strong {
-  color: var(--pool-info);
-}
-
-.pool-email-metrics .pool-metric-card--danger strong {
-  color: var(--pool-danger);
-}
-
+/* This sits inside .pool-page__filters, which already draws the panel. Repeating the
+   border, material and padding here framed the row twice, and because the inner box
+   shrink-wrapped its content the buttons were squeezed until "选择本页" wrapped in half.
+   It is a plain row now, spanning the surface it is given. */
 .pool-email-toolbar {
   display: flex;
+  flex: 1 1 auto;
   align-items: center;
   gap: 8px;
   min-width: 0;
-  padding: 8px;
-  border: 1px solid var(--pool-border-subtle);
-  border-radius: var(--pool-radius-panel);
-  background: var(--pool-bg-material);
-  box-shadow: var(--pool-shadow-panel);
-  backdrop-filter: var(--pool-material-blur);
-  -webkit-backdrop-filter: var(--pool-material-blur);
 }
 
 .pool-email-toolbar > .pool-input-wrap {
   flex: 1 1 300px;
   width: min(460px, 100%);
+}
+
+/* A label is the button's whole content: shrinking past it does not save space, it just
+   breaks the word. Only the search field gives way when the row runs short. */
+.pool-email-toolbar > .pool-button {
+  flex: 0 0 auto;
 }
 
 .pool-email-search {
@@ -3468,8 +3512,6 @@
     overflow: visible;
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    padding: 8px;
-    border-radius: 14px;
   }
 
   .pool-email-toolbar > * {
@@ -3486,7 +3528,7 @@
   }
 
   .pool-email-toolbar .pool-input-wrap,
-  .pool-email-toolbar .pool-input {
+.pool-email-toolbar .pool-input {
     min-height: var(--pool-hit-target);
   }
 
@@ -5063,12 +5105,23 @@
   max-width: 860px;
 }
 
+/* Wraps rather than scrolls.
+   This was `overflow-x: auto`, which made the seven diagnostic tabs a horizontal scroller: at
+   390px they need 598px, so four of them sat off-screen behind a gesture with nothing indicating
+   it, and the tab straddling the edge was left as a 10px shard of "路由" — 20% of a 52px button,
+   which reads as a rendering fault rather than as a control. A scrolling *carousel* at least
+   implies more content; a scrolling *tab group* hides the fact that other views exist at all.
+
+   Wrapping shows all seven on two rows with no gesture and no clipped glyph, and it cannot
+   regress at any width, which a scroll container plus an edge-fade affordance could. Left as
+   wrap at every breakpoint deliberately: the tabs fit one row on desktop, so this is inert there
+   and there is no second code path to keep correct. */
 .pool-segmented {
   display: inline-flex;
+  flex-wrap: wrap;
   max-width: 100%;
   gap: 4px;
   padding: 4px;
-  overflow-x: auto;
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-lg);
   background: var(--pool-bg-surface-2);
@@ -5087,8 +5140,22 @@
   box-shadow: none;
 }
 
+/* `minmax(0, 1fr)`, not the implicit `auto` track this had.
+   A `display: grid` with no grid-template-columns gets one implicit `auto` track, and an `auto`
+   track is sized to its content's max-content and is never shrunk to fit its container — it
+   simply overflows. The diagnostic cards are full of `white-space: nowrap` values, so max-content
+   here was 407px inside a 366px container. Both children stretched to the 407px track, which is
+   why the segmented control reported a 405px client box in a 390px viewport and why .pool-content
+   itself scrolled 29px sideways: the entire admin page could be dragged off-axis on a phone.
+
+   `minmax(0, 1fr)` bounds the track by the available space instead, so nowrap text ellipsizes
+   (every value already has min-width: 0 + text-overflow: ellipsis for exactly this) rather than
+   pushing the page wider. Nothing in the existing checks could see it: the overflow was contained
+   by .pool-content's own `overflow: auto`, so documentElement.scrollWidth never grew and
+   noPageOverflow stayed true. */
 .pool-usage-diagnostics {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
 }
 
@@ -5099,21 +5166,6 @@
   gap: 12px;
   flex-wrap: wrap;
 }
-
-.pool-dashboard-command__side .pool-attention-list div {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 2px 10px;
-  align-items: center;
-}
-
-.pool-attention-list p {
-  grid-column: 1 / -1;
-  margin: 0;
-  color: var(--pool-text-3);
-  font-size: 12px;
-}
-
 .pool-chart-empty {
   height: 100%;
   min-height: 140px;
@@ -5150,7 +5202,7 @@
 
 @media (max-width: 767px) {
   .pool-account-menu-button .pool-account-menu-ident,
-  .pool-account-menu-button .pool-account-menu-caret {
+.pool-account-menu-button .pool-account-menu-caret {
     display: none;
   }
 
@@ -5165,23 +5217,43 @@
     gap: 14px;
   }
 
+  /* Wraps, deliberately, instead of scrolling sideways.
+     This was `grid-auto-flow: column` + `max-content` + `overflow-x: auto`: six tabs need 506px,
+     so at 360x800 (336px client) the last one — "Codex" — was sliced to 11px of its 67px, 16%
+     visible, and at 390x844 the pane still ran 140px past the edge. That produced all 12 failures
+     in the full-matrix run, one per AI route per theme, and it is the same defect class already
+     fixed on .pool-segmented: a scrolling *tab group* hides that the other views exist at all,
+     behind a gesture with no affordance. Slicing a card is cosmetic; slicing a tab costs the user
+     a whole screen they cannot see is there.
+
+     Wrapping puts all six on two rows (ChatGPT/Claude/Kiro/Antigravity ~319px, then
+     Codex/Claude Code ~181px). It costs ~44px of sticky height — 46px to ~90px — which is the
+     right trade for making every destination reachable without a hidden swipe. */
   .pool-ai-settings-nav {
     position: sticky;
     z-index: 18;
     top: 58px;
-    grid-auto-flow: column;
-    grid-auto-columns: max-content;
-    overflow-x: auto;
-    overscroll-behavior-inline: contain;
-    padding: 0 0 6px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 6px;
+    padding: 6px 0;
     border: 0;
     border-bottom: 1px solid var(--pool-border);
     border-radius: 0;
-    scrollbar-width: thin;
+    /* Sticky needs an opaque backdrop. The base rule is `transparent`, which was already wrong at
+       one row — page content scrolled visibly through the tabs — and wrapping to two rows doubles
+       the exposed area, so it is fixed here rather than left as inherited damage. */
+    background: var(--pool-bg-page);
   }
 
   .pool-ai-settings-nav button {
     min-height: 40px;
+    /* Grow to fill the row. Without this the wrap left the second row ragged — four tabs packed
+       into row one, two tabs and a wide void in row two — which reads as "failed to fit" rather
+       than a deliberate two-row nav. Each row now goes full width, so the wrap looks intended.
+       Rows differ in per-tab width as a result; that is acceptable for a tab strip, where the
+       active pill carrying the emphasis is the point. */
+    flex: 1 1 auto;
     white-space: nowrap;
     text-align: center;
   }
@@ -5340,7 +5412,7 @@
   }
 
   .pool-settings-refresh-button .pool-button__label,
-  .pool-settings-action-label--long {
+.pool-settings-action-label--long {
     display: none;
   }
 
@@ -5383,17 +5455,17 @@
   }
 
   .pool-registrar-provider-card .pool-field,
-  .pool-registrar-fields .pool-field {
+.pool-registrar-fields .pool-field {
     flex-basis: calc(50% - 7px);
   }
 
   .pool-registrar-provider-card .pool-input,
-  .pool-registrar-provider-card .pool-input-wrap,
-  .pool-registrar-provider-card .pool-select,
-  .pool-registrar-fields .pool-input,
-  .pool-registrar-fields .pool-input-wrap,
-  .pool-registrar-fields .pool-select,
-  .pool-registrar-fields .pool-textarea {
+.pool-registrar-provider-card .pool-input-wrap,
+.pool-registrar-provider-card .pool-select,
+.pool-registrar-fields .pool-input,
+.pool-registrar-fields .pool-input-wrap,
+.pool-registrar-fields .pool-select,
+.pool-registrar-fields .pool-textarea {
     max-width: 100%;
   }
 
@@ -5458,17 +5530,17 @@
   }
 
   .pool-button,
-  .pool-icon-button,
-  .pool-button--icon-only,
-  .pool-account-menu-item,
-  .pool-tab-trigger,
-  .pool-nav-item,
-  .pool-nav-group-label {
+.pool-icon-button,
+.pool-button--icon-only,
+.pool-account-menu-item,
+.pool-tab-trigger,
+.pool-nav-item,
+.pool-nav-group-label {
     min-height: var(--pool-hit-target);
   }
 
   .pool-icon-button,
-  .pool-button--icon-only {
+.pool-button--icon-only {
     width: var(--pool-hit-target);
     min-width: var(--pool-hit-target);
   }
@@ -5478,8 +5550,8 @@
   }
 
   .pool-card,
-  .pool-panel,
-  .pool-chart-card {
+.pool-panel,
+.pool-chart-card {
     padding: 16px 0;
     border-radius: 0;
   }
@@ -5512,13 +5584,13 @@
   }
 
   .pool-table--cards td[data-label='账号'],
-  .pool-table--cards td[data-label='API Key'] {
+.pool-table--cards td[data-label='API Key'] {
     display: block;
     padding: 0;
   }
 
   .pool-table--cards td[data-label='账号']::before,
-  .pool-table--cards td[data-label='API Key']::before {
+.pool-table--cards td[data-label='API Key']::before {
     display: none;
   }
 
@@ -5546,12 +5618,12 @@
   }
 
   .pool-tabs--left,
-  .pool-settings-tabs.pool-tabs--left {
+.pool-settings-tabs.pool-tabs--left {
     grid-template-columns: 1fr;
   }
 
   .pool-tabs--left .pool-tabs-list,
-  .pool-settings-tabs.pool-tabs--left .pool-tabs-list {
+.pool-settings-tabs.pool-tabs--left .pool-tabs-list {
     flex-direction: row;
     overflow-x: auto;
   }
@@ -5565,15 +5637,15 @@
   }
 
   .pool-settings-row__control .pool-input,
-  .pool-settings-row__control .pool-select,
-  .pool-settings-row__control .pool-input-wrap,
-  .pool-settings-row__control .pool-textarea,
-  .pool-settings-row__control .pool-multi-select,
-  .pool-registrar-form .pool-input,
-  .pool-registrar-form .pool-input-wrap,
-  .pool-registrar-form .pool-select,
-  .pool-registrar-form .pool-textarea,
-  .pool-registrar-form .pool-multi-select {
+.pool-settings-row__control .pool-select,
+.pool-settings-row__control .pool-input-wrap,
+.pool-settings-row__control .pool-textarea,
+.pool-settings-row__control .pool-multi-select,
+.pool-registrar-form .pool-input,
+.pool-registrar-form .pool-input-wrap,
+.pool-registrar-form .pool-select,
+.pool-registrar-form .pool-textarea,
+.pool-registrar-form .pool-multi-select {
     width: 100% !important;
     min-height: var(--pool-hit-target);
   }
@@ -5601,7 +5673,8 @@
   }
 
   /* Page workspaces own the final mobile layout so generic card/table rules
-     cannot reintroduce the older flat, overlong presentation. */
+     cannot reintroduce the older flat,
+overlong presentation. */
   .pool-metric-rail.pool-email-metrics {
     grid-template-columns: none;
     grid-auto-flow: column;
@@ -5619,7 +5692,7 @@
   }
 
   .pool-registrar-provider-card,
-  .pool-settings-empty {
+.pool-settings-empty {
     padding: 14px;
     border: 1px solid var(--pool-border-subtle);
     border-radius: 14px;
@@ -5627,7 +5700,7 @@
   }
 
   .pool-settings-tabs .pool-switch,
-  .pool-registrar-form .pool-switch {
+.pool-registrar-form .pool-switch {
     width: var(--pool-hit-target);
     min-width: var(--pool-hit-target);
     height: var(--pool-hit-target);
@@ -5636,13 +5709,13 @@
   }
 
   .pool-settings-tabs .pool-switch[data-state='checked'],
-  .pool-registrar-form .pool-switch[data-state='checked'] {
+.pool-registrar-form .pool-switch[data-state='checked'] {
     border-color: transparent;
     background: transparent;
   }
 
   .pool-settings-tabs .pool-switch::before,
-  .pool-registrar-form .pool-switch::before {
+.pool-registrar-form .pool-switch::before {
     content: '';
     position: absolute;
     inset: 9px 1px;
@@ -5652,13 +5725,13 @@
   }
 
   .pool-settings-tabs .pool-switch[data-state='checked']::before,
-  .pool-registrar-form .pool-switch[data-state='checked']::before {
+.pool-registrar-form .pool-switch[data-state='checked']::before {
     border-color: var(--pool-accent);
     background: var(--pool-accent);
   }
 
   .pool-settings-tabs .pool-switch__thumb,
-  .pool-registrar-form .pool-switch__thumb {
+.pool-registrar-form .pool-switch__thumb {
     position: absolute;
     z-index: 1;
     top: 11px;
@@ -5666,8 +5739,8 @@
   }
 
   .pool-registration-quickstart,
-  .pool-registration-start-card,
-  .pool-sms-market-card {
+.pool-registration-start-card,
+.pool-sms-market-card {
     padding: 16px;
     border: 1px solid var(--pool-border-subtle);
     border-radius: 14px;
@@ -5690,29 +5763,24 @@
     flex: 0 0 auto;
   }
 
-  .pool-registration-quickstart .pool-copy-code textarea {
-    min-height: 116px;
-    max-height: 180px;
-  }
-
   .pool-registration-start-form {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 12px;
   }
 
   .pool-registration-start-form .pool-input,
-  .pool-registration-start-form .pool-input-wrap,
-  .pool-registration-start-form .pool-select,
-  .pool-registration-start-form .pool-multi-select,
-  .pool-registration-control .pool-select,
-  .pool-registration-control .pool-multi-select,
-  .pool-sms-price-policy .pool-input {
+.pool-registration-start-form .pool-input-wrap,
+.pool-registration-start-form .pool-select,
+.pool-registration-start-form .pool-multi-select,
+.pool-registration-control .pool-select,
+.pool-registration-control .pool-multi-select,
+.pool-sms-price-policy .pool-input {
     min-height: var(--pool-hit-target);
   }
 
   .pool-registration-engine-summary,
-  .pool-registration-strategy-row,
-  .pool-registration-actions {
+.pool-registration-strategy-row,
+.pool-registration-actions {
     grid-column: 1 / -1;
   }
 
@@ -5739,21 +5807,19 @@
     text-align: left;
   }
 
-  .pool-sms-market-grid {
-    grid-template-columns: none;
-    grid-auto-flow: column;
-    grid-auto-columns: min(84vw, 340px);
-    gap: 10px;
-    overflow-x: auto;
-    padding: 2px 2px 9px;
-    scroll-snap-type: x proximity;
-    scrollbar-width: thin;
-  }
+  /* No carousel here. This row used to be `grid-auto-flow: column` with min(84vw, 340px)
+     slides, which at 390px fits one 328px card in 354px of pane and leaves the next one
+     showing 16px — 5% of itself, a strip of rank digit and nothing else. Same defect class
+     as the dashboard chart row, and invisible to every detector for the same reason: the
+     overflow is inside the pane, so the document never overflows.
 
+     The @media (max-width: 900px) block above already sets this grid to a single column;
+     the carousel was layered on top and overrode that. Dropping it restores the intent.
+     A ranked market list is read top-to-bottom anyway, and full width lets each row lay
+     out as rank | country | success | price without competing for 328px. */
   .pool-sms-market-item {
     grid-template-columns: 28px minmax(0, 1fr) auto;
     align-content: start;
-    scroll-snap-align: start;
   }
 
   .pool-sms-market-rank {
@@ -5851,8 +5917,51 @@
     max-width: 48%;
   }
 
+  /* Horizontal inset so the right-aligned values are not flush against the enclosing card border.
+     Applied to the card rather than to the rows, because the row carries the separator line — pad
+     the row and the separators shift inward while the card title stays put, breaking the shared
+     left edge that makes the list read as one column. */
+  .pool-diagnostic-card {
+    padding-inline: 10px;
+  }
+
+  /* One column, and the label/value pair goes on one line as a settings-list row.
+     Stacked (label above value) this card ran ~500px per row of data: five pairs of two lines
+     each, so reading two accounts meant a full screen of scrolling for ten numbers. Label left,
+     value right is the iOS list idiom, halves the height, and puts the values in a single
+     right-hand column the eye can scan straight down instead of hunting for them mid-card. */
   .pool-diagnostic-card__grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* border-inline-start is the *column* divider from the two-column desktop layout. Collapsed to
+     one column it has nothing left to divide, so it rendered as a stray vertical line floating to
+     the left of every other row — a border with no relationship to anything. Rows are separated
+     horizontally instead, which is what a one-column list actually needs. */
+  .pool-diagnostic-card__item {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 7px 0;
+    border-inline-start: 0;
+    border-bottom: 1px solid var(--pool-border-subtle);
+  }
+
+  .pool-diagnostic-card__item:last-child {
+    border-bottom: 0;
+  }
+
+  /* The label holds its size and the value absorbs the squeeze: a long model id ellipsizes on
+     the right rather than compressing "缓存单位" into an unreadable stub. */
+  .pool-diagnostic-card__label {
+    flex: 0 0 auto;
+  }
+
+  .pool-diagnostic-card__value {
+    flex: 1 1 auto;
+    margin-top: 0;
+    text-align: right;
   }
 
   .pool-key-mobile-cell {
@@ -5889,15 +5998,15 @@
   }
 
   .pool-registrar-provider-card .pool-field,
-  .pool-registrar-fields .pool-field {
+.pool-registrar-fields .pool-field {
     flex-basis: 100%;
   }
 }
 
 @media (max-width: 390px) {
   .pool-registration-start-form,
-  .pool-registration-strategy-row,
-  .pool-sms-price-policy {
+.pool-registration-strategy-row,
+.pool-sms-price-policy {
     grid-template-columns: minmax(0, 1fr);
   }
 }
@@ -5935,15 +6044,6 @@
   word-break: break-word;
 }
 
-.pool-break-value {
-  display: block;
-  min-width: 0;
-  max-width: 100%;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-}
-
 .pool-mobile-row__badges,
 .pool-mobile-row__chips,
 .pool-event-meta,
@@ -5960,16 +6060,16 @@
 
 @media (max-width: 767px) {
   .pool-tabs--left .pool-tabs-list,
-  .pool-settings-tabs.pool-tabs--left .pool-tabs-list,
-  .pool-page-actions,
-  .pool-toolbar {
+.pool-settings-tabs.pool-tabs--left .pool-tabs-list,
+.pool-page-actions,
+.pool-toolbar {
     scrollbar-width: thin;
     overscroll-behavior-inline: contain;
     -webkit-overflow-scrolling: touch;
   }
 
   .pool-tabs--left .pool-tabs-list,
-  .pool-settings-tabs.pool-tabs--left .pool-tabs-list {
+.pool-settings-tabs.pool-tabs--left .pool-tabs-list {
     padding-right: 0;
     mask-image: none;
   }
@@ -6087,19 +6187,19 @@
 
 @media (max-width: 767px) {
   .pool-account-menu-button .pool-account-menu-ident,
-  .pool-account-menu-button .pool-account-menu-caret {
+.pool-account-menu-button .pool-account-menu-caret {
     display: none;
   }
 }
 
 @media (max-width: 640px) {
   .pool-table--cards th,
-  .pool-table--cards td {
+.pool-table--cards td {
     height: auto;
   }
 
   .pool-table--cards td[data-label='账号'],
-  .pool-table--cards td[data-label='API Key'] {
+.pool-table--cards td[data-label='API Key'] {
     min-height: auto;
     overflow: visible;
   }
@@ -6237,7 +6337,8 @@
   font-size: initial;
 }
 
-/* Calm, Apple-like chart treatment with compact legends and readable tooltips. */
+/* Calm,
+Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-chart-frame {
   width: 100%;
   min-width: 0;
@@ -6397,122 +6498,13 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
-/* Dashboard hierarchy */
-.pool-dashboard-command {
-  align-items: start;
-  gap: 16px;
-  margin-bottom: 18px;
-}
-
-.pool-dashboard-command__main,
-.pool-dashboard-command__side {
-  padding: 20px;
-  overflow: hidden;
-  border: 1px solid var(--pool-border-subtle);
-  border-radius: var(--pool-radius-panel);
-  background: var(--pool-bg-material);
-  box-shadow: var(--pool-shadow-panel);
-}
-
-.pool-dashboard-command__main {
-  gap: 16px;
-}
-
-.pool-dashboard-command__metric strong {
-  font-size: clamp(42px, 5vw, 58px);
-  font-variant-numeric: tabular-nums;
-  letter-spacing: -0.045em;
-}
-
-.pool-dashboard-command__subgrid {
-  gap: 0;
-  overflow: hidden;
-  border: 1px solid var(--pool-border-subtle);
-  border-radius: 12px;
-  background: var(--pool-border-subtle);
-}
-
-.pool-dashboard-command__subgrid div {
-  min-height: 72px;
-  padding: 11px 12px;
-  border: 0;
-  border-inline-start: 1px solid var(--pool-border-subtle);
-  border-radius: 0;
-  background: var(--pool-bg-surface-2);
-}
-
-.pool-dashboard-command__subgrid div:first-child {
-  border-inline-start: 0;
-}
-
-.pool-dashboard-command__side {
-  gap: 12px;
-}
-
-.pool-dashboard-command__side .pool-attention-list {
-  gap: 8px;
-  border: 0;
-}
-
-.pool-dashboard-command__side .pool-attention-list div {
-  padding: 11px 12px;
-  border: 1px solid var(--pool-border-subtle);
-  border-radius: 12px;
-  background: var(--pool-bg-surface-2);
-}
-
-.pool-dashboard-command__side .pool-attention-list .pool-attention-item--issue {
-  border-inline-start: 3px solid var(--pool-danger);
-  background: color-mix(in srgb, var(--pool-danger-soft) 42%, var(--pool-bg-surface-2));
-}
-
-.pool-dashboard-command__side .pool-attention-list .pool-attention-item--clear {
-  border-color: var(--pool-border-subtle);
-}
-
-.pool-dashboard-command__side .pool-attention-list p {
-  line-height: 1.5;
-}
-
-.pool-quick-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  flex-wrap: wrap;
-  margin-bottom: 18px;
-}
-
-.pool-quick-actions__label {
-  flex: 0 0 auto;
-  margin-right: 2px;
-  color: var(--pool-text-2);
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.pool-dashboard-command__main > .pool-quick-actions {
-  margin: 0;
-  padding-top: 0;
-}
-
 @media (min-width: 1101px) {
-  .pool-dashboard-command {
-    grid-template-columns: minmax(0, 1fr) minmax(340px, 390px);
-  }
-
-  .pool-dashboard-command__side .pool-attention-list {
-    grid-template-columns: minmax(0, 1fr);
-  }
 }
 
-.pool-dashboard-trend,
 .pool-dashboard-chart-grid {
   margin-bottom: 16px;
 }
 
-.pool-dashboard-trend,
 .pool-dashboard-chart-grid > .pool-chart-card {
   padding: 18px;
   border: 1px solid var(--pool-border-subtle);
@@ -6520,11 +6512,6 @@
   background: var(--pool-bg-material);
   box-shadow: var(--pool-shadow-panel);
 }
-
-.pool-dashboard-trend__canvas {
-  height: 280px;
-}
-
 .pool-dashboard-chart-grid {
   align-items: stretch;
 }
@@ -6535,14 +6522,6 @@
 }
 
 @media (min-width: 768px) and (max-width: 1100px) {
-  .pool-dashboard-command {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .pool-dashboard-command__side .pool-attention-list {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .pool-dashboard-chart-grid.pool-grid.cols-3 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -6556,94 +6535,30 @@
   .pool-account-quota--compact .pool-account-quota__head {
     max-width: 280px;
   }
+  /* Stacked, not a swipe carousel.
+     This row used to be `grid-auto-flow: column` with `grid-auto-columns: min(86vw, 360px)`
+     and `overflow-x: auto`. At 390px that leaves ~50px of the next card in frame, so the
+     dashboard rendered a column of legend dots and half-glyphs bleeding off the right edge —
+     text sliced vertically down its middle. No detector sees it: the clipping happens inside
+     a scroll container, so documentWidth still equals viewportWidth and noPageOverflow stays
+     true. It is only visible in a screenshot.
 
-  .pool-dashboard-command__subgrid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 0;
-  }
-
-  .pool-dashboard-command__main,
-  .pool-dashboard-command__side {
-    padding: 16px;
-    border-radius: 14px;
-  }
-
-  .pool-dashboard-command__subgrid div {
-    min-height: 68px;
-    border-inline-start: 1px solid var(--pool-border-subtle);
-  }
-
-  .pool-dashboard-command__subgrid div:nth-child(odd) {
-    border-inline-start: 0;
-  }
-
-  .pool-dashboard-command__subgrid div:nth-child(n + 3) {
-    border-top: 1px solid var(--pool-border-subtle);
-  }
-
-  .pool-quick-actions {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    width: 100%;
-    overflow: visible;
-    padding: 8px 0 0;
-    border-top: 1px solid var(--pool-border-subtle);
-  }
-
-  .pool-quick-actions__label {
-    grid-column: 1 / -1;
-  }
-
-  .pool-quick-actions .pool-button {
-    width: 100%;
-    min-width: 0;
-    min-height: var(--pool-hit-target);
-  }
-
-  .pool-dashboard-command__side .pool-attention-list {
-    grid-template-columns: none;
-    grid-auto-flow: column;
-    grid-auto-columns: min(82vw, 292px);
-    gap: 10px;
-    overflow-x: auto;
-    padding: 2px 2px 8px;
-    scroll-snap-type: x proximity;
-    scrollbar-width: thin;
-  }
-
-  .pool-dashboard-command__side .pool-attention-list > div {
-    min-height: 112px;
-    scroll-snap-align: start;
-  }
-
-  .pool-dashboard-command__side .pool-attention-list p {
-    display: -webkit-box;
-    overflow: hidden;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-  }
-
-  .pool-dashboard-trend__canvas,
-  .pool-dashboard-trend .pool-chart-frame {
-    height: 238px !important;
-  }
-
+     A carousel also buries two of three charts behind a gesture with no affordance pointing
+     at it, on the one surface whose job is showing all the numbers at once. Full width is
+     enough for every card here: a donut is ~270px of intrinsic SVG plus a wrapping legend,
+     and the ranked-bar cards are label/value rows that only read better wider. So the charts
+     stack and the page scrolls vertically, which is the axis the reader is already on. */
   .pool-dashboard-chart-grid.pool-grid.cols-3 {
-    grid-template-columns: none;
-    grid-auto-flow: column;
-    grid-auto-columns: min(86vw, 360px);
+    grid-template-columns: minmax(0, 1fr);
     gap: 12px;
-    overflow-x: auto;
-    padding: 2px 2px 10px;
-    scroll-snap-type: x proximity;
-    scrollbar-width: thin;
   }
 
+  /* No min-height. The 320px floor existed to keep carousel slides a uniform height; stacked,
+     it just pads short cards with a void — the model-token card showed ~180px of empty white
+     under its last bar. Each card is now as tall as its own content. */
   .pool-dashboard-chart-grid > .pool-chart-card {
-    min-height: 320px;
     padding: 16px;
     border-radius: 14px;
-    scroll-snap-align: start;
   }
 
   .pool-chart-card {
@@ -7133,17 +7048,17 @@
 
 @media (max-width: 1100px) and (min-width: 768px) {
   .pool-lifecycle-readiness__grid,
-  .pool-lifecycle-flow {
+.pool-lifecycle-flow {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .pool-lifecycle-readiness__grid > :nth-child(5),
-  .pool-lifecycle-flow > :nth-child(5) {
+.pool-lifecycle-flow > :nth-child(5) {
     border-inline-start: 0;
   }
 
   .pool-lifecycle-readiness__grid > :nth-child(n + 5),
-  .pool-lifecycle-flow > :nth-child(n + 5) {
+.pool-lifecycle-flow > :nth-child(n + 5) {
     border-top: 1px solid var(--pool-border);
   }
 
@@ -7163,7 +7078,7 @@
   }
 
   .pool-lifecycle-readiness__grid article,
-  .pool-lifecycle-readiness__grid li {
+.pool-lifecycle-readiness__grid li {
     border-inline-start: 0;
     border-top: 1px solid var(--pool-border);
     padding-inline: 0;
@@ -7347,7 +7262,10 @@
   border-inline-start: 1px solid var(--pool-border);
 }
 
-.pool-cf-mail .pool-section-heading {
+/* Names the block of content under it and carries that block's own controls. Used by any
+   page with more than one thing on it, so a setting can sit next to what it governs
+   instead of in a toolbar that reads as unrelated chrome. */
+.pool-section-heading {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -7355,11 +7273,11 @@
   margin-bottom: 18px;
 }
 
-.pool-cf-mail .pool-section-heading > div {
+.pool-section-heading > div {
   min-width: 0;
 }
 
-.pool-cf-mail .pool-section-heading span {
+.pool-section-heading span {
   display: block;
   margin-bottom: 5px;
   color: var(--pool-text-3);
@@ -7368,7 +7286,7 @@
   letter-spacing: .06em;
 }
 
-.pool-cf-mail .pool-section-heading h3 {
+.pool-section-heading h3 {
   margin: 0;
   color: var(--pool-text);
   font-size: 19px;
@@ -7377,10 +7295,31 @@
   line-height: 1.4;
 }
 
-.pool-cf-mail .pool-section-heading small {
+.pool-section-heading small {
   color: var(--pool-text-3);
   line-height: 1.45;
   text-align: end;
+}
+
+.pool-section-heading__controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.pool-section-heading__controls label {
+  color: var(--pool-text-2);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* The heading's own bottom margin is the gap; a table margin on top of it would
+   double the space between the name and the thing it names. */
+.pool-egress-pools {
+  margin-top: 20px;
 }
 
 .pool-cf-mail-form {
@@ -7463,10 +7402,11 @@
   gap: 8px;
 }
 
+/* Height is set inline by CopyCodeBlock from the content's own measured height — a
+   min-height here would clip anything taller than the number it happens to name. */
 .pool-copy-code textarea {
   box-sizing: border-box;
   width: 100%;
-  min-height: 104px;
   resize: vertical;
   padding: 13px 14px;
   border: 1px solid var(--pool-border-strong);
@@ -7474,7 +7414,11 @@
   background: var(--pool-bg-page);
   color: var(--pool-text);
   font: 12px/1.65 var(--pool-font-mono);
-  white-space: pre;
+  /* `pre` would put a long command behind a horizontal scrollbar the reader has to find
+     before they can see what they are about to copy. Wrapping keeps every line visible;
+     indentation still survives because leading whitespace is preserved. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .pool-copy-code .pool-button {
@@ -7663,7 +7607,7 @@
   }
 
   .pool-cf-mail-profile__flags,
-  .pool-cf-mail-profile__actions {
+.pool-cf-mail-profile__actions {
     grid-column: auto;
   }
 
@@ -7692,14 +7636,14 @@
   }
 
   .pool-cf-mail-setup,
-  .pool-cf-mail-guide,
-  .pool-cf-mail-profiles {
+.pool-cf-mail-guide,
+.pool-cf-mail-profiles {
     padding: 18px 0;
   }
 
   .pool-cf-mail-form,
-  .pool-cf-mail-switches,
-  .pool-cf-mail-profile {
+.pool-cf-mail-switches,
+.pool-cf-mail-profile {
     grid-template-columns: minmax(0, 1fr);
   }
 
@@ -7712,7 +7656,7 @@
   }
 
   .pool-cf-mail-profile__flags,
-  .pool-cf-mail-profile__actions {
+.pool-cf-mail-profile__actions {
     grid-column: 1;
   }
 
@@ -7725,10 +7669,25 @@
   }
 }
 
+/* Four columns at full width, which is what fixes the row rhythm.
+   At two columns the eight fields made four rows, and help text landed on only some of them, so
+   measured heights alternated 136 / 137 / 96 / 96px — the grid read as two tight pairs and then a
+   gap, and the field a caption belonged to was ambiguous. Four columns make two rows of four, and
+   each row now carries exactly one help line (slug in the first, 承接分组 in the second, present on
+   both branches of that conditional) so the two rows grow by the same amount and stay equal.
+
+   Used only by PublicChat, so widening it here is page-scoped despite the generic name. */
 .pool-form-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 14px 16px;
+  align-items: start;
+}
+
+@media (max-width: 1100px) {
+  .pool-form-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .pool-form-actions {
@@ -7738,8 +7697,24 @@
   margin-top: 18px;
 }
 
+/* Stacked, not side by side.
+   This was `minmax(340px, 0.95fr) minmax(430px, 1.05fr)` — form left, link list right. The two
+   panes have nothing like comparable heights: the form is ~900px of eight fields plus a textarea,
+   the list card was ~290px, so the right column ended less than a third of the way down and left
+   a tall void beside the rest of the form. Empty (the common first-run state) it was worse: a
+   single "暂无在线聊天链接" line holding open half the page.
+
+   Stacking puts the list first, where it answers the question the page is actually opened to
+   answer, and gives both panes the full width they want — the list rows lay out as summary +
+   five actions on one line instead of wrapping in a 430px column, and the form gets enough
+   width for four field columns. The list is omitted entirely when there are no links, so the
+   first-run view is just the form rather than the form plus an empty announcement. */
 .public-chat-layout {
-  grid-template-columns: minmax(340px, 0.95fr) minmax(430px, 1.05fr);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  margin-top: 16px;
+  align-items: start;
 }
 
 .public-chat-list {
@@ -7747,10 +7722,15 @@
   gap: 12px;
 }
 
+/* Summary left, actions right. Was a single column, which stacked five small buttons under the
+   text; at the full width this card now gets, that put a row of buttons against ~800px of empty
+   band. Side by side, the actions sit where the eye already is after reading the row, and the
+   card is one line shorter. Collapses back to stacked at 767px, where there is no room for both. */
 .public-chat-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px 18px;
   padding: 14px;
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-lg);
@@ -7786,15 +7766,15 @@
   align-content: flex-start;
 }
 
-@media (max-width: 1100px) {
-  .public-chat-layout {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-
 @media (max-width: 767px) {
   .pool-form-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Back to stacked: 390px cannot hold a summary and five buttons on one line. */
+  .public-chat-row {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
   }
 
   .public-chat-row__actions {

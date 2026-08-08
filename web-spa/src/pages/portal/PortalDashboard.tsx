@@ -1,12 +1,12 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import * as PoolUI from '../../components/pool/index.jsx';
 import { IconRefresh } from '../../components/pool/icons.jsx';
 import LoadErrorBannerBase from '../../components/LoadErrorBanner.jsx';
 import PageHeaderBase, { Panel as PanelBase } from '../../components/PageHeader.jsx';
 import ResourceTable from '../../components/ResourceTable.jsx';
 import MobileResourceCellBase from '../../components/MobileResourceCell.jsx';
-import StatCardBase from '../../components/StatCard.jsx';
-import { UsageAreaChart, DonutChart } from '../../components/LazyCharts.jsx';
+import * as MicroCharts from '../../components/MicroCharts.jsx';
+import { UsageAreaChart } from '../../components/LazyCharts.jsx';
 import { PALETTE, COLORS } from '../../lib/chartTheme.js';
 import { fmtTokens, fmtInt } from '../../lib/format.js';
 import { t } from '../../lib/i18n.js';
@@ -19,13 +19,19 @@ const PageHeader = PageHeaderBase as any;
 const Panel = PanelBase as any;
 const DataTable = ResourceTable as any;
 const MobileResourceCell = MobileResourceCellBase as any;
-const StatCard = StatCardBase as any;
 const AreaChart = UsageAreaChart as any;
-const ModelDonut = DonutChart as any;
+const { Sparkline, RankedBars, RadialGauge } = MicroCharts as any;
 const C = COLORS;
 
 export default function PortalDashboard() {
   const { data, loading, error, lastRefresh, reload } = usePortalUsageDashboardData();
+  const buckets = data?.buckets;
+
+  const trend = useMemo(() => {
+    const series = (buckets || []).map((bucket) => Number(bucket.total_tokens) || 0);
+    return { series, peak: series.length ? Math.max(...series) : 0 };
+  }, [buckets]);
+
   if (error && !lastRefresh && !loading) {
     return (
       <div>
@@ -44,15 +50,30 @@ export default function PortalDashboard() {
   }
 
   const rows = data?.rows || [];
-  const buckets = data?.buckets || [];
   const partialError = data?.error || error;
   const total = rows.reduce((sum, row) => sum + (row.total_tokens || 0), 0);
   const requests = rows.reduce((sum, row) => sum + (row.requests || 0), 0);
-  const modelDonut = rows.slice(0, 6).map((row, index) => ({
-    name: row.model_label || row.model,
-    value: row.total_tokens || 0,
-    color: PALETTE[index % PALETTE.length],
-  }));
+  const inputTokens = rows.reduce((sum, row) => sum + (row.prompt_tokens || 0), 0);
+  const outputTokens = rows.reduce((sum, row) => sum + (row.completion_tokens || 0), 0);
+  const cachedTokens = rows.reduce((sum, row) => sum + (row.cache_read_tokens || row.cached_tokens || 0), 0);
+  // "Served from cache" is the one efficiency number a portal user can act on:
+  // it is the share of their input that did not have to be reprocessed.
+  const cacheShare = inputTokens > 0 ? Math.max(0, Math.min(1, cachedTokens / inputTokens)) : null;
+  const avgTokensPerRequest = requests > 0 ? Math.round(total / requests) : 0;
+
+  const modelRows = rows
+    .slice()
+    .sort((a, b) => (b.total_tokens || 0) - (a.total_tokens || 0))
+    .slice(0, 6)
+    .map((row, index) => ({
+      key: row.model_key || row.model,
+      name: row.model_label || row.model,
+      value: row.total_tokens || 0,
+      color: PALETTE[index % PALETTE.length],
+      // Keep the meta to the one figure the table below does not lead with, so the
+      // two views complement each other instead of restating the same row twice.
+      meta: `${fmtInt(row.requests || 0)} ${t('portal_usage.requests')}`,
+    }));
 
   const columns: any[] = [
     { title: t('portal_usage.model'), dataIndex: 'model', render: (value: unknown, row: PortalUsageRow) => <b>{row.model_label || String(value || '')}</b> },
@@ -63,28 +84,70 @@ export default function PortalDashboard() {
   ];
 
   return (
-    <div>
+    <div className="pool-portal-page">
       <PageHeader title={t('portal_usage.title')} subtitle={t('portal_usage.subtitle')}
         actions={<Button icon={<IconRefresh />} onClick={reload} loading={loading}>{t('common.refresh')}</Button>} />
 
       <LoadErrorBanner error={partialError} onRetry={reload} title={partialError ? t('portal_usage.partial_failed') : undefined} />
 
-      <div className="pool-stat-grid" style={{ marginBottom: 18 }}>
-        <StatCard label={t('portal_usage.period')} value={t('portal_usage.last_7_days')} color={C.cyan} />
-        <StatCard label={t('portal_usage.total_tokens')} value={fmtTokens(total)} color={C.violet} />
-        <StatCard label={t('portal_usage.requests')} value={fmtInt(requests)} color={C.blue} />
-        <StatCard label={t('portal_usage.models_used')} value={fmtInt(rows.length)} color={C.green} />
-      </div>
+      <section className="pool-portal-hero">
+        <div className="pool-portal-hero__main">
+          <span className="pool-portal-hero__eyebrow">{t('portal_usage.last_7_days')}</span>
+          <div className="pool-portal-hero__figure">
+            <strong>{fmtTokens(total)}</strong>
+            <span>{t('portal_usage.total_tokens')}</span>
+          </div>
+          <dl className="pool-portal-hero__facts">
+            <div>
+              <dt>{t('portal_usage.requests')}</dt>
+              <dd>{fmtInt(requests)}</dd>
+            </div>
+            <div>
+              <dt>{t('portal_usage.models_used')}</dt>
+              <dd>{fmtInt(rows.length)}</dd>
+            </div>
+            <div>
+              <dt>{t('portal_usage.avg_per_request')}</dt>
+              <dd>{fmtTokens(avgTokensPerRequest)}</dd>
+            </div>
+          </dl>
+          {trend.series.length > 1 ? (
+            <div className="pool-portal-hero__spark">
+              <Sparkline values={trend.series} color={C.blue} height={54} ariaLabel={t('portal_usage.trend')} />
+            </div>
+          ) : null}
+        </div>
+        <div className="pool-portal-hero__aside">
+          {cacheShare !== null ? (
+            <RadialGauge
+              value={cacheShare}
+              size={148}
+              thickness={13}
+              color={C.green}
+              label={t('portal_usage.cache_saved_desc')}
+              caption={t('portal_usage.cache_saved')}
+            />
+          ) : (
+            <div className="pool-portal-hero__split">
+              <div><span>{t('portal_usage.input')}</span><b>{fmtTokens(inputTokens)}</b></div>
+              <div><span>{t('portal_usage.output')}</span><b>{fmtTokens(outputTokens)}</b></div>
+            </div>
+          )}
+        </div>
+      </section>
 
       {data?.timeseriesAvailable ? (
-        <div className="pool-chart-card" style={{ marginBottom: 18 }}>
-          <div className="head"><div className="t">{t('portal_usage.trend')}</div></div>
-          <div style={{ height: 260 }}><AreaChart buckets={buckets} height={260} /></div>
+        <div className="pool-chart-card pool-portal-trend">
+          <div className="head"><div><div className="t">{t('portal_usage.trend')}</div><div className="s">{t('portal_usage.trend_desc')}</div></div></div>
+          <div style={{ height: 260 }}><AreaChart buckets={data.buckets} height={260} ariaLabel={t('portal_usage.trend')} /></div>
         </div>
       ) : null}
 
-      <div className="pool-grid cols-2">
-        <div className="pool-chart-card"><div className="head"><div className="t">{t('portal_usage.model_share')}</div></div><ModelDonut data={modelDonut} unit="tokens" valueFormatter={fmtTokens} /></div>
+      <div className="pool-portal-breakdown">
+        <div className="pool-chart-card">
+          <div className="head"><div><div className="t">{t('portal_usage.model_share')}</div><div className="s">{t('portal_usage.model_share_desc')}</div></div></div>
+          <RankedBars rows={modelRows} valueFormatter={fmtTokens} emptyText={t('portal_usage.empty')} ariaLabel={t('portal_usage.model_share')} />
+        </div>
         <Panel title={t('portal_usage.by_model')}>
           <DataTable
             loading={loading}

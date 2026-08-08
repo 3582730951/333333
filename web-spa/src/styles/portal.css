@@ -1,0 +1,204 @@
+/* User portal surface.
+   The portal is deliberately a different instrument from the admin console:
+   the console optimises for density and scanning, the portal for calm reading.
+   Larger radii, more generous padding and a bigger type scale keep the two
+   halves of the product from feeling like the same screen with a different menu. */
+
+.pool-portal-page {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-5);
+}
+
+/* ---------- Hero summary ---------- */
+
+.pool-portal-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+  gap: var(--pool-space-6);
+  align-items: center;
+  padding: var(--pool-space-7);
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-portal);
+  background:
+    radial-gradient(120% 140% at 0% 0%, var(--pool-accent-soft), transparent 62%),
+    var(--pool-bg-surface);
+  box-shadow: var(--pool-shadow-panel);
+}
+
+.pool-portal-hero__main {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-4);
+}
+
+.pool-portal-hero__eyebrow {
+  color: var(--pool-text-3);
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: var(--pool-leading-tight);
+  text-transform: uppercase;
+}
+
+.pool-portal-hero__figure {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--pool-space-3);
+}
+
+.pool-portal-hero__figure strong {
+  color: var(--pool-text);
+  font-size: clamp(34px, 4.4vw, 46px);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.035em;
+  line-height: 1.05;
+}
+
+.pool-portal-hero__figure span {
+  color: var(--pool-text-2);
+  font-size: var(--pool-type-callout);
+  line-height: var(--pool-leading-tight);
+}
+
+.pool-portal-hero__facts {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: var(--pool-space-3) var(--pool-space-7);
+  margin: 0;
+}
+
+.pool-portal-hero__facts > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.pool-portal-hero__facts dt {
+  color: var(--pool-text-3);
+  font-size: var(--pool-type-caption);
+  line-height: var(--pool-leading-tight);
+}
+
+.pool-portal-hero__facts dd {
+  margin: 0;
+  color: var(--pool-text);
+  font-size: 19px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.018em;
+  line-height: var(--pool-leading-tight);
+}
+
+/* The hero trend sits on its own tinted plinth: without a surface behind it a
+   near-flat sparkline reads as a stray rule rather than a chart. */
+.pool-portal-hero__spark {
+  height: 62px;
+  min-width: 0;
+  margin-top: var(--pool-space-1);
+  padding: var(--pool-space-3) var(--pool-space-4);
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-surface-2);
+}
+
+.pool-portal-hero__aside {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+}
+
+.pool-portal-hero__split {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pool-space-4);
+  padding: var(--pool-space-4) var(--pool-space-6);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-surface-2);
+}
+
+.pool-portal-hero__split > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.pool-portal-hero__split span {
+  color: var(--pool-text-3);
+  font-size: var(--pool-type-caption);
+  line-height: var(--pool-leading-tight);
+}
+
+.pool-portal-hero__split b {
+  color: var(--pool-text);
+  font-size: 20px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  line-height: var(--pool-leading-tight);
+}
+
+/* ---------- Breakdown ---------- */
+
+/* Stacked rather than side-by-side: a five-column table needs the full content
+   width, and squeezing it into a half-width track clipped the trailing columns. */
+.pool-portal-breakdown {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--pool-space-4);
+  align-items: start;
+}
+
+/* Portal cards read a notch softer and roomier than console cards. */
+.pool-portal-page .pool-chart-card,
+.pool-portal-page .pool-panel {
+  padding: var(--pool-space-6);
+  border-radius: var(--pool-radius-portal);
+}
+
+.pool-portal-page .pool-chart-card .t,
+.pool-portal-page .pool-panel .pool-section-title {
+  font-size: var(--pool-type-callout);
+  letter-spacing: -0.012em;
+}
+
+@media (max-width: 1080px) {
+  .pool-portal-hero {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--pool-space-5);
+  }
+
+  .pool-portal-hero__aside {
+    justify-content: flex-start;
+  }
+
+  .pool-portal-breakdown {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 767px) {
+  .pool-portal-page {
+    gap: var(--pool-space-4);
+  }
+
+  .pool-portal-hero {
+    padding: var(--pool-space-5);
+  }
+
+  .pool-portal-hero__facts {
+    gap: var(--pool-space-3) var(--pool-space-5);
+  }
+
+  .pool-portal-page .pool-chart-card,
+  .pool-portal-page .pool-panel {
+    padding: var(--pool-space-4);
+  }
+}

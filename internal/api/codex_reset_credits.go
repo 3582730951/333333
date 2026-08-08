@@ -19,12 +19,16 @@ import (
 
 const (
 	codexResetCreditsLimiterType = "codex_reset_credits"
-	codexSevenDayLimiterType     = "7d_polled"
-	codexResetAuditAttempt       = "codex_reset_credit_attempt"
-	codexResetAuditSuccess       = "codex_reset_credit_success"
-	codexResetAuditFailure       = "codex_reset_credit_failure"
-	codexResetAuditSkip          = "codex_reset_credit_skip"
-	codexResetAuditUnknown       = "codex_reset_credit_unknown"
+	// Extra paid balance reported by /wham/usage `credits` + `spend_control`.
+	// Kept separate from the reset-credit counter: one is a money-like balance,
+	// the other is a count of rate-limit resets.
+	codexCreditsLimiterType  = "codex_credits"
+	codexSevenDayLimiterType = "7d_polled"
+	codexResetAuditAttempt   = "codex_reset_credit_attempt"
+	codexResetAuditSuccess   = "codex_reset_credit_success"
+	codexResetAuditFailure   = "codex_reset_credit_failure"
+	codexResetAuditSkip      = "codex_reset_credit_skip"
+	codexResetAuditUnknown   = "codex_reset_credit_unknown"
 )
 
 var (

@@ -3,6 +3,7 @@ import { Card, Form, Button, Toast, Typography, Avatar, Tabs, TabPane } from '..
 import { setToken, clearToken, get, login, registerUser } from '../api.js';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
+import { t } from '../lib/i18n.js';
 
 export default function Login({ onSuccess }) {
   const [mode, setMode] = useState('login'); // user tab: login | register
@@ -34,11 +35,11 @@ export default function Login({ onSuccess }) {
   });
 
   return (
-    <div className="pool-login-wrap">
+    <main id="main-content" tabIndex={-1} className="pool-login-wrap">
       <Card className="pool-card pool-login-card">
         <div className="pool-login-brand">
           <Avatar size="default" style={{ background: 'var(--pool-accent)' }}>P</Avatar>
-          <Typography.Title heading={3}>登录 Pool 控制台</Typography.Title>
+          <Typography.Title heading={1} tabIndex={-1}>{t('auth.login_title')}</Typography.Title>
           <Typography.Text type="tertiary" size="small">使用管理员凭据进入控制台。</Typography.Text>
         </div>
         <Tabs type="line" size="small">
@@ -80,6 +81,6 @@ export default function Login({ onSuccess }) {
           </TabPane>
         </Tabs>
       </Card>
-    </div>
+    </main>
   );
 }

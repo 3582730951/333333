@@ -1,7 +1,32 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 
 import EmptyState from './EmptyState.jsx';
 import { Button } from './Button.jsx';
+
+// A pane that scrolls horizontally must be reachable by keyboard, otherwise the
+// columns past the fold are only available to pointer users (axe:
+// scrollable-region-focusable). Tables become scrollable purely as a function of
+// column count and viewport, so the affordance is applied only while it is needed —
+// an always-on tab stop would add a focus target to every table on every page.
+//
+// `signature` keys the effect to the things that can change the table's intrinsic
+// width. Re-running on every render would rebuild the observer and force a synchronous
+// layout read on each sort, hover or selection change.
+function useScrollableRegion(ref, signature) {
+  const [scrollable, setScrollable] = useState(false);
+  useEffect(() => {
+    const element = ref.current;
+    if (!element) return undefined;
+    const measure = () => setScrollable(element.scrollWidth - element.clientWidth > 1);
+    measure();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    for (const child of element.children) observer.observe(child);
+    return () => observer.disconnect();
+  }, [ref, signature]);
+  return scrollable;
+}
 
 function cx(...parts) {
   return parts.filter(Boolean).join(' ');
@@ -16,10 +41,24 @@ function valueFor(row, column) {
   return undefined;
 }
 
+// Numbers read best right-aligned, so a column is aligned that way when its key names a
+// quantity. The words have to be matched as whole tokens: as bare substrings, "count" is
+// inside "account" and "rate" is inside "assignment_strategy", which right-aligned account
+// ids, account labels and strategy tags — text, in columns whose neighbours are all left.
+const NUMERIC_KEY_WORDS = new Set([
+  'token', 'tokens', 'total', 'count', 'rate', 'pct', 'percent', 'bytes', 'panic', 'pid',
+]);
+// CJK does not tokenise on separators, so these stay substring tests.
+const NUMERIC_KEY_CJK = /(请求|数|内存|磁盘|重启)/;
+
 function inferredAlign(column) {
   if (column.align) return column.align;
-  const key = String(column.key || column.dataIndex || column.title || '').toLowerCase();
-  if (/(token|tokens|请求|数|total|count|rate|pct|percent|bytes|内存|磁盘|重启|panic|pid)/.test(key)) return 'right';
+  const key = String(column.key || column.dataIndex || column.title || '');
+  if (NUMERIC_KEY_CJK.test(key)) return 'right';
+  // snake_case, kebab-case, dotted paths and camelCase all split into their own words.
+  // The camel boundary has to be found before the key is lowercased, or it is gone.
+  const tokens = key.split(/[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])/).map((part) => part.toLowerCase());
+  if (tokens.some((token) => NUMERIC_KEY_WORDS.has(token))) return 'right';
   return undefined;
 }
 
@@ -45,8 +84,12 @@ export function DataTable({
   style,
   scroll,
   onRow,
+  expandedRowRender,
+  'aria-label': ariaLabel,
   ...props
 }) {
+  const wrapperRef = useRef(null);
+  const [expandedKeys, setExpandedKeys] = useState(() => new Set());
   const rows = Array.isArray(dataSource) ? dataSource : [];
   const leafColumns = flattenColumns(columns);
   const defaultSort = leafColumns.find((column) => column.defaultSortOrder);
@@ -74,6 +117,11 @@ export function DataTable({
     '--pool-table-fit-width': scroll?.x ? `${scroll.x}px` : undefined,
     ...(style || {}),
   };
+  // Anything that can change how wide the table wants to be.
+  const scrollable = useScrollableRegion(
+    wrapperRef,
+    `${leafColumns.length}:${pageRows.length}:${loading ? 1 : 0}:${scroll?.x ?? ''}:${className || ''}`,
+  );
 
   const setPage = (next) => {
     const page = Math.min(pageCount, Math.max(1, next));
@@ -94,6 +142,7 @@ export function DataTable({
       <thead>
         <tr>
           {rowSelection ? <th style={{ width: 44 }} aria-label="选择" /> : null}
+          {expandedRowRender ? <th className="pool-table-expander-cell" style={{ width: 40 }} aria-label="展开" /> : null}
           {leafColumns.map((column) => {
             const key = column.key || column.dataIndex || column.title;
             const active = sortState?.key === key ? sortState.order : '';
@@ -126,9 +175,49 @@ export function DataTable({
           const rowProps = onRow?.(row, index) || {};
           const checked = selected.has(key);
           const checkboxProps = rowSelection?.getCheckboxProps?.(row) || {};
+          const expandable = typeof expandedRowRender === 'function' ? expandedRowRender(row, index) : null;
+          const isExpanded = expandedKeys.has(String(key));
+          const bodyCells = (
+            <>
+              {rowSelection ? (
+                <td>
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    disabled={checkboxProps.disabled}
+                    onChange={(event) => toggleRow(key, event.target.checked)}
+                    aria-label={checkboxProps['aria-label'] || `选择第 ${index + 1} 行`}
+                  />
+                </td>
+              ) : null}
+              {expandedRowRender ? (
+                <td className="pool-table-expander-cell">
+                  {expandable ? (
+                    <button
+                      type="button"
+                      className="pool-table-expander"
+                      aria-expanded={isExpanded}
+                      aria-label={isExpanded ? '收起其余字段' : '展开其余字段'}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setExpandedKeys((current) => {
+                          const next = new Set(current);
+                          if (next.has(String(key))) next.delete(String(key));
+                          else next.add(String(key));
+                          return next;
+                        });
+                      }}
+                    >
+                      <span aria-hidden="true">{isExpanded ? '⌄' : '›'}</span>
+                    </button>
+                  ) : null}
+                </td>
+              ) : null}
+            </>
+          );
           return (
+            <React.Fragment key={String(key)}>
             <tr
-              key={String(key)}
               aria-selected={checked}
               tabIndex={rowProps.onClick ? 0 : undefined}
               onClick={(event) => {
@@ -142,17 +231,7 @@ export function DataTable({
                 }
               }}
             >
-              {rowSelection ? (
-                <td>
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    disabled={checkboxProps.disabled}
-                    onChange={(event) => toggleRow(key, event.target.checked)}
-                    aria-label={checkboxProps['aria-label'] || `选择第 ${index + 1} 行`}
-                  />
-                </td>
-              ) : null}
+              {bodyCells}
               {leafColumns.map((column) => {
                 const keyName = column.key || column.dataIndex || column.title;
                 const value = valueFor(row, column);
@@ -160,6 +239,12 @@ export function DataTable({
                 return <td key={String(keyName)} data-label={label} data-align={inferredAlign(column)}>{column.render ? column.render(value, row, index) : value}</td>;
               })}
             </tr>
+            {expandable && isExpanded ? (
+              <tr className="pool-table-expanded-row">
+                <td colSpan={leafColumns.length + (rowSelection ? 1 : 0) + 1}>{expandable}</td>
+              </tr>
+            ) : null}
+            </React.Fragment>
           );
         })}
       </tbody>
@@ -169,7 +254,14 @@ export function DataTable({
   );
 
   return (
-    <div className={cx('pool-table-wrapper', className)} style={tableStyle}>
+    <div
+      ref={wrapperRef}
+      className={cx('pool-table-wrapper', className)}
+      style={tableStyle}
+      tabIndex={scrollable ? 0 : undefined}
+      role={scrollable ? 'group' : undefined}
+      aria-label={scrollable ? (ariaLabel || '可横向滚动的数据表') : undefined}
+    >
       {loading && !rows.length ? <div className="pool-table-empty"><span className="pool-spinner" role="status" aria-label="正在加载数据" /></div> : content}
       {pagination && pagination !== false && total > pageSize ? (
         <div className="pool-pagination">

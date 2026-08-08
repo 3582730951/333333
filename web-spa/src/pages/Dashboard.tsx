@@ -1,14 +1,15 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import * as PoolUI from '../components/pool/index.jsx';
 import { IconRefresh, IconPlus, IconUser, IconKey, IconSetting, IconLineChartStroked } from '../components/pool/icons.jsx';
 import LoadErrorBannerBase from '../components/LoadErrorBanner.jsx';
 import PageHeaderBase from '../components/PageHeader.jsx';
 import SystemHealthSummaryBase from '../components/SystemHealthSummary.jsx';
+import * as MicroCharts from '../components/MicroCharts.jsx';
 import useVisibleInterval, { usePageVisible } from '../hooks/useVisibleInterval.js';
 import { UsageAreaChart, UsageModelAreaChart, DonutChart, GroupedBar, CacheRateBars } from '../components/LazyCharts.jsx';
 import { COLORS, modelColor } from '../lib/chartTheme.js';
-import { fmtTokens, fmtInt } from '../lib/format.js';
+import { fmtTokens, fmtInt, fmtTime } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
 import {
   DASHBOARD_REFRESH_MS, invalidateDashboardUsageSnapshot, useDashboardCoreData, useDashboardSecondaryData,
@@ -23,6 +24,7 @@ const ModelAreaChart = UsageModelAreaChart as any;
 const Donut = DonutChart as any;
 const BarChart = GroupedBar as any;
 const CacheBars = CacheRateBars as any;
+const { Sparkline, RadialGauge, RankedBars, HeatStrip, StackedMeter, DeltaBadge } = MicroCharts as any;
 const C = COLORS;
 
 function newestDate(...values: Array<Date | null>) {
@@ -47,6 +49,55 @@ export function compactIdentity(value: unknown, head = 8, tail = 6) {
   const text = String(value || t('common.unknown'));
   if (text.length <= head + tail + 1) return text;
   return `${text.slice(0, head)}…${text.slice(-tail)}`;
+}
+
+// Momentum of a series: the second half of the window against the first half.
+// Returns null when there is not enough signal to make the comparison honest.
+export function halfWindowDelta(values: number[]): number | null {
+  const series = (values || []).filter((value) => Number.isFinite(value));
+  if (series.length < 4) return null;
+  const middle = Math.floor(series.length / 2);
+  const first = series.slice(0, middle).reduce((sum, value) => sum + value, 0);
+  const second = series.slice(middle).reduce((sum, value) => sum + value, 0);
+  if (first <= 0) return second > 0 ? 1 : null;
+  return (second - first) / first;
+}
+
+function ratioOrNull(numerator: unknown, denominator: unknown): number | null {
+  const top = Number(numerator);
+  const bottom = Number(denominator);
+  if (!Number.isFinite(top) || !Number.isFinite(bottom) || bottom <= 0) return null;
+  return Math.max(0, Math.min(1, top / bottom));
+}
+
+function KpiTile({
+  label, value, delta, series, color, caption, invertDelta,
+}: {
+  label: string;
+  value: React.ReactNode;
+  delta?: number | null;
+  series?: number[];
+  color: string;
+  caption?: string;
+  invertDelta?: boolean;
+}) {
+  return (
+    <article className="pool-kpi">
+      <div className="pool-kpi__head">
+        <span className="pool-kpi__label">{label}</span>
+        {delta !== undefined ? <DeltaBadge value={delta} invert={invertDelta} /> : null}
+      </div>
+      <div className="pool-kpi__value">{value}</div>
+      <div className="pool-kpi__foot">
+        {caption ? <span className="pool-kpi__caption">{caption}</span> : <span className="pool-kpi__caption" />}
+        {series && series.length > 1 ? (
+          <div className="pool-kpi__spark">
+            <Sparkline values={series} color={color} height={30} ariaLabel={t('dashboard.trend_sparkline').replace('{label}', label)} />
+          </div>
+        ) : null}
+      </div>
+    </article>
+  );
 }
 
 export default function Dashboard() {
@@ -74,6 +125,22 @@ export default function Dashboard() {
     if (!loading && lastRefresh) setCountdown(DASHBOARD_REFRESH_MS / 1000);
   }, [loading, lastRefresh]);
 
+  const buckets = core?.buckets || [];
+  const derived = useMemo(() => {
+    const requestSeries = buckets.map((bucket) => Number(bucket.requests) || 0);
+    const tokenSeries = buckets.map((bucket) => Number(bucket.total_tokens) || 0);
+    const cachedSeries = buckets.map((bucket) => Number(bucket.cached_tokens) || 0);
+    return {
+      requestSeries,
+      tokenSeries,
+      cachedSeries,
+      requests: requestSeries.reduce((sum, value) => sum + value, 0),
+      tokens: tokenSeries.reduce((sum, value) => sum + value, 0),
+      requestDelta: halfWindowDelta(requestSeries),
+      tokenDelta: halfWindowDelta(tokenSeries),
+    };
+  }, [buckets]);
+
   if (coreQuery.error && !coreQuery.lastRefresh && !coreQuery.loading) {
     return (
       <div>
@@ -93,17 +160,17 @@ export default function Dashboard() {
 
   const summary = core?.accountSummary;
   const active = summary?.active || 0;
+  const total = summary?.total || 0;
   const quarantined = summary?.quarantined || 0;
   const cooling = summary?.cooling || 0;
   const recheck = summary?.recheck || 0;
   const codex = summary?.codex || 0;
   const claude = summary?.claude || 0;
   const other = summary?.other || 0;
-  const buckets = core?.buckets || [];
   const providerModelSeries = core?.modelSeries || [];
   const providerModelDescriptors = core?.series || [];
-  const tokens = buckets.reduce((sum, bucket) => sum + (bucket.total_tokens || 0), 0);
-  const requests = buckets.reduce((sum, bucket) => sum + (bucket.requests || 0), 0);
+  const { requests, tokens, requestSeries, tokenSeries, requestDelta, tokenDelta } = derived;
+
   const cacheByModel = secondary?.cache?.by_provider_model || secondary?.cache?.by_model || [];
   const officialCacheByModel = cacheByModel.filter((row) => String(row.provider || '').toLowerCase() !== 'kiro');
   const cacheByProvider = secondary?.cache?.by_provider || [];
@@ -125,6 +192,20 @@ export default function Dashboard() {
   const registrationRate = secondary?.registration?.totals?.success_rate || 0;
   const byModel = secondary?.byModel || [];
 
+  // Cache efficiency reads three different ways; showing them side by side stops a
+  // single headline percentage from hiding a bad write ratio.
+  const requestHitRate = cacheSummary.request_hit_rate ?? ratioOrNull(cacheSummary.hit_requests, cacheSummary.real_requests ?? cacheSummary.requests);
+  const tokenHitRate = cacheSummary.real_token_hit_rate ?? cacheSummary.token_hit_rate ?? ratioOrNull(cacheRead, cacheInput);
+  const eligibleHitRate = cacheSummary.eligible_cache_hit_rate
+    ?? ratioOrNull(cacheSummary.cache_read_tokens, Number(cacheSummary.cache_read_tokens || 0) + Number(cacheSummary.cache_creation_tokens || 0));
+  const cacheSegments = [
+    { key: 'read', name: t('dashboard.cache_read'), value: Number(cacheSummary.cache_read_tokens || 0), color: C.green },
+    { key: 'write', name: t('dashboard.cache_write'), value: Number(cacheSummary.cache_creation_tokens || 0), color: C.violet },
+    { key: 'miss', name: t('dashboard.cache_miss'), value: Number(cacheSummary.cache_miss_tokens || 0), color: C.grey },
+  ];
+  const hasCacheComposition = cacheSegments.some((segment) => segment.value > 0);
+  const hasCacheGauges = [requestHitRate, tokenHitRate, eligibleHitRate].some((rate) => rate !== null && rate !== undefined);
+
   const statusDonut = [
     { name: t('dashboard.active'), value: active, color: C.green },
     { name: t('dashboard.cooling'), value: cooling, color: C.cyan },
@@ -139,17 +220,15 @@ export default function Dashboard() {
   const registrationDays = (secondary?.registration?.by_day || []).map((row) => ({
     x: (row.date || '').slice(5), success: row.succeeded || 0, failed: row.failed || 0,
   }));
-  const modelTokenDonut = byModel.slice(0, 6).map((row) => ({
+  const modelTokenRows = byModel.slice(0, 6).map((row) => ({
+    key: String(row.dimension_key || row.model_key || row.model || ''),
     name: row.display_label || row.series_label || `${row.provider_name || row.provider_id || ''}${row.provider_name || row.provider_id ? ' · ' : ''}${row.model_label || row.model || `(${t('common.unknown')})`}`,
     value: row.total_tokens || 0,
     color: modelColor(row.dimension_key || row.model_key || row.model),
+    meta: row.requests ? `${fmtInt(row.requests)} ${t('dashboard.requests_unit')}` : undefined,
   }));
-  const topAccounts = (secondary?.cache?.by_account || []).slice(0, 8).map((row) => ({
-    x: compactIdentity(row.account_id),
-    fullLabel: String(row.account_id || t('common.unknown')),
-    input: Number(row.actual_prompt_tokens || row.prompt_tokens || 0),
-    output: Number(row.actual_completion_tokens || 0),
-  }));
+  // Local formatter: the compact B/M/k scale belongs to this view only and must not
+  // be achieved by reaching into the shared fmtTokens helper.
   const modelTokenFormatter = (value: unknown) => {
     const number = Number(value) || 0;
     if (number >= 1e9) return `${(number / 1e9).toFixed(2)}B`;
@@ -157,14 +236,89 @@ export default function Dashboard() {
     if (number >= 1e3) return `${(number / 1e3).toFixed(1)}k`;
     return `${number}`;
   };
+  const topAccountRows = (secondary?.cache?.by_account || []).slice(0, 6).map((row) => {
+    const input = Number(row.actual_prompt_tokens || row.prompt_tokens || 0);
+    const output = Number(row.actual_completion_tokens || row.completion_tokens || 0);
+    return {
+      key: String(row.account_id || ''),
+      name: compactIdentity(row.account_id),
+      value: input + output,
+      color: modelColor(row.account_id),
+      meta: `${t('usage.input')} ${fmtTokens(input)} · ${t('usage.output')} ${fmtTokens(output)}`,
+    };
+  });
+
+  // Hourly request intensity — a band that reads at a glance next to the
+  // axis-heavy trend chart above it.
+  const activityCells = buckets.map((bucket) => ({
+    key: String(bucket.bucket),
+    value: Number(bucket.requests) || 0,
+    label: fmtTime(bucket.bucket),
+    valueText: `${fmtInt(bucket.requests || 0)} ${t('dashboard.requests_unit')}`,
+  }));
+  const peakBucket = buckets.reduce<{ requests: number; bucket: number } | null>((best, bucket) => {
+    const value = Number(bucket.requests) || 0;
+    return !best || value > best.requests ? { requests: value, bucket: bucket.bucket } : best;
+  }, null);
+
+  const system = secondary?.system;
+  const hostMeters = system?.supported ? [
+    { key: 'cpu', label: t('dashboard.cpu'), pct: Number(system.cpu?.usage_pct ?? NaN), color: C.blue },
+    { key: 'mem', label: t('dashboard.memory'), pct: Number(system.mem?.used_pct ?? NaN), color: C.violet },
+    { key: 'disk', label: t('dashboard.disk'), pct: Number(system.disk?.used_pct ?? NaN), color: C.amber },
+  ].filter((meter) => Number.isFinite(meter.pct)) : [];
+
   const partialError = core?.error || secondary?.error || secondaryQuery.error;
   const hasStatusDistribution = statusDonut.some((item) => item.value > 0);
   const hasProviderDistribution = providerDonut.some((item) => item.value > 0);
   const hasRegistrationTrend = secondary?.registrationAvailable && registrationDays.some((item) => item.success || item.failed);
-  const hasModelTokens = secondary?.modelAvailable && modelTokenDonut.some((item) => item.value > 0);
+  const hasModelTokens = secondary?.modelAvailable && modelTokenRows.some((item) => item.value > 0);
+
+  const attentionItems = [
+    {
+      key: 'quarantined',
+      tone: quarantined ? 'issue' : 'clear',
+      label: t('dashboard.quarantined_accounts'),
+      value: fmtInt(quarantined),
+      description: quarantined ? t('dashboard.quarantined_issue') : t('dashboard.quarantined_clear'),
+      action: quarantined ? { label: t('dashboard.view_accounts'), to: '/accounts' } : null,
+    },
+    {
+      key: 'recheck',
+      tone: recheck ? 'issue' : 'clear',
+      label: t('dashboard.recheck'),
+      value: fmtInt(recheck),
+      description: recheck ? t('dashboard.recheck_issue') : t('dashboard.recheck_clear'),
+      action: null,
+    },
+    {
+      key: 'cooling',
+      tone: cooling ? 'warn' : 'clear',
+      label: t('dashboard.cooling'),
+      value: fmtInt(cooling),
+      description: cooling ? t('dashboard.cooling_issue') : t('dashboard.cooling_clear'),
+      action: null,
+    },
+    {
+      key: 'coverage',
+      tone: 'neutral',
+      label: t('dashboard.model_coverage'),
+      value: secondary?.modelAvailable ? fmtInt(byModel.length) : '—',
+      description: t('dashboard.model_coverage_desc'),
+      action: null,
+    },
+    {
+      key: 'completeness',
+      tone: 'neutral',
+      label: t('dashboard.cache_completeness'),
+      value: secondary?.cacheAvailable ? cacheCompleteness : '—',
+      description: kiroCache?.cache_reporting_state === 'unreported' ? t('dashboard.kiro_cache_unreported') : t('dashboard.cache_completeness_desc'),
+      action: null,
+    },
+  ];
 
   return (
-    <div>
+    <div className="pool-dashboard">
       <PageHeader title={t('dashboard.title')} subtitle={t('dashboard.subtitle')}
         actions={<>
           <Button icon={<IconRefresh />} onClick={reload} loading={loading}>{t('common.refresh')}</Button>
@@ -175,68 +329,139 @@ export default function Dashboard() {
 
       <LoadErrorBanner error={partialError} onRetry={reload} title={partialError ? t('dashboard.partial_failed') : undefined} />
 
-      <section className="pool-dashboard-command">
-        <div className="pool-dashboard-command__main">
-          <div className="pool-dashboard-command__eyebrow">
-            {healthTag(Boolean(core?.healthAvailable), core?.health?.ok)}
-            <span>{lastRefreshText(lastRefresh)}</span>
-          </div>
-          <div className="pool-dashboard-command__metric">
-            <strong>{fmtInt(active)}</strong>
-            <span>{t('dashboard.schedulable_accounts')}</span>
-          </div>
-          <div className="pool-dashboard-command__subgrid">
-            <div><span>{t('dashboard.requests_24h')}</span><b>{core?.timeseriesAvailable ? fmtInt(requests) : '—'}</b></div>
-            <div><span>{t('dashboard.tokens_24h')}</span><b>{core?.timeseriesAvailable ? fmtTokens(tokens) : '—'}</b></div>
-            <div><span>{t('dashboard.cache_hit')}</span><b>{secondary?.cacheAvailable ? `${Math.round(cacheHitRate * 100)}%` : '—'}</b></div>
-            <div><span>{t('dashboard.registration_rate')}</span><b>{secondary?.registrationAvailable ? `${Math.round(registrationRate * 100)}%` : '—'}</b></div>
-          </div>
-          <div className="pool-quick-actions">
-            <span className="pool-quick-actions__label">{t('dashboard.quick_actions')}</span>
-            <Button icon={<IconPlus />} type="primary" onClick={() => navigate('/accounts?action=import')}>{t('dashboard.import_account')}</Button>
-            <Button icon={<IconUser />} onClick={() => navigate('/accounts')}>{t('dashboard.account_management')}</Button>
-            <Button icon={<IconKey />} onClick={() => navigate('/keys')}>API Keys</Button>
-            <Button icon={<IconLineChartStroked />} onClick={() => navigate('/usage')}>{t('dashboard.usage')}</Button>
-            <Button icon={<IconSetting />} onClick={() => navigate('/settings-v2')}>{t('dashboard.system_settings')}</Button>
-          </div>
+      <div className="pool-dashboard-statusbar">
+        <div className="pool-dashboard-statusbar__health">
+          {healthTag(Boolean(core?.healthAvailable), core?.health?.ok)}
+          <span>{lastRefreshText(lastRefresh)}</span>
         </div>
-        <div className="pool-dashboard-command__side">
-          <div className="pool-section-title">{t('dashboard.attention')}</div>
-          <div className="pool-attention-list">
-            <div className={quarantined ? 'pool-attention-item--issue' : 'pool-attention-item--clear'}>
-              <span>{t('dashboard.quarantined_accounts')}</span><b className={quarantined ? 'pool-danger-text' : ''}>{fmtInt(quarantined)}</b>
-              <p>{quarantined ? t('dashboard.quarantined_issue') : t('dashboard.quarantined_clear')}</p>
-              {quarantined ? <Button size="small" theme="borderless" onClick={() => navigate('/accounts')}>{t('dashboard.view_accounts')}</Button> : null}
-            </div>
-            <div className={recheck ? 'pool-attention-item--issue' : 'pool-attention-item--clear'}>
-              <span>{t('dashboard.recheck')}</span><b className={recheck ? 'pool-danger-text' : ''}>{fmtInt(recheck)}</b>
-              <p>{recheck ? t('dashboard.recheck_issue') : t('dashboard.recheck_clear')}</p>
-            </div>
-            <div className={cooling ? 'pool-attention-item--issue' : 'pool-attention-item--clear'}>
-              <span>{t('dashboard.cooling')}</span><b>{fmtInt(cooling)}</b>
-              <p>{cooling ? t('dashboard.cooling_issue') : t('dashboard.cooling_clear')}</p>
-            </div>
-            <div className="pool-attention-item--neutral">
-              <span>{t('dashboard.model_coverage')}</span><b>{secondary?.modelAvailable ? fmtInt(byModel.length) : '—'}</b>
-              <p>{t('dashboard.model_coverage_desc')}</p>
-            </div>
-            <div className="pool-attention-item--neutral">
-              <span>{t('dashboard.cache_completeness')}</span><b>{secondary?.cacheAvailable ? cacheCompleteness : '—'}</b>
-              <p>{kiroCache?.cache_reporting_state === 'unreported' ? t('dashboard.kiro_cache_unreported') : t('dashboard.cache_completeness_desc')}</p>
-            </div>
-          </div>
+        <div className="pool-dashboard-statusbar__actions">
+          <Button size="small" icon={<IconPlus />} type="primary" onClick={() => navigate('/accounts?action=import')}>{t('dashboard.import_account')}</Button>
+          <Button size="small" icon={<IconUser />} onClick={() => navigate('/accounts')}>{t('dashboard.account_management')}</Button>
+          <Button size="small" icon={<IconKey />} onClick={() => navigate('/keys')}>API Keys</Button>
+          <Button size="small" icon={<IconLineChartStroked />} onClick={() => navigate('/usage')}>{t('dashboard.usage')}</Button>
+          <Button size="small" icon={<IconSetting />} onClick={() => navigate('/settings-v2')}>{t('dashboard.system_settings')}</Button>
         </div>
+      </div>
+
+      <section className="pool-kpi-strip" aria-label={t('dashboard.key_metrics')}>
+        <KpiTile
+          label={t('dashboard.schedulable_accounts')}
+          value={fmtInt(active)}
+          color={C.green}
+          caption={total ? t('dashboard.of_total').replace('{count}', fmtInt(total)) : undefined}
+        />
+        <KpiTile
+          label={t('dashboard.requests_24h')}
+          value={core?.timeseriesAvailable ? fmtInt(requests) : '—'}
+          delta={core?.timeseriesAvailable ? requestDelta : undefined}
+          series={requestSeries}
+          color={C.blue}
+          caption={t('dashboard.vs_first_half')}
+        />
+        <KpiTile
+          label={t('dashboard.tokens_24h')}
+          value={core?.timeseriesAvailable ? fmtTokens(tokens) : '—'}
+          delta={core?.timeseriesAvailable ? tokenDelta : undefined}
+          series={tokenSeries}
+          color={C.violet}
+          caption={t('dashboard.vs_first_half')}
+        />
+        <KpiTile
+          label={t('dashboard.cache_hit')}
+          value={secondary?.cacheAvailable ? `${Math.round(cacheHitRate * 100)}%` : '—'}
+          color={C.cyan}
+          caption={secondary?.cacheAvailable ? t('dashboard.cache_read_of_input') : undefined}
+        />
+        <KpiTile
+          label={t('dashboard.registration_rate')}
+          value={secondary?.registrationAvailable ? `${Math.round(registrationRate * 100)}%` : '—'}
+          color={C.amber}
+          caption={secondary?.registrationAvailable && secondary?.registration?.totals
+            ? t('dashboard.registration_counts')
+              .replace('{ok}', fmtInt(secondary.registration.totals.succeeded || 0))
+              .replace('{fail}', fmtInt(secondary.registration.totals.failed || 0))
+            : undefined}
+        />
       </section>
 
-      {core?.timeseriesAvailable ? (
-        <div className="pool-chart-card pool-dashboard-trend">
-          <div className="head"><div><div className="t">{t('dashboard.provider_model_trend')}</div><div className="s">{t('dashboard.provider_model_trend_desc')}</div></div></div>
-          <div className="pool-dashboard-trend__canvas">
-            {providerModelSeries.length && providerModelDescriptors.length
-              ? <ModelAreaChart modelSeries={providerModelSeries} series={providerModelDescriptors} height={280} ariaLabel={t('dashboard.provider_model_trend')} />
-              : <AreaChart buckets={buckets} height={280} ariaLabel={t('dashboard.provider_model_trend')} />}
+      <section className="pool-ops-split">
+        {core?.timeseriesAvailable ? (
+          <div className="pool-chart-card pool-ops-split__trend">
+            <div className="head"><div><div className="t">{t('dashboard.provider_model_trend')}</div><div className="s">{t('dashboard.provider_model_trend_desc')}</div></div></div>
+            <div className="pool-ops-split__canvas">
+              {providerModelSeries.length && providerModelDescriptors.length
+                ? <ModelAreaChart modelSeries={providerModelSeries} series={providerModelDescriptors} height="100%" ariaLabel={t('dashboard.provider_model_trend')} />
+                : <AreaChart buckets={buckets} height="100%" ariaLabel={t('dashboard.provider_model_trend')} />}
+            </div>
+            {activityCells.length > 1 ? (
+              <div className="pool-ops-split__activity">
+                <div className="pool-ops-split__activity-label">{t('dashboard.activity_24h')}</div>
+                <HeatStrip
+                  cells={activityCells}
+                  color={C.blue}
+                  ariaLabel={t('dashboard.activity_desc')}
+                  footer={(
+                    <>
+                      <span>{activityCells[0]?.label}</span>
+                      {peakBucket ? <span>{t('dashboard.peak_hour').replace('{value}', `${fmtTime(peakBucket.bucket)} · ${fmtInt(peakBucket.requests)}`)}</span> : null}
+                      <span>{activityCells[activityCells.length - 1]?.label}</span>
+                    </>
+                  )}
+                />
+              </div>
+            ) : null}
           </div>
-        </div>
+        ) : null}
+
+        <aside className="pool-card pool-attention-rail" aria-label={t('dashboard.attention')}>
+          <div className="pool-section-title">{t('dashboard.attention')}</div>
+          <ul className="pool-attention-rail__list">
+            {attentionItems.map((item) => (
+              <li key={item.key} className={`pool-attention-card pool-attention-card--${item.tone}`}>
+                <div className="pool-attention-card__head">
+                  <span className="pool-attention-card__label">{item.label}</span>
+                  <b className="pool-attention-card__value">{item.value}</b>
+                </div>
+                <p className="pool-attention-card__desc">{item.description}</p>
+                {item.action ? (
+                  <Button size="small" theme="borderless" onClick={() => navigate(item.action!.to)}>{item.action.label}</Button>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </aside>
+      </section>
+
+      {secondary?.cacheAvailable && (hasCacheGauges || hasCacheComposition || officialCacheByModel.length) ? (
+        <section className="pool-chart-card pool-cache-panel">
+          <div className="head"><div><div className="t">{t('dashboard.cache_efficiency')}</div><div className="s">{t('dashboard.cache_efficiency_desc')}</div></div></div>
+          <div className="pool-cache-panel__body">
+            {hasCacheGauges ? (
+              <div className="pool-cache-panel__gauges">
+                {/* No caption: each one read as a truncation of its own label — 请求 inside
+                    请求命中率 — so every gauge said its subject twice, once in 12px inside the
+                    ring and once underneath it. The label alone names the metric. */}
+                <RadialGauge value={requestHitRate ?? 0} color={C.blue} label={t('dashboard.request_hit_rate')} valueText={requestHitRate == null ? '—' : undefined} />
+                <RadialGauge value={tokenHitRate ?? 0} color={C.green} label={t('dashboard.token_hit_rate')} valueText={tokenHitRate == null ? '—' : undefined} />
+                <RadialGauge value={eligibleHitRate ?? 0} color={C.violet} label={t('dashboard.eligible_hit_rate')} valueText={eligibleHitRate == null ? '—' : undefined} />
+              </div>
+            ) : null}
+            <div className="pool-cache-panel__detail">
+              {hasCacheComposition ? (
+                <div className="pool-cache-panel__composition">
+                  <div className="pool-subsection-title">{t('dashboard.cache_composition')}</div>
+                  <StackedMeter segments={cacheSegments} valueFormatter={fmtTokens} ariaLabel={t('dashboard.cache_composition')} />
+                </div>
+              ) : null}
+              {officialCacheByModel.length ? (
+                <div className="pool-cache-panel__models">
+                  <div className="pool-subsection-title">{t('dashboard.model_cache_rate')}</div>
+                  <CacheBars data={officialCacheByModel} />
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </section>
       ) : null}
 
       {(hasStatusDistribution || hasProviderDistribution || hasRegistrationTrend) ? (
@@ -249,22 +474,28 @@ export default function Dashboard() {
         </div>
       ) : null}
 
-      {(officialCacheByModel.length || hasModelTokens || topAccounts.length) ? (
+      {(hasModelTokens || topAccountRows.length || hostMeters.length) ? (
         <div className="pool-grid cols-3 pool-dashboard-chart-grid">
-          {secondary?.cacheAvailable && officialCacheByModel.length ? <div className="pool-chart-card">
-            <div className="head"><div><div className="t">{t('dashboard.model_cache_rate')}</div><div className="s">{t('dashboard.model_cache_desc')}</div></div></div>
-            <div style={{ paddingTop: 6 }}><CacheBars data={officialCacheByModel} /></div>
-          </div> : null}
-          {hasModelTokens ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.model_token_share')}</div></div><Donut data={modelTokenDonut} unit="Token" valueFormatter={modelTokenFormatter} ariaLabel={t('dashboard.model_token_share')} /></div> : null}
-          {topAccounts.length ? (
+          {hasModelTokens ? (
+            <div className="pool-chart-card">
+              <div className="head"><div><div className="t">{t('dashboard.model_token_share')}</div><div className="s">{t('dashboard.model_token_share_desc')}</div></div></div>
+              <RankedBars rows={modelTokenRows} valueFormatter={modelTokenFormatter} ariaLabel={t('dashboard.model_token_share')} />
+            </div>
+          ) : null}
+          {topAccountRows.length ? (
             <div className="pool-chart-card">
               <div className="head"><div><div className="t">{t('dashboard.top_accounts')}</div><div className="s">{t('dashboard.top_accounts_desc')}</div></div></div>
-              <BarChart
-                ariaLabel={t('dashboard.top_accounts')}
-                data={topAccounts}
-                series={[{ key: 'input', name: t('usage.input'), color: C.blue }, { key: 'output', name: t('usage.output'), color: C.green }]}
-                tooltipLabelFormatter={(label: string, payload: any[]) => payload?.[0]?.payload?.fullLabel || label}
-                stacked
+              <RankedBars rows={topAccountRows} valueFormatter={fmtTokens} ariaLabel={t('dashboard.top_accounts')} />
+            </div>
+          ) : null}
+          {hostMeters.length ? (
+            <div className="pool-chart-card">
+              <div className="head"><div><div className="t">{t('dashboard.host_resources')}</div><div className="s">{t('dashboard.host_resources_desc')}</div></div></div>
+              <RankedBars
+                rows={hostMeters.map((meter) => ({ key: meter.key, name: meter.label, value: Math.max(meter.pct, 0.01), color: meter.color }))}
+                max={100}
+                valueFormatter={(value: number) => `${Math.round(value)}%`}
+                ariaLabel={t('dashboard.host_resources')}
               />
             </div>
           ) : null}

@@ -16,7 +16,7 @@ import useAsyncAction from '../hooks/useAsyncAction.js';
 import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
 import useResponsiveLayout from '../hooks/useResponsiveLayout.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
-import { fmtInt, fmtRelative, fmtTokens } from '../lib/format.js';
+import { fmtInt, fmtRelative, fmtTokens, middleEllipsis } from '../lib/format.js';
 import { accountQueryKeys, useAccountsPage } from '../features/accounts/queries/accounts.ts';
 import { fetchAccountArchive, importAccountArchive } from '../features/accounts/api/accounts.ts';
 import { abortController, abortSignal, createAbortController } from '../lib/browserAbort.js';
@@ -181,12 +181,6 @@ function routeSummary(account) {
   const model = account.force_model || account.model || '';
   const effort = account.force_effort || account.effort || '';
   return { primary, model, effort };
-}
-
-function middleEllipsis(value, head = 24, tail = 14) {
-  const text = String(value || '');
-  if (text.length <= head + tail + 1) return text;
-  return `${text.slice(0, head)}…${text.slice(-tail)}`;
 }
 
 function mergeAccountUpdate(account, patch) {

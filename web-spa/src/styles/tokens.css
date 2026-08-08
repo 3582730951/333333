@@ -64,6 +64,7 @@ html[data-theme='dark'] {
   --pool-radius-lg: 10px;
   --pool-radius-xl: 12px;
   --pool-radius-panel: 16px;
+  --pool-radius-portal: 20px;
   --pool-material-blur: saturate(180%) blur(18px);
   --pool-hit-target: 44px;
   --pool-space-1: 4px;

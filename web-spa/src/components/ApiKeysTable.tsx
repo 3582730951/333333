@@ -159,7 +159,10 @@ export default function ApiKeysTable({
   ];
   const columns = portal ? [
     { title: t('keys.name'), dataIndex: 'label', width: 180, render: (value: unknown, row: ApiKeyRow) => labelCell(value, row, mode) },
-    { title: t('keys.copy_install'), dataIndex: 'secret', width: 320, render: (value: string | undefined) => <CopyActions secret={value} /> },
+    // priority 10: ResourceTable folds columns away, right-most first, when the set is
+    // wider than the pane. The key and its install command are what this page exists to
+    // hand over, so it outranks every other column and folds last.
+    { title: t('keys.copy_install'), dataIndex: 'secret', width: 320, priority: 10, render: (value: string | undefined) => <CopyActions secret={value} /> },
     { title: t('keys.force_model'), dataIndex: 'force_model', width: 160, render: (value: string | undefined) => (value ? <Tag>{value}</Tag> : '—') },
     { title: t('keys.group'), dataIndex: 'group_name', width: 120, render: (value: string | undefined) => value || '—' },
     { title: t('keys.enabled'), dataIndex: 'enabled', width: 90, render: (value: boolean | undefined, row: ApiKeyRow) => {
@@ -182,7 +185,10 @@ export default function ApiKeysTable({
     { title: t('keys.group'), dataIndex: 'group_name', width: 120, render: (value: string | undefined) => value || t('keys.default_group') },
     { title: t('keys.force_model'), dataIndex: 'force_model', width: 180, render: (value: string | undefined) => value || '—' },
     { title: t('keys.effort'), dataIndex: 'force_effort', width: 120, render: (value: string | undefined) => (value ? <Tag color="blue">{value}</Tag> : '—') },
-    { title: t('keys.copy_install'), dataIndex: 'secret', width: 320, render: (value: string | undefined) => <CopyActions secret={value} /> },
+    // Sits seventh of eleven admin columns, so on a 1440px viewport it was the widest thing
+    // in the fold window and disappeared into the row expander — leaving a Keys table with no
+    // key in it. Same reasoning as the portal set above: this column folds last.
+    { title: t('keys.copy_install'), dataIndex: 'secret', width: 320, priority: 10, render: (value: string | undefined) => <CopyActions secret={value} /> },
     { title: t('keys.enabled'), dataIndex: 'enabled', width: 90, render: (value: boolean | undefined) => (value === false ? <Tag color="orange">{t('keys.no')}</Tag> : <Tag color="green">{t('keys.yes')}</Tag>) },
     { title: t('keys.expires_at'), dataIndex: 'expires_at', width: 150, render: (value: number | undefined) => (value ? fmtDateTime(value) : t('keys.never_expires')) },
     { title: t('keys.last_used'), dataIndex: 'last_used_at', width: 150, render: (value: number | undefined) => (value ? fmtDateTime(value) : '—') },

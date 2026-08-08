@@ -5,7 +5,7 @@ export default function PageHeader({ title, subtitle, actions }) {
   return (
     <header className="pool-pagehead">
       <div className="pool-pagehead-copy">
-        <Typography.Title heading={1} className="pool-page-title">{title}</Typography.Title>
+        <Typography.Title heading={1} className="pool-page-title" tabIndex={-1}>{title}</Typography.Title>
         {subtitle ? <div className="sub">{subtitle}</div> : null}
       </div>
       {actions ? <div className="actions pool-page-actions">{actions}</div> : null}

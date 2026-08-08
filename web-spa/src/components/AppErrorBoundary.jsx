@@ -208,9 +208,13 @@ export default class AppErrorBoundary extends React.Component {
     this.state = { error: null, chunkError: false };
   }
 
-  componentDidUpdate(prevProps) {
+  componentDidUpdate(prevProps, prevState) {
     if (this.state.error && prevProps.resetKey !== this.props.resetKey) {
       this.reset();
+      return;
+    }
+    if (this.state.error && !prevState.error && typeof this.props.onFallbackCommit === 'function') {
+      this.props.onFallbackCommit();
     }
   }
 
@@ -257,7 +261,7 @@ export default class AppErrorBoundary extends React.Component {
     return (
       <div className={rootClass}>
         <div className={panelClass}>
-          <Typography.Title heading={4} style={{ margin: 0 }}>
+          <Typography.Title heading={isPage ? 1 : 4} tabIndex={isPage ? -1 : undefined} style={{ margin: 0 }}>
             {chunkError ? '页面模块已更新' : '页面遇到错误'}
           </Typography.Title>
           <Typography.Text type="secondary">

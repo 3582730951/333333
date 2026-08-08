@@ -218,7 +218,7 @@ export default function AISettings() {
             );
           })}
         </nav>
-        <main className="pool-ai-settings-content">
+        <div className="pool-ai-settings-content">
           <div className="pool-ai-settings-heading">
             <div>
               <Typography.Title heading={2} style={{ margin: 0 }}>{copy.title}</Typography.Title>
@@ -238,7 +238,7 @@ export default function AISettings() {
           ) : (
             <Banner type="info" title={t('ai_settings.empty_title')} description={t('ai_settings.empty_description')} />
           )}
-        </main>
+        </div>
       </div>
       <ConfirmDialog
         open={Boolean(leaveTarget)}

@@ -162,7 +162,7 @@ export default function CloudflareMailbox() {
         </div>
       </section>
 
-      <SummaryRail items={metrics} className="pool-cf-mail-metrics" />
+      <SummaryRail items={metrics} className="pool-metric-rail--band pool-cf-mail-metrics" />
       {error ? <ErrorBanner error={error} title={t('cf_mail.load_failed')} onRetry={reload} /> : null}
 
       <div className="pool-cf-mail-layout">

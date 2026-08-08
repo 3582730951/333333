@@ -65,10 +65,29 @@ const userPages = [
   ['PortalProfile', '/portal/profile'],
 ];
 
+function requested(envName) {
+  return String(process.env[envName] || '').split(',').map((item) => item.trim()).filter(Boolean);
+}
+
 function selected(value, envName) {
-  const values = String(process.env[envName] || '').split(',').map((item) => item.trim()).filter(Boolean);
+  const values = requested(envName);
   return !values.length || values.includes(value);
 }
+
+// A filter naming something that does not exist used to select nothing, capture only the
+// state shots, print the success line and exit 0 — so a run that reviewed none of the pages
+// asked for was indistinguishable from one that reviewed all of them. These are page names,
+// and passing a route (a natural mistake) matches nothing at all.
+function assertKnownFilter(envName, known) {
+  const unknown = requested(envName).filter((value) => !known.includes(value));
+  if (!unknown.length) return;
+  throw new Error(`${envName} names nothing that exists: ${unknown.join(', ')}\n  known values: ${known.join(', ')}`);
+}
+
+const knownPageNames = [...adminPages, ...userPages].map(([name]) => name);
+assertKnownFilter('UI_REVIEW_VIEWPORTS', viewports.map((viewport) => viewport.name));
+assertKnownFilter('UI_REVIEW_THEMES', themes);
+assertKnownFilter('UI_REVIEW_PAGES', knownPageNames);
 
 const activeViewports = viewports.filter((viewport) => selected(viewport.name, 'UI_REVIEW_VIEWPORTS'));
 const activeThemes = themes.filter((theme) => selected(theme, 'UI_REVIEW_THEMES'));
@@ -156,10 +175,58 @@ const fixtures = {
     { id: 'user_admin', email: 'admin@example.test', name: 'Admin Fixture', role: 'admin', status: 'active', created_at: now - 86400 },
     { id: 'user_normal', email: 'user@example.test', name: 'User Fixture With Long Display Name', role: 'user', status: 'active', created_at: now - 3600 },
   ],
+  // Spread across the families ModelNameList groups by, including one name that matches
+  // no prefix, so the "其他" bucket is exercised too.
+  modelNames: [
+    'gpt-5.5', 'gpt-5.5-mini', 'gpt-5.4', 'gpt-4.1', 'o4-mini', 'codex-mini-latest',
+    'claude-opus-4-6-20260501', 'claude-sonnet-4-5-20250929', 'claude-haiku-4-5-20251001',
+    'gemini-3.0-pro', 'gemini-2.5-flash',
+    'deepseek-v3.2', 'qwen3-max', 'glm-5', 'kimi-k2-turbo',
+    'llama-4-maverick', 'mistral-large-2', 'grok-4',
+    'text-embedding-3-large', 'internal-eval-harness-v2',
+  ],
   configFields: [
     { key: 'require_downstream_key', label: '下游 Key 必填', category: '访问控制', type: 'bool', effect: 'hot', options: [], help: '要求普通请求携带用户 API Key。', value: true, overridden: true },
     { key: 'conversation_isolation', label: '会话隔离', category: '访问控制', type: 'bool', effect: 'hot', options: [], help: '按账号隔离上游会话标识。', value: true, overridden: false },
     { key: 'claude_cache_ttl', label: 'Claude 缓存 TTL', category: '缓存', type: 'select', effect: 'hot', options: ['', '5m', '1h'], help: 'Claude prompt cache control TTL。', value: '1h', overridden: true },
+  ],
+  // PublicChat had no fixture, so /admin/public-chat/links fell through to the catch-all `{}`
+  // at the bottom of handleAPI and the page rendered its empty state in every single capture —
+  // the list half of that screen has never once been photographed. Both enabled and disabled
+  // are present so each Tag colour is exercised, one name is long enough to test truncation in
+  // the summary column, and the two route_type branches are covered because they print through
+  // different sides of routeSummary().
+  publicChatLinks: [
+    {
+      id: 'pcl_support',
+      slug: 'support-chat',
+      name: '官网客服',
+      title: '在线客服',
+      enabled: true,
+      route_type: 'user_group',
+      user_group_id: 'ug_fixture',
+      route_label: 'Fixture users',
+      model: 'gpt-5.5',
+      welcome_message: '您好，请描述遇到的问题。',
+      max_history_messages: 24,
+      rate_limit_per_minute: 30,
+      public_url: 'https://pool.example.test/chat/support-chat',
+    },
+    {
+      id: 'pcl_trial',
+      slug: 'trial-desk-with-a-long-slug-for-truncation',
+      name: '试用咨询入口（长名称用于验证摘要列截断）',
+      title: '试用咨询',
+      enabled: false,
+      route_type: 'account_pool_group',
+      group_name: 'staging',
+      route_label: 'staging',
+      model: 'claude-sonnet-4-5-20250929',
+      welcome_message: '',
+      max_history_messages: 12,
+      rate_limit_per_minute: 10,
+      public_url: 'https://pool.example.test/chat/trial-desk-with-a-long-slug-for-truncation',
+    },
   ],
 };
 
@@ -297,8 +364,8 @@ function usageWindow(req) {
 
 function cacheReport(req) {
   const byProviderModel = [
-    { provider: 'codex', provider_id: 'codex', provider_name: 'Codex', model: 'gpt-5.5', display_label: 'Codex · gpt-5.5', requests: 1234, prompt_tokens: 7100000, cached_tokens: 5900000, cache_input_tokens: 10300000, cache_read_tokens: 5900000, cache_creation_tokens: 320000 },
-    { provider: 'claude', provider_id: 'claude', provider_name: 'Claude', model: 'claude-sonnet-4', display_label: 'Claude · Sonnet 4', requests: 98, prompt_tokens: 4200000, cached_tokens: 1200, cache_input_tokens: 6300000, cache_read_tokens: 1200, cache_creation_tokens: 2100000 },
+    { provider: 'codex', provider_id: 'codex', provider_name: 'Codex', model: 'gpt-5.5', display_label: 'Codex · gpt-5.5', requests: 1234, prompt_tokens: 7100000, completion_tokens: 890000, total_tokens: 7990000, cached_tokens: 5900000, cache_input_tokens: 10300000, cache_read_tokens: 5900000, cache_creation_tokens: 320000 },
+    { provider: 'claude', provider_id: 'claude', provider_name: 'Claude', model: 'claude-sonnet-4', display_label: 'Claude · Sonnet 4', requests: 98, prompt_tokens: 4200000, completion_tokens: 180000, total_tokens: 4380000, cached_tokens: 1200, cache_input_tokens: 6300000, cache_read_tokens: 1200, cache_creation_tokens: 2100000 },
   ];
   return {
     ...usageWindow(req),
@@ -325,6 +392,11 @@ function cacheReport(req) {
     by_api_key: [
       { api_key_hash_prefix: 'abcdef123456', requests: 1200, hit_requests: 790, request_hit_rate: 0.66, token_hit_rate: 0.52, real_token_hit_rate: 0.53, cache_read_tokens: 5900000, cache_creation_tokens: 320000, cache_miss_tokens: 1200000, estimated_rate: 0.01 },
       { api_key_hash_prefix: 'deadbeef9876', requests: 132, hit_requests: 22, request_hit_rate: 0.17, token_hit_rate: 0.01, real_token_hit_rate: 0.01, cache_read_tokens: 1200, cache_creation_tokens: 2100000, cache_miss_tokens: 4200000, estimated_rate: 0.13 },
+    ],
+    by_account: [
+      { account_id: fixtures.accounts[0].id, requests: 1234, prompt_tokens: 7100000, completion_tokens: 890000, actual_prompt_tokens: 7100000, actual_completion_tokens: 890000, total_tokens: 7990000, hit_requests: 800, request_hit_rate: 0.65, real_token_hit_rate: 0.52, cache_read_tokens: 5900000, cache_creation_tokens: 320000, cache_miss_tokens: 1200000 },
+      { account_id: fixtures.accounts[1].id, requests: 98, prompt_tokens: 4200000, completion_tokens: 180000, actual_prompt_tokens: 4200000, actual_completion_tokens: 180000, total_tokens: 4380000, hit_requests: 12, request_hit_rate: 0.12, real_token_hit_rate: 0.01, cache_read_tokens: 1200, cache_creation_tokens: 2100000, cache_miss_tokens: 4200000 },
+      { account_id: fixtures.accounts[2].id, requests: 12, prompt_tokens: 260000, completion_tokens: 31000, actual_prompt_tokens: 260000, actual_completion_tokens: 31000, total_tokens: 291000, hit_requests: 0, request_hit_rate: 0, real_token_hit_rate: 0, cache_read_tokens: 0, cache_creation_tokens: 41000, cache_miss_tokens: 260000 },
     ],
     by_account_model: [
       { account_id: fixtures.accounts[0].id, model: 'gpt-5.5', requests: 1234, hit_requests: 800, request_hit_rate: 0.65, token_hit_rate: 0.52, real_token_hit_rate: 0.52, cache_read_tokens: 5900000, cache_creation_tokens: 320000, cache_miss_tokens: 1200000 },
@@ -443,6 +515,9 @@ async function handleAPI(req) {
   if (p === '/admin/api-keys') return req.respond(json({ keys: fixtures.apiKeys }));
   if (p === '/admin/users') return req.respond(json({ users: fixtures.users }));
   if (p === '/admin/providers') return req.respond(json({ providers: [{ id: 'openai', name: 'OpenAI', base_url: 'https://api.openai.com/v1', enabled: true, auto_discover_models: true, models: ['gpt-5.5', 'gpt-5.4'] }] }));
+  // Without these the model pages review as their own empty state, which says nothing
+  // about how they render a real capability snapshot.
+  if (p === '/admin/models' || p === '/user/models') return req.respond(json({ models: fixtures.modelNames, generated_at: Math.floor(Date.now() / 1000) - 240 }));
   if (p === '/admin/register/providers') return req.respond(json({ providers: [
     { type: 'sms', key: 'smsactivate', display_name: 'SMS-Activate', enabled: true, priority: 20, config: { api_key: '', api_key_configured: true, service: 'dr', max_price: '0.50' } },
     { type: 'mailbox', key: 'imap', display_name: 'IMAP', enabled: true, priority: 10, config: { host: 'imap.example.test', port: '993', email: '', email_configured: true, password: '', password_configured: true, use_tls: true } },
@@ -450,8 +525,29 @@ async function handleAPI(req) {
     { type: 'email', key: 'hotmail_otp', display_name: 'Hotmail OTP', enabled: true, priority: 10, config: { base_email: '', base_email_configured: true, otp_url: '', otp_url_configured: true, auth_token: '', auth_token_configured: true } },
   ] }));
   if (p === '/admin/register/providers/options') return req.respond(json({ sms: ['smsbower', 'herosms'], mailbox: ['cloudflare'], captcha: ['capsolver'] }));
-  if (p === '/admin/egress-profiles') return req.respond(json({ profiles: [{ id: 'egress_direct', name: 'Direct', type: 'direct', region: 'us-east', health: 'ok', latency_millis: 42, stream_capable: true }] }));
-  if (p === '/admin/egress-pools') return req.respond(json({ pools: [{ id: 'pool_registration', name: 'Registration Pool', purpose: 'registration', members: ['egress_direct'] }, { id: 'pool_runtime', name: 'Runtime Pool', purpose: 'runtime', members: ['egress_direct'] }] }));
+  // health values are the ones scheduler.EgressHealthy actually recognises:
+  // "", healthy, cooldown, tripped are schedulable; disabled is not.
+  if (p === '/admin/egress-profiles') return req.respond(json({ profiles: [
+    // The proxy endpoint field is `endpoint` (storage.EgressProfile), not proxy_url, and
+    // exit_ip is what the network column leads with — without it every row read as "—".
+    { id: 'egress_direct', name: 'Direct', type: 'direct', region: 'us-east', health: 'healthy', latency_millis: 42, stream_capable: true, max_concurrency: 8, exit_ip: '203.0.113.17' },
+    { id: 'egress_resi_us', name: 'Residential US · sticky session pool', type: 'http', region: 'us-west', health: 'healthy', latency_millis: 188, stream_capable: true, max_concurrency: 4, endpoint: 'http://resi.example.test:8080', proxy_auth_mode: 'credential', exit_ip: '198.51.100.204' },
+    { id: 'egress_socks_eu', name: 'SOCKS5 EU', type: 'socks5', region: 'eu-central', health: 'tripped', latency_millis: 604, stream_capable: false, max_concurrency: 2, cooldown_until: Math.floor(Date.now() / 1000) + 900, endpoint: 'socks5://eu.example.test:1080', proxy_auth_mode: 'api_whitelist', exit_ip: '192.0.2.88' },
+    { id: 'egress_warp', name: 'WARP sidecar', type: 'warp', region: 'auto', health: 'disabled', latency_millis: 0, stream_capable: true, max_concurrency: 0 },
+  ] }));
+  // Shape follows storage.EgressPool: members are objects carrying egress_id and an
+  // embedded egress, and the strategy field is assignment_strategy. The previous fixture
+  // used bare id strings and `strategy`, so the members column rendered as a stray comma.
+  if (p === '/admin/egress-pools') return req.respond(json({ pools: [
+    { id: 'pool_registration', name: 'Registration Pool', purpose: 'registration', assignment_strategy: 'sticky_least_used', members: [
+      { pool_id: 'pool_registration', egress_id: 'egress_direct', enabled: true, capacity: 4, egress: { id: 'egress_direct', name: 'Direct' } },
+      { pool_id: 'pool_registration', egress_id: 'egress_resi_us', enabled: true, capacity: 1, egress: { id: 'egress_resi_us', name: 'Residential US · sticky session pool' } },
+    ] },
+    { id: 'pool_runtime', name: 'Runtime Pool', purpose: 'runtime', assignment_strategy: 'round_robin', members: [
+      { pool_id: 'pool_runtime', egress_id: 'egress_direct', enabled: true, capacity: 8, egress: { id: 'egress_direct', name: 'Direct' } },
+      { pool_id: 'pool_runtime', egress_id: 'egress_socks_eu', enabled: false, capacity: 2, egress: { id: 'egress_socks_eu', name: 'SOCKS5 EU' } },
+    ] },
+  ] }));
   if (hasFixture(req, 'force403') && p.startsWith('/admin/usage')) return req.respond(json({ error: { message: 'admin role required' } }, 403));
   if (p === '/admin/usage/dashboard') {
     const trend = timeseries(req);
@@ -480,7 +576,13 @@ async function handleAPI(req) {
     if (hasFixture(req, 'fixture_empty')) return req.respond(json({ rows: [] }));
     return req.respond(json({ rows: fixtures.auditRows }));
   }
-  if (p === '/admin/quota') return req.respond(json([{ account_id: fixtures.accounts[0].id, provider: 'codex', model: 'gpt-5.5', used_percent: 62, remaining_tokens: 123456, limit_tokens: 999999, status: 'ok' }]));
+  if (p === '/admin/quota') return req.respond(json([
+    // Mirrors codex-backend RateLimitStatusPayload: `credits` (extra paid balance) and
+    // `spend_control` are siblings of `rate_limit`, and only Codex reports them.
+    { account_id: fixtures.accounts[0].id, provider: 'codex', model: 'gpt-5.5', used_percent: 62, remaining_tokens: 123456, limit_tokens: 999999, status: 'ok', quota_summary: { sync_reason: 'ok', primary: { used_percent: 62, remaining_tokens: 123456, reset_at: now + 5400 }, secondary: { used_percent: 41 }, credits: { has_credits: true, unlimited: false, balance: '$12.50', spend_control_reached: false, source: 'workspace', limit: '$100.00', used: '$37.00', remaining: '$63.00', used_percent: 37, remaining_percent: 63, reset_at: now + 172800, status: 'ok', updated_at: now - 300 }, reset_credits: { status: 'ok', available_count: 4, source: 'rate-limit-reset-credits', updated_at: now - 300 } } },
+    { account_id: fixtures.accounts[1].id, provider: 'claude', model: 'claude-sonnet-4', used_percent: 94, remaining_tokens: 8200, limit_tokens: 500000, status: 'error/token_expired', quota_summary: { sync_reason: 'error/token_expired', primary: { used_percent: 94, remaining_tokens: 8200, reset_at: now + 900 }, secondary: { used_percent: 88 } } },
+    { account_id: fixtures.accounts[2].id, provider: 'codex', model: '', used_percent: 76, remaining_tokens: 64000, limit_tokens: 300000, status: 'ok', quota_summary: { sync_reason: 'ok', primary: { used_percent: 76, remaining_tokens: 64000, reset_at: now + 14400 }, secondary: { used_percent: 55 }, credits: { has_credits: false, unlimited: false, balance: '$0.00', spend_control_reached: true, source: 'workspace', limit: '$50.00', used: '$50.00', remaining: '$0.00', used_percent: 100, remaining_percent: 0, reset_at: now + 86400, status: 'spend_limit_reached', updated_at: now - 120 }, reset_credits: { status: 'ok', available_count: 0, source: 'rate-limit-reset-credits', updated_at: now - 120 } } },
+  ]));
   if (p === '/admin/system') return req.respond(json({
     supported: true,
     hostname: 'fixture-vps',
@@ -505,6 +607,23 @@ async function handleAPI(req) {
     ],
     supervisor_events: [
       { time_unix: now - 300, module: 'cache-diagnostics', type: 'event', message: 'fixture heartbeat', uptime_millis: 256000, backoff_millis: 0 },
+    ],
+  }));
+  if (p === '/admin/model-quality') return req.respond(json({
+    enabled: true,
+    running: false,
+    interval_minutes: 60,
+    reasoning_effort: 'medium',
+    degraded_threshold: 2,
+    statuses: [
+      { group_name: 'cyber', model: 'gpt-5.5', provider: 'codex', state: 'healthy', last_outcome: 'match', consecutive_anomalies: 0, last_actual: '42', last_expected: '42', last_returned_model: 'gpt-5.5', total_tokens: 184000, last_latency_ms: 812, last_probe_at: now - 900 },
+      { group_name: 'staging', model: 'claude-sonnet-4', provider: 'claude', state: 'suspect', last_outcome: 'mismatch', consecutive_anomalies: 1, last_actual: '41', last_expected: '42', last_returned_model: 'claude-sonnet-4-20250514', total_tokens: 96000, last_latency_ms: 1540, last_probe_at: now - 1800 },
+      { group_name: '', model: 'gpt-5-mini-with-a-very-long-model-identifier', provider: 'custom', state: 'degraded', last_outcome: 'mismatch', consecutive_anomalies: 3, last_actual: '', last_expected: '42', last_returned_model: '', total_tokens: 12000, last_latency_ms: 4200, last_probe_at: now - 5400 },
+    ],
+    runs: [
+      { created_at: now - 900, group_name: 'cyber', model: 'gpt-5.5', phase: 'primary', outcome: 'match', actual: '42', expected: '42', returned_model: 'gpt-5.5', total_tokens: 1800, latency_ms: 812 },
+      { created_at: now - 1800, group_name: 'staging', model: 'claude-sonnet-4', phase: 'confirmation', outcome: 'mismatch', actual: '41', expected: '42', returned_model: 'claude-sonnet-4-20250514', total_tokens: 2100, latency_ms: 1540, error_kind: '' },
+      { created_at: now - 5400, group_name: '', model: 'gpt-5-mini-with-a-very-long-model-identifier', phase: 'primary', outcome: 'error', actual: '', expected: '42', returned_model: '', total_tokens: 0, latency_ms: 4200, error_kind: 'upstream_timeout', error_message: 'fixture upstream timeout after 4200ms' },
     ],
   }));
   if (p === '/admin/cf-events') return req.respond(json([{ id: 1, created_at: now - 60, account_id: fixtures.accounts[0].id, status: 403, cf_ray: 'fixture-ray', category: 'challenge', message: 'fixture challenge' }]));
@@ -532,15 +651,23 @@ async function handleAPI(req) {
     { isoCode: 'US', name: 'United States', nameZh: '美国' },
     { isoCode: 'JP', name: 'Japan', nameZh: '日本' },
   ]));
+  // Every status the page counts separately gets a non-zero row: idle/ready roll up into
+  // 可用, and in_use / used / error are their own metrics. With only idle and error present
+  // three of the five rail tracks reviewed as a flat 0, which says nothing about how the
+  // rail reads when the proportions actually differ.
   if (p === '/admin/email-pool') return req.respond(json({
     accounts: [
       { id: 'mail-primary-fixture-001', email: 'registration.primary.with.long.alias@example-very-long-domain.test', client_id: 'cloudflare-primary', status: 'idle', group_name: 'registration', created_at: now - 86400, updated_at: now - 120 },
+      { id: 'mail-ready-fixture-006', email: 'standby@example.test', client_id: 'cloudflare-secondary', status: 'ready', group_name: 'registration', created_at: now - 43200, updated_at: now - 300 },
+      { id: 'mail-inuse-fixture-003', email: 'claiming.now@example.test', client_id: 'cloudflare-primary', status: 'in_use', group_name: 'registration', last_used_at: now - 45, created_at: now - 7200, updated_at: now - 45 },
+      { id: 'mail-used-fixture-004', email: 'spent.alias@example.test', client_id: 'cloudflare-secondary', status: 'used', group_name: 'team', last_used_at: now - 90000, created_at: now - 604800, updated_at: now - 90000 },
+      { id: 'mail-used-fixture-005', email: 'spent.second@example.test', client_id: 'cloudflare-secondary', status: 'used', group_name: 'team', last_used_at: now - 250000, created_at: now - 900000, updated_at: now - 250000 },
       { id: 'mail-error-fixture-002', email: 'retry@example.test', client_id: 'cloudflare-primary', status: 'error', group_name: 'team', error_message: 'upstream mailbox token expired; rotate the admin token and retry', last_used_at: now - 3600, created_at: now - 172800, updated_at: now - 60 },
     ],
-    total: 2,
+    total: 6,
     page: 1,
     page_size: 20,
-    counts: { idle: 1, error: 1 },
+    counts: { idle: 1, ready: 1, in_use: 1, used: 2, error: 1 },
   }, 200, { 'x-request-id': 'ui-review-email-pool-001' }));
   if (p === '/admin/email-pool/cloudflare') return req.respond(json({
     profiles: [{
@@ -577,11 +704,12 @@ async function handleAPI(req) {
   if (p === '/user/usage/timeseries') return req.respond(json({ buckets: timeseries(req).buckets.slice(0, 5) }));
   if (p === '/user/api-keys') return req.respond(json([{ label: 'my-portal-key-with-long-label', key_hash: 'portal1234567890abcdef', enabled: true, created_at: now - 1200, secret: 'cap_user_fixture' }]));
   if (p === '/user/profile') return req.respond(json({ email: 'user@example.test', name: 'User Fixture With Long Display Name', role: 'user' }));
+  if (p === '/admin/public-chat/links') return req.respond(json({ links: fixtures.publicChatLinks }));
   if (p.startsWith('/admin/') || p.startsWith('/user/')) return req.respond(json({}));
   return req.continue();
 }
 
-async function installMocks(page) {
+export async function installMocks(page) {
   await page.setRequestInterception(true);
   page.on('request', async (req) => {
     try {
@@ -755,7 +883,18 @@ async function pageMetrics(page) {
       const text = (card.innerText || '').replace(/\s+/g, ' ').trim();
       const title = card.querySelector('.t')?.textContent?.trim() || text.slice(0, 40);
       if (/暂无数据|加载图表/.test(text)) return null;
-      const visibleVisuals = [...card.querySelectorAll('svg path, svg rect, svg circle, .pool-meter span, .pool-cache-breakdown__bar span')]
+      // Every drawn primitive in MicroCharts, not just the SVG-based ones. Sparkline and
+      // RadialGauge draw SVG; RankedBars, StackedMeter and HeatStrip draw filled divs, and
+      // leaving those out reported cards as blank whose bars were plainly on screen —
+      // a false alarm that hides the real ones. Keep this in step with MicroCharts.jsx.
+      const visibleVisuals = [...card.querySelectorAll([
+        'svg path', 'svg rect', 'svg circle',
+        '.pool-meter span',
+        '.pool-cache-breakdown__bar span',
+        '.pool-ranked__track > span',
+        '.pool-stacked-meter__track > span',
+        '.pool-heatstrip__cell',
+      ].join(', '))]
         .filter((el) => {
           const style = getComputedStyle(el);
           const box = el.getBoundingClientRect();
@@ -832,6 +971,85 @@ async function pageMetrics(page) {
         client: `${element.clientWidth}x${element.clientHeight}`,
         scroll: `${element.scrollWidth}x${element.scrollHeight}`,
       }));
+    // A card left as an unreadable sliver at the edge of a horizontal scroll pane.
+    //
+    // This is the blind spot that let a real defect ship. The dashboard chart row was a
+    // `grid-auto-flow: column` carousel with min(86vw, 360px) slides, so on a 390px phone
+    // the third card sat 17px inside a 366px pane: a strip of legend dots and half-drawn
+    // glyphs pinned to the right edge, reading as damage rather than as content. Every
+    // existing check passed it. The overflow lives inside the pane, so documentElement
+    // .scrollWidth never grows and noPageOverflow stays true; siblingOverlaps looks for
+    // intersecting boxes and these do not intersect; clippedControls asks whether an element
+    // clips its OWN text, not whether an ancestor clips it. Only a screenshot showed it.
+    //
+    // Measured at the slide, not at text nodes. Text granularity turned out to be a pixel
+    // lottery: that card's 16px padding put its first glyph at x=377 against a 378px edge,
+    // so a straddle test needing 2px inside missed the whole defect by one pixel while the
+    // card itself was unambiguously sliced.
+    //
+    // The threshold is what separates a defect from a deliberate carousel. A slide showing
+    // half of itself is an affordance — it says "keep scrolling" and stays legible. A slide
+    // showing a fraction of one word is neither, so a sliver is flagged when the visible
+    // part is under 25% of the slide AND under 72px, which is narrower than any label on
+    // these surfaces. Slides that snap to the full pane width are exempt: paging one at a
+    // time never leaves anything half-drawn at rest. Table cells are exempt too — a wide
+    // table is one continuous surface that pages horizontally by design, and cutting a
+    // column mid-cell is how every data grid behaves.
+    const scrollClippedText = [];
+    const scrollPaneInventory = [];
+    const EDGE_TOLERANCE = 2;
+    for (const pane of document.querySelectorAll('*')) {
+      if (pane.scrollWidth <= pane.clientWidth + EDGE_TOLERANCE) continue;
+      const paneStyle = getComputedStyle(pane);
+      if (!/(auto|scroll)/.test(paneStyle.overflowX)) continue;
+      if (pane.closest('[aria-hidden="true"]')) continue;
+      const paneRect = pane.getBoundingClientRect();
+      if (paneRect.width <= 1 || paneRect.height <= 1) continue;
+      const rightEdge = paneRect.right - parseFloat(paneStyle.borderRightWidth || 0);
+      scrollPaneInventory.push({
+        pane: String(pane.className || pane.tagName).slice(0, 60),
+        client: pane.clientWidth,
+        scroll: pane.scrollWidth,
+        overflowX: paneStyle.overflowX,
+        snapType: paneStyle.scrollSnapType,
+        rightEdge: Math.round(rightEdge),
+      });
+
+      const SLIVER_FRACTION = 0.25;
+      const SLIVER_PX = 72;
+      for (const slide of pane.children) {
+        if (/^(TD|TH|TR|THEAD|TBODY|COLGROUP|COL)$/.test(slide.tagName)) continue;
+        if (slide.closest('[aria-hidden="true"]')) continue;
+        const ss = getComputedStyle(slide);
+        if (ss.visibility === 'hidden' || ss.display === 'none' || Number(ss.opacity) === 0) continue;
+
+        const slideRect = slide.getBoundingClientRect();
+        if (slideRect.width < 1 || slideRect.height < 1) continue;
+
+        const straddles = slideRect.left < rightEdge - EDGE_TOLERANCE
+          && slideRect.right > rightEdge + EDGE_TOLERANCE;
+        if (!straddles) continue;
+
+        // Paged one-slide-at-a-time: nothing is half-drawn once the scroll settles.
+        if (ss.scrollSnapAlign !== 'none' && Math.abs(slideRect.width - paneRect.width) <= 4) continue;
+
+        const visiblePx = rightEdge - slideRect.left;
+        const fraction = visiblePx / slideRect.width;
+        if (fraction >= SLIVER_FRACTION || visiblePx >= SLIVER_PX) continue;
+
+        scrollClippedText.push({
+          pane: String(pane.className || pane.tagName).slice(0, 60),
+          slide: String(slide.className || slide.tagName).slice(0, 60),
+          text: (slide.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+          visiblePx: Math.round(visiblePx),
+          slideWidth: Math.round(slideRect.width),
+          visiblePct: Math.round(fraction * 100),
+        });
+        if (scrollClippedText.length >= 12) break;
+      }
+      if (scrollClippedText.length >= 12) break;
+    }
+
     const navigation = performance.getEntriesByType('navigation')[0];
     return {
       textOverflows: textOverflows.slice(0, 12),
@@ -839,6 +1057,41 @@ async function pageMetrics(page) {
       siblingOverlaps: siblingOverlaps.slice(0, 12),
       chartTextOverlaps: chartTextOverlaps.slice(0, 12),
       clippedControls: clippedControls.slice(0, 12),
+      scrollClippedText: scrollClippedText.slice(0, 12),
+      // Informational: every horizontal scroll pane and how far its content runs past the
+      // edge. Not an assertion — a horizontal scroller is legitimate (wide tables page this
+      // way). It is recorded so the reviewer can see which panes exist and confirm each one
+      // is deliberate, and so scrollClippedText above has context when it fires.
+      scrollPanes: scrollPaneInventory.slice(0, 12),
+      // The app's main scroll container, measured on its own.
+      //
+      // noPageOverflow compares documentElement.scrollWidth against the viewport, which cannot
+      // see this: .pool-content has `overflow: auto`, so anything too wide is absorbed into ITS
+      // scroll range and the document never grows. Usage overflowed 29px here — the whole admin
+      // page could be dragged sideways on a phone — and every check passed for the full matrix.
+      //
+      // Cause was a `display: grid` with no grid-template-columns. The implicit `auto` track is
+      // sized to max-content and is never shrunk to fit, so nowrap table values pushed the track
+      // past the viewport. Reported with the widest offending descendants because the overflow is
+      // always inherited by a chain of stretched children, and the top of that chain is the fix
+      // site, not the elements that merely report a wide box.
+      shellOverflow: (() => {
+        const host = document.querySelector('.pool-content');
+        if (!host) return null;
+        const overflow = host.scrollWidth - host.clientWidth;
+        if (overflow <= 2) return null;
+        const blame = [];
+        for (const el of host.querySelectorAll('*')) {
+          if (el.getBoundingClientRect().width <= host.clientWidth + 2) continue;
+          const cs = getComputedStyle(el);
+          if (/(auto|scroll)/.test(cs.overflowX)) continue;
+          let depth = 0;
+          for (let p = el; p && p !== host; p = p.parentElement) depth += 1;
+          blame.push({ cls: String(el.className || el.tagName).slice(0, 60), w: Math.round(el.getBoundingClientRect().width), depth });
+        }
+        blame.sort((a, b) => a.depth - b.depth || b.w - a.w);
+        return { overflow, client: host.clientWidth, scroll: host.scrollWidth, blame: blame.slice(0, 6) };
+      })(),
       path: location.pathname + location.search,
       textLength: document.body.innerText.length,
       documentWidth: document.documentElement.scrollWidth,
@@ -875,6 +1128,15 @@ function assertNoTextOverlap(metrics, label) {
   }
   if (metrics.clippedControls?.length) {
     throw new Error(`${label} has clipped control text: ${JSON.stringify(metrics.clippedControls.slice(0, 4))}`);
+  }
+  if (metrics.scrollClippedText?.length) {
+    throw new Error(`${label} has text sliced by a scroll container edge: ${JSON.stringify(metrics.scrollClippedText.slice(0, 4))}`);
+  }
+  // Unconditional: a horizontal scrollbar on the page container is never intentional. Individual
+  // panes inside it may scroll sideways by design (wide tables), which is why scrollPanes stays
+  // informational, but the shell that holds the whole page must fit the viewport it was given.
+  if (metrics.shellOverflow) {
+    throw new Error(`${label} page shell scrolls horizontally by ${metrics.shellOverflow.overflow}px (${metrics.shellOverflow.client}->${metrics.shellOverflow.scroll}); widest culprits: ${JSON.stringify(metrics.shellOverflow.blame)}`);
   }
 }
 
@@ -1057,6 +1319,22 @@ async function clickButtonByText(page, text) {
   return button;
 }
 
+// Actions that live in a dropdown are not buttons: Radix renders each item as a
+// role="menuitem" div, and it only exists in the DOM once the trigger is open.
+async function clickMenuItemByText(page, triggerText, itemText) {
+  await clickButtonByText(page, triggerText);
+  const item = await page.waitForFunction((label) => {
+    const match = [...document.querySelectorAll('[role="menuitem"]')].find((el) => (el.textContent || '').trim() === label);
+    if (!match) return null;
+    const rect = match.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 ? match : null;
+  }, { timeout: 45000 }, itemText);
+  const element = item.asElement();
+  if (!element) throw new Error(`menu item not found: ${itemText}`);
+  await element.click();
+  return element;
+}
+
 async function waitForText(page, text, timeout = 45000) {
   await page.waitForFunction((needle) => document.body.innerText.includes(needle), { timeout }, text);
 }
@@ -1210,7 +1488,7 @@ async function captureStates(browser, baseURL) {
 
   const failedExport = await preparePage(browser, baseURL, 'admin', { name: '1280x720', width: 1280, height: 720 }, 'dark');
   await gotoApp(failedExport, baseURL, '/audit?fixture_export_fail=1');
-  await clickButtonByText(failedExport, '导出缓存命中 ZIP');
+  await clickMenuItemByText(failedExport, '导出', '缓存命中 ZIP');
   const exportErrorToast = await failedExport.waitForSelector('.pool-toast--error[role="alert"]', { visible: true, timeout: 15000 });
   const exportErrorText = String(await exportErrorToast.evaluate((element) => element.textContent || '')).trim();
   if (!exportErrorText) throw new Error('export failure toast has no accessible error content');
@@ -1220,7 +1498,7 @@ async function captureStates(browser, baseURL) {
   const audit = await preparePage(browser, baseURL, 'admin', { name: '1280x720', width: 1280, height: 720 }, 'dark');
   await gotoApp(audit, baseURL, '/audit');
   const before = new Set(fs.readdirSync(downloadRoot));
-  await clickButtonByText(audit, '导出缓存命中 ZIP');
+  await clickMenuItemByText(audit, '导出', '缓存命中 ZIP');
   await delay(120);
   await captureState(audit, dir, 'audit-download-loading.png', ['submitting', 'loading'], covered);
   const after = await waitForNewDownload(before);
@@ -1289,10 +1567,13 @@ async function main() {
   console.log(`UI review capture written to ${path.relative(workspaceRoot, outDir)}`);
 }
 
-main().catch((error) => {
-  log('fatal', { message: error.message, stack: error.stack });
-  fs.mkdirSync(outDir, { recursive: true });
-  fs.writeFileSync(path.join(outDir, 'operation-log.json'), `${JSON.stringify(operationLog, null, 2)}\n`);
-  console.error(error);
-  process.exit(1);
-});
+// Only run the capture when invoked directly; other tooling imports installMocks.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    log('fatal', { message: error.message, stack: error.stack });
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(path.join(outDir, 'operation-log.json'), `${JSON.stringify(operationLog, null, 2)}\n`);
+    console.error(error);
+    process.exit(1);
+  });
+}

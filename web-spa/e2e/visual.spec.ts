@@ -368,7 +368,7 @@ test('OAuth link generation and clipboard copy work in a real browser', async ({
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(authURL);
 });
 
-test('account import provider marks stay bounded and model donut has one readable center label', async ({ browser }) => {
+test('account import provider marks stay bounded and model token bars stay readable', async ({ browser }) => {
   const accountPage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   await mockBackend(accountPage, 'admin', 'interactive');
   await accountPage.goto('/console/accounts');
@@ -393,7 +393,12 @@ test('account import provider marks stay bounded and model donut has one readabl
   const dashboardPage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   await mockBackend(dashboardPage, 'admin', 'interactive');
   await dashboardPage.goto('/console/');
-  await expect(dashboardPage.getByText('3.22B', { exact: true })).toHaveCount(1);
+  // The model breakdown must format with the page-local compact formatter (one
+  // value per model, never the shared fmtTokens output) and must not clip.
+  const modelCard = dashboardPage.locator('.pool-chart-card').filter({ hasText: '模型 Token 占比' });
+  await expect(modelCard.locator('.pool-ranked__value')).toHaveText(['3.00B', '220.00M']);
+  await expect.poll(() => modelCard.locator('.pool-ranked__value').first()
+    .evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
   await dashboardPage.close();
 });
 
@@ -690,7 +695,7 @@ test('dashboard and portal usage distinguish primary and partial failures', asyn
   await dashboardPartial.goto('/console/');
   await expect(dashboardPartial.getByRole('alert')).toHaveCount(0);
   await expect(dashboardPartial.getByText('可调度账号', { exact: true })).toBeVisible();
-  await expect(dashboardPartial.locator('.pool-dashboard-command__metric strong')).toHaveText('2');
+  await expect(dashboardPartial.locator('.pool-kpi').filter({ hasText: '可调度账号' }).locator('.pool-kpi__value')).toHaveText('2');
   await dashboardPartial.close();
 
   const dashboardFailure = await browser.newPage({ viewport: { width: 390, height: 844 } });
@@ -705,7 +710,7 @@ test('dashboard and portal usage distinguish primary and partial failures', asyn
   await mockBackend(portalPartial, 'user', 'partial');
   await portalPartial.goto('/console/portal');
   await expect(portalPartial.getByRole('alert')).toContainText('趋势数据暂时不可用');
-  await expect(portalPartial.locator('.pool-stat').filter({ hasText: '总 Token' }).locator('.value')).toHaveText('1500');
+  await expect(portalPartial.locator('.pool-portal-hero__figure strong')).toHaveText('1500');
   await expect.poll(() => portalPartial.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await portalPartial.close();
 

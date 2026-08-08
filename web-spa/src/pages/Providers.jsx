@@ -516,7 +516,6 @@ export default function Providers() {
         pagination={false}
         className="pool-mobile-table pool-providers-table"
         density="compact"
-        layout="fit"
         scroll={false}
         rowHeight={72}
         mobileColumns={mobileColumns}

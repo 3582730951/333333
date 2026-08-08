@@ -23,6 +23,22 @@ export function fmtBytes(value) {
 
 export const fmtKB = (kb) => fmtBytes((Number(kb) || 0) * 1024);
 
+// Shortens an identifier from the middle, keeping both ends.
+//
+// Account ids, emails and error strings are frequently distinguished only by their tail —
+// acct_prod_primary_001 vs acct_prod_primary_002 — so a trailing ellipsis throws away the one
+// part the reader needs, and letting the cell wrap breaks the token at an arbitrary character
+// (…_spend_00 / 2), which is worse still: the suffix is there but no longer legible as one.
+//
+// Callers pass the full string as a title so nothing is lost. Previously copy-pasted into
+// Accounts (24/14) and EmailPool (22/14); the defaults here are EmailPool's, and both keep
+// passing explicit lengths where the column width called for something different.
+export function middleEllipsis(value, head = 22, tail = 14) {
+  const text = String(value ?? '');
+  if (text.length <= head + tail + 1) return text;
+  return `${text.slice(0, head)}…${text.slice(-tail)}`;
+}
+
 export function fmtDuration(value) {
   const seconds = Math.max(0, Number(value) || 0);
   const days = Math.floor(seconds / 86400);

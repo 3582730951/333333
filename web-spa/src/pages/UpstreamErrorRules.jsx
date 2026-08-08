@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Button, Drawer, Tag, Toast, Switch, Select } from '../components/pool/index.jsx';
 import { IconPlus, IconRefresh, IconEdit, IconDelete, IconPlay } from '../components/pool/icons.jsx';
 import PageHeader from '../components/PageHeader.jsx';
+import { MetricRail } from '../components/DisplayPrimitives.jsx';
 import { get, post, patch, del } from '../api.js';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 
@@ -139,12 +140,23 @@ export default function UpstreamErrorRules() {
   }, []);
   useEffect(() => { load(); }, [load]);
 
-  const stats = useMemo(() => ({
-    enabled: rules.filter((r) => r.enabled).length,
-    failover: rules.filter((r) => r.downstream_action === 'failover').length,
-    pass: rules.filter((r) => r.downstream_action === 'pass').length,
-    idle: rules.filter((r) => r.downstream_action === 'idle_stream').length,
-  }), [rules]);
+  // Every count here is a slice of the rule list, so each gets its proportion of the
+  // total rather than leaving four bare numbers to be compared by eye.
+  const metrics = useMemo(() => {
+    const share = (part) => (rules.length ? part / rules.length : 0);
+    const enabled = rules.filter((r) => r.enabled).length;
+    const byAction = (action) => rules.filter((r) => r.downstream_action === action).length;
+    const failover = byAction('failover');
+    const pass = byAction('pass');
+    const idle = byAction('idle_stream');
+    return [
+      { label: '规则总数', value: rules.length },
+      { label: '已启用', value: enabled, share: share(enabled), tone: enabled ? 'success' : 'warning' },
+      { label: '自动切换', value: failover, share: share(failover), tone: 'info' },
+      { label: '透传', value: pass, share: share(pass) },
+      { label: '空转', value: idle, share: share(idle), tone: idle ? 'warning' : undefined },
+    ];
+  }, [rules]);
 
   const openEditor = (rule) => {
     const values = normalizeForEditor(rule);
@@ -215,13 +227,15 @@ export default function UpstreamErrorRules() {
     <div className="upstream-rules-page">
       <PageHeader title="上游错误规则" subtitle="按状态码、响应内容、模型和入口控制上游错误处理方式；严格 CPA 同样遵守已启用规则" actions={<><Button icon={<IconRefresh />} onClick={load} loading={loading}>刷新</Button><Button icon={<IconPlus />} theme="solid" onClick={() => openEditor(null)}>新建规则</Button></>} />
 
-      <section className="upstream-rule-overview">
-        <div><span>已启用规则数</span><strong>{stats.enabled}</strong></div>
-        <div><span>自动切换规则数</span><strong>{stats.failover}</strong></div>
-        <div><span>透传规则数</span><strong>{stats.pass}</strong></div>
-        <div><span>空转规则数</span><strong>{stats.idle}</strong></div>
-      </section>
-      <p className="upstream-rule-note">严格 CPA 兼容：已启用的响应过滤、账号动作和终态下游动作都会执行；它只保证发往上游的 session、previous_response_id 与工具结果保持原生。failover 对自包含请求会自动切换；带上游状态的会话无法跨账号迁移时，会安全轮换 context epoch 并返回 cpa-v2 可见状态。</p>
+      <MetricRail items={metrics} className="pool-metric-rail--band" label="规则概览" />
+      {/* Four dense sentences of protocol caveats sat above the rules themselves and
+          pushed them below the fold. The claim stays visible; the mechanics are one
+          click away for whoever actually needs them. */}
+      <details className="upstream-rule-note">
+        <summary>严格 CPA 兼容：规则照常执行，只保留上游会话状态原生</summary>
+        <p>已启用的响应过滤、账号动作和终态下游动作都会执行；严格 CPA 只保证发往上游的 session、previous_response_id 与工具结果保持原生。</p>
+        <p>failover 对自包含请求会自动切换。带上游状态的会话无法跨账号迁移时，会安全轮换 context epoch 并返回 cpa-v2 可见状态。</p>
+      </details>
 
       <section className="upstream-rule-list">
         {rules.length === 0 ? <div className="upstream-rule-empty">暂无规则。点击“新建规则”开始配置。</div> : null}
@@ -245,12 +259,14 @@ export default function UpstreamErrorRules() {
 
       <section className="upstream-rule-test-panel">
         <div className="upstream-rule-section-head"><h2>测试与预览</h2><p>输入模拟上游错误，查看命中的规则、账号动作、下游动作和最终响应预览。</p></div>
+        {/* A placeholder disappears the moment you type, so a filled-in form became five
+            unlabelled boxes. Persistent labels, same shape as the rule editor below. */}
         <div className="upstream-rule-test-grid">
-          <input className="pool-input" placeholder="provider" value={testInput.provider} onChange={(e) => setTestInput((x) => ({ ...x, provider: e.target.value }))} />
-          <select className="pool-select" value={testInput.entrypoint} onChange={(e) => setTestInput((x) => ({ ...x, entrypoint: e.target.value }))}>{ENTRYPOINTS.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select>
-          <input className="pool-input" placeholder="model" value={testInput.model} onChange={(e) => setTestInput((x) => ({ ...x, model: e.target.value }))} />
-          <input className="pool-input" type="number" placeholder="status" value={testInput.status} onChange={(e) => setTestInput((x) => ({ ...x, status: e.target.value }))} />
-          <textarea className="pool-textarea" placeholder="模拟 body" value={testInput.body} onChange={(e) => setTestInput((x) => ({ ...x, body: e.target.value }))} />
+          <label><span>平台</span><input className="pool-input" placeholder="claude" value={testInput.provider} onChange={(e) => setTestInput((x) => ({ ...x, provider: e.target.value }))} /></label>
+          <label><span>入口</span><select className="pool-select" value={testInput.entrypoint} onChange={(e) => setTestInput((x) => ({ ...x, entrypoint: e.target.value }))}>{ENTRYPOINTS.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>
+          <label><span>模型</span><input className="pool-input" placeholder="claude-sonnet-4.5" value={testInput.model} onChange={(e) => setTestInput((x) => ({ ...x, model: e.target.value }))} /></label>
+          <label><span>状态码</span><input className="pool-input" type="number" placeholder="429" value={testInput.status} onChange={(e) => setTestInput((x) => ({ ...x, status: e.target.value }))} /></label>
+          <label className="upstream-rule-test-body"><span>响应 body</span><textarea className="pool-textarea" placeholder="quota reached" value={testInput.body} onChange={(e) => setTestInput((x) => ({ ...x, body: e.target.value }))} /></label>
           <Button icon={<IconPlay />} theme="solid" onClick={runTest}>测试匹配</Button>
         </div>
         {testResult ? <pre className="upstream-rule-preview">{JSON.stringify(testResult, null, 2)}</pre> : null}

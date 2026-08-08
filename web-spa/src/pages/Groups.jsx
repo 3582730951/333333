@@ -1305,14 +1305,14 @@ export default function Groups() {
         <TabPane key="account_pool" tab="账号池分组" itemKey="account_pool">
           <Banner type="info" title="动态出口继承" description="账号记录不保存分组出口副本。出口列表首项为主出口，其余按顺序备用；用户指令与模型策略请在用户分组中配置。" />
           <div className="pool-resource-split pool-group-resource-split">
-            <ResourceTable error={groupsResource.error} onRetry={groupsResource.reload} loading={groupsResource.loading} lastRefresh={groupsResource.lastRefresh} dataSource={data.groups} columns={accountColumns} rowKey="name" pagination={false} density="compact" layout="fit" scroll={false} rowHeight={68} emptyTitle="暂无账号池分组" skeletonRows={5} />
+            <ResourceTable error={groupsResource.error} onRetry={groupsResource.reload} loading={groupsResource.loading} lastRefresh={groupsResource.lastRefresh} dataSource={data.groups} columns={accountColumns} rowKey="name" pagination={false} density="compact" scroll={false} rowHeight={68} emptyTitle="暂无账号池分组" skeletonRows={5} />
             {!groupsResource.error || groupsResource.lastRefresh ? <MetricRail items={accountMetrics} /> : null}
           </div>
         </TabPane>
         <TabPane key="user" tab="用户分组" itemKey="user">
           <Banner type="info" title="Super-Instruct：分组授权 + API Key 安装选择" description="列表开关默认关闭并设置分组能力上限；API Key 用户运行一键安装命令时，还需在 Codex 配置步骤选择启用，两项同时开启才生效。响应改写、Memory、Monitor 请在“编辑完整策略”中逐项授权。" />
           <div className="pool-resource-split pool-group-resource-split">
-            <ResourceTable error={userGroupsResource.error} onRetry={userGroupsResource.reload} loading={userGroupsResource.loading} lastRefresh={userGroupsResource.lastRefresh} dataSource={data.userGroups} columns={userColumns} rowKey="id" pagination={false} density="compact" layout="fit" scroll={false} rowHeight={68} emptyTitle="暂无用户分组" emptyDescription="创建后可混合选择账号池分组与模型提供商，并按模型设置优先层级。" skeletonRows={5} />
+            <ResourceTable error={userGroupsResource.error} onRetry={userGroupsResource.reload} loading={userGroupsResource.loading} lastRefresh={userGroupsResource.lastRefresh} dataSource={data.userGroups} columns={userColumns} rowKey="id" pagination={false} density="compact" scroll={false} rowHeight={68} emptyTitle="暂无用户分组" emptyDescription="创建后可混合选择账号池分组与模型提供商，并按模型设置优先层级。" skeletonRows={5} />
             {!userGroupsResource.error || userGroupsResource.lastRefresh ? <MetricRail items={userMetrics} /> : null}
           </div>
         </TabPane>

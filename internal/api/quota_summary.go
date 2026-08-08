@@ -31,6 +31,7 @@ type QuotaSummary struct {
 	Provider     string             `json:"provider"`
 	Primary      *QuotaWindow       `json:"primary,omitempty"`
 	Secondary    *QuotaWindow       `json:"secondary,omitempty"`
+	Credits      *QuotaCredits      `json:"credits,omitempty"`
 	ResetCredits *QuotaResetCredits `json:"reset_credits,omitempty"`
 
 	SyncReason string `json:"sync_reason"`
@@ -38,6 +39,27 @@ type QuotaSummary struct {
 	Stale      bool   `json:"stale,omitempty"`
 	Partial    bool   `json:"partial,omitempty"`
 	Supported  bool   `json:"supported"`
+}
+
+// QuotaCredits is the account's extra paid balance beyond the plan's included
+// windows, plus any workspace spend control applied to it. Upstream formats
+// balance/limit/used as display strings (and may hide the balance entirely while
+// still reporting that credits exist), so those are passed through verbatim and the
+// numeric percentages carry -1 for "not signalled".
+type QuotaCredits struct {
+	HasCredits          bool    `json:"has_credits"`
+	Unlimited           bool    `json:"unlimited"`
+	Balance             string  `json:"balance,omitempty"`
+	SpendControlReached bool    `json:"spend_control_reached,omitempty"`
+	Source              string  `json:"source,omitempty"`
+	Limit               string  `json:"limit,omitempty"`
+	Used                string  `json:"used,omitempty"`
+	Remaining           string  `json:"remaining,omitempty"`
+	UsedPercent         float64 `json:"used_percent"`
+	RemainingPercent    float64 `json:"remaining_percent"`
+	ResetAt             int64   `json:"reset_at,omitempty"`
+	Status              string  `json:"status,omitempty"`
+	UpdatedAt           int64   `json:"updated_at"`
 }
 
 type QuotaResetCredits struct {
@@ -67,6 +89,9 @@ func BuildQuotaSummary(account storage.Account, token *storage.AccountToken, sna
 	}
 	if reset := selectQuotaResetCredits(snapshots); reset != nil {
 		out.ResetCredits = reset
+	}
+	if credits := selectQuotaCredits(snapshots); credits != nil {
+		out.Credits = credits
 	}
 
 	if !quotaAccountActive(account, now) {
@@ -160,7 +185,7 @@ func selectQuotaPrimary(provider string, snapshots []storage.AccountRateLimit) *
 		if limiter == "" {
 			limiter = strings.TrimSpace(snap.Source)
 		}
-		if limiter == "7d_oauth_usage" || limiter == "7d_polled" || limiter == codexResetCreditsLimiterType || limiter == "quota_poll_error" || strings.HasPrefix(strings.TrimSpace(snap.Status), "error/") {
+		if limiter == "7d_oauth_usage" || limiter == "7d_polled" || limiter == codexResetCreditsLimiterType || limiter == codexCreditsLimiterType || limiter == "quota_poll_error" || strings.HasPrefix(strings.TrimSpace(snap.Status), "error/") {
 			continue
 		}
 		if provider == "claude" && (limiter == "opus" || limiter == "sonnet" || limiter == "haiku") {
@@ -202,6 +227,56 @@ func selectQuotaSecondary(primary *storage.AccountRateLimit, snapshots []storage
 		return &w
 	}
 	return nil
+}
+
+// selectQuotaCredits rebuilds the extra-balance block from the snapshot the quota
+// poller stored. The row's Raw payload is the source of truth for the display
+// strings; UsedPercent on the row itself mirrors the spend-control percentage so
+// callers that only read the flat column still see something meaningful.
+func selectQuotaCredits(snapshots []storage.AccountRateLimit) *QuotaCredits {
+	snap := latestSnapshotWithLimiter(snapshots, codexCreditsLimiterType)
+	if snap == nil {
+		return nil
+	}
+	detail := map[string]interface{}{}
+	if strings.TrimSpace(snap.Raw) != "" {
+		_ = json.Unmarshal([]byte(snap.Raw), &detail)
+	}
+	numeric := func(key string) float64 {
+		if value, ok := detail[key].(float64); ok {
+			return value
+		}
+		return -1
+	}
+	text := func(key string) string {
+		if value, ok := detail[key].(string); ok {
+			return strings.TrimSpace(value)
+		}
+		return ""
+	}
+	boolean := func(key string) bool {
+		value, _ := detail[key].(bool)
+		return value
+	}
+	usedPercent := numeric("used_percent")
+	if usedPercent < 0 && snap.UsedPercent >= 0 {
+		usedPercent = snap.UsedPercent
+	}
+	return &QuotaCredits{
+		HasCredits:          boolean("has_credits"),
+		Unlimited:           boolean("unlimited"),
+		Balance:             text("balance"),
+		SpendControlReached: boolean("spend_control_reached"),
+		Source:              text("source"),
+		Limit:               text("limit"),
+		Used:                text("used"),
+		Remaining:           text("remaining"),
+		UsedPercent:         usedPercent,
+		RemainingPercent:    numeric("remaining_percent"),
+		ResetAt:             snap.ResetAt,
+		Status:              strings.TrimSpace(snap.Status),
+		UpdatedAt:           snap.UpdatedAt,
+	}
 }
 
 func selectQuotaResetCredits(snapshots []storage.AccountRateLimit) *QuotaResetCredits {

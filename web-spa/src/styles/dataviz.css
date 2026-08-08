@@ -1,0 +1,953 @@
+/* Data-visualisation primitives (see components/MicroCharts.jsx).
+   Kept in its own sheet so the dense console surfaces can evolve without
+   growing components.css further. */
+
+/* ---------- Sparkline ---------- */
+
+.pool-sparkline-wrap {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+}
+
+.pool-sparkline {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.pool-sparkline__dot {
+  position: absolute;
+  left: 100%;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1.5px var(--pool-bg-surface);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.pool-sparkline--empty {
+  width: 100%;
+  border-radius: var(--pool-radius-sm);
+  background: linear-gradient(90deg, var(--pool-gray-soft), transparent);
+  opacity: 0.5;
+}
+
+/* ---------- Activity-ring gauge ---------- */
+
+.pool-gauge {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--pool-space-2);
+}
+
+.pool-gauge__svg {
+  display: block;
+  width: 100%;
+  max-width: 148px;
+  height: auto;
+}
+
+.pool-gauge__value {
+  fill: var(--pool-text);
+  font-family: var(--pool-font-sans);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+.pool-gauge__caption {
+  fill: var(--pool-text-3);
+  font-family: var(--pool-font-sans);
+  font-weight: 500;
+}
+
+.pool-gauge__label {
+  max-width: 100%;
+  color: var(--pool-text-2);
+  font-size: var(--pool-type-caption);
+  line-height: var(--pool-leading-tight);
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- Ranked horizontal bars ---------- */
+
+.pool-ranked {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pool-space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pool-ranked__row {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.pool-ranked__head {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--pool-space-3);
+}
+
+.pool-ranked__name {
+  display: flex;
+  min-width: 0;              /* lets the label ellipsize instead of pushing the value */
+  align-items: center;
+  gap: 7px;
+  color: var(--pool-text-2);
+  font-size: 12.5px;
+  line-height: var(--pool-leading-tight);
+}
+
+.pool-ranked__name > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-ranked__dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border-radius: 3px;
+}
+
+.pool-ranked__value {
+  flex: 0 0 auto;            /* never compressed by a long label */
+  color: var(--pool-text);
+  font-size: 12.5px;
+  font-weight: 620;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.pool-ranked__track {
+  position: relative;
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--pool-gray-soft);
+}
+
+.pool-ranked__track > span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  transition: width var(--pool-motion-slow) var(--pool-motion-ease);
+}
+
+.pool-ranked__meta {
+  color: var(--pool-text-3);
+  font-size: var(--pool-type-caption);
+  line-height: var(--pool-leading-tight);
+}
+
+/* ---------- Heat strip ---------- */
+
+.pool-heatstrip {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.pool-heatstrip__cells {
+  display: flex;
+  min-width: 0;
+  align-items: stretch;
+  gap: 3px;
+}
+
+.pool-heatstrip__cell {
+  min-width: 0;
+  height: 34px;
+  flex: 1 1 0;
+  border-radius: 3px;
+}
+
+.pool-heatstrip__footer {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--pool-space-3);
+  color: var(--pool-text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: var(--pool-leading-tight);
+}
+
+/* ---------- Stacked composition meter ---------- */
+
+.pool-stacked-meter {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-2);
+}
+
+.pool-stacked-meter__track {
+  display: flex;
+  height: 9px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--pool-gray-soft);
+}
+
+.pool-stacked-meter__track > span {
+  height: 100%;
+  min-width: 2px;
+}
+
+.pool-stacked-meter__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px var(--pool-space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pool-stacked-meter__legend li {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--pool-text-3);
+  font-size: 11.5px;
+  line-height: var(--pool-leading-tight);
+}
+
+.pool-stacked-meter__legend i {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 2px;
+}
+
+.pool-stacked-meter__legend b {
+  color: var(--pool-text-2);
+  font-weight: 620;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Delta badge ---------- */
+
+.pool-delta {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.pool-delta__arrow {
+  font-size: 10px;
+  line-height: 1;
+}
+
+.pool-delta--up {
+  color: var(--pool-success);
+  background: var(--pool-success-soft);
+}
+
+.pool-delta--down {
+  color: var(--pool-danger);
+  background: var(--pool-danger-soft);
+}
+
+.pool-delta--flat {
+  color: var(--pool-text-3);
+  background: var(--pool-gray-soft);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pool-ranked__track > span {
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .pool-ranked__track,
+  .pool-stacked-meter__track,
+  .pool-heatstrip__cell {
+    border: 1px solid ButtonText;
+  }
+
+  .pool-delta {
+    border: 1px solid ButtonText;
+  }
+}
+
+/* ============================================================
+   Admin dashboard composition
+   ============================================================ */
+
+.pool-dashboard {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-5);
+}
+
+/* --- status + quick actions bar --- */
+
+.pool-dashboard-statusbar {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--pool-space-3) var(--pool-space-4);
+}
+
+.pool-dashboard-statusbar__health {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--pool-space-2);
+  color: var(--pool-text-3);
+  font-size: var(--pool-type-caption);
+}
+
+.pool-dashboard-statusbar__actions {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--pool-space-2);
+}
+
+/* --- KPI strip --- */
+
+.pool-kpi-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: var(--pool-space-3);
+}
+
+.pool-kpi {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-4);
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-xl);
+  background: var(--pool-bg-surface);
+  box-shadow: var(--pool-shadow-panel);
+}
+
+.pool-kpi__head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--pool-space-2);
+}
+
+.pool-kpi__label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--pool-text-3);
+  font-size: var(--pool-type-caption);
+  font-weight: 550;
+  line-height: var(--pool-leading-tight);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-kpi__value {
+  color: var(--pool-text);
+  font-size: 27px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.028em;
+  line-height: 1.12;
+  overflow-wrap: anywhere;
+}
+
+.pool-kpi__foot {
+  display: flex;
+  min-width: 0;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--pool-space-3);
+  margin-top: auto;
+}
+
+.pool-kpi__caption {
+  min-width: 0;
+  flex: 1 1 auto;
+  color: var(--pool-text-3);
+  font-size: 11.5px;
+  line-height: var(--pool-leading-tight);
+  overflow-wrap: anywhere;
+}
+
+.pool-kpi__spark {
+  width: 96px;
+  height: 30px;
+  flex: 0 0 auto;   /* the caption reflows; the sparkline keeps its footprint */
+}
+
+/* --- trend + attention rail --- */
+
+.pool-ops-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(288px, 340px);
+  gap: var(--pool-space-4);
+  align-items: stretch;
+}
+
+.pool-ops-split__trend {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-3);
+}
+
+/* Absolute fill lets the chart follow the row height set by the taller column,
+   so neither side ever leaves a blank tail. */
+.pool-ops-split__canvas {
+  position: relative;
+  min-width: 0;
+  min-height: 264px;
+  flex: 1 1 auto;
+}
+
+.pool-ops-split__canvas > * {
+  position: absolute;
+  inset: 0;
+}
+
+.pool-ops-split__activity {
+  display: flex;
+  min-width: 0;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 7px;
+  padding-top: var(--pool-space-3);
+  border-top: 1px solid var(--pool-border-subtle);
+}
+
+.pool-ops-split__activity-label {
+  color: var(--pool-text-3);
+  font-size: 11.5px;
+  font-weight: 550;
+  line-height: var(--pool-leading-tight);
+}
+
+.pool-attention-rail {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-3);
+}
+
+.pool-attention-rail__list {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--pool-space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pool-attention-card {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px var(--pool-space-3);
+  border: 1px solid transparent;
+  border-radius: var(--pool-radius-lg);
+  background: var(--pool-bg-surface-2);
+}
+
+.pool-attention-card__head {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--pool-space-3);
+}
+
+.pool-attention-card__label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--pool-text-2);
+  font-size: 12.5px;
+  font-weight: 560;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-attention-card__value {
+  flex: 0 0 auto;
+  color: var(--pool-text);
+  font-size: 16px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: var(--pool-leading-tight);
+}
+
+.pool-attention-card__desc {
+  margin: 0;
+  color: var(--pool-text-3);
+  font-size: 11.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.pool-attention-card--issue {
+  border-color: color-mix(in srgb, var(--pool-danger) 30%, transparent);
+  background: var(--pool-danger-soft);
+}
+
+.pool-attention-card--issue .pool-attention-card__value {
+  color: var(--pool-danger);
+}
+
+.pool-attention-card--warn {
+  border-color: color-mix(in srgb, var(--pool-warning) 30%, transparent);
+  background: var(--pool-warning-soft);
+}
+
+.pool-attention-card--clear,
+.pool-attention-card--neutral {
+  border-color: var(--pool-border-subtle);
+}
+
+/* --- cache efficiency panel --- */
+
+.pool-cache-panel__body {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.9fr) minmax(0, 1.1fr);
+  gap: var(--pool-space-5);
+  align-items: start;
+}
+
+.pool-cache-panel__gauges {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--pool-space-3);
+}
+
+.pool-cache-panel__detail {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-5);
+}
+
+.pool-cache-panel__composition,
+.pool-cache-panel__models {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-3);
+}
+
+.pool-subsection-title {
+  color: var(--pool-text-2);
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  line-height: var(--pool-leading-tight);
+}
+
+/* --- responsive --- */
+
+@media (max-width: 1180px) {
+  .pool-ops-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pool-cache-panel__body {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--pool-space-4);
+  }
+}
+
+@media (max-width: 767px) {
+  .pool-dashboard {
+    gap: var(--pool-space-4);
+  }
+
+  .pool-dashboard-statusbar__actions {
+    width: 100%;
+  }
+
+  .pool-kpi__value {
+    font-size: 24px;
+  }
+
+  /* Three across, not auto-fit. A 112px minimum only fits two tracks in the ~326px of
+     content a 390px phone leaves inside this card, so the third gauge dropped to its own
+     row beside a half-card hole — and the two that stayed rendered at the 148px svg cap,
+     making the section ~340px taller than the numbers need.
+
+     The rings are a single at-a-glance triple (they answer one question three ways), so
+     they belong on one line. Three tracks give ~100px each, and the gauge svg scales to
+     its track, so the readout lands at ~24px: still the largest thing in the card. */
+  .pool-cache-panel__gauges {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--pool-space-2);
+  }
+
+  .pool-heatstrip__cell {
+    height: 28px;
+  }
+}
+
+/* A dashboard row must not leave dead space when a card is hidden because its
+   backing section is unavailable. auto-fit lets the surviving cards claim the
+   full width instead of stranding empty grid tracks.
+   Scoped above the tablet breakpoint so the mobile snap-carousel still applies. */
+@media (min-width: 1101px) {
+  .pool-dashboard-chart-grid.pool-grid.cols-3 {
+    grid-template-columns: repeat(auto-fit, minmax(316px, 1fr));
+  }
+}
+
+/* The rail's inline action is a link-weight affordance, not a full-width control. */
+.pool-attention-card .pool-button {
+  align-self: flex-start;
+  margin-top: 3px;
+  padding-inline: 0;
+  color: var(--pool-accent-text);
+}
+
+/* Console stat tiles are tuned for scanning: the portal keeps the roomier default
+   so the operator console and the end-user portal stay visibly different products.
+   Specificity (0,2,0) intentionally beats the base .pool-stat rules. */
+.pool-admin-shell .pool-stat {
+  min-height: 0;
+  padding: 13px var(--pool-space-4);
+}
+
+.pool-admin-shell .pool-stat .value {
+  margin-top: 5px;
+  font-size: 25px;
+}
+
+.pool-admin-shell .pool-stat .sub {
+  margin-top: 4px;
+  line-height: var(--pool-leading-tight);
+}
+
+.pool-admin-shell .pool-stat-grid {
+  gap: var(--pool-space-3);
+}
+
+/* On phones the KPI strip pairs up: a single column pushed the charts far below
+   the fold. The sparkline takes its own full-width row so the caption beside it
+   never has to compete for the remaining ~30px. */
+@media (max-width: 767px) {
+  /* Explicit two columns, not auto-fit. Five tiles divide into no column count the
+     mobile band produces, so auto-fit stranded the remainder: measured across the band
+     (32px page padding) it resolved to 1 column at 320px, 2 from 360-480, 3 from
+     540-600 and 4 from 680-767, which left the fifth tile sitting alone beside a
+     185px hole at 390px and a 495px hole at 680px.
+
+     Pinning the track count means the span rules below know how many tracks there are
+     to fill. Two columns hold the widest value comfortably — the tiles measure 173px at
+     390px against a ~112px worst-case number ("166.8万" at 27px/700). */
+  .pool-kpi-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  /* The odd tile out takes the whole row rather than half of one, giving a deliberate
+     2/2/1 composition with no empty track anywhere. Guarded on :nth-child(5):last-child
+     so it applies only to a five-tile strip and quietly does nothing at any other count. */
+  .pool-kpi-strip > .pool-kpi:nth-child(5):last-child {
+    grid-column: 1 / -1;
+  }
+
+  .pool-kpi__foot {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--pool-space-2);
+  }
+
+  /* No margin-top: auto here. The base rule bottom-anchors the foot, which is right on
+     desktop where caption and sparkline share one row so every tile is the same height.
+     Stacked for mobile the sparkline sits below the caption, making those tiles ~34px
+     taller; the grid stretched their sparkline-less neighbours to match and the auto
+     margin banked all of that slack between the value and its own caption — "1" and
+     "共 3 个账号" ended up a third of a card apart, reading as two unrelated facts.
+     Top-anchored, the spare height collects under the caption where it says nothing. */
+  .pool-kpi__foot {
+    margin-top: 0;
+  }
+
+  .pool-kpi__spark {
+    width: 100%;
+    height: 26px;
+  }
+}
+
+/* Upper half of the mobile band fits three tracks, so five tiles land 3 + 2 and strand
+   one track. The fourth tile absorbs it, filling the second row as 2 + 1. Same
+   child-count guard: :nth-child(4):nth-last-child(2) matches the fourth of exactly five. */
+@media (min-width: 540px) and (max-width: 767px) {
+  .pool-kpi-strip {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .pool-kpi-strip > .pool-kpi:nth-child(4):nth-last-child(2) {
+    grid-column: span 2;
+  }
+
+  .pool-kpi-strip > .pool-kpi:nth-child(5):last-child {
+    grid-column: auto;
+  }
+}
+
+/* ---------- Quota overview ---------- */
+
+.pool-quota-page {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-4);
+}
+
+.pool-quota-overview {
+  display: grid;
+  grid-template-columns: minmax(290px, 0.85fr) minmax(0, 1.15fr);
+  gap: var(--pool-space-4);
+  align-items: stretch;
+}
+
+.pool-quota-overview__gauge,
+.pool-quota-overview__ranked {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-3);
+}
+
+.pool-quota-overview__gauge-body {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-4);
+  justify-content: center;
+  flex: 1 1 auto;
+}
+
+.pool-quota-overview__note {
+  margin: 0;
+  color: var(--pool-warning);
+  font-size: 11.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 900px) {
+  .pool-quota-overview {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---------- Quota: credit-metered accounts ---------- */
+
+.pool-quota-credits__body {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.6fr) minmax(0, 1.4fr);
+  gap: var(--pool-space-5);
+  align-items: start;
+}
+
+.pool-quota-credits__facts {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-3);
+  margin: 0;
+}
+
+.pool-quota-credits__facts > div {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--pool-space-3);
+}
+
+.pool-quota-credits__facts dt {
+  min-width: 0;
+  color: var(--pool-text-3);
+  font-size: var(--pool-type-caption);
+  line-height: var(--pool-leading-tight);
+}
+
+.pool-quota-credits__facts dd {
+  flex: 0 0 auto;
+  margin: 0;
+  color: var(--pool-text);
+  font-size: 17px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  line-height: var(--pool-leading-tight);
+}
+
+.pool-quota-credits__ranked {
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
+  .pool-quota-credits__body {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--pool-space-4);
+  }
+}
+
+/* Balance list shown when accounts carry credits but no workspace spend limit,
+   so there is no percentage to plot. */
+.pool-quota-credits__balances {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pool-quota-credits__balances li {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--pool-space-3);
+  padding-bottom: var(--pool-space-2);
+  border-bottom: 1px solid var(--pool-border-subtle);
+}
+
+.pool-quota-credits__balances li:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.pool-quota-credits__balances span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--pool-text-2);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-quota-credits__balances b {
+  flex: 0 0 auto;
+  color: var(--pool-text);
+  font-size: 13px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Table column folding ---------- */
+
+.pool-table-pane {
+  min-width: 0;
+}
+
+.pool-table-expander-cell {
+  width: 40px;
+  padding-inline: 0 !important;
+  text-align: center;
+}
+
+.pool-table-expander {
+  display: inline-flex;
+  width: 26px;
+  height: 26px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-sm);
+  background: var(--pool-bg-surface-2);
+  color: var(--pool-text-3);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--pool-motion-fast) var(--pool-motion-ease),
+    color var(--pool-motion-fast) var(--pool-motion-ease);
+}
+
+.pool-table-expander:hover {
+  background: var(--pool-bg-hover);
+  color: var(--pool-text);
+}
+
+.pool-table-expander[aria-expanded='true'] {
+  border-color: color-mix(in srgb, var(--pool-accent) 35%, transparent);
+  background: var(--pool-accent-soft);
+  color: var(--pool-accent-text);
+}
+
+.pool-table-expanded-row > td {
+  padding: 0 !important;
+  background: var(--pool-bg-surface-2);
+}
+
+.pool-table-more {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: var(--pool-space-3) var(--pool-space-5);
+  margin: 0;
+  padding: var(--pool-space-4) var(--pool-space-5);
+}
+
+.pool-table-more > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.pool-table-more dt {
+  color: var(--pool-text-3);
+  font-size: 11.5px;
+  line-height: var(--pool-leading-tight);
+}
+
+.pool-table-more dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--pool-text);
+  font-size: 12.5px;
+  line-height: var(--pool-leading-tight);
+  overflow-wrap: anywhere;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pool-table-expander {
+    transition: none;
+  }
+}

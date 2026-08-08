@@ -6,7 +6,10 @@ import { ConfirmDialog } from './Dialog.jsx';
 import { MoreHorizontal } from './icons.jsx';
 import { cancelBrowserAnimationFrame, requestBrowserAnimationFrame } from '../../lib/browserLifecycle.js';
 
-export function ActionMenu({ items = [], label = '更多操作' }) {
+// `text` turns the trigger into a labelled button. A row of table actions is fine as a
+// bare "…" because its column header says what it is; a menu in a page header has no
+// such context and needs to name itself.
+export function ActionMenu({ items = [], label = '更多操作', text, icon, loading = false, disabled = false }) {
   const [confirmItem, setConfirmItem] = useState(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const dialogFrameRef = useRef(null);
@@ -15,7 +18,11 @@ export function ActionMenu({ items = [], label = '更多操作' }) {
     <>
       <DropdownMenu.Root modal={false} open={menuOpen} onOpenChange={setMenuOpen}>
         <DropdownMenu.Trigger asChild>
-          <Button theme="borderless" icon={<MoreHorizontal />} aria-label={label} />
+          {text ? (
+            <Button icon={icon} loading={loading} disabled={disabled} aria-label={label}>{text}</Button>
+          ) : (
+            <Button theme="borderless" icon={<MoreHorizontal />} aria-label={label} />
+          )}
         </DropdownMenu.Trigger>
         <DropdownMenu.Portal>
           <DropdownMenu.Content className="pool-account-menu" align="end">

@@ -210,7 +210,6 @@ export default function ModelQuality() {
           columns={statusColumns}
           rowKey={qualityKey}
           pagination={{ pageSize: 20, currentPage: statusPage, onPageChange: setStatusPage }}
-          layout="fit"
           emptyTitle="暂无可检测的分组模型"
           emptyDesc="请先添加活跃账号及其模型能力；启用定时检测后会自动生成状态。"
           skeletonRows={6}
@@ -228,7 +227,6 @@ export default function ModelQuality() {
           columns={runColumns}
           rowKey="id"
           pagination={{ pageSize: 20 }}
-          layout="fit"
           emptyTitle="暂无检测记录"
           skeletonRows={6}
           skeletonCols={10}

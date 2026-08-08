@@ -14,10 +14,18 @@ import useAsyncResource from '../hooks/useAsyncResource.js';
 import { loadResourceGroup } from '../lib/resource.js';
 
 // 代理模式常量：决定 cliproxy 取 IP 的方式。
+// `short` is what the table cell shows. It used to be derived by regex from `label`, which
+// pulled out the parenthetical — the wire value, not a name a reader recognises — so the
+// column read "credential" / "api_whitelist" in a UI that is otherwise Chinese throughout.
 const AUTH_MODES = [
-  { value: '', label: '账号密码模式 (credential)', desc: '用户名内嵌 region/sid，网关自动轮换。每次 sid 轮换取新 IP。' },
-  { value: 'api_whitelist', label: 'API 白名单模式 (api_whitelist)', desc: '调 api.cliproxy.io/white/api 提取 ip:port，无认证，按 region 锁国家。' },
+  { value: '', short: '账号密码', label: '账号密码模式 (credential)', desc: '用户名内嵌 region/sid，网关自动轮换。每次 sid 轮换取新 IP。' },
+  { value: 'api_whitelist', short: 'API 白名单', label: 'API 白名单模式 (api_whitelist)', desc: '调 api.cliproxy.io/white/api 提取 ip:port，无认证，按 region 锁国家。' },
 ];
+
+// storage.normalizeEgressPoolStrategy accepts any non-empty string and defaults to
+// sticky_least_used, so this maps the one value it names and passes anything else through
+// rather than hiding a strategy the backend accepted behind a missing translation.
+const STRATEGY_LABELS = { sticky_least_used: '粘滞 · 最少占用' };
 
 const EMPTY_EGRESS = { profiles: [], pools: [], config: [], error: null };
 
@@ -27,7 +35,12 @@ read -rsp 'Residential proxy URL: ' RESIDENTIAL_PROXY_URL; echo
 
 curl -fsS -X POST "$POOL_URL/admin/egress-profiles" \\
   -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \\
-  --data "$(jq -n --arg endpoint "$RESIDENTIAL_PROXY_URL" '{id:"egress_residential_registration",name:"Registration residential",type:"http_proxy",endpoint:$endpoint,region:"US",ip_mode:"dynamic_residential",provider_key:"residential",max_concurrency:1,detect_region:true}')"`;
+  --data "$(jq -n --arg endpoint "$RESIDENTIAL_PROXY_URL" '{
+    id: "egress_residential_registration", name: "Registration residential",
+    type: "http_proxy", endpoint: $endpoint, region: "US",
+    ip_mode: "dynamic_residential", provider_key: "residential",
+    max_concurrency: 1, detect_region: true
+  }')"`;
 
 const formatDynamicConfig = (value) => {
   if (!value) return '{}';
@@ -75,15 +88,28 @@ export default function Egress() {
   const configRows = data.config || [];
   const registrationPoolSetting = configRows.find((row) => row.key === 'registration_egress_pool_id')?.value || '';
   const registrationPools = pools.filter((pool) => !pool.purpose || pool.purpose === 'registration');
-  const healthyCount = rows.filter((row) => !row.health || row.health === 'healthy').length;
+  // Mirrors scheduler.EgressHealthy: an egress is schedulable unless it is disabled
+  // or still cooling down. "健康" would be the wrong word for a tripped egress the
+  // scheduler will still pick, so the rail reports schedulability instead.
+  const now = Math.floor(Date.now() / 1000);
+  const schedulableCount = rows.filter((row) => {
+    if (Number(row.cooldown_until) > now) return false;
+    return ['', 'healthy', 'cooldown', 'tripped'].includes(String(row.health || ''));
+  }).length;
   const proxyCount = rows.filter((row) => row.type && row.type !== 'direct').length;
   const concurrencyTotal = rows.reduce((sum, row) => sum + (Number(row.max_concurrency) || 0), 0);
+  const share = (part) => (rows.length ? part / rows.length : 0);
   const egressMetrics = [
-    { label: '出口数', value: rows.length },
-    { label: '健康出口', value: healthyCount, tone: healthyCount === rows.length ? 'success' : 'warning' },
-    { label: '代理出口', value: proxyCount },
+    { label: '出口', value: rows.length },
+    {
+      label: '可调度',
+      value: schedulableCount,
+      share: share(schedulableCount),
+      tone: schedulableCount === rows.length ? 'success' : 'warning',
+    },
+    { label: '走代理', value: proxyCount, share: share(proxyCount), tone: 'info' },
     { label: '注册池', value: registrationPools.length },
-    { label: '总并发', value: concurrencyTotal },
+    { label: '并发上限', value: concurrencyTotal },
   ];
 
   useEffect(() => {
@@ -195,9 +221,17 @@ export default function Egress() {
     return <Tag color={ok ? 'green' : warning ? 'orange' : 'red'}>{v || 'healthy'}</Tag>;
   };
 
-  const renderMode = (v) => {
-    const m = AUTH_MODES.find(m => m.value === v);
-    return <Tag color={v === 'api_whitelist' ? 'blue' : 'grey'}>{m ? m.label.split(' ')[0] : 'credential'}</Tag>;
+  // storage.EgressProfile.ProxyAuthMode only describes how a proxy's IPs are obtained, so
+  // it says nothing about an egress that has no proxy endpoint. Those used to read
+  // "credential", which is a claim about credentials the egress does not use.
+  const renderMode = (row) => {
+    if (!row.endpoint && !row.chain_proxy) return <span className="pool-muted">—</span>;
+    const mode = AUTH_MODES.find((entry) => entry.value === (row.proxy_auth_mode || ''));
+    return (
+      <Tag color={row.proxy_auth_mode === 'api_whitelist' ? 'blue' : 'grey'} title={mode?.desc}>
+        {mode ? mode.short : String(row.proxy_auth_mode)}
+      </Tag>
+    );
   };
 
   const renderActions = (row) => (
@@ -234,9 +268,9 @@ export default function Egress() {
     },
     {
       title: '代理模式',
-      dataIndex: 'proxy_auth_mode',
+      key: 'proxy_auth_mode',
       width: 140,
-      render: renderMode,
+      render: (_, row) => renderMode(row),
     },
     { title: '健康', dataIndex: 'health', width: 120, render: renderHealth },
     { title: '并发', dataIndex: 'max_concurrency', width: 96, render: (v) => v ?? '—' },
@@ -255,10 +289,9 @@ export default function Egress() {
       render: (_, row) => (
         <div className="pool-resource-summary">
           <TextClamp strong>{row.name || row.id}</TextClamp>
-          <div className="pool-resource-summary__meta">
-            <Tag size="small" color="orange">registration</Tag>
-            <span>{row.id}</span>
-          </div>
+          {/* The table is titled 注册池 and only lists pools whose purpose is registration,
+              so a `registration` tag on every row restated the heading four times over. */}
+          <div className="pool-resource-summary__meta"><span>{row.id}</span></div>
         </div>
       ),
     },
@@ -266,7 +299,10 @@ export default function Egress() {
       title: '策略',
       dataIndex: 'assignment_strategy',
       width: 160,
-      render: (v) => <Tag color="blue">{v || 'sticky_least_used'}</Tag>,
+      render: (v) => {
+        const strategy = v || 'sticky_least_used';
+        return <Tag color="blue" title={strategy}>{STRATEGY_LABELS[strategy] || strategy}</Tag>;
+      },
     },
     {
       title: '成员',
@@ -274,7 +310,9 @@ export default function Egress() {
       width: 320,
       render: (_, row) => (
         <div className="pool-resource-summary">
-          <TextClamp>{(row.members || []).map((m) => m.egress?.name || m.egress_id).join(', ') || '未添加成员'}</TextClamp>
+          {/* A member whose egress has neither name nor id contributed an empty string,
+              so a pool of two unnamed members rendered as a bare ", ". */}
+          <TextClamp>{(row.members || []).map((m) => m.egress?.name || m.egress_id).filter(Boolean).join(' · ') || '未添加成员'}</TextClamp>
           <div className="pool-resource-summary__meta">{(row.members || []).length} 个出口</div>
         </div>
       ),
@@ -304,7 +342,7 @@ export default function Egress() {
           subtitle={`${row.exit_ip || '—'} · ${row.region || '未指定地区'}`}
           badges={<><Tag>{row.type || 'direct'}</Tag>{renderHealth(row.health)}</>}
           details={[
-            { label: '代理模式', value: renderMode(row.proxy_auth_mode) },
+            { label: '代理模式', value: renderMode(row) },
             { label: '并发', value: row.max_concurrency ?? '—' },
           ]}
           actions={renderActions(row)}
@@ -329,24 +367,6 @@ export default function Egress() {
         </div>
         <CopyCodeBlock code={RESIDENTIAL_QUICKSTART} label="复制住宅代理命令" />
       </section>
-      <div className="pool-toolbar pool-egress-registration-toolbar">
-        <Typography.Text strong>默认注册池</Typography.Text>
-        <Select
-          value={registrationPoolDraft}
-          onChange={setRegistrationPoolDraft}
-          optionList={[
-            { label: '未设置', value: '' },
-            ...(registrationPools || []).map((pool) => ({ label: `${pool.name || pool.id} (${pool.members?.length || 0})`, value: pool.id })),
-          ]}
-          style={{ width: 260 }}
-        />
-        <Button
-          size="small"
-          loading={savingRegistrationPool}
-          disabled={registrationPoolDraft === registrationPoolSetting}
-          onClick={saveRegistrationPool}
-        >保存</Button>
-      </div>
       <div className="pool-resource-split">
         <ResourceTable
           error={error}
@@ -361,7 +381,6 @@ export default function Egress() {
           mobileColumns={mobileColumns}
           mobileScroll={false}
           density="compact"
-          layout="fit"
           scroll={false}
           rowHeight={64}
           emptyTitle="暂无出口配置"
@@ -370,25 +389,53 @@ export default function Egress() {
         />
         {!error || lastRefresh ? <MetricRail items={egressMetrics} /> : null}
       </div>
-      <ResourceTable
-        error={data.error}
-        onRetry={load}
-        loading={loading}
-        lastRefresh={lastRefresh}
-        dataSource={registrationPools}
-        columns={registrationPoolColumns}
-        rowKey="id"
-        pagination={{ pageSize: 12 }}
-        className="pool-egress-pools-table"
-        density="compact"
-        layout="fit"
-        scroll={false}
-        rowHeight={64}
-        emptyTitle="暂无注册池"
-        emptyDesc="创建注册池后，注册任务可从池内选择代理出口"
-        emptyType="egress"
-        skeletonRows={4}
-      />
+      {/* The default-pool setting only means anything in terms of the pools listed below,
+          so it rides in this table's heading instead of a toolbar of its own. */}
+      <section className="pool-egress-pools">
+        <div className="pool-section-heading">
+          <div>
+            <span>注册出口</span>
+            <h3>注册池</h3>
+          </div>
+          <div className="pool-section-heading__controls">
+            <label htmlFor="egress-default-pool">默认池</label>
+            <Select
+              id="egress-default-pool"
+              value={registrationPoolDraft}
+              onChange={setRegistrationPoolDraft}
+              optionList={[
+                { label: '未设置', value: '' },
+                ...(registrationPools || []).map((pool) => ({ label: `${pool.name || pool.id} (${pool.members?.length || 0})`, value: pool.id })),
+              ]}
+              style={{ width: 220 }}
+            />
+            <Button
+              size="small"
+              loading={savingRegistrationPool}
+              disabled={registrationPoolDraft === registrationPoolSetting}
+              onClick={saveRegistrationPool}
+            >保存</Button>
+          </div>
+        </div>
+        <ResourceTable
+          error={data.error}
+          onRetry={load}
+          loading={loading}
+          lastRefresh={lastRefresh}
+          dataSource={registrationPools}
+          columns={registrationPoolColumns}
+          rowKey="id"
+          pagination={{ pageSize: 12 }}
+          className="pool-egress-pools-table"
+          density="compact"
+          scroll={false}
+          rowHeight={64}
+          emptyTitle="暂无注册池"
+          emptyDesc="创建注册池后，注册任务可从池内选择代理出口"
+          emptyType="egress"
+          skeletonRows={4}
+        />
+      </section>
 
       <Modal
         title={editing?.id ? `编辑出口 ${editing.id}` : '新建出口'}
@@ -462,7 +509,7 @@ export default function Egress() {
             <Form.Input field="id" label="ID" disabled={!!poolEditing.id} placeholder="pool_registration_proxy" />
             <Form.Input field="name" label="名称" placeholder="自动注册代理池" />
             <Form.Select field="assignment_strategy" label="分配策略" optionList={[
-              { value: 'sticky_least_used', label: 'sticky_least_used' },
+              { value: 'sticky_least_used', label: STRATEGY_LABELS.sticky_least_used },
             ]} />
           </Form>
         )}

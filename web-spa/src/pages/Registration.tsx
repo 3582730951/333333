@@ -526,7 +526,6 @@ export default function Registration() {
           pagination={{ pageSize: 15 }}
           className="pool-registration-jobs"
           density="compact"
-          layout="fit"
           scroll={false}
           rowHeight={64}
           emptyTitle={t('registration.empty')}

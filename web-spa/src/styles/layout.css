@@ -1,12 +1,21 @@
 .pool-app-layout {
+  display: block;
   min-height: 100vh;
+  min-height: 100dvh;
   background: var(--pool-bg-page);
   color: var(--pool-text);
 }
 
-.pool-app-layout.pool-layout,
-.pool-main-layout.pool-layout {
+.pool-app-layout.pool-layout {
   display: block;
+}
+
+.pool-main-layout.pool-layout {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
 }
 
 .pool-layout {
@@ -16,8 +25,11 @@
 
 .pool-main-layout {
   min-height: 100vh;
+  min-height: 100dvh;
   width: calc(100vw - var(--pool-sidebar-width, 0px));
   min-width: 0;
+  background: var(--pool-bg-page);
+  transition: margin-left var(--pool-motion-normal) var(--pool-motion-ease), width var(--pool-motion-normal) var(--pool-motion-ease);
 }
 
 .pool-sider {
@@ -31,9 +43,11 @@
 }
 
 .pool-content {
-  min-height: calc(100vh - 56px);
+  flex: 1;
+  min-height: 0;
   min-width: 0;
   overflow: auto;
+  background: var(--pool-bg-page);
 }
 
 .pool-shell {
@@ -46,11 +60,27 @@
 .pool-brand {
   display: flex;
   align-items: center;
-  padding: 0 16px;
   gap: 10px;
-  font-weight: 650;
-  letter-spacing: 0;
+  padding: 0 16px;
   color: var(--pool-text);
+  flex: 0 0 64px;
+  min-height: 64px;
+  border-bottom: 1px solid var(--pool-border-subtle);
+  font-size: 15px;
+  font-weight: 680;
+  letter-spacing: -0.015em;
+}
+
+.pool-brand .pool-avatar {
+  flex: 0 0 auto;
+  background: var(--pool-accent-soft);
+  color: var(--pool-accent-text);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--pool-accent) 15%, transparent);
+}
+
+.pool-sidebar-is-collapsed .pool-brand {
+  justify-content: center;
+  padding-inline: 8px;
 }
 
 .pool-mobile-drawer-close {
@@ -59,11 +89,18 @@
 }
 
 .pool-sidebar-collapse {
-  height: 48px;
+  height: 52px;
   display: flex;
   align-items: center;
-  padding: 0 8px;
-  border-top: 1px solid var(--pool-border);
+  padding: 9px 10px;
+  background: var(--pool-bg-surface);
+  border-top: 1px solid var(--pool-border-subtle);
+}
+
+.pool-sidebar-collapse .pool-button {
+  width: 100%;
+  justify-content: flex-start;
+  color: var(--pool-text-3);
 }
 
 .pool-topbar-left,
@@ -169,14 +206,6 @@
 }
 
 /* Application shell */
-.pool-app-layout {
-  background: var(--pool-bg-page);
-}
-
-.pool-main-layout {
-  background: var(--pool-bg-page);
-}
-
 .pool-sider {
   background: var(--pool-bg-surface);
 }
@@ -191,23 +220,13 @@
   padding: 24px;
 }
 
-.pool-brand {
-  padding: 0 14px;
-  font-weight: 720;
-  letter-spacing: -0.018em;
-}
-
-.pool-sidebar-collapse {
-  height: 52px;
-  padding: 8px;
-  background: var(--pool-bg-surface);
-}
-
 .pool-shell-drawer-overlay {
   position: fixed;
   inset: 0;
   z-index: 999;
   background: var(--pool-bg-overlay);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
   animation: pool-fade-in var(--pool-motion-normal) var(--pool-motion-ease);
 }
 
@@ -407,14 +426,16 @@
   max-width: var(--pool-sidebar-width);
   height: 100dvh;
   overflow: hidden;
-  background: var(--pool-bg-surface);
-  border-right: 1px solid var(--pool-border);
+  background: var(--pool-bg-material-strong);
+  border-right: 1px solid var(--pool-border-subtle);
+  backdrop-filter: var(--pool-material-blur);
+  -webkit-backdrop-filter: var(--pool-material-blur);
 }
 
 .pool-brand {
-  flex: 0 0 60px;
-  min-height: 60px;
-  border-bottom: 1px solid var(--pool-border);
+  flex: 0 0 64px;
+  min-height: 64px;
+  border-bottom: 1px solid var(--pool-border-subtle);
 }
 
 .pool-nav-scroll {
@@ -543,9 +564,11 @@
 
 @media (max-width: 767px) {
   .pool-shell-sider {
-    width: min(86vw, 304px) !important;
-    min-width: min(86vw, 304px);
-    max-width: min(86vw, 304px);
+    width: min(312px, calc(100vw - 40px)) !important;
+    min-width: min(312px, calc(100vw - 40px));
+    max-width: min(312px, calc(100vw - 40px));
+    padding-top: env(safe-area-inset-top);
+    box-shadow: var(--pool-shadow-lg);
   }
 
   .pool-shell-sider[aria-hidden="true"] {

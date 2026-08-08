@@ -42,6 +42,38 @@ type NavigationItem = {
   items?: NavigationItem[];
 };
 
+type CommittedViewPayload = {
+  identity: string;
+  title: string;
+};
+
+function CommittedView({
+  identity,
+  title,
+  onCommit,
+  children,
+}: {
+  identity: string;
+  title: string;
+  onCommit: (payload: CommittedViewPayload) => void;
+  children: ReactNode;
+}) {
+  const onCommitRef = useRef(onCommit);
+  const titleRef = useRef(title);
+  onCommitRef.current = onCommit;
+  titleRef.current = title;
+
+  useEffect(() => {
+    onCommitRef.current({ identity, title: titleRef.current });
+  }, [identity]);
+
+  return <>{children}</>;
+}
+
+function RouteStatus({ announcement }: { announcement: string }) {
+  return <div className="pool-sr-only" role="status" aria-live="polite" aria-atomic="true">{announcement}</div>;
+}
+
 function reportPrefetchError(error: unknown, route: RouteDefinition) {
   reportClientError(error, { source: 'route.prefetch', componentStack: `prefetch:${route.path}` });
   if (isChunkLoadError(error)) notifyChunkUpdateAvailable(error);
@@ -149,19 +181,44 @@ function portalNavigation(): NavigationItem[] {
   });
 }
 
-function AppRoutes({ admin }: { admin: boolean }) {
+function AppRoutes({
+  admin,
+  routeIdentity,
+  routeTitle,
+  onViewCommit,
+}: {
+  admin: boolean;
+  routeIdentity: string;
+  routeTitle: string;
+  onViewCommit: (payload: CommittedViewPayload) => void;
+}) {
   const location = useLocation();
   const routes: ReadonlyArray<RouteDefinition> = admin ? adminRoutes : portalRoutes;
   const pages = admin ? adminPages : portalPages;
   const fallback = admin ? '/' : '/portal';
+  const shellIdentity = `shell:${admin ? 'admin' : 'portal'}:${routeIdentity}`;
   return (
-    <AppErrorBoundary variant="page" resetKey={`${location.pathname}${location.search}`}>
+    <AppErrorBoundary
+      variant="page"
+      resetKey={`${location.pathname}${location.search}`}
+      onFallbackCommit={() => onViewCommit({ identity: shellIdentity, title: routeTitle })}
+    >
       <Suspense fallback={<RouteFallback />}>
         <StablePageReady routeKey={`${location.pathname}${location.search}`}>
           <Routes>
             {routes.map((route) => {
               const Page = pages.get(route.path)!;
-              return <Route key={route.path} path={route.path} element={<Page />} />;
+              return (
+                <Route
+                  key={route.path}
+                  path={route.path}
+                  element={(
+                    <CommittedView identity={shellIdentity} title={routeTitle} onCommit={onViewCommit}>
+                      <Page />
+                    </CommittedView>
+                  )}
+                />
+              );
             })}
             {admin ? legacyRedirects.map((redirect) => (
               <Route key={redirect.path} path={redirect.path} element={<Navigate to={redirect.to} replace />} />
@@ -185,6 +242,7 @@ export default function App() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [aiSettingsDirty, setAISettingsDirty] = useState(false);
+  const [routeAnnouncement, setRouteAnnouncement] = useState('');
   const accountMenuRef = useRef<HTMLDivElement | null>(null);
   const accountMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const mobileMenuButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -308,6 +366,86 @@ export default function App() {
       ? '/settings/ai/chatgpt'
       : location.pathname;
   const activeRoute = (isAdmin ? adminRoutes : portalRoutes).find((route) => route.path === location.pathname);
+  const activeSettingsSection = location.pathname === '/settings-v2'
+    ? settingsSections.find((section) => section.key === activeSettingsTab)
+    : undefined;
+  const routeIdentity = location.pathname === '/settings-v2'
+    ? `/settings-v2?tab=${activeSettingsTab}`
+    : location.pathname;
+  const routeTitle = activeSettingsSection
+    ? `${t('nav.settings')} · ${t(activeSettingsSection.labelKey)}`
+    : activeRoute
+      ? t(activeRoute.titleKey)
+      : t('app.title');
+  const shellViewIdentity = `shell:${isAdmin ? 'admin' : 'portal'}:${routeIdentity}`;
+  const currentViewIdentity = !auth.ready
+    ? 'auth:boot'
+    : auth.error
+      ? 'auth:error'
+      : auth.authed
+        ? shellViewIdentity
+        : 'auth:login';
+  const currentViewTitle = !auth.ready
+    ? t('app.title')
+    : auth.error
+      ? t('error.console_connection')
+      : auth.authed
+        ? routeTitle
+        : t('auth.login_title');
+  const lastCommittedViewRef = useRef<string | null>(null);
+  const pendingCommittedViewRef = useRef<CommittedViewPayload | null>(null);
+  const expectedViewIdentityRef = useRef(currentViewIdentity);
+  const previousRequestedShellViewRef = useRef(shellViewIdentity);
+  expectedViewIdentityRef.current = currentViewIdentity;
+
+  useEffect(() => {
+    const appTitle = t('app.title');
+    document.title = currentViewTitle === appTitle ? appTitle : `${currentViewTitle} – ${appTitle}`;
+  }, [currentViewTitle, locale]);
+
+  const applyCommittedView = useCallback((payload: CommittedViewPayload) => {
+    if (lastCommittedViewRef.current === payload.identity) return;
+    const isInitialCommit = lastCommittedViewRef.current === null;
+    lastCommittedViewRef.current = payload.identity;
+    if (isInitialCommit) return;
+
+    setRouteAnnouncement(t('app.page_changed').replace('{title}', payload.title));
+    const main = document.getElementById('main-content');
+    const heading = main?.querySelector<HTMLElement>('h1');
+    (heading || main)?.focus();
+  }, []);
+
+  const handleViewCommit = useCallback((payload: CommittedViewPayload) => {
+    if (lastCommittedViewRef.current === payload.identity) return;
+    if (lastCommittedViewRef.current === null) {
+      applyCommittedView(payload);
+      return;
+    }
+    if (payload.identity.startsWith('shell:admin:') && responsive.isMobile && mobileOpen) {
+      pendingCommittedViewRef.current = payload;
+      setMobileOpen(false);
+      return;
+    }
+    applyCommittedView(payload);
+  }, [applyCommittedView, mobileOpen, responsive.isMobile]);
+
+  useEffect(() => {
+    if (mobileOpen) return;
+    const pending = pendingCommittedViewRef.current;
+    if (!pending) return;
+    pendingCommittedViewRef.current = null;
+    if (pending.identity !== expectedViewIdentityRef.current) return;
+    applyCommittedView(pending);
+  }, [applyCommittedView, mobileOpen]);
+
+  useEffect(() => {
+    const previous = previousRequestedShellViewRef.current;
+    previousRequestedShellViewRef.current = shellViewIdentity;
+    if (previous === shellViewIdentity) return;
+    if (auth.authed && isAdmin && responsive.isMobile && mobileOpen) {
+      setMobileOpen(false);
+    }
+  }, [auth.authed, isAdmin, mobileOpen, responsive.isMobile, shellViewIdentity]);
   const ident = auth.user?.email || auth.user?.name || (isAdmin ? 'admin' : 'user');
   const identInitial = String(ident).trim().charAt(0).toUpperCase();
   const navCollapsed = isAdmin && !responsive.isMobile ? collapsed : false;
@@ -317,20 +455,35 @@ export default function App() {
     if (aiSettingsDirty && !window.confirm(t('ai_settings.leave_description'))) return;
     setAISettingsDirty(false);
     navigate(target);
-    if (responsive.isMobile && isAdmin) closeMobileMenu();
+    if (responsive.isMobile && isAdmin) setMobileOpen(false);
   };
 
   if (!auth.ready) return <BootScreen portal={location.pathname.startsWith('/portal')} />;
   if (auth.error) {
     return (
-      <div className="pool-auth-error">
-        <div className="pool-auth-error__brand"><Avatar size="small">P</Avatar><strong>{t('app.title')}</strong></div>
-        <LoadErrorBanner error={auth.error} onRetry={auth.refresh} title={t('error.console_connection')} />
-      </div>
+      <>
+        <RouteStatus announcement={routeAnnouncement} />
+        <CommittedView identity="auth:error" title={t('error.console_connection')} onCommit={handleViewCommit}>
+          <main id="main-content" tabIndex={-1} className="pool-auth-error">
+            <div className="pool-auth-error__brand"><Avatar size="small">P</Avatar><strong>{t('app.title')}</strong></div>
+            <h1 className="pool-page-title" tabIndex={-1}>{t('error.console_connection')}</h1>
+            <LoadErrorBanner error={auth.error} onRetry={auth.refresh} title={t('error.console_connection')} />
+          </main>
+        </CommittedView>
+      </>
     );
   }
   if (!auth.authed) {
-    return <Suspense fallback={<BootScreen portal={location.pathname.startsWith('/portal')} />}><LoginPage onSuccess={auth.refresh} /></Suspense>;
+    return (
+      <>
+        <RouteStatus announcement={routeAnnouncement} />
+        <Suspense fallback={<BootScreen portal={location.pathname.startsWith('/portal')} />}>
+          <CommittedView identity="auth:login" title={t('auth.login_title')} onCommit={handleViewCommit}>
+            <LoginPage onSuccess={auth.refresh} />
+          </CommittedView>
+        </Suspense>
+      </>
+    );
   }
 
   const layoutStyle = { '--pool-sidebar-width': `${sidebarWidth}px` } as CSSProperties;
@@ -357,6 +510,16 @@ export default function App() {
   );
   return (
     <Layout className={`pool-app-layout ${responsive.isMobile ? 'pool-app-mobile' : 'pool-app-desktop'} ${isAdmin ? 'pool-admin-shell' : 'pool-portal-shell'} ${navCollapsed ? 'pool-sidebar-is-collapsed' : ''}`} style={layoutStyle}>
+      <a
+        href="#main-content"
+        className="pool-skip-link"
+        onClick={() => document.getElementById('main-content')?.focus()}
+        inert={isAdmin && responsive.isMobile && mobileOpen ? true : undefined}
+        tabIndex={isAdmin && responsive.isMobile && mobileOpen ? -1 : undefined}
+        aria-hidden={isAdmin && responsive.isMobile && mobileOpen ? true : undefined}
+      >
+        {t('app.skip_to_content')}
+      </a>
       {isAdmin && responsive.isMobile && mobileOpen ? <div className="pool-shell-drawer-overlay" aria-hidden="true" onClick={closeMobileMenu} /> : null}
       {isAdmin ? <Sider
         id={responsive.isMobile ? 'pool-mobile-navigation' : 'pool-desktop-navigation'}
@@ -393,6 +556,7 @@ export default function App() {
         aria-hidden={isAdmin && responsive.isMobile && mobileOpen ? true : undefined}
         style={{ marginLeft: isAdmin && !responsive.isMobile ? sidebarWidth : 0 }}
       >
+        <RouteStatus announcement={routeAnnouncement} />
         <Header className={`pool-shell-header ${isAdmin ? 'pool-admin-header' : 'pool-portal-header'}`}>
           {isAdmin ? <div className="pool-topbar-left">
             {responsive.isMobile ? <Button ref={mobileMenuButtonRef} theme="borderless" icon={<IconList />} onClick={() => { setAccountMenuOpen(false); setMobileOpen((value) => !value); }} className="pool-mobile-menu-btn" aria-label={t('app.toggle_menu')} aria-expanded={mobileOpen} aria-controls="pool-mobile-navigation" /> : null}
@@ -411,7 +575,7 @@ export default function App() {
             {accountMenu}
           </div>
         </Header>
-        <Content className="pool-content"><div className="pool-shell"><AppRoutes admin={isAdmin} /></div></Content>
+        <Content id="main-content" tabIndex={-1} className="pool-content"><div className="pool-shell"><AppRoutes admin={isAdmin} routeIdentity={routeIdentity} routeTitle={routeTitle} onViewCommit={handleViewCommit} /></div></Content>
         {!isAdmin && responsive.isMobile ? <nav className="pool-portal-tabbar" aria-label={t('app.navigation')}>
           {navigation.map((item) => <button type="button" key={item.itemKey} className="pool-portal-tabbar__item" aria-label={item.text} aria-current={currentNavKey === item.itemKey ? 'page' : undefined} onClick={() => navigateFromShell(item.itemKey)}>{item.icon}<span>{item.text}</span></button>)}
         </nav> : null}

@@ -27,11 +27,13 @@ export default function CFEvents() {
   const blockedCount = rows.filter((row) => Number(row.status) >= 400).length;
   const serverErrorCount = rows.filter((row) => Number(row.status) >= 500).length;
   const challengeCount = rows.filter((row) => String(row.category || '').toLowerCase().includes('challenge')).length;
+  const passedCount = rows.filter((row) => Number(row.status) < 400).length;
+  const share = (part: number) => (rows.length ? part / rows.length : 0);
   const cfMetrics = [
     { label: t('cf.events'), value: rows.length },
-    { label: t('cf.passed'), value: rows.filter((row) => Number(row.status) < 400).length, tone: 'success' },
-    { label: t('cf.challenges'), value: challengeCount, tone: challengeCount ? 'warning' : undefined },
-    { label: '4xx / 5xx', value: `${blockedCount} / ${serverErrorCount}`, tone: blockedCount ? 'danger' : undefined },
+    { label: t('cf.passed'), value: passedCount, share: share(passedCount), tone: 'success' },
+    { label: t('cf.challenges'), value: challengeCount, share: share(challengeCount), tone: challengeCount ? 'warning' : undefined },
+    { label: '4xx / 5xx', value: `${blockedCount} / ${serverErrorCount}`, share: share(blockedCount), tone: blockedCount ? 'danger' : undefined },
   ];
 
   const cols: any[] = [
@@ -82,7 +84,6 @@ export default function CFEvents() {
           pagination={{ pageSize: 25 }}
           className="pool-cf-events-table"
           density="compact"
-          layout="fit"
           scroll={false}
           rowHeight={64}
           emptyTitle={t('cf.empty')}

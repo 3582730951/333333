@@ -1,14 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Banner, Button, Card, Switch, Tag, Toast } from '../components/pool/index.jsx';
+import { Button, Card, Switch, Tag, Toast } from '../components/pool/index.jsx';
 import { IconCopy, IconDelete, IconEdit, IconGlobe, IconPlus, IconRefresh } from '../components/pool/icons.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import { del, get, post, put } from '../api.js';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import { openExternalURL } from '../lib/browserNavigation.js';
 import { writeClipboard } from '../lib/browserClipboard.js';
+import { getDocumentElementById } from '../lib/browserDocument.js';
 
 const ROUTE_USER_GROUP = 'user_group';
 const ROUTE_ACCOUNT_POOL = 'account_pool_group';
+const FORM_ANCHOR_ID = 'public-chat-form';
 
 function emptyDraft() {
   return {
@@ -91,13 +93,33 @@ export default function PublicChat() {
   useEffect(() => { load(); }, [load]);
 
   const updateDraft = (patch) => setDraft((current) => ({ ...current, ...patch }));
-  const editLink = (link) => setDraft({
-    ...emptyDraft(),
-    ...link,
-    max_history_messages: link.max_history_messages || 24,
-    rate_limit_per_minute: link.rate_limit_per_minute || 30,
-  });
+
+  // The form sits below the link list, so once a few links exist it can be off screen when
+  // "新建链接" or "编辑" is pressed — without this the button looks inert. `block: 'nearest'`
+  // scrolls only when the form is actually out of view, so the common case (short list, form
+  // already visible) stays perfectly still instead of jumping.
+  const revealForm = () => {
+    getDocumentElementById(FORM_ANCHOR_ID)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  };
+
+  const editLink = (link) => {
+    setDraft({
+      ...emptyDraft(),
+      ...link,
+      max_history_messages: link.max_history_messages || 24,
+      rate_limit_per_minute: link.rate_limit_per_minute || 30,
+    });
+    revealForm();
+  };
+  // Pure state reset, used after a save or a delete. No scroll there on purpose: the list is
+  // what just changed, so pulling the viewport down to an emptied form would hide the result.
   const resetDraft = () => setDraft(emptyDraft());
+
+  // Header "新建链接" is a navigation intent, so this one does scroll.
+  const startNewLink = () => {
+    resetDraft();
+    revealForm();
+  };
 
   const payload = () => ({
     slug: slugify(draft.slug),
@@ -177,15 +199,37 @@ export default function PublicChat() {
       <PageHeader
         title="在线聊天"
         subtitle="生成无需登录的网页聊天 URL；管理员指定由哪个用户分组或账号池分组承接流量。"
-        actions={<><Button icon={<IconRefresh />} loading={loading} onClick={load}>刷新</Button><Button icon={<IconPlus />} theme="solid" onClick={resetDraft}>新建链接</Button></>}
+        actions={<><Button icon={<IconRefresh />} loading={loading} onClick={load}>刷新</Button><Button icon={<IconPlus />} theme="solid" onClick={startNewLink}>新建链接</Button></>}
       />
 
-      <Banner type="info" title="工作方式">
-        访客只访问 /chat/&lt;slug&gt;，不会拿到 API Key。后端按这里配置的分组和模型内部转发到 /v1/chat/completions，并继续复用已有的强制模型、指令、Super-Instruct、用量统计和调度能力。
-      </Banner>
+      <div className="public-chat-layout">
+        {links.length > 0 ? (
+          <Card title="已配置链接" className="pool-card" headerExtraContent={<span className="pool-resource-summary__meta">{links.length} 条</span>}>
+            <div className="public-chat-list">
+              {links.map((link) => (
+                <div className="public-chat-row" key={link.id}>
+                  <div className="public-chat-row__main">
+                    <div className="public-chat-row__title">
+                      <strong>{link.name || link.slug}</strong>
+                      <Tag color={link.enabled ? 'green' : 'grey'}>{link.enabled ? '已启用' : '已关闭'}</Tag>
+                    </div>
+                    <div className="pool-resource-summary__meta">{routeSummary(link)} · 模型 {link.model} · 历史 {link.max_history_messages} · 限速 {link.rate_limit_per_minute}/分钟</div>
+                    <code className="pool-mono">{link.public_url || `/chat/${link.slug}`}</code>
+                  </div>
+                  <div className="public-chat-row__actions">
+                    <Button size="small" icon={<IconCopy />} onClick={() => copy(link.public_url || `/chat/${link.slug}`)}>复制</Button>
+                    <Button size="small" icon={<IconGlobe />} onClick={() => openExternalURL(link.public_url || `/chat/${link.slug}`)}>打开</Button>
+                    <Button size="small" icon={<IconEdit />} onClick={() => editLink(link)}>编辑</Button>
+                    <Button size="small" onClick={() => toggle(link)}>{link.enabled ? '关闭' : '启用'}</Button>
+                    <Button size="small" type="danger" icon={<IconDelete />} onClick={() => remove(link)}>删除</Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Card>
+        ) : null}
 
-      <div className="pool-grid pool-grid-2 public-chat-layout" style={{ alignItems: 'start', marginTop: 16 }}>
-        <Card title={draft.id ? '编辑聊天链接' : '新建聊天链接'} className="pool-card">
+        <Card id={FORM_ANCHOR_ID} title={draft.id ? '编辑聊天链接' : '新建聊天链接'} className="pool-card">
           <div className="pool-form-grid">
             <label className="pool-field">
               <span className="pool-field__label">名称</span>
@@ -197,7 +241,7 @@ export default function PublicChat() {
             <label className="pool-field">
               <span className="pool-field__label">URL Slug</span>
               <input className="pool-input" value={draft.slug} onChange={(event) => updateDraft({ slug: slugify(event.target.value) })} placeholder="support-chat" />
-              <span className="pool-field__help">最终访问地址为 /chat/&lt;slug&gt;，仅允许英文、数字、- 和 _。</span>
+              <span className="pool-field__help">访问地址 /chat/&lt;slug&gt;，访客不会拿到 API Key。</span>
             </label>
             <label className="pool-field">
               <span className="pool-field__label">页面标题</span>
@@ -206,7 +250,6 @@ export default function PublicChat() {
             <label className="pool-field">
               <span className="pool-field__label">模型</span>
               <input className="pool-input" value={draft.model} onChange={(event) => updateDraft({ model: event.target.value })} placeholder="gpt-5.6-sol" />
-              <span className="pool-field__help">如果所选用户分组配置了强制模型，最终以用户分组强制模型为准。</span>
             </label>
             <label className="pool-field">
               <span className="pool-field__label">承接类型</span>
@@ -222,6 +265,7 @@ export default function PublicChat() {
                   <option value="">请选择用户分组</option>
                   {userGroupOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                 </select>
+                <span className="pool-field__help">分组配置了强制模型时，以强制模型为准。</span>
               </label>
             ) : (
               <label className="pool-field">
@@ -230,6 +274,7 @@ export default function PublicChat() {
                   <option value="">请选择账号池分组</option>
                   {accountGroupOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                 </select>
+                <span className="pool-field__help">直接绑定账号池分组，不经过用户分组策略。</span>
               </label>
             )}
             <label className="pool-field">
@@ -252,31 +297,6 @@ export default function PublicChat() {
           <div className="pool-form-actions">
             <Button theme="solid" icon={<IconGlobe />} loading={saving} onClick={save}>{draft.id ? '保存修改' : '创建链接'}</Button>
             {draft.id ? <Button onClick={resetDraft}>取消编辑</Button> : null}
-          </div>
-        </Card>
-
-        <Card title="已配置链接" className="pool-card">
-          <div className="public-chat-list">
-            {links.length === 0 ? <div className="pool-empty">暂无在线聊天链接</div> : links.map((link) => (
-              <div className="public-chat-row" key={link.id}>
-                <div className="public-chat-row__main">
-                  <div className="public-chat-row__title">
-                    <strong>{link.name || link.slug}</strong>
-                    <Tag color={link.enabled ? 'green' : 'grey'}>{link.enabled ? '已启用' : '已关闭'}</Tag>
-                  </div>
-                  <div className="pool-resource-summary__meta">{routeSummary(link)}</div>
-                  <div className="pool-resource-summary__meta">模型：{link.model} · 历史 {link.max_history_messages} · 限速 {link.rate_limit_per_minute}/分钟</div>
-                  <code className="pool-mono">{link.public_url || `/chat/${link.slug}`}</code>
-                </div>
-                <div className="public-chat-row__actions">
-                  <Button size="small" icon={<IconCopy />} onClick={() => copy(link.public_url || `/chat/${link.slug}`)}>复制</Button>
-                  <Button size="small" icon={<IconGlobe />} onClick={() => openExternalURL(link.public_url || `/chat/${link.slug}`)}>打开</Button>
-                  <Button size="small" icon={<IconEdit />} onClick={() => editLink(link)}>编辑</Button>
-                  <Button size="small" onClick={() => toggle(link)}>{link.enabled ? '关闭' : '启用'}</Button>
-                  <Button size="small" type="danger" icon={<IconDelete />} onClick={() => remove(link)}>删除</Button>
-                </div>
-              </div>
-            ))}
           </div>
         </Card>
       </div>

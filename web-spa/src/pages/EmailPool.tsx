@@ -14,7 +14,7 @@ import {
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
 import { showErrorToast } from '../components/ErrorToast.jsx';
-import { fmtDateTime } from '../lib/format.js';
+import { fmtDateTime, middleEllipsis } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
 import {
   fetchEmailPool, importEmailAccounts, deleteEmailAccounts, testEmailAccount,
@@ -33,12 +33,6 @@ const STATUS_META: Record<string, { color: string; key: string }> = {
 function StatusTag({ status }: { status: string }) {
   const meta = STATUS_META[status] || { color: 'gray', key: '' };
   return <Tag color={meta.color}>{meta.key ? t(meta.key) : (status || t('common.unknown'))}</Tag>;
-}
-
-function middleEllipsis(value: unknown, head = 22, tail = 14) {
-  const text = String(value ?? '');
-  if (text.length <= head + tail + 1) return text;
-  return `${text.slice(0, head)}…${text.slice(-tail)}`;
 }
 
 function countOf(counts: Record<string, number>, key: string) {
@@ -315,7 +309,7 @@ export default function EmailPool() {
           ) : null}
         </div>
       )}
-      summary={hasLoadedData ? <MetricRail items={metrics} className="pool-email-metrics" /> : null}
+      summary={hasLoadedData ? <MetricRail items={metrics} className="pool-metric-rail--band pool-email-metrics" /> : null}
     >
       <ResourceTable
         error={loadError}
