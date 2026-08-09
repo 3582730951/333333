@@ -27,7 +27,7 @@
     "check:layout-collisions": "node scripts/check-layout-collisions.mjs",
     "check:class-drift": "node scripts/check-class-drift.mjs",
     "capture:ui-review": "node scripts/capture-ui-review.mjs",
-    "build": "npm run typecheck && vite build && node scripts/check-build-budget.mjs",
+    "build": "npm run typecheck && vite build && node scripts/check-build-budget.mjs && bash ../scripts/generate-managed-source-manifest.sh && bash ../scripts/verify-console-release.sh",
     "preview": "vite preview",
     "check:upstream-error-rules": "node scripts/check-upstream-error-rules.mjs",
     "check:codex-reauth-ui": "node scripts/check-codex-reauth-ui.mjs",

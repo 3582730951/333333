@@ -25,6 +25,17 @@ if grep -Eq '(^/|(^|/)\.\.(/|$)|[[:cntrl:]])' "$MANIFEST"; then
   exit 1
 fi
 
+# Validate the new SPA closure before removing anything. Additive uploads may
+# legitimately contain old hashed chunks, so those extras are allowed only for
+# this pre-prune check; every file declared by the new release and every asset
+# referenced by its index.html must already be present.
+if [[ -f "${ROOT}/scripts/verify-console-release.sh" ]]; then
+  PROJECT_ROOT="$ROOT" \
+    MANAGED_SOURCE_MANIFEST="$MANIFEST" \
+    CONSOLE_RELEASE_ALLOW_STALE=1 \
+    bash "${ROOT}/scripts/verify-console-release.sh"
+fi
+
 managed_roots=(
   cmd internal services sidecar scripts deploy web-spa/src web-spa/scripts
   workers/node-registrar/src
@@ -32,13 +43,20 @@ managed_roots=(
 candidate_file="$(mktemp)"
 trap 'rm -f "$candidate_file"' EXIT
 
-for relative_root in "${managed_roots[@]}"; do
-  [[ -d "${ROOT}/${relative_root}" ]] || continue
-  find "${ROOT}/${relative_root}" -type f \
-    \( -name '*.go' -o -name '*.py' -o -name '*.js' -o -name '*.jsx' \
-       -o -name '*.ts' -o -name '*.tsx' -o -name '*.css' -o -name '*.json' \
-       -o -name '*.jsonc' -o -name '*.mjs' -o -name '*.sql' -o -name '*.sh' \) -print
-done | sed "s#^${ROOT%/}/##" | sort -u >"$candidate_file"
+{
+  for relative_root in "${managed_roots[@]}"; do
+    [[ -d "${ROOT}/${relative_root}" ]] || continue
+    find "${ROOT}/${relative_root}" -type f \
+      \( -name '*.go' -o -name '*.py' -o -name '*.js' -o -name '*.jsx' \
+         -o -name '*.ts' -o -name '*.tsx' -o -name '*.css' -o -name '*.json' \
+         -o -name '*.jsonc' -o -name '*.mjs' -o -name '*.sql' -o -name '*.sh' \) -print
+  done
+  # The embedded SPA is a release artifact, not ordinary source: manage every
+  # file regardless of extension (HTML, fonts, images, source maps, and chunks).
+  if [[ -d "${ROOT}/internal/console/dist" ]]; then
+    find "${ROOT}/internal/console/dist" -type f -print
+  fi
+} | sed "s#^${ROOT%/}/##" | sort -u >"$candidate_file"
 
 removed=0
 while IFS= read -r relative; do

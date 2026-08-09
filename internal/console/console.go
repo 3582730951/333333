@@ -8,10 +8,12 @@ import (
 	"bytes"
 	"compress/gzip"
 	"embed"
+	"fmt"
 	"io/fs"
 	"mime"
 	"net/http"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -35,16 +37,21 @@ const consoleBuildErrorHTML = `<!doctype html>
     main { width: min(520px, calc(100% - 32px)); padding: 24px; border: 1px solid #d8dee4; border-radius: 8px; background: #fff; box-shadow: 0 12px 32px rgba(31, 35, 40, 0.08); }
     h1 { margin: 0 0 8px; font-size: 20px; line-height: 1.3; }
     p { margin: 0; color: #57606a; line-height: 1.6; }
+    p + p { margin-top: 12px; }
+    a { color: #0969da; font-weight: 600; }
     code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
   </style>
 </head>
 <body>
   <main>
     <h1>Console is unavailable</h1>
-    <p>The embedded SPA build is missing. Run <code>npm --prefix web-spa run build</code> and restart the server.</p>
+    <p>The embedded SPA build is missing or incomplete. Run <code>npm --prefix web-spa run build</code>, verify the release manifest, and restart the server.</p>
+    <p><a href="/legacy/">Open the legacy console</a> while the release is repaired.</p>
   </main>
 </body>
 </html>`
+
+var consoleAssetReferenceRE = regexp.MustCompile(`(?i)(?:src|href)\s*=\s*["'](/console/[^"'?#]+)`)
 
 // Handler serves the SPA under /console/. Real assets are served from the embedded FS;
 // any other sub-path falls back to index.html so react-router (basename /console) handles
@@ -57,6 +64,9 @@ func Handler() http.Handler {
 		})
 	}
 	index, ixErr := fs.ReadFile(sub, "index.html")
+	if ixErr == nil {
+		ixErr = validateConsoleIndexAssets(sub, index)
+	}
 	gzippedAssets := buildCompressedAssets(sub)
 	fileServer := http.StripPrefix("/console/", http.FileServer(http.FS(sub)))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -78,8 +88,42 @@ func Handler() http.Handler {
 			fileServer.ServeHTTP(w, r) // real asset (js/css/img)
 			return
 		}
+		if strings.HasPrefix(rel, "assets/") {
+			// A missing immutable asset is never a client-side route. Returning the
+			// SPA shell here produces a misleading 200 text/html response and a blank
+			// page when the browser enforces module MIME types.
+			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		serveIndex(w, index) // SPA deep link → client-side route
 	})
+}
+
+func validateConsoleIndexAssets(sub fs.FS, index []byte) error {
+	matches := consoleAssetReferenceRE.FindAllSubmatch(index, -1)
+	if len(matches) == 0 {
+		return fmt.Errorf("console index contains no local assets")
+	}
+	seen := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		rel := strings.TrimPrefix(string(match[1]), "/console/")
+		if !fs.ValidPath(rel) {
+			return fmt.Errorf("console index contains invalid asset path %q", rel)
+		}
+		if _, ok := seen[rel]; ok {
+			continue
+		}
+		seen[rel] = struct{}{}
+		st, err := fs.Stat(sub, rel)
+		if err != nil {
+			return fmt.Errorf("console index asset %q is missing: %w", rel, err)
+		}
+		if st.IsDir() {
+			return fmt.Errorf("console index asset %q is a directory", rel)
+		}
+	}
+	return nil
 }
 
 func serveConsoleBuildError(w http.ResponseWriter) {

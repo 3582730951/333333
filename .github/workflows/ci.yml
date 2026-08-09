@@ -98,7 +98,9 @@ jobs:
         working-directory: web-spa
         run: npm run verify
       - name: Verify the embedded SPA artifact is current
-        run: git diff --exit-code -- internal/console/dist
+        run: |
+          git diff --exit-code -- internal/console/dist scripts/managed-source-manifest.txt
+          bash scripts/verify-console-release.sh
       - name: Audit production Node dependencies
         run: |
           npm --prefix web-spa audit --omit=dev --audit-level=high

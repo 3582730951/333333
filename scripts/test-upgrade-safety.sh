@@ -161,9 +161,91 @@ test_managed_source_manifest_current() {
   fi
 }
 
+test_console_release_guard() {
+  local fixture="${TMP}/console-release" manifest="${TMP}/console-release-manifest.txt"
+  mkdir -p "$fixture/internal/console/dist/assets"
+  printf '%s\n' \
+    '<!doctype html><script type="module" src="/console/assets/index-new.js"></script>' \
+    '<link rel="stylesheet" href="/console/assets/index-new.css">' \
+    >"$fixture/internal/console/dist/index.html"
+  printf 'console.log("ok")\n' >"$fixture/internal/console/dist/assets/index-new.js"
+  printf 'body { color: black; }\n' >"$fixture/internal/console/dist/assets/index-new.css"
+  printf '%s\n' \
+    'internal/console/dist/assets/index-new.css' \
+    'internal/console/dist/assets/index-new.js' \
+    'internal/console/dist/index.html' \
+    >"$manifest"
+
+  PROJECT_ROOT="$fixture" MANAGED_SOURCE_MANIFEST="$manifest" \
+    bash "$ROOT/scripts/verify-console-release.sh" >/dev/null ||
+    fail "complete embedded console release was rejected"
+
+  printf 'stale chunk\n' >"$fixture/internal/console/dist/assets/index-old.js"
+  if PROJECT_ROOT="$fixture" MANAGED_SOURCE_MANIFEST="$manifest" \
+      bash "$ROOT/scripts/verify-console-release.sh" >/dev/null 2>&1; then
+    fail "strict console release verification accepted an undeclared file"
+  fi
+  PROJECT_ROOT="$fixture" MANAGED_SOURCE_MANIFEST="$manifest" \
+    CONSOLE_RELEASE_ALLOW_STALE=1 \
+    bash "$ROOT/scripts/verify-console-release.sh" >/dev/null ||
+    fail "pre-prune console verification rejected a harmless stale chunk"
+  rm -f "$fixture/internal/console/dist/assets/index-old.js"
+
+  rm -f "$fixture/internal/console/dist/assets/index-new.js"
+  if PROJECT_ROOT="$fixture" MANAGED_SOURCE_MANIFEST="$manifest" \
+      CONSOLE_RELEASE_ALLOW_STALE=1 \
+      bash "$ROOT/scripts/verify-console-release.sh" >/dev/null 2>&1; then
+    fail "console release verification accepted a missing entry asset"
+  fi
+}
+
+test_console_prune_is_atomic() {
+  local fixture="${TMP}/console-prune" manifest="${TMP}/console-prune-manifest.txt"
+  mkdir -p "$fixture/internal/console/dist/assets" "$fixture/scripts"
+  cp "$ROOT/scripts/verify-console-release.sh" "$fixture/scripts/verify-console-release.sh"
+  printf '<script type="module" src="/console/assets/index-new.js"></script>\n' \
+    >"$fixture/internal/console/dist/index.html"
+  printf 'new release\n' >"$fixture/internal/console/dist/assets/index-new.js"
+  printf 'old release\n' >"$fixture/internal/console/dist/assets/index-old.js"
+  printf '%s\n' \
+    'internal/console/dist/assets/index-old.js' \
+    'internal/console/dist/index.html' \
+    >"$manifest"
+
+  if PROJECT_ROOT="$fixture" MANAGED_SOURCE_MANIFEST="$manifest" \
+      "$ROOT/scripts/prune-managed-source.sh" >/dev/null 2>&1; then
+    fail "source pruning accepted a mismatched console entry and asset manifest"
+  fi
+  [[ -f "$fixture/internal/console/dist/assets/index-new.js" ]] ||
+    fail "source pruning deleted a new asset before validating the release"
+}
+
+test_manifest_generation_without_git() {
+  local fixture="${TMP}/source-archive" generated="${TMP}/source-archive-manifest.txt"
+  mkdir -p "$fixture/scripts" "$fixture/cmd/app" "$fixture/internal/console/dist/assets"
+  cp "$ROOT/scripts/generate-managed-source-manifest.sh" "$fixture/scripts/generate-managed-source-manifest.sh"
+  printf 'package main\n' >"$fixture/cmd/app/main.go"
+  printf '<script src="/console/assets/index.js"></script>\n' >"$fixture/internal/console/dist/index.html"
+  printf 'console.log("archive")\n' >"$fixture/internal/console/dist/assets/index.js"
+  printf '<svg/>\n' >"$fixture/internal/console/dist/assets/logo.svg"
+
+  bash "$fixture/scripts/generate-managed-source-manifest.sh" "$generated" >/dev/null
+  for expected in \
+    cmd/app/main.go \
+    internal/console/dist/index.html \
+    internal/console/dist/assets/index.js \
+    internal/console/dist/assets/logo.svg; do
+    grep -Fqx "$expected" "$generated" ||
+      fail "source-archive manifest omitted ${expected}"
+  done
+}
+
 test_install_dispatch
 test_explicit_listen_addr_resolution
 test_backup_rotation
 test_managed_source_pruning
+test_console_release_guard
+test_console_prune_is_atomic
+test_manifest_generation_without_git
 test_managed_source_manifest_current
-printf 'PASS: install dispatch, bounded backups, managed-source convergence, and release manifest freshness\n'
+printf 'PASS: install dispatch, bounded backups, managed-source convergence, console release closure, and manifest freshness\n'

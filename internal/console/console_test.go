@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 func TestHandlerCachePolicy(t *testing.T) {
@@ -74,6 +75,37 @@ func TestHandlerServesGzipAssets(t *testing.T) {
 	rangeReq := requestWithHeader(t, handler, "/console/"+asset, "Range", "bytes=0-20")
 	if got := rangeReq.Header().Get("Content-Encoding"); got != "" {
 		t.Fatalf("range Content-Encoding = %q", got)
+	}
+}
+
+func TestHandlerReturnsNotFoundForMissingImmutableAsset(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/console/assets/index-missing.js", nil)
+	rec := httptest.NewRecorder()
+	Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing asset status = %d, want %d; body=%q", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+	if strings.Contains(strings.ToLower(rec.Header().Get("Content-Type")), "text/html") {
+		t.Fatalf("missing asset was disguised as HTML: %#v", rec.Header())
+	}
+}
+
+func TestValidateConsoleIndexAssets(t *testing.T) {
+	assets := fstest.MapFS{
+		"assets/index-ok.js":  {Data: []byte(`console.log("ok")`)},
+		"assets/index-ok.css": {Data: []byte(`body { color: black; }`)},
+	}
+	good := []byte(`<script type="module" src="/console/assets/index-ok.js"></script><link rel="stylesheet" href="/console/assets/index-ok.css">`)
+	if err := validateConsoleIndexAssets(assets, good); err != nil {
+		t.Fatalf("complete index rejected: %v", err)
+	}
+	missing := []byte(`<script type="module" src="/console/assets/index-missing.js"></script>`)
+	if err := validateConsoleIndexAssets(assets, missing); err == nil {
+		t.Fatal("index with missing asset was accepted")
+	}
+	unsafe := []byte(`<script type="module" src="/console/assets/../index-ok.js"></script>`)
+	if err := validateConsoleIndexAssets(assets, unsafe); err == nil {
+		t.Fatal("index with unsafe asset path was accepted")
 	}
 }
 

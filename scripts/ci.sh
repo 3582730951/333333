@@ -62,6 +62,7 @@ if [ "${SKIP_SPA:-0}" != "1" ]; then
       echo "visual smoke check skipped (SKIP_VISUAL_SMOKE=1)"
     fi
     npm --prefix web-spa run build
+    bash scripts/verify-console-release.sh
     echo "ok — rebuilt embedded console; re-run 'go build' to embed it"
   else
     echo "npm not found — skipping SPA build"

@@ -1134,6 +1134,13 @@ ensure_project_files() {
   [[ -f cmd/pool-handoff/main.go ]] || die "cmd/pool-handoff/main.go not found"
   [[ -f scripts/rollback-release.sh ]] || die "scripts/rollback-release.sh not found"
   [[ -f config.example.json ]] || die "config.example.json not found"
+  [[ -f internal/console/dist/index.html ]] || die "embedded console index.html not found"
+  [[ -f scripts/verify-console-release.sh ]] || die "embedded console release verifier not found"
+  PROJECT_ROOT="$PROJECT_ROOT" \
+    MANAGED_SOURCE_MANIFEST="${PROJECT_ROOT}/scripts/managed-source-manifest.txt" \
+    CONSOLE_RELEASE_ALLOW_STALE=1 \
+    bash "${PROJECT_ROOT}/scripts/verify-console-release.sh" >/dev/null ||
+    die "embedded console release is incomplete; refusing to build or switch releases"
   # These resources are always shipped. User-group policy plus the API-key
   # Codex installer choice controls use; the cloud installer has no global gate.
   [[ -f super-instruct/bridge.md ]] || die "Super-Instruct M1 bridge not found: super-instruct/bridge.md"
