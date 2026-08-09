@@ -189,8 +189,8 @@ func TestAnthropicAPIKeyInferenceFailureQuarantinesUntilConfirmedRecovery(t *tes
 			_, _ = io.WriteString(w, `{"data":[{"id":"claude-3-5-haiku-latest","max_input_tokens":200000}]}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
 			raw, _ := io.ReadAll(r.Body)
-			if !bytes.Contains(raw, []byte(`"content":"Reply exactly OK"`)) || !bytes.Contains(raw, []byte(`"max_tokens":8`)) ||
-				bytes.Contains(raw, []byte(`"tools"`)) || bytes.Contains(raw, []byte(`"cache_control"`)) || bytes.Contains(raw, []byte(`"thinking"`)) {
+			assertClaudeCodeProbeWireShape(t, string(raw), "claude-3-5-haiku-latest", "Reply exactly OK", 8)
+			if bytes.Contains(raw, []byte(`"thinking"`)) || bytes.Contains(raw, []byte(`"context_management"`)) {
 				t.Errorf("non-minimal Anthropic inference body: %s", raw)
 			}
 			if failInference.Load() {

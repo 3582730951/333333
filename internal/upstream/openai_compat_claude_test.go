@@ -86,11 +86,13 @@ func TestClaudeCodeCustomHeadersCarryClientShape(t *testing.T) {
 		"Anthropic-Beta",
 		"Anthropic-Dangerous-Direct-Browser-Access",
 		"X-Claude-Code-Session-Id",
-		"Accept-Language",
 	} {
 		if built.Get(name) == "" {
 			t.Errorf("missing Claude Code marker %s: %#v", name, built)
 		}
+	}
+	if got := built.Get("Accept-Language"); got != "" {
+		t.Errorf("Accept-Language = %q, want absent as in Claude Code 2.1.226", got)
 	}
 	if got := built.Get("X-App"); got != "cli" {
 		t.Errorf("X-App = %q, want cli", got)
@@ -98,8 +100,8 @@ func TestClaudeCodeCustomHeadersCarryClientShape(t *testing.T) {
 	if ua := built.Get("User-Agent"); !strings.HasPrefix(ua, "claude-cli/") {
 		t.Errorf("User-Agent = %q, want a claude-cli UA", ua)
 	}
-	if got := built.Get("Accept"); got != "text/event-stream" {
-		t.Errorf("streaming Accept = %q", got)
+	if got := built.Get("Accept"); got != "application/json" {
+		t.Errorf("streaming Accept = %q, want native Claude application/json", got)
 	}
 	// A relay-issued key must reach BOTH auth headers: relay auth conventions differ,
 	// and the generic builder this replaces sent both. Dropping either regresses relays.

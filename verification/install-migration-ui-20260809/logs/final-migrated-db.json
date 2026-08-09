@@ -1,0 +1,27 @@
+{
+  "counts": {
+    "account_egress_bindings": 8,
+    "accounts": 8,
+    "api_keys": 1,
+    "cf_events": 3,
+    "egress_profiles": 5,
+    "groups": 5,
+    "model_quality_status": 3,
+    "registration_stats_daily": 3,
+    "usage_records": 49,
+    "users": 2
+  },
+  "fingerprint_settings": {
+    "claude_force_direct": "false",
+    "claude_ja3": "native",
+    "egress_fingerprint_engine": "inprocess"
+  },
+  "sha256": "19a203c53843f0ec0ea4cf44d95ff0696887f56289c85fbdeb1e759f274dddc9",
+  "table_count": 95,
+  "usage_totals": {
+    "completion_tokens": 3304000,
+    "prompt_tokens": 17948000,
+    "rows": 49,
+    "total_tokens": 21252000
+  }
+}

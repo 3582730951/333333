@@ -139,7 +139,7 @@ func ChatCompletionToAnthropic(raw []byte) ([]byte, error) {
 		out["system"] = strings.Join(systemParts, "\n\n")
 	}
 	out["messages"] = anthMessages
-	return json.Marshal(out)
+	return anthropicwire.MarshalPreservingOrder(nil, out)
 }
 
 // AnthropicToChatCompletion converts an Anthropic Messages response into an
@@ -253,7 +253,7 @@ func ensureAnthropicCacheControlWithOptions(body []byte, ttl, policy string, lat
 		if !changed {
 			return body
 		}
-		out, err := json.Marshal(root)
+		out, err := anthropicwire.MarshalPreservingOrder(body, root)
 		if err != nil {
 			return body
 		}
@@ -580,7 +580,7 @@ func LosslessSplitAnthropicTextBlocks(body []byte) []byte {
 	if !changed {
 		return body
 	}
-	out, err := json.Marshal(root)
+	out, err := anthropicwire.MarshalPreservingOrder(body, root)
 	if err != nil {
 		return body
 	}

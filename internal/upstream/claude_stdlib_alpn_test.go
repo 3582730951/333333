@@ -14,9 +14,9 @@ import (
 // TestClaudeStdlibFallbackPinsHTTP11 covers the third transport engine.
 //
 // The in-process and sidecar engines both consult forceHTTP1ForClaudeImpersonation, because
-// Node's bundled undici forces allowH2:false and a capture of the real client offers ALPN
-// http/1.1 only — so a claude-cli User-Agent arriving over HTTP/2 is, by construction, never
-// the real client. The stdlib fallback (ClaudeForceDirect, or an engine that resolved to
+// Claude Code 2.1.226's captured native Bun ClientHello has no ALPN extension and the
+// request is HTTP/1.1 — so a claude-cli User-Agent arriving over HTTP/2 is, by construction,
+// never the captured client. The stdlib fallback (ClaudeForceDirect, or an engine that resolved to
 // stdlib because no TLS factory exists) built its client through httpClientForEgress, which
 // hardcodes forceHTTP1=false, so net/http's ForceAttemptHTTP2 negotiated h2 against
 // Anthropic's edge while applyClaudeHeaders had already stamped the full claude-cli

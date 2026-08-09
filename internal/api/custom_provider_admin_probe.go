@@ -94,14 +94,12 @@ func (s *Server) adminCustomProviderModelTest(w http.ResponseWriter, r *http.Req
 
 	headers := http.Header{}
 	var body []byte
+	probeOSHint := ""
 	switch provider.UpstreamProtocol {
 	case storage.CustomProviderProtocolAnthropicMessages:
 		result.UpstreamPath = "/messages"
 		headers.Set("Anthropic-Version", "2023-06-01")
-		body, _ = json.Marshal(map[string]interface{}{
-			"model": targetModel, "max_tokens": 1, "stream": false,
-			"messages": []map[string]interface{}{{"role": "user", "content": "Reply OK"}},
-		})
+		body, probeOSHint = s.claudeCodeMinimalProbeBody(account, token, lease.Egress, targetModel, "Reply OK", 1)
 	case storage.CustomProviderProtocolResponses:
 		result.UpstreamPath = "/responses"
 		body, _ = json.Marshal(map[string]interface{}{
@@ -123,6 +121,7 @@ func (s *Server) adminCustomProviderModelTest(w http.ResponseWriter, r *http.Req
 		UpstreamProtocol: provider.UpstreamProtocol,
 		Headers:          headers, Account: account, Token: token, Egress: lease.Egress,
 		CookieJarKey: customProviderCookieJarKey(r, lease, provider), MinimalProbe: true,
+		OSHint: probeOSHint,
 	}
 	probe.SetBodyBytes(body)
 	started := time.Now()

@@ -24,7 +24,7 @@ import (
 //
 //	{
 //	  "egress_id":    "<optional; a curl_cffi_sidecar egress to also test via sidecar>",
-//	  "profile":      "<optional; chrome|node|rustls, default chrome>",
+//	  "profile":      "<optional; chrome|claude_bun|node|rustls, default chrome>",
 //	  "reflector_url":"<optional; default https://tls.peet.ws/api/all>"
 //	}
 func (s *Server) adminEgressFingerprintCheck(w http.ResponseWriter, r *http.Request) {
@@ -73,9 +73,10 @@ func (s *Server) adminEgressFingerprintCheck(w http.ResponseWriter, r *http.Requ
 		sc := s.upstream.ReflectFingerprint(r.Context(), egress, "sidecar", profile, req.ReflectorURL)
 		result["sidecar"] = sc
 		result["match"] = map[string]interface{}{
-			"ja3_hash":    inproc.JA3Hash != "" && inproc.JA3Hash == sc.JA3Hash,
-			"ja4":         inproc.JA4 != "" && inproc.JA4 == sc.JA4,
-			"akamai_hash": inproc.AkamaiHash != "" && inproc.AkamaiHash == sc.AkamaiHash,
+			"ja3_hash":       inproc.JA3Hash != "" && inproc.JA3Hash == sc.JA3Hash,
+			"ja4":            inproc.JA4 != "" && inproc.JA4 == sc.JA4,
+			"akamai_hash":    akamaiFingerprintMatches(profile, inproc.AkamaiHash, sc.AkamaiHash),
+			"http2_expected": profile != tlsclient.ProfileClaude,
 		}
 	} else {
 		result["sidecar_skipped"] = "no sidecar endpoint on egress; showing in-process fingerprint only"
@@ -84,9 +85,22 @@ func (s *Server) adminEgressFingerprintCheck(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, result)
 }
 
+// akamaiFingerprintMatches treats the intentional absence of HTTP/2 as a match for
+// Claude. The captured Bun ClientHello has no ALPN extension, so both engines should
+// report no Akamai/SETTINGS fingerprint; requiring a non-empty hash would incorrectly
+// flag the faithful result as a mismatch in the admin diagnostic.
+func akamaiFingerprintMatches(profile, inProcess, sidecar string) bool {
+	if profile == tlsclient.ProfileClaude {
+		return inProcess == "" && sidecar == ""
+	}
+	return inProcess != "" && inProcess == sidecar
+}
+
 // inProcessProfileName maps an admin-supplied profile label onto a tlsclient profile const.
 func inProcessProfileName(label string) string {
 	switch strings.ToLower(strings.TrimSpace(label)) {
+	case tlsclient.ProfileClaude, "claude", "claude-cli", "bun":
+		return tlsclient.ProfileClaude
 	case tlsclient.ProfileNode, "node_undici", "undici", "kiro":
 		return tlsclient.ProfileNode
 	case tlsclient.ProfileRustls, "aws_sdk_rust", "amazon_q", "q":

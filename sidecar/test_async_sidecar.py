@@ -18,6 +18,90 @@ def load_sidecar():
     return module
 
 
+class NativeHeaderShapeTest(unittest.TestCase):
+    def test_claude_connection_and_accept_encoding_overrides(self):
+        sidecar = load_sidecar()
+        headers = {
+            "Accept": ["application/json"],
+            "anthropic-version": ["2023-06-01"],
+            "Connection": ["keep-alive"],
+            "Host": ["wrong.test"],
+            "Accept-Encoding": ["identity"],
+            "Content-Length": ["9"],
+        }
+        cleaned = sidecar.clean_headers(headers, preserve_connection=True)
+        self.assertEqual(list(cleaned), ["Accept", "anthropic-version", "Connection"])
+        self.assertEqual(cleaned["Connection"], "keep-alive")
+        self.assertNotIn("Connection", sidecar.clean_headers(headers))
+        self.assertEqual(
+            sidecar.request_accept_encoding({"accept_encoding": "gzip, deflate, br, zstd"}),
+            "gzip, deflate, br, zstd",
+        )
+        self.assertEqual(
+            sidecar.request_accept_encoding({"accept_encoding": "gzip\r\nx-relay: 1"}),
+            sidecar.ACCEPT_ENCODING,
+        )
+        algorithms = ["ecdsa_secp256r1_sha256", "rsa_pkcs1_sha1"]
+        self.assertEqual(
+            sidecar.raw_ja3_extra_fp({"tls_signature_algorithms": algorithms}),
+            {
+                "tls_grease": False,
+                "tls_permute_extensions": False,
+                "tls_signature_algorithms": algorithms,
+            },
+        )
+        self.assertNotIn(
+            "tls_signature_algorithms",
+            sidecar.raw_ja3_extra_fp({"tls_signature_algorithms": ["bad,value"]}),
+        )
+        ordered = sidecar.request_headers(
+            {
+                "headers": headers,
+                "preserve_connection_header": True,
+                "native_header_order": True,
+                "header_order": [
+                    "accept", "anthropic-version", "connection", "host",
+                    "accept-encoding", "content-length",
+                ],
+            },
+            "https://api.anthropic.com/v1/messages",
+            "POST",
+            "gzip, deflate, br, zstd",
+            9,
+        )
+        self.assertEqual(
+            list(ordered),
+            ["Accept", "anthropic-version", "Connection", "Host", "Accept-Encoding", "Content-Length"],
+        )
+        self.assertEqual(ordered["Host"], "api.anthropic.com")
+        self.assertEqual(ordered["Content-Length"], "9")
+
+    def test_raw_ja3_session_does_not_inherit_chrome_impersonation(self):
+        sidecar = load_sidecar()
+        created = []
+
+        class FakeSession:
+            def __init__(self, **kwargs):
+                created.append(kwargs)
+
+            async def close(self):
+                pass
+
+        original = sidecar.AsyncSession
+        sidecar.AsyncSession = FakeSession
+        try:
+            asyncio.run(sidecar.session_for(("", "771,1,0,29,0", "", "raw-ja3", "v1")))
+            asyncio.run(sidecar.release_session(("", "771,1,0,29,0", "", "raw-ja3", "v1")))
+            asyncio.run(sidecar.session_for(("", "", "", "browser", "v2")))
+            asyncio.run(sidecar.release_session(("", "", "", "browser", "v2")))
+        finally:
+            sidecar.AsyncSession = original
+            sidecar._sessions.clear()
+            sidecar._session_active.clear()
+        self.assertIsNone(created[0]["impersonate"])
+        self.assertEqual(created[1]["impersonate"], sidecar.IMPERSONATE)
+
+
 async def read_chunked_body(reader):
     """Decode the sidecar v2 HTTP/1.1 chunked relay body and trailers."""
     body = bytearray()
@@ -416,7 +500,7 @@ class AsyncSidecarIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
         # An authentic non-browser client header set (mirrors the Go applyClaudeHeaders shape).
         client_headers = {
-            "User-Agent": "claude-cli/2.1.206 (external, cli)",
+            "User-Agent": "claude-cli/2.1.226 (external, cli)",
             "X-Stainless-Lang": "js",
             "Anthropic-Version": "2023-06-01",
             "Accept": "application/json",

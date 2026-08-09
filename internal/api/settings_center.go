@@ -1205,6 +1205,13 @@ func optimalStableModelsTemplateValues() map[string]interface{} {
 		"seamless_failover":                    true,
 		"failover_max_attempts":                float64(3),
 		"leak_scrub":                           true,
+		// Keep both Claude transport escape hatches explicitly closed. Empty
+		// claude_ja3 currently resolves to native too, but spelling it out in the
+		// recommended template prevents a future default change from silently
+		// moving deployed accounts to the browser compatibility profile.
+		"egress_fingerprint_engine": "inprocess",
+		"claude_ja3":                "native",
+		"claude_force_direct":       false,
 	} {
 		values[key] = value
 	}
@@ -1216,7 +1223,7 @@ func systemConfigTemplates() []map[string]interface{} {
 		{
 			"id":          "optimal-stable-models-v1",
 			"name":        "全模型稳定推荐配置",
-			"description": "Codex HTTP 使用无状态完整上下文转发以支持任意健康账号无感切换；WebSocket 保留固定连接内的原生状态，并启用会话隔离、流式保活、故障转移和 Kiro 原生高质量缓存配置。",
+			"description": "启用会话隔离、流式保活、故障转移和 Kiro 原生高质量缓存，并锁定 Claude 进程内 Bun 指纹（关闭强制直连与 Chrome 指纹逃生阀）。",
 			"section":     "config",
 			"values":      optimalStableModelsTemplateValues(),
 		},

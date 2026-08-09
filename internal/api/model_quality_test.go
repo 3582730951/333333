@@ -13,6 +13,7 @@ import (
 
 	"codex-account-pool/internal/capability"
 	kirowire "codex-account-pool/internal/kiro"
+	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 )
 
@@ -145,6 +146,41 @@ func TestModelQualityKiroUsesMandatoryMaxQualityPath(t *testing.T) {
 	if err != nil || state.ModelState != "verified" || state.ThinkingState != "verified" {
 		t.Fatalf("Kiro quality probe capability=%+v err=%v", state, err)
 	}
+}
+
+func TestCustomAnthropicModelQualityUsesMessagesAndClaudeWireShape(t *testing.T) {
+	h := newHarness(t, nil)
+	ctx := context.Background()
+	provider := storage.CustomProvider{
+		ID: "quality-anthropic", Name: "Quality Anthropic", BaseURL: "https://relay.invalid/v1",
+		UpstreamProtocol: storage.CustomProviderProtocolAnthropicMessages,
+		TransportProfile: storage.CustomProviderTransportClaudeCode,
+		Enabled:          true,
+	}
+	if err := h.store.UpsertCustomProvider(ctx, provider); err != nil {
+		t.Fatal(err)
+	}
+	account := storage.Account{ID: "quality-anthropic-account", Provider: provider.ID, Status: "active"}
+	token := storage.AccountToken{OpenAIAPIKey: "relay-quality-key"}
+	spec, err := h.app.modelQualityUpstreamRequest(
+		ctx,
+		modelQualityCombo{Group: "cyber", Model: "claude-sonnet-5", Provider: provider.ID},
+		modelQualityProbe{ID: "wire", Prompt: "Reply <quality>& OK", Expected: "OK"},
+		"primary",
+		scheduler.Lease{Account: account, Egress: storage.EgressProfile{ID: "direct", Type: "direct"}},
+		token,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.DownstreamPath != "/messages" || spec.UpstreamProtocol != storage.CustomProviderProtocolAnthropicMessages || spec.TransportProfile != storage.CustomProviderTransportClaudeCode {
+		t.Fatalf("custom Anthropic quality route = path %q protocol %q profile %q", spec.DownstreamPath, spec.UpstreamProtocol, spec.TransportProfile)
+	}
+	body, err := spec.ReadBody()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertClaudeCodeProbeWireShape(t, string(body), "claude-sonnet-5", modelQualityCommonInstruction+"\n\nReply <quality>& OK", 32)
 }
 
 func TestModelQualityRequiresRepeatedConfirmedAnomaly(t *testing.T) {

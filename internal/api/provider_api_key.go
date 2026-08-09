@@ -204,8 +204,9 @@ func (s *Server) runProviderAPIKeyInferenceProbe(ctx context.Context, account st
 	req := upstream.Request{Method: http.MethodPost, Provider: provider, Account: account, Token: token, Egress: egress, CookieJarKey: account.ID + ":" + egress.ID, MinimalProbe: true}
 	if provider == "claude" {
 		req.DownstreamPath = "/v1/messages"
-		body, _ := json.Marshal(map[string]interface{}{"model": model, "max_tokens": 8, "messages": []interface{}{map[string]interface{}{"role": "user", "content": "Reply exactly OK"}}})
+		body, osHint := s.claudeCodeMinimalProbeBody(account, token, egress, model, "Reply exactly OK", 8)
 		req.SetBodyBytes(body)
+		req.OSHint = osHint
 	} else {
 		req.DownstreamPath = "/v1/responses"
 		body, _ := json.Marshal(map[string]interface{}{"model": model, "input": "Reply exactly OK", "max_output_tokens": 8, "stream": false})

@@ -10,9 +10,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/storage"
 )
 
@@ -22,11 +24,11 @@ import (
 // to doClaude therefore apply here, and an operator may legitimately point a custom
 // provider at api.anthropic.com itself, so this path can reach the same edge.
 
-// TestCustomClaudeSidecarCarriesUndiciHeaderOrder: the sidecar receives its header set as
+// TestCustomClaudeSidecarCarriesCapturedHeaderOrder: the sidecar receives its header set as
 // JSON, and Go's encoding/json sorts map keys. curl_cffi preserves the order it is given all
 // the way to CurlOpt.HTTPHEADER, so with no explicit order this path put alphabetical
 // headers on the wire beneath a claude-cli User-Agent.
-func TestCustomClaudeSidecarCarriesUndiciHeaderOrder(t *testing.T) {
+func TestCustomClaudeSidecarCarriesCapturedHeaderOrder(t *testing.T) {
 	capture := captureCustomClaudeSidecarMeta(t)
 
 	if _, ok := capture.Fields["header_order"]; !ok {
@@ -36,10 +38,10 @@ func TestCustomClaudeSidecarCarriesUndiciHeaderOrder(t *testing.T) {
 	if len(names) < 4 {
 		t.Fatalf("sidecar meta carried only %d headers (%v); the capture is not exercising the Claude header set", len(names), names)
 	}
-	wantPrefix := []string{"accept", "user-agent", "x-stainless-retry-count"}
+	wantPrefix := []string{"accept", "authorization", "content-type", "user-agent"}
 	for i, want := range wantPrefix {
 		if i >= len(names) || names[i] != want {
-			t.Fatalf("custom Claude sidecar wire header order = %v\nwant it to start with %v (the Anthropic TS SDK insertion order)", names, wantPrefix)
+			t.Fatalf("custom Claude sidecar wire header order = %v\nwant it to start with captured native order %v", names, wantPrefix)
 		}
 	}
 }
@@ -61,10 +63,47 @@ func TestCustomClaudeSidecarPinsHTTP11(t *testing.T) {
 	}
 }
 
-// TestCustomClaudeDirectPinsHTTP11 covers the non-sidecar transport of the same path: it
-// built its client through httpClientForEgress, which hardcodes forceHTTP1=false, so
-// net/http's ForceAttemptHTTP2 negotiated h2 under the claude-cli identity.
-func TestCustomClaudeDirectPinsHTTP11(t *testing.T) {
+// TestCustomClaudeSidecarCarriesCapturedBunFingerprint proves the custom-provider
+// dispatcher does not stop at Claude-looking headers while leaving Chrome beneath them.
+// A raw native JA3 also disables curl's browser default-header injection and carries the
+// signature-algorithm payload that JA3 itself cannot describe.
+func TestCustomClaudeSidecarCarriesCapturedBunFingerprint(t *testing.T) {
+	capture := captureCustomClaudeSidecarMeta(t)
+
+	var ja3 string
+	if err := json.Unmarshal(capture.Fields["ja3"], &ja3); err != nil {
+		t.Fatalf("ja3 is absent or invalid: %v", err)
+	}
+	if ja3 != identity.ClaudeJA3 {
+		t.Fatalf("custom Claude JA3 = %q, want captured Bun JA3 %q", ja3, identity.ClaudeJA3)
+	}
+	var defaultHeaders bool
+	if err := json.Unmarshal(capture.Fields["default_headers"], &defaultHeaders); err != nil {
+		t.Fatalf("default_headers is absent or invalid: %v", err)
+	}
+	if defaultHeaders {
+		t.Fatal("custom Claude sidecar enables Chrome default headers beneath a claude-cli identity")
+	}
+	var acceptEncoding string
+	if err := json.Unmarshal(capture.Fields["accept_encoding"], &acceptEncoding); err != nil {
+		t.Fatalf("accept_encoding is absent or invalid: %v", err)
+	}
+	if acceptEncoding != claudeAcceptEncoding {
+		t.Errorf("accept_encoding = %q, want %q", acceptEncoding, claudeAcceptEncoding)
+	}
+	var algorithms []string
+	if err := json.Unmarshal(capture.Fields["tls_signature_algorithms"], &algorithms); err != nil {
+		t.Fatalf("tls_signature_algorithms is absent or invalid: %v", err)
+	}
+	if !reflect.DeepEqual(algorithms, claudeTLSSignatureAlgorithms) {
+		t.Errorf("signature algorithms = %v, want %v", algorithms, claudeTLSSignatureAlgorithms)
+	}
+}
+
+// TestCustomClaudeDirectUsesFingerprintEngine covers direct/proxy egress for the same
+// path. Merely pinning the stdlib transport to h1 still exposed Go's ClientHello; the
+// request must avoid the stdlib transport cache entirely and use the native profile.
+func TestCustomClaudeDirectUsesFingerprintEngine(t *testing.T) {
 	client, seen := runCustomClaudeDirectRequest(t)
 
 	if ua := seen.Get("User-Agent"); len(ua) < len("claude-cli/") || ua[:len("claude-cli/")] != "claude-cli/" {
@@ -76,17 +115,13 @@ func TestCustomClaudeDirectPinsHTTP11(t *testing.T) {
 	for key := range client.transports {
 		keys = append(keys, key)
 	}
-	transport := client.transports["http1|direct"]
 	client.tmu.Unlock()
 
-	if transport == nil {
-		t.Fatalf("custom Claude direct call built transports %v; want http1|direct, i.e. ALPN pinned to http/1.1", keys)
+	if len(keys) != 0 {
+		t.Fatalf("custom Claude direct call built stdlib transports %v; want the in-process captured Bun profile", keys)
 	}
-	if transport.ForceAttemptHTTP2 {
-		t.Errorf("custom Claude direct transport has ForceAttemptHTTP2 set")
-	}
-	if got := transport.TLSClientConfig.NextProtos; len(got) != 1 || got[0] != "http/1.1" {
-		t.Errorf("custom Claude direct ALPN = %v, want exactly [http/1.1]", got)
+	if client.tlsFactory == nil {
+		t.Fatal("custom Claude direct call has no in-process fingerprint factory")
 	}
 }
 
@@ -138,7 +173,7 @@ func TestNonClaudeCustomProviderKeepsItsOwnTransport(t *testing.T) {
 // Claude-Code-shaped branch of that dispatcher sends the claude-cli header set and would
 // silently go back to encoding/json's alphabetical map order. The assertion is only that
 // the order-less entry point is unused; which order expression is passed is covered
-// behaviorally by TestCustomClaudeSidecarCarriesUndiciHeaderOrder above.
+// behaviorally by TestCustomClaudeSidecarCarriesCapturedHeaderOrder above.
 func TestCustomProviderSidecarCallsPassAHeaderOrder(t *testing.T) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, filepath.Join(".", "openai_compat.go"), nil, parser.ParseComments)
@@ -201,7 +236,9 @@ func captureCustomClaudeSidecarMeta(t *testing.T) sidecarMetaCapture {
 	}))
 	defer sidecar.Close()
 
-	client := NewClient(config.Default())
+	cfg := config.Default()
+	cfg.EgressFingerprintEngine = "sidecar"
+	client := NewClient(cfg)
 	egress := storage.EgressProfile{
 		ID:       "eg-sidecar",
 		Type:     storage.CurlCFFISidecarEgressType,

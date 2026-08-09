@@ -18,16 +18,19 @@ import (
 // forwarded envelope (target URL + headers + body) and replays a canned upstream
 // response using the x-sidecar-upstream-status / -headers-b64 contract.
 type sidecarCapture struct {
-	url     string
-	method  string
-	headers http.Header
-	body    string
-	ja3     string
-	proxy   string
+	url            string
+	method         string
+	headers        http.Header
+	body           string
+	ja3            string
+	proxy          string
+	acceptEncoding string
+	headerOrder    []string
+	httpVersion    string
 	// defaultHeaders mirrors the meta's "default_headers" field: nil = absent (sidecar
 	// keeps curl's browser defaults), non-nil = the caller pinned it. The Claude path
 	// pins it false to stop curl-impersonate injecting sec-ch-ua/sec-fetch browser headers
-	// on top of the claude-cli/Node identity.
+	// on top of the native claude-cli/Bun identity.
 	defaultHeaders *bool
 	hit            bool
 }
@@ -48,6 +51,9 @@ func newFakeSidecar(t *testing.T, cap *sidecarCapture) *httptest.Server {
 			JA3            string              `json:"ja3"`
 			Proxy          string              `json:"proxy"`
 			DefaultHeaders *bool               `json:"default_headers"`
+			AcceptEncoding string              `json:"accept_encoding"`
+			HeaderOrder    []string            `json:"header_order"`
+			HTTPVersion    string              `json:"http_version"`
 		}
 		raw, _ := io.ReadAll(r.Body)
 		if meta := r.Header.Get("X-Sidecar-Meta"); meta != "" {
@@ -68,10 +74,15 @@ func newFakeSidecar(t *testing.T, cap *sidecarCapture) *httptest.Server {
 		}
 		cap.url = payload.URL
 		cap.method = payload.Method
-		cap.headers = http.Header(payload.Headers)
+		// Semantic assertions use canonical keys; raw casing/order is covered by
+		// claude_sidecar_shape_test against the undecoded meta bytes.
+		cap.headers = canonicalizeHeaders(payload.Headers)
 		cap.ja3 = payload.JA3
 		cap.proxy = payload.Proxy
 		cap.defaultHeaders = payload.DefaultHeaders
+		cap.acceptEncoding = payload.AcceptEncoding
+		cap.headerOrder = append([]string(nil), payload.HeaderOrder...)
+		cap.httpVersion = payload.HTTPVersion
 		upstreamHdr := http.Header{"Content-Type": []string{"text/event-stream"}}
 		enc, _ := json.Marshal(upstreamHdr)
 		w.Header().Set("x-sidecar-upstream-status", "200")
@@ -149,6 +160,45 @@ func TestClaudeRoutesThroughSidecarWithClaudeHeaders(t *testing.T) {
 	// A real client never asks for identity encoding; the sidecar negotiates it.
 	if cap.headers.Get("Accept-Encoding") != "" {
 		t.Fatalf("Accept-Encoding should be unset on the sidecar path, got %q", cap.headers.Get("Accept-Encoding"))
+	}
+}
+
+func TestClaudeOAuthSidecarUsesCapturedAxiosWireShape(t *testing.T) {
+	var cap sidecarCapture
+	sidecar := newFakeSidecar(t, &cap)
+	defer sidecar.Close()
+
+	client := NewClient(sidecarEngineConfig())
+	headers := make(http.Header)
+	headers.Set("Accept", "application/json, text/plain, */*")
+	headers.Set("Content-Type", "application/json")
+	headers.Set("User-Agent", "axios/1.15.2")
+	headers.Set("Accept-Encoding", "gzip, compress, deflate, br")
+	headers.Set("Connection", "keep-alive")
+	resp, err := client.DoAnthropicOAuth(nilContext(t),
+		storage.EgressProfile{ID: "eg-oauth", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
+		storage.Account{ID: "acc-oauth"}, "https://platform.claude.com/v1/oauth/token", headers,
+		[]byte(`{"grant_type":"refresh_token"}`), "oauth:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if !cap.hit || cap.url != "https://platform.claude.com/v1/oauth/token" {
+		t.Fatalf("OAuth token call missed sidecar/native target: %+v", cap)
+	}
+	if cap.headers.Get("User-Agent") != "axios/1.15.2" || cap.headers.Get("Accept") != "application/json, text/plain, */*" {
+		t.Fatalf("OAuth application headers = %+v", cap.headers)
+	}
+	if cap.acceptEncoding != "gzip, compress, deflate, br" {
+		t.Fatalf("accept_encoding = %q, want captured Axios value", cap.acceptEncoding)
+	}
+	wantOrder := "accept,content-type,user-agent,content-length,accept-encoding,host,connection"
+	if strings.Join(cap.headerOrder, ",") != wantOrder {
+		t.Fatalf("header_order = %v, want %s", cap.headerOrder, wantOrder)
+	}
+	if cap.httpVersion != sidecarHTTPVersion1 || cap.ja3 != identity.ClaudeJA3 {
+		t.Fatalf("OAuth transport profile = http/%s ja3=%q", cap.httpVersion, cap.ja3)
 	}
 }
 
@@ -315,11 +365,10 @@ func TestClaudeCLIVersionOverrideAppliesToHeaders(t *testing.T) {
 	}
 }
 
-// TestClaudeSidecarDefaultsToChromeJA3 verifies the evidence-based default: with no
-// claude_ja3 configured, the Claude sidecar path forwards NO ja3, so the sidecar uses
-// its native Chrome impersonation (matching reference relays; Anthropic's third-party
-// detection is system-prompt-content based, not TLS, so this is the lower-risk default).
-func TestClaudeSidecarDefaultsToChromeJA3(t *testing.T) {
+// TestClaudeSidecarDefaultsToCapturedBunJA3 verifies TLS↔UA coherence: with no
+// claude_ja3 configured, the sidecar receives the JA3 captured from the shipping native
+// Bun build rather than putting a Chrome ClientHello beneath a claude-cli User-Agent.
+func TestClaudeSidecarDefaultsToCapturedBunJA3(t *testing.T) {
 	for _, tok := range []storage.AccountToken{
 		{AccessToken: "sk-ant-oat-xyz"},      // OAuth
 		{OpenAIAPIKey: "sk-ant-api03-abcde"}, // API key
@@ -344,16 +393,14 @@ func TestClaudeSidecarDefaultsToChromeJA3(t *testing.T) {
 		resp.Body.Close()
 		sidecar.Close()
 
-		if cap.ja3 != "" {
-			t.Fatalf("default must forward no ja3 (Chrome impersonation), got %q", cap.ja3)
+		if cap.ja3 != identity.ClaudeJA3 {
+			t.Fatalf("default JA3 = %q, want captured Bun JA3 %q", cap.ja3, identity.ClaudeJA3)
 		}
 	}
 }
 
-// TestClaudeJA3OptInReplaysRealClaudeJA3 verifies the opt-in path: setting
-// claude_ja3=claude-cli makes the sidecar replay the captured real claude-cli (Node)
-// JA3 for operators who want explicit TLS↔UA coherence.
-func TestClaudeJA3OptInReplaysRealClaudeJA3(t *testing.T) {
+// TestClaudeJA3NativeAliasesReplayCapturedClaudeJA3 verifies the native aliases.
+func TestClaudeJA3NativeAliasesReplayCapturedClaudeJA3(t *testing.T) {
 	for _, override := range []string{"claude-cli", "real", "native", identity.ClaudeJA3} {
 		var cap sidecarCapture
 		sidecar := newFakeSidecar(t, &cap)
@@ -411,13 +458,12 @@ func TestClaudeJA3DisableKeepsChrome(t *testing.T) {
 }
 
 // TestClaudeSidecarSuppressesBrowserDefaultHeaders is the relay-fingerprint fix: on the
-// DEFAULT (Chrome-impersonation, no explicit JA3) sidecar path, the Claude request must
+// default native-JA3 sidecar path, the Claude request must
 // pin the meta "default_headers": false so the sidecar tells curl-impersonate NOT to
 // inject the browser's own header set (sec-ch-ua*, sec-fetch-*, accept-language,
 // upgrade-insecure-requests). Those browser-only headers riding next to a claude-cli
-// User-Agent + x-stainless-* headers are a combination no genuine Claude Code (Node)
-// client emits — i.e. a clear "impersonation relay" tell to the upstream. The Chrome
-// TLS/HTTP2 impersonation is unaffected (still no ja3 forwarded).
+// User-Agent + x-stainless-* headers are a combination no genuine Claude Code client
+// emits — i.e. a clear "impersonation relay" tell to the upstream.
 func TestClaudeSidecarSuppressesBrowserDefaultHeaders(t *testing.T) {
 	for _, tok := range []storage.AccountToken{
 		{AccessToken: "sk-ant-oat-xyz"},    // OAuth (Pro/Max)
@@ -448,9 +494,9 @@ func TestClaudeSidecarSuppressesBrowserDefaultHeaders(t *testing.T) {
 		if *cap.defaultHeaders {
 			t.Fatalf("Claude sidecar must pin default_headers=false, got true")
 		}
-		// The Chrome TLS/HTTP2 impersonation stays: suppression is headers-only.
-		if cap.ja3 != "" {
-			t.Fatalf("suppression must not change the TLS default; want no ja3, got %q", cap.ja3)
+		// Header suppression must not change the captured native TLS default.
+		if cap.ja3 != identity.ClaudeJA3 {
+			t.Fatalf("suppression changed the TLS default: got %q, want %q", cap.ja3, identity.ClaudeJA3)
 		}
 	}
 }

@@ -184,11 +184,11 @@ func TestClaudeUpstreamHeadersDoNotLeakDownstreamClientIdentity(t *testing.T) {
 	}
 }
 
-// TestClaudeHeaderOrderMatchesSDKInsertionOrder locks the wire header order to the
-// Anthropic TypeScript SDK's insertion order. Without an explicit order fhttp sorts header
-// names lexicographically, which is an ordering no real Node/undici client emits and is
-// therefore a fingerprint of its own.
-func TestClaudeHeaderOrderMatchesSDKInsertionOrder(t *testing.T) {
+// TestClaudeHeaderOrderMatchesCapturedNativeOrder locks the wire header order to a raw
+// ANTHROPIC_BASE_URL capture from the shipping native binary. Without an explicit order
+// fhttp sorts header names lexicographically, which is an ordering the captured client
+// never emits and is therefore a relay fingerprint of its own.
+func TestClaudeHeaderOrderMatchesCapturedNativeOrder(t *testing.T) {
 	c, secret := fixedSecretClient(t, config.Default())
 	id := identity.For(secret, "acc-order")
 
@@ -202,11 +202,10 @@ func TestClaudeHeaderOrderMatchesSDKInsertionOrder(t *testing.T) {
 
 	order := claudeHeaderOrder(built)
 
-	// host leads the HTTP/1.1 wire, matching undici's writer (client-h1.js emits `host:`
-	// before any other field). fhttp sets it from the URL in Request.write, after this
-	// order is computed, so it can only hold that slot by being listed unconditionally.
-	if len(order) == 0 || order[0] != "host" {
-		t.Fatalf("host must lead the wire order, got %v", order)
+	// The native Bun build starts with Accept. Host is transport-injected near the tail,
+	// after Connection and before Accept-Encoding.
+	if len(order) == 0 || order[0] != "accept" {
+		t.Fatalf("accept must lead the captured wire order, got %v", order)
 	}
 
 	// Every built header appears exactly once, plus exactly the transport-injected names.
@@ -239,7 +238,7 @@ func TestClaudeHeaderOrderMatchesSDKInsertionOrder(t *testing.T) {
 		}
 	}
 
-	// The SDK's relative order is preserved for the headers present.
+	// The capture's relative order is preserved for the headers present.
 	pos := func(name string) int {
 		for i, n := range order {
 			if n == name {
@@ -249,20 +248,26 @@ func TestClaudeHeaderOrderMatchesSDKInsertionOrder(t *testing.T) {
 		return -1
 	}
 	for _, pair := range [][2]string{
-		{"accept", "user-agent"},
-		{"user-agent", "x-stainless-retry-count"},
-		{"x-stainless-retry-count", "x-stainless-timeout"},
-		{"x-stainless-timeout", "x-stainless-lang"},
-		{"x-stainless-lang", "x-stainless-package-version"},
-		{"x-stainless-package-version", "x-stainless-os"},
-		{"x-stainless-os", "x-stainless-arch"},
-		{"x-stainless-arch", "x-stainless-runtime"},
+		{"accept", "authorization"},
+		{"authorization", "content-type"},
+		{"content-type", "user-agent"},
+		{"user-agent", "x-claude-code-session-id"},
+		{"x-claude-code-session-id", "x-stainless-arch"},
+		{"x-stainless-arch", "x-stainless-lang"},
+		{"x-stainless-lang", "x-stainless-os"},
+		{"x-stainless-os", "x-stainless-package-version"},
+		{"x-stainless-package-version", "x-stainless-retry-count"},
+		{"x-stainless-retry-count", "x-stainless-runtime"},
 		{"x-stainless-runtime", "x-stainless-runtime-version"},
-		{"x-stainless-runtime-version", "anthropic-dangerous-direct-browser-access"},
+		{"x-stainless-runtime-version", "x-stainless-timeout"},
+		{"x-stainless-timeout", "anthropic-beta"},
+		{"anthropic-beta", "anthropic-dangerous-direct-browser-access"},
 		{"anthropic-dangerous-direct-browser-access", "anthropic-version"},
-		{"anthropic-version", "authorization"},
-		{"authorization", "anthropic-beta"},
-		{"anthropic-beta", "content-type"},
+		{"anthropic-version", "x-app"},
+		{"x-app", "connection"},
+		{"connection", "host"},
+		{"host", "accept-encoding"},
+		{"accept-encoding", "content-length"},
 	} {
 		a, b := pos(pair[0]), pos(pair[1])
 		if a < 0 || b < 0 {
@@ -295,7 +300,7 @@ func TestClaudeHeaderOrderMatchesSDKInsertionOrder(t *testing.T) {
 func TestClaudeHeaderOrderCoversUnknownHeaders(t *testing.T) {
 	built := http.Header{}
 	built.Set("Accept", "application/json")
-	built.Set("User-Agent", "claude-cli/2.1.220")
+	built.Set("User-Agent", "claude-cli/2.1.226")
 	built.Set("Z-Unknown", "1")
 	built.Set("A-Unknown", "2")
 	built.Set("M-Unknown", "3")
@@ -312,9 +317,9 @@ func TestClaudeHeaderOrderCoversUnknownHeaders(t *testing.T) {
 			}
 		}
 	}
-	// host leads, then the known SDK headers in table order (including the
-	// transport-injected content-length slot), then unknown ones in a stable sorted tail.
-	if want := []string{"host", "accept", "user-agent", "content-length"}; len(first) < len(want) {
+	// Known captured headers lead, followed by the transport-injected tail, then unknown
+	// names in a stable sorted tail.
+	if want := []string{"accept", "user-agent", "connection", "host", "accept-encoding", "content-length"}; len(first) < len(want) {
 		t.Fatalf("order too short: %v", first)
 	} else {
 		for i, name := range want {
@@ -323,19 +328,17 @@ func TestClaudeHeaderOrderCoversUnknownHeaders(t *testing.T) {
 			}
 		}
 	}
-	if got := first[4:]; len(got) != 3 || got[0] != "a-unknown" || got[1] != "m-unknown" || got[2] != "z-unknown" {
+	if got := first[6:]; len(got) != 3 || got[0] != "a-unknown" || got[1] != "m-unknown" || got[2] != "z-unknown" {
 		t.Fatalf("unknown headers not in stable sorted tail: %v", got)
 	}
 }
 
-// TestForceHTTP1ForClaudeImpersonation pins the ALPN decision. Real Claude Code runs on
-// Node's global fetch, whose bundled undici cannot speak HTTP/2 at all, and a capture of
-// the real client shows it offering ALPN http/1.1 only (tools/capture/parse.py). Our
-// Chrome_120 profile would otherwise offer h2 and negotiate it, putting a claude-cli
-// User-Agent on an HTTP/2 connection — something the real client cannot produce.
+// TestForceHTTP1ForClaudeImpersonation pins the protocol decision. The captured native
+// Bun ClientHello has no ALPN extension and its request is HTTP/1.1. An accidental Chrome
+// profile would otherwise negotiate h2 beneath a claude-cli User-Agent.
 func TestForceHTTP1ForClaudeImpersonation(t *testing.T) {
 	claudeUA := http.Header{}
-	claudeUA.Set("User-Agent", "claude-cli/2.1.220 (external, cli)")
+	claudeUA.Set("User-Agent", "claude-cli/2.1.226 (external, sdk-cli)")
 
 	cases := []struct {
 		name    string
@@ -348,6 +351,7 @@ func TestForceHTTP1ForClaudeImpersonation(t *testing.T) {
 		{"anthropic oauth token", "https://api.anthropic.com/v1/oauth/token", http.Header{}, true},
 		{"console subdomain", "https://console.anthropic.com/v1/x", http.Header{}, true},
 		{"claude.ai", "https://claude.ai/api/x", http.Header{}, true},
+		{"platform claude oauth", "https://platform.claude.com/v1/oauth/token", http.Header{}, true},
 		// A custom base URL still claims to be Claude Code, so it must look like it.
 		{"custom base url with claude-cli UA", "https://gateway.internal.test/v1/messages", claudeUA, true},
 		// Lookalike hosts must not match on a substring.
@@ -366,23 +370,30 @@ func TestForceHTTP1ForClaudeImpersonation(t *testing.T) {
 	}
 }
 
-// TestInProcessAcceptEncodingMatchesUndici pins the Accept-Encoding on the wire. Left
+// TestInProcessAcceptEncodingMatchesCapturedBun pins the Accept-Encoding on the wire. Left
 // empty, fhttp fills it with "gzip, deflate, br" (transport.go:2567) — an order no real
-// client sends, missing zstd, on a request whose UA claims to be Node. fhttp can decode
-// all four codecs and arms decompression whenever our value contains "gzip", so undici's
+// captured request sends, missing zstd, on a request whose UA claims to be Claude. fhttp
+// can decode all four codecs and arms decompression whenever our value contains "gzip", so Bun's
 // exact value is both faithful and still transparently decompressed.
-func TestInProcessAcceptEncodingMatchesUndici(t *testing.T) {
-	t.Run("claude target gets undici's value", func(t *testing.T) {
+func TestInProcessAcceptEncodingMatchesCapturedBun(t *testing.T) {
+	t.Run("claude target gets Bun's value", func(t *testing.T) {
 		h := http.Header{}
-		h.Set("Accept-Encoding", "identity")
 		applyInProcessAcceptEncoding(h, "https://api.anthropic.com/v1/messages")
-		if got := h.Get("Accept-Encoding"); got != undiciAcceptEncoding {
-			t.Fatalf("Accept-Encoding = %q, want %q", got, undiciAcceptEncoding)
+		if got := h.Get("Accept-Encoding"); got != claudeAcceptEncoding {
+			t.Fatalf("Accept-Encoding = %q, want %q", got, claudeAcceptEncoding)
 		}
 		// Must contain gzip or fhttp will not arm transparent decompression, and the SSE
 		// scanner would then read compressed bytes.
 		if !strings.Contains(h.Get("Accept-Encoding"), "gzip") {
 			t.Fatal("value must contain gzip so fhttp arms DecompressBody")
+		}
+	})
+	t.Run("claude oauth keeps captured Axios value", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Accept-Encoding", "gzip, compress, deflate, br")
+		applyInProcessAcceptEncoding(h, "https://platform.claude.com/v1/oauth/token")
+		if got := h.Get("Accept-Encoding"); got != "gzip, compress, deflate, br" {
+			t.Fatalf("Accept-Encoding = %q, want captured Axios value", got)
 		}
 	})
 	t.Run("non-claude target is left to the transport", func(t *testing.T) {
@@ -395,26 +406,18 @@ func TestInProcessAcceptEncodingMatchesUndici(t *testing.T) {
 	})
 }
 
-// TestApplyClaudeFetchHeaders pins the undici-appended headers. A request claiming to be
-// claude-cli on Node while missing accept-language, or asking an HTTPS endpoint for
-// `identity` encoding, diverges from every real Node client.
+// TestApplyClaudeFetchHeaders pins the native Bun header absence. The shipping capture has
+// no Accept-Language, and caller-provided locale/encoding fields must not leak through.
 func TestApplyClaudeFetchHeaders(t *testing.T) {
 	h := http.Header{}
 	h.Set("Accept-Encoding", "identity")
+	h.Set("Accept-Language", "en-US,en;q=0.9")
 	applyClaudeFetchHeaders(h)
-	if got := h.Get("Accept-Language"); got != "*" {
-		t.Errorf("Accept-Language = %q, want undici's %q", got, "*")
+	if got := h.Get("Accept-Language"); got != "" {
+		t.Errorf("Accept-Language = %q, want absent as in the native capture", got)
 	}
 	if got := h.Get("Accept-Encoding"); got != "" {
 		t.Errorf("Accept-Encoding = %q, want unset so the transport negotiates it", got)
-	}
-
-	// An explicit client Accept-Language is preserved.
-	h2 := http.Header{}
-	h2.Set("Accept-Language", "en-US,en;q=0.9")
-	applyClaudeFetchHeaders(h2)
-	if got := h2.Get("Accept-Language"); got != "en-US,en;q=0.9" {
-		t.Errorf("Accept-Language = %q, want the client's own value preserved", got)
 	}
 }
 
@@ -442,8 +445,61 @@ func TestClaudeStreamingDoesNotRequestIdentityEncoding(t *testing.T) {
 		if got := h.Get("Accept-Encoding"); strings.Contains(strings.ToLower(got), "identity") {
 			t.Errorf("%s: Accept-Encoding = %q; no real Node/browser client asks HTTPS for identity", tc.name, got)
 		}
-		if got := h.Get("Accept-Language"); got == "" {
-			t.Errorf("%s: Accept-Language missing; undici always appends it", tc.name)
+		if got := h.Get("Accept-Language"); got != "" {
+			t.Errorf("%s: Accept-Language = %q; native Claude 2.1.226 sends none", tc.name, got)
+		}
+	}
+}
+
+func TestClaudeWireHeadersMatchCapturedCasing(t *testing.T) {
+	built := http.Header{}
+	built.Set("Accept", "application/json")
+	built.Set("Anthropic-Beta", "beta")
+	built.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
+	built.Set("Anthropic-Version", "2023-06-01")
+	built.Set("X-Api-Key", "secret")
+	built.Set("X-App", "cli")
+	built.Set("X-Stainless-Arch", "x64")
+	built.Set("X-Stainless-OS", "Linux")
+
+	wire := claudeWireHeaders(built)
+	for _, name := range []string{"anthropic-beta", "anthropic-dangerous-direct-browser-access", "anthropic-version", "x-api-key", "x-app"} {
+		if _, ok := wire[name]; !ok {
+			t.Errorf("wire header %q missing: %#v", name, wire)
+		}
+		if _, duplicate := wire[http.CanonicalHeaderKey(name)]; duplicate {
+			t.Errorf("wire contains canonical duplicate %q", http.CanonicalHeaderKey(name))
+		}
+	}
+	if _, ok := wire["X-Stainless-Arch"]; !ok {
+		t.Errorf("captured canonical X-Stainless-Arch casing changed: %#v", wire)
+	}
+	if _, ok := wire["X-Stainless-OS"]; !ok {
+		t.Errorf("captured literal X-Stainless-OS casing missing: %#v", wire)
+	}
+	if _, wrong := wire["X-Stainless-Os"]; wrong {
+		t.Errorf("Go-canonical X-Stainless-Os leaked onto the wire: %#v", wire)
+	}
+	if got := wire["Connection"]; len(got) != 1 || got[0] != "keep-alive" {
+		t.Errorf("Connection = %v, want [keep-alive]", got)
+	}
+}
+
+func TestResolveClaudeTLSDefaultsToCapturedBun(t *testing.T) {
+	for _, value := range []string{"", "claude-cli", "real", "native", "bun"} {
+		if got := resolveClaudeJA3(value); got != identity.ClaudeJA3 {
+			t.Errorf("resolveClaudeJA3(%q) = %q, want captured %q", value, got, identity.ClaudeJA3)
+		}
+		if got := resolveClaudeTLSProfile(value); got != "claude_bun" {
+			t.Errorf("resolveClaudeTLSProfile(%q) = %q, want claude_bun", value, got)
+		}
+	}
+	for _, value := range []string{"off", "chrome", "browser"} {
+		if got := resolveClaudeJA3(value); got != "" {
+			t.Errorf("resolveClaudeJA3(%q) = %q, want empty Chrome sentinel", value, got)
+		}
+		if got := resolveClaudeTLSProfile(value); got != "chrome" {
+			t.Errorf("resolveClaudeTLSProfile(%q) = %q, want chrome", value, got)
 		}
 	}
 }

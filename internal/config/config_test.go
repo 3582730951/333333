@@ -24,6 +24,30 @@ func TestLoadMigratesLegacyClaudeOAuthTokenURL(t *testing.T) {
 	}
 }
 
+func TestLoadMigratesPre21226ClaudeOAuthFingerprint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	raw := []byte(`{
+		"claude_oauth_auth_url":"https://claude.ai/oauth/authorize",
+		"claude_oauth_token_url":"https://api.anthropic.com/v1/oauth/token",
+		"claude_oauth_redirect_uri":"http://localhost:54545/callback",
+		"claude_oauth_scope":"user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+	}`)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ClaudeOAuthAuthURL != DefaultClaudeOAuthAuthURL ||
+		cfg.ClaudeOAuthTokenURL != DefaultClaudeOAuthTokenURL ||
+		cfg.ClaudeOAuthRedirectURI != DefaultClaudeOAuthRedirectURI ||
+		cfg.ClaudeOAuthScope != DefaultClaudeOAuthScope {
+		t.Fatalf("legacy Claude OAuth tuple was not migrated: auth=%q token=%q redirect=%q scope=%q",
+			cfg.ClaudeOAuthAuthURL, cfg.ClaudeOAuthTokenURL, cfg.ClaudeOAuthRedirectURI, cfg.ClaudeOAuthScope)
+	}
+}
+
 func TestOAuthDefaultsAvailableWithoutLoad(t *testing.T) {
 	cfg := Default()
 	for name, value := range map[string]string{

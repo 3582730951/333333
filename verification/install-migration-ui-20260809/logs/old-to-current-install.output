@@ -1,0 +1,64 @@
+================================
+ Pool Server 安装 / 更新
+================================
+==> Codex skills 兼容提示：完整官方 skills/plugins/Browser Use 体验请使用官方 Codex 账号通道；第三方 API 通道为 best-effort。
+
+==> 检测到现有配置、数据库或已激活 release：自动进入备份保护的更新流程
+==> 如需刻意新建独立实例，请使用 --fresh-install 并传入独立的 CONFIG_FILE/DATA_DIR/APP_DIR。
+==> Backed up accounts DB -> /tmp/codex-pool-install-fixture-20260809/old/backups/pool-20260809-121029-576119852.sqlite3.gz (压缩后 32.0KB，源库 1.1MB)
+==> Clearing Go build cache (go clean -cache) for a clean recompile
+==> 受管源码同步完成：移除 0 个旧文件；配置、数据与插件目录未触碰
+==> Rebuilding + reinstalling via scripts/install.sh (LISTEN_ADDR=127.0.0.1:18787) --minimal --no-systemd --no-start --no-tests --without-sidecar --without-registration --without-warp --no-migrate-user-groups
+==> Codex skills compatibility: full official skills/plugins/Browser Use support requires the official Codex account path; custom providers are best-effort.
+==> Using Go 1.25.12: /usr/local/go1.25.12/bin/go
+==> Downloading Go modules
+WARN: Skipping go test ./...
+==> Building codex-pool-server release 20260809T121031Z-source-402361
+==> Building downloadable gateway binaries
+==> Staging immutable release 20260809T121031Z-source-402361
+codex-pool-server self-test ok
+codex-pool-handoff self-test ok
+WARN: Keeping existing config: /tmp/codex-pool-install-fixture-20260809/old/etc/config.json
+WARN: Skipping systemd unit install
+
+Install complete.
+
+Binary:        /tmp/codex-pool-install-fixture-20260809/old/bin/codex-pool-server
+Handoff:       /tmp/codex-pool-install-fixture-20260809/old/bin/codex-pool-handoff
+Release:       20260809T121031Z-source-402361 (/tmp/codex-pool-install-fixture-20260809/old/app/releases/20260809T121031Z-source-402361)
+Context clear: /tmp/codex-pool-install-fixture-20260809/old/bin/codex-pool-clear-context
+Config:        /tmp/codex-pool-install-fixture-20260809/old/etc/config.json
+Data:          /tmp/codex-pool-install-fixture-20260809/old/data/data
+Database:      /tmp/codex-pool-install-fixture-20260809/old/data/pool.sqlite3
+Listen:        127.0.0.1:18787
+Frontend:      http://127.0.0.1:18787/
+Handoff svc:  codex-pool-handoff.service
+Compat svc:   codex-pool.service
+Sidecar:       disabled
+Super-Instruct: bundled; enabled per API-key install choice within user-group policy
+Registration:  disabled
+Group migration: disabled (account-pool groups stay separate)
+WARP:          disabled
+Admin token:   <configured in /tmp/codex-pool-install-fixture-20260809/old/data/data/keys/admin.token>
+
+Manual run:
+  CODEX_POOL_DATABASE=/tmp/codex-pool-install-fixture-20260809/old/data/pool.sqlite3 CODEX_POOL_MIGRATE_USER_GROUPS=0 CODEX_POOL_LISTEN_ADDR=127.0.0.1:18787 CODEX_POOL_SUPER_INSTRUCT_DIR=/tmp/codex-pool-install-fixture-20260809/old/app/current/super-instruct/codex-skills CODEX_POOL_SUPER_INSTRUCT_BRIDGE_FILE=/tmp/codex-pool-install-fixture-20260809/old/app/current/super-instruct/bridge.md CODEX_POOL_ADMIN_TOKEN_FILE=/tmp/codex-pool-install-fixture-20260809/old/data/data/keys/admin.token /tmp/codex-pool-install-fixture-20260809/old/bin/codex-pool-server --config /tmp/codex-pool-install-fixture-20260809/old/etc/config.json
+
+Useful service commands:
+  systemctl status codex-pool-handoff.service
+  systemctl status codex-pool.socket
+  systemctl status codex-pool-worker@20260809T121031Z-source-402361.service
+  systemctl status codex-pool-reauth.service
+  /tmp/codex-pool-install-fixture-20260809/old/bin/codex-pool-rollback
+  journalctl -u codex-pool-handoff.service -f
+  systemctl status codex-pool-sidecar.service
+
+更新完成 / Update complete.
+  项目目录 Project:   /tmp/codex-pool-current-source-20260809
+  账号数据库 DB:      /tmp/codex-pool-install-fixture-20260809/old/data/pool.sqlite3
+  本次备份 Backup:    /tmp/codex-pool-install-fixture-20260809/old/backups/pool-20260809-121029-576119852.sqlite3.gz  (恢复: 停服后 gunzip -c <file> > /tmp/codex-pool-install-fixture-20260809/old/data/pool.sqlite3)
+  池内账号 Accounts:  数据库文件已原样保留（未安装 sqlite3，跳过计数校验）
+  监听 Listen:        127.0.0.1:18787
+                      ↳ 仅本机监听（如需外部访问：LISTEN_ADDR=0.0.0.0:18787 sudo ./update.sh）
+
+  日志 logs: journalctl -u codex-pool-handoff.service -f

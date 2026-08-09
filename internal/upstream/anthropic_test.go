@@ -63,9 +63,9 @@ func TestMergeBetasFallsBackToCanonical(t *testing.T) {
 		"oauth-2025-04-20",
 		"interleaved-thinking-2025-05-14",
 		"thinking-token-count-2026-05-13",
-		"mid-conversation-system-2026-04-07",
+		"context-management-2025-06-27",
+		"prompt-caching-scope-2026-01-05",
 		"effort-2025-11-24",
-		"fallback-credit-2026-06-01",
 		"extended-cache-ttl-2025-04-11",
 	} {
 		if !strings.Contains(got, want) {
@@ -85,11 +85,25 @@ func TestMergeBetasAPIKeyDropsOAuth(t *testing.T) {
 		t.Fatalf("dropped a non-oauth client beta on the api-key path: %s", got)
 	}
 	canonical := mergeBetas(claudeAPIKeyBetas, http.Header{}, true)
-	if !strings.Contains(canonical, "fallback-credit-2026-06-01") {
-		t.Fatalf("current API-key fingerprint is missing fallback credit: %s", canonical)
+	if !strings.Contains(canonical, "prompt-caching-scope-2026-01-05") {
+		t.Fatalf("current API-key fingerprint is missing prompt caching scope: %s", canonical)
 	}
 	if strings.Contains(canonical, "extended-cache-ttl-2025-04-11") {
 		t.Fatalf("API-key fingerprint carried OAuth-only extended cache TTL: %s", canonical)
+	}
+}
+
+func TestClaudeOAuthHeaderOrderMatchesNativeAxiosCapture(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set("Accept", "application/json, text/plain, */*")
+	headers.Set("Content-Type", "application/json")
+	headers.Set("User-Agent", "axios/1.15.2")
+	headers.Set("Accept-Encoding", "gzip, compress, deflate, br")
+	headers.Set("Connection", "keep-alive")
+	want := []string{"accept", "content-type", "user-agent", "content-length", "accept-encoding", "host", "connection"}
+	got := claudeOAuthHeaderOrder(headers)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("OAuth header order = %v, want %v", got, want)
 	}
 }
 
@@ -312,7 +326,7 @@ func TestClaudeMessagesFinalSanitizerBeforeSidecar(t *testing.T) {
 		t.Fatalf("Claude body/header identity drift: metadata=%+v headers=%+v", userIdentity, cap.headers)
 	}
 	if cap.headers.Get("x-client-request-id") != "" || cap.headers.Get("Accept") != "application/json" {
-		t.Fatalf("Claude 2.1.206 header fingerprint mismatch: %+v", cap.headers)
+		t.Fatalf("Claude 2.1.226 header fingerprint mismatch: %+v", cap.headers)
 	}
 	tools := got["tools"].([]interface{})
 	firstTool := tools[0].(map[string]interface{})

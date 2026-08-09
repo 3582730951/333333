@@ -945,19 +945,23 @@ type orderedHeaders struct {
 
 func (o orderedHeaders) MarshalJSON() ([]byte, error) {
 	remaining := make(map[string][]string, len(o.Header))
+	byLower := make(map[string]string, len(o.Header))
 	for k, values := range o.Header {
 		remaining[k] = values
+		byLower[strings.ToLower(k)] = k
 	}
 	keys := make([]string, 0, len(o.Header))
 	for _, name := range o.Order {
-		canonical := http.CanonicalHeaderKey(strings.TrimSpace(name))
-		if _, ok := remaining[canonical]; !ok {
+		lower := strings.ToLower(strings.TrimSpace(name))
+		actual, ok := byLower[lower]
+		if !ok {
 			// Ordered names that are absent (e.g. host/content-length, which the transport
 			// adds) or already consumed are skipped rather than emitted empty.
 			continue
 		}
-		keys = append(keys, canonical)
-		delete(remaining, canonical)
+		keys = append(keys, actual)
+		delete(remaining, actual)
+		delete(byLower, lower)
 	}
 	tail := make([]string, 0, len(remaining))
 	for k := range remaining {
@@ -991,7 +995,7 @@ func (o orderedHeaders) MarshalJSON() ([]byte, error) {
 // defaultHeaders controls whether the sidecar lets curl-impersonate INJECT the
 // impersonated browser's own header set (sec-ch-ua*, sec-fetch-*, accept-language,
 // upgrade-insecure-requests, …) on top of `built`. Pass false whenever `built` is a
-// complete, authentic non-browser client fingerprint (e.g. the claude-cli/Node header
+// complete, authentic non-browser client fingerprint (e.g. the native claude-cli header
 // set): the browser extras would otherwise ride alongside a claude-cli User-Agent +
 // x-stainless-* headers, an incoherent combination no real client emits and thus a
 // clear impersonation-relay tell. The TLS/HTTP2 impersonation is unaffected either way.
@@ -1012,9 +1016,9 @@ func (c *Client) postViaSidecar(ctx context.Context, spec Request, target string
 // an order-preserving comprehension), hands it to curl_cffi — whose Headers type is an
 // ordered list and whose set_curl_options writes CurlOpt.HTTPHEADER in exactly that order.
 // So Go's map-key sort propagated all the way to the socket: the in-process engine got the
-// real undici order in round one while the sidecar engine kept emitting `accept,
+// captured native order in round one while the sidecar engine kept emitting `accept,
 // anthropic-beta, anthropic-version, authorization, content-type, user-agent, x-app,
-// x-stainless-*` — alphabetical, which no Node/undici client produces.
+// x-stainless-*` — alphabetical, which the native client does not produce.
 //
 // Passing the order makes the meta JSON an ORDERED object, so the same claudeHeaderOrder
 // projection that drives the in-process engine reaches the wire through the sidecar too.
@@ -1025,7 +1029,15 @@ func (c *Client) postViaSidecarOrdered(ctx context.Context, spec Request, target
 	if spec.Egress.Endpoint == "" {
 		return nil, errors.New("curl_cffi_sidecar endpoint required")
 	}
-	headers := orderedHeaders{Header: built, Order: headerOrder}
+	claudeShape := forceHTTP1ForClaudeImpersonation(target, built)
+	if claudeShape && len(headerOrder) == 0 {
+		headerOrder = claudeHeaderOrder(built)
+	}
+	wireHeaders := built
+	if claudeShape {
+		wireHeaders = claudeWireHeaders(built)
+	}
+	headers := orderedHeaders{Header: wireHeaders, Order: headerOrder}
 	// The request body travels as the raw HTTP body; only the small routing metadata is
 	// base64'd, into the X-Sidecar-Meta header. This avoids base64-inflating a large
 	// (1M-context) body by ~33% plus a full encode here and decode in the sidecar on
@@ -1045,11 +1057,26 @@ func (c *Client) postViaSidecarOrdered(ctx context.Context, spec Request, target
 	// tls_client.WithForceHttp1(); the sidecar's curl_cffi impersonation offers ALPN
 	// ["h2","http/1.1"] and Anthropic's edge prefers h2, so without this the sidecar engine
 	// puts a claude-cli User-Agent on an HTTP/2 connection — a combination the real client
-	// (Node's bundled undici, allowH2:false) cannot produce. Emitted only when pinning, so
+	// captured native Bun client cannot produce. Emitted only when pinning, so
 	// the wire meta of every existing Codex/registration caller is byte-identical and an
 	// older sidecar simply ignores the unknown key during a rolling deploy.
-	if forceHTTP1ForClaudeImpersonation(target, built) {
+	if claudeShape {
 		meta["http_version"] = sidecarHTTPVersion1
+		// curl_cffi normally applies its global browser encoding list and strips
+		// Connection. Both differ from the native Bun request, so carry the captured
+		// request-specific value and retain the explicit keep-alive field for Claude.
+		// OAuth uses Axios' "gzip, compress, deflate, br" rather than the messages
+		// SDK's "gzip, deflate, br, zstd".
+		acceptEncoding := strings.TrimSpace(built.Get("Accept-Encoding"))
+		if acceptEncoding == "" {
+			acceptEncoding = claudeAcceptEncoding
+		}
+		meta["accept_encoding"] = acceptEncoding
+		meta["preserve_connection_header"] = true
+		meta["native_header_order"] = true
+		if sanitizeJA3(ja3) == identity.ClaudeJA3 {
+			meta["tls_signature_algorithms"] = claudeTLSSignatureAlgorithms
+		}
 	}
 	if !defaultHeaders {
 		// Tell the sidecar NOT to let curl-impersonate inject the browser's own header set
@@ -1061,8 +1088,8 @@ func (c *Client) postViaSidecarOrdered(ctx context.Context, spec Request, target
 	if ja3 != "" {
 		// Strip unlistable SCSV signalling values (e.g. rustls' 0xFF) so an explicit
 		// operator JA3 can actually replay; the sidecar still degrades to Chrome if its
-		// local curl_cffi build can't reproduce the rest. Codex/Claude default paths pass
-		// ja3="" (Chrome) and never reach here.
+		// local curl_cffi build can't reproduce the rest. Browser/Codex default paths pass
+		// ja3=""; Claude's native default deliberately reaches this branch.
 		meta["ja3"] = sanitizeJA3(ja3)
 	}
 	// A sidecar egress may chain through an upstream proxy (e.g. a WARP exit's local

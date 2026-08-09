@@ -1,11 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/anthropicwire"
 	"codex-account-pool/internal/routing"
 )
 
@@ -41,7 +43,9 @@ func (s *Server) applyClaudeCacheDiagnostics(ctx context.Context, headers http.H
 		return body
 	}
 	var root map[string]interface{}
-	if json.Unmarshal(body, &root) != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if decoder.Decode(&root) != nil {
 		return body
 	}
 	diag, _ := root["diagnostics"].(map[string]interface{})
@@ -50,7 +54,7 @@ func (s *Server) applyClaudeCacheDiagnostics(ctx context.Context, headers http.H
 		root["diagnostics"] = diag
 	}
 	diag["previous_message_id"] = prev
-	out, err := json.Marshal(root)
+	out, err := anthropicwire.MarshalPreservingOrder(body, root)
 	if err != nil {
 		return body
 	}

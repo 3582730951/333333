@@ -10,14 +10,16 @@ import (
 	"time"
 
 	"codex-account-pool/internal/bodysource"
+	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream/tlsclient"
 )
 
 // postInProcess is the in-process analogue of postViaSidecar. It performs the actual
-// network call through the bogdanfinn/tls-client engine so the upstream sees a real
-// browser TLS/JA3 + HTTP2 fingerprint (Chrome_120, matching the sidecar's chrome120
-// default) instead of the Go standard library's — with no external Python process.
+// network call through the bogdanfinn/tls-client engine so the upstream sees the
+// selected native TLS/HTTP fingerprint instead of the Go standard library's — with no
+// external Python process. Claude uses its captured Bun profile; browser-shaped callers
+// keep their browser profile.
 //
 // It is provider-neutral: the caller supplies the target URL, the fully-built upstream
 // header set, the overall timeout, and an optional explicit JA3/profile override
@@ -26,10 +28,10 @@ import (
 // each read) so a long streaming completion is never truncated. A sidecar egress's chain
 // proxy is honored so traffic still leaves from the intended exit IP.
 //
-// jaProfileOverride "" keeps the default Chrome_120. The in-process engine works with
-// hardened named profiles from profiles.MappedTLSClients rather than raw-string JA3 replay
-// (the sidecar's curl_cffi feature); an unrecognized override degrades to Chrome_120 rather
-// than failing the request.
+// jaProfileOverride "" keeps the caller-selected profile. The in-process engine works with
+// complete named profiles rather than partial raw-JA3 replay; an unknown override therefore
+// falls back to the caller's complete profile (native Bun for Claude) instead of emitting a
+// hybrid ClientHello.
 func (c *Client) postInProcess(ctx context.Context, spec Request, target string, built http.Header, timeout time.Duration, jaProfileOverride, profileName string) (*Response, error) {
 	return c.postInProcessOrdered(ctx, spec, target, built, timeout, jaProfileOverride, profileName, nil)
 }
@@ -37,11 +39,18 @@ func (c *Client) postInProcess(ctx context.Context, spec Request, target string,
 // postInProcessOrdered is postInProcess with an explicit wire header order. Passing a
 // non-nil order is what keeps the emitted header sequence identical to the impersonated
 // client: with no order set, fhttp sorts header names lexicographically (see
-// fhttp/header.go headerSorter.Less), an ordering no real Node/undici or Chrome client
+// fhttp/header.go headerSorter.Less), an ordering no captured native or Chrome client
 // produces and therefore a fingerprint of its own.
 func (c *Client) postInProcessOrdered(ctx context.Context, spec Request, target string, built http.Header, timeout time.Duration, jaProfileOverride, profileName string, headerOrder []string) (*Response, error) {
 	headers := built.Clone()
+	claudeShape := forceHTTP1ForClaudeImpersonation(target, headers)
 	applyInProcessAcceptEncoding(headers, target)
+	if claudeShape {
+		if len(headerOrder) == 0 {
+			headerOrder = claudeHeaderOrder(headers)
+		}
+		headers = claudeWireHeaders(headers)
+	}
 
 	ctx, guard := newRequestGuard(ctx, timeout)
 	resp, err := c.tlsFactory.Do(ctx, tlsclient.Request{
@@ -69,52 +78,61 @@ func (c *Client) postInProcessOrdered(ctx context.Context, spec Request, target 
 	}, nil
 }
 
-// undiciAcceptEncoding is the Accept-Encoding value Node's fetch appends to every https
-// request. Claude Code never sets one itself, so this is what the real client's wire
-// carries.
-const undiciAcceptEncoding = "br, gzip, deflate, zstd"
+// claudeAcceptEncoding is the byte-exact Accept-Encoding value captured from Claude Code
+// 2.1.226's native Bun transport. Order and whitespace are observable fingerprint fields.
+const claudeAcceptEncoding = "gzip, deflate, br, zstd"
+
+// claudeTLSSignatureAlgorithms is the ordered signature_algorithms payload captured in
+// the native ClientHello. JA3 records only extension ID 13, not this payload, so the
+// sidecar must receive it separately to avoid a near-match that omits rsa_pkcs1_sha1.
+var claudeTLSSignatureAlgorithms = []string{
+	"ecdsa_secp256r1_sha256",
+	"rsa_pss_rsae_sha256",
+	"rsa_pkcs1_sha256",
+	"ecdsa_secp384r1_sha384",
+	"rsa_pss_rsae_sha384",
+	"rsa_pkcs1_sha384",
+	"rsa_pss_rsae_sha512",
+	"rsa_pkcs1_sha512",
+	"rsa_pkcs1_sha1",
+}
 
 // applyInProcessAcceptEncoding decides the Accept-Encoding this request puts on the wire.
 //
 // The header set we are handed never carries one (applyClaudeFetchHeaders deletes it,
 // deliberately, because the stdlib fallback can only transparently decompress gzip that IT
 // added). If we simply forwarded that emptiness, fhttp fills the gap itself with
-// "gzip, deflate, br" (transport.go:2567) — three codecs in an order no real client sends,
-// and missing zstd, on a request whose User-Agent claims to be Node.
+// "gzip, deflate, br" (transport.go:2567) — three codecs in an order no captured Claude
+// Code request sends, and missing zstd, on a request whose User-Agent claims to be Claude.
 //
 // For Claude impersonation we can do better, because fhttp CAN decode all four codecs:
 // DecompressBodyByType handles gzip/br/deflate/zstd (transport.go:2883), and it is armed
 // whenever the caller's own value merely contains "gzip" (transport.go:2571 sets
 // requestedGzip, which becomes rc.addedGzip at :2609). That is an fhttp patch — the Go
-// stdlib only decompresses what it added itself — so sending undici's exact value here is
+// stdlib only decompresses what it added itself — so sending Bun's exact value here is
 // both faithful and still transparently decompressed for the SSE scanner.
 //
 // Any non-Claude target keeps the previous behavior (deleted, transport decides) so no
 // other provider's header set moves.
 func applyInProcessAcceptEncoding(headers http.Header, target string) {
+	explicit := strings.TrimSpace(headers.Get("Accept-Encoding"))
 	headers.Del("Accept-Encoding")
 	if forceHTTP1ForClaudeImpersonation(target, headers) {
-		headers.Set("Accept-Encoding", undiciAcceptEncoding)
+		if explicit == "" {
+			explicit = claudeAcceptEncoding
+		}
+		headers.Set("Accept-Encoding", explicit)
 	}
 }
 
 // forceHTTP1ForClaudeImpersonation reports whether this request must be pinned to
 // HTTP/1.1 at the ALPN layer.
 //
-// GROUND TRUTH: Claude Code reaches Anthropic through the Anthropic TypeScript SDK, which
-// issues its calls on Node's global fetch. Global fetch is backed by Node's BUNDLED undici,
-// and undici forces allowH2:false for those legacy v1 dispatcher consumers ("Legacy (v1)
-// consumers (like Node.js's bundled undici on Node 22) do not support HTTP/2", undici
-// commit for issue #4989). A packet capture of the real client agrees — see
-// tools/capture/parse.py: "Claude Code -> api.anthropic.com offers ALPN http/1.1". So every
-// genuine Claude Code request is HTTP/1.1 and its ClientHello advertises only http/1.1.
-//
-// Our default Chrome_120 profile advertises ["h2","http/1.1"], and an edge that prefers h2
-// (Anthropic's does) then negotiates HTTP/2. That produces two signals real Claude Code
-// cannot produce: a JA4 whose ALPN field reads h2 instead of h1, and an HTTP/2
-// SETTINGS/Akamai fingerprint on a connection carrying a claude-cli User-Agent. The second
-// is a cheap, essentially false-positive-free discriminator — "claude-cli UA arriving over
-// h2" is by construction never the real client.
+// GROUND TRUTH: a ClientHello captured from Claude Code 2.1.226's native Bun 1.4.0 binary
+// contains no ALPN extension, and the following request is HTTP/1.1. A Chrome profile would
+// advertise h2 and add a browser HTTP/2 SETTINGS fingerprint beneath a claude-cli UA. The
+// custom Claude profile already has no ALPN; this flag also pins protocol selection in the
+// transport and protects explicit profile overrides from accidentally negotiating h2.
 //
 // The trigger is deliberately derived from the request itself rather than a new parameter,
 // so every caller (including the OpenAI-compat -> Claude bridge) is covered without any
@@ -142,7 +160,7 @@ func isAnthropicTarget(rawURL string) bool {
 		return false
 	}
 	host := strings.ToLower(parsed.Hostname())
-	for _, domain := range []string{"anthropic.com", "claude.ai"} {
+	for _, domain := range []string{"anthropic.com", "claude.ai", "claude.com"} {
 		if host == domain || strings.HasSuffix(host, "."+domain) {
 			return true
 		}
@@ -152,9 +170,9 @@ func isAnthropicTarget(rawURL string) bool {
 
 // inProcessNamedProfile maps a resolved sidecar JA3 string onto a named tls-client
 // profile key. The sidecar consumes a raw JA3 string; the in-process engine consumes a
-// named profile from profiles.MappedTLSClients. Empty / Chrome sentinels keep the default
-// (Chrome_120). A raw JA3 string that isn't a known named key returns "" so ResolveProfile
-// degrades to Chrome_120 rather than presenting an incoherent partial fingerprint.
+// named profile from profiles.MappedTLSClients. Empty / Chrome sentinels select no named
+// override. A raw JA3 string that is not a known profile key cannot be replayed safely
+// in-process, so ResolveProfile ignores it and keeps the caller's complete profile.
 func inProcessNamedProfile(ja3 string) string {
 	switch v := strings.ToLower(strings.TrimSpace(ja3)); v {
 	case "", "off", "none", "disabled", "-", "chrome", "browser":
@@ -162,7 +180,7 @@ func inProcessNamedProfile(ja3 string) string {
 	default:
 		// Named profile passthrough (e.g. "chrome_133", "firefox_120"): ResolveProfile
 		// looks these up in profiles.MappedTLSClients. A raw JA3 fingerprint string will
-		// not match and safely degrades to Chrome_120.
+		// not match and safely keeps the caller-selected complete profile.
 		return v
 	}
 }
@@ -178,7 +196,14 @@ func (c *Client) doRawInProcess(ctx context.Context, egress storage.EgressProfil
 
 func (c *Client) doRawInProcessSource(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body bodysource.BodySource, cookieJarKey, profileName string, headerOrder []string) (*Response, error) {
 	built := headers.Clone()
+	claudeShape := forceHTTP1ForClaudeImpersonation(rawURL, built)
 	applyInProcessAcceptEncoding(built, rawURL)
+	if claudeShape {
+		if len(headerOrder) == 0 {
+			headerOrder = claudeHeaderOrder(built)
+		}
+		built = claudeWireHeaders(built)
+	}
 
 	ctx, guard := newRequestGuard(ctx, c.cfg.RequestTimeout())
 	resp, err := c.tlsFactory.Do(ctx, tlsclient.Request{
@@ -238,18 +263,31 @@ type FingerprintReflection struct {
 //
 // engine: "inprocess" routes through the tls-client engine; "sidecar" routes through the
 // curl_cffi sidecar (only valid for a curl_cffi_sidecar egress). profileName selects the
-// in-process profile (ProfileChrome for Codex/Claude, ProfileNode/ProfileRustls for Kiro).
+// in-process profile (ProfileChrome for Codex, ProfileClaude for Claude,
+// ProfileNode/ProfileRustls for Kiro).
 func (c *Client) ReflectFingerprint(ctx context.Context, egress storage.EgressProfile, engine, profileName, reflectorURL string) FingerprintReflection {
 	if strings.TrimSpace(reflectorURL) == "" {
 		reflectorURL = "https://tls.peet.ws/api/all"
 	}
 	out := FingerprintReflection{Engine: engine}
 	headers := http.Header{}
+	if profileName == tlsclient.ProfileClaude {
+		headers.Set("Accept", "application/json")
+		headers.Set("User-Agent", "claude-cli/"+identity.ClaudeCLIVersion+" (external, sdk-cli)")
+	}
 	var resp *Response
 	var err error
 	switch strings.ToLower(strings.TrimSpace(engine)) {
 	case "sidecar":
-		resp, err = c.DoViaSidecar(ctx, egress, http.MethodGet, reflectorURL, headers, nil, "fingerprint-check")
+		if profileName == tlsclient.ProfileClaude {
+			resp, err = c.postViaSidecarOrdered(ctx, Request{
+				Method:       http.MethodGet,
+				Egress:       egress,
+				CookieJarKey: "fingerprint-check",
+			}, reflectorURL, headers, c.cfg.SidecarTimeout(), identity.ClaudeJA3, false, claudeHeaderOrder(headers))
+		} else {
+			resp, err = c.DoViaSidecar(ctx, egress, http.MethodGet, reflectorURL, headers, nil, "fingerprint-check")
+		}
 	default: // inprocess
 		resp, err = c.doRawInProcess(ctx, egress, http.MethodGet, reflectorURL, headers, nil, "fingerprint-check", profileName, nil)
 	}

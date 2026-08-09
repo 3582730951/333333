@@ -121,10 +121,36 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 		}
 	}
 
-	// Sidecar egress: present a real client TLS/JA3 + HTTP2 fingerprint and (optionally)
-	// chain through a proxy/WARP exit, exactly like the Codex/Claude sidecar paths. ja3=""
-	// keeps the sidecar's native Chrome impersonation (these providers need no specific JA3).
-	if spec.Egress.Type == "curl_cffi_sidecar" {
+	// A custom Anthropic Messages/Claude-Code transport carries the same claude-cli
+	// identity as the built-in Claude route, so it must use the same captured Bun TLS,
+	// HTTP/1.1 and header profile as well. Previously this branch only changed the
+	// application headers: sidecar traffic still inherited Chrome's ClientHello and
+	// browser defaults, while direct/proxy traffic exposed Go's ClientHello. Both are
+	// internally contradictory fingerprints visible to an upstream relay.
+	claudeTransport := claudeShaped ||
+		(spec.PassThrough && spec.TransportProfile == storage.CustomProviderTransportClaudeCode)
+	if claudeTransport && c.claudeFingerprintEngine(spec.Egress) != claudeEngineStdlib {
+		built.Del("Accept-Encoding")
+		transportSpec := spec
+		transportSpec.Method = method
+		override := c.cfgSnapshot().ClaudeJA3Override
+		headerOrder := claudeHeaderOrder(built)
+		switch c.claudeFingerprintEngine(spec.Egress) {
+		case claudeEngineInProcess:
+			return c.postInProcessOrdered(ctx, transportSpec, target, built, c.cfg.RequestTimeout(), resolveClaudeJA3(override), resolveClaudeTLSProfile(override), headerOrder)
+		case claudeEngineSidecar:
+			timeout := c.cfg.RequestTimeout()
+			if st := c.cfg.SidecarTimeout(); st > timeout {
+				timeout = st
+			}
+			return c.postViaSidecarOrdered(ctx, transportSpec, target, built, timeout, resolveClaudeJA3(override), false, headerOrder)
+		}
+	}
+
+	// Non-Claude sidecar egress keeps the browser profile used by generic custom
+	// providers and may chain through a proxy/WARP exit. Claude-shaped calls have
+	// already returned through the provider-coherent branch above.
+	if spec.Egress.Type == "curl_cffi_sidecar" && !claudeTransport {
 		built.Del("Accept-Encoding")
 		timeout := c.cfg.RequestTimeout()
 		if st := c.cfg.SidecarTimeout(); st > timeout {
@@ -132,26 +158,7 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 		}
 		sidecarSpec := spec
 		sidecarSpec.Method = method
-		// Only this opaque Claude-Code-shaped path builds the complete Node/SDK
-		// header set. Keep existing custom message transport behavior unchanged.
-		defaultHeaders := !(spec.PassThrough &&
-			spec.TransportProfile == storage.CustomProviderTransportClaudeCode)
-		// A Claude-Code-shaped custom call carries the SAME claude-cli identity as native
-		// Claude traffic (applyClaudeCodeCustomHeaders / applyClaudePassthroughHeaders both
-		// stamp the full x-app + x-stainless-* + claude-cli UA set), so it needs the same
-		// undici wire order. Without an explicit order the sidecar receives the header map
-		// as JSON, and encoding/json sorts map keys — curl_cffi then preserves that order
-		// all the way to the socket, putting alphabetical headers under a claude-cli UA.
-		// An operator may legitimately point a custom provider at api.anthropic.com itself,
-		// so this path can reach the same edge as doClaude.
-		// claudeHeaderOrder is reused rather than duplicated: it projects the known undici
-		// order onto whatever is present and sorts anything else into a stable tail, so the
-		// extra passthrough headers (Range, If-Match, ...) get a deterministic slot.
-		headerOrder := []string(nil)
-		if claudeShaped || spec.TransportProfile == storage.CustomProviderTransportClaudeCode {
-			headerOrder = claudeHeaderOrder(built)
-		}
-		return c.postViaSidecarOrdered(ctx, sidecarSpec, target, built, timeout, "", defaultHeaders, headerOrder)
+		return c.postViaSidecarOrdered(ctx, sidecarSpec, target, built, timeout, "", true, nil)
 	}
 
 	ctx, guard := newRequestGuard(ctx, c.cfg.RequestTimeout())
@@ -160,18 +167,24 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 		guard.Fail()
 		return nil, err
 	}
-	for k, values := range built {
+	wireBuilt := built
+	if claudeTransport && forceHTTP1ForClaudeImpersonation(target, built) {
+		wireBuilt = claudeWireHeaders(built)
+	}
+	for k, values := range wireBuilt {
 		req.Header[k] = append([]string(nil), values...)
 	}
 	// httpClientForEgress does not understand the sidecar type; that case is handled
 	// above, so any non-direct/proxy egress here is treated as direct.
 	directSpec := spec
-	if directSpec.Egress.Type == "curl_cffi_sidecar" {
+	if claudeTransport {
+		directSpec.Egress = claudeDirectFallbackEgress(spec.Egress)
+	} else if directSpec.Egress.Type == "curl_cffi_sidecar" {
 		directSpec.Egress.Type = "direct"
 	}
 	// Same ALPN reasoning as doClaude's stdlib fallback: when this request claims to be
 	// claude-cli (or targets an Anthropic host), it must not ride HTTP/2, because the real
-	// client's bundled undici cannot speak it. Non-Claude custom providers are untouched —
+	// captured native client does not negotiate it. Non-Claude custom providers are untouched —
 	// the predicate keys off the target host and the claude-cli User-Agent only.
 	client, err := c.httpClientForEgressMode(directSpec, forceHTTP1ForClaudeImpersonation(target, built))
 	if err != nil {

@@ -48,9 +48,9 @@ import (
 //	Akamai hash: 52d84b11737d980aef856699f885ca86
 //	Akamai fp:   1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p
 //
-// Chrome is the default profile and matches the curl_cffi sidecar's impersonate=chrome120
-// output exactly (same BoringSSL/uTLS parameters). This is the validated in-process
-// fingerprint for Codex, Claude, and Kiro (see ProfileNode below).
+// Chrome remains the validated profile for Codex and Kiro. Claude selects the separate
+// byte-captured native Bun profile below rather than mixing this browser ClientHello with
+// a claude-cli HTTP identity.
 //
 // # ProfileNode rationale — Chrome_120 is correct, not a placeholder
 //
@@ -79,6 +79,10 @@ import (
 // which is unlistable in bogdanfinn's BoringSSL layer and would crash with ImpersonateError.
 const (
 	ProfileChrome = "chrome"
+	// ProfileClaude reproduces the ClientHello of Claude Code 2.1.226's
+	// native Bun 1.4.0 binary. It deliberately has no ALPN extension; the
+	// shipping client speaks HTTP/1.1 on this path.
+	ProfileClaude = "claude_bun"
 	// ProfileNode is the Kiro KiroIDE fingerprint (aws-sdk-js / Node.js). Resolves to
 	// Chrome_120 — the same profile the sidecar used for Kiro traffic.  See above for why
 	// Chrome_120 is the correct value, not a placeholder.
@@ -87,6 +91,61 @@ const (
 	// to Chrome_120 — same reasoning as ProfileNode.
 	ProfileRustls = "rustls"
 )
+
+// claudeBunProfile is built from the byte-level ClientHello captured through a
+// local CONNECT tunnel to api.anthropic.com on 2026-08-09. HTTP/2 settings are
+// intentionally empty because the native client advertises no ALPN and never
+// reaches an h2 round trip.
+var claudeBunProfile = profiles.NewClientProfile(utls.ClientHelloID{
+	Client:  "ClaudeCodeBun",
+	Version: "2.1.226-bun-1.4.0",
+	SpecFactory: func() (utls.ClientHelloSpec, error) {
+		return utls.ClientHelloSpec{
+			CipherSuites: []uint16{
+				utls.TLS_AES_128_GCM_SHA256,
+				utls.TLS_AES_256_GCM_SHA384,
+				utls.TLS_CHACHA20_POLY1305_SHA256,
+				utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+				utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				utls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+				utls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+				utls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+				utls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+				utls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+				utls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+				utls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+				utls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+				utls.TLS_RSA_WITH_AES_128_CBC_SHA,
+				utls.TLS_RSA_WITH_AES_256_CBC_SHA,
+			},
+			CompressionMethods: []uint8{utls.CompressionNone},
+			Extensions: []utls.TLSExtension{
+				&utls.SNIExtension{},
+				&utls.ExtendedMasterSecretExtension{},
+				&utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient},
+				&utls.SupportedCurvesExtension{Curves: []utls.CurveID{utls.X25519, utls.CurveP256, utls.CurveP384}},
+				&utls.SupportedPointsExtension{SupportedPoints: []byte{utls.PointFormatUncompressed}},
+				&utls.SessionTicketExtension{},
+				&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
+					utls.ECDSAWithP256AndSHA256,
+					utls.PSSWithSHA256,
+					utls.PKCS1WithSHA256,
+					utls.ECDSAWithP384AndSHA384,
+					utls.PSSWithSHA384,
+					utls.PKCS1WithSHA384,
+					utls.PSSWithSHA512,
+					utls.PKCS1WithSHA512,
+					utls.PKCS1WithSHA1,
+				}},
+				&utls.KeyShareExtension{KeyShares: []utls.KeyShare{{Group: utls.X25519}}},
+				&utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}},
+				&utls.SupportedVersionsExtension{Versions: []uint16{utls.VersionTLS13, utls.VersionTLS12}},
+			},
+		}, nil
+	},
+}, nil, nil, nil, 0, nil, nil, 0, false, nil, nil, 0, nil, false)
 
 // Request is a provider-neutral egress request. HeaderOrder, when set, pins the exact
 // wire order of the request headers (the curl_cffi default_headers=false / operator-JA3
@@ -97,24 +156,19 @@ type Request struct {
 	Header       stdhttp.Header
 	HeaderOrder  []string
 	Body         bodysource.BodySource
-	Profile      string        // "" or ProfileChrome => Chrome_120; ProfileNode/ProfileRustls => stub
+	Profile      string        // ProfileClaude => captured Bun; ""/ProfileChrome => Chrome_120
 	JA3Override  string        // explicit named profile key from profiles.MappedTLSClients ("chrome_120" etc.)
 	ProxyURL     string        // optional chain proxy (http(s)/socks5(h))
 	CookieJarKey string        // scopes a persistent cookie jar across a multi-call flow
 	Timeout      time.Duration // 0 => factory default
-	// ForceHTTP1 restricts the TLS ClientHello's ALPN extension to exactly
-	// ["http/1.1"], so the connection can only negotiate HTTP/1.1.
+	// ForceHTTP1 restricts protocol selection to HTTP/1.1. Profiles with an ALPN
+	// extension are narrowed to ["http/1.1"]; profiles without one retain its absence.
 	//
-	// This exists to impersonate Node's global fetch. Node's BUNDLED undici (what
-	// global fetch is built on, and therefore what the Anthropic TS SDK uses) cannot
-	// speak HTTP/2 at all — undici forces allowH2:false for those legacy v1
-	// dispatcher consumers. Real Claude Code therefore offers ALPN ["http/1.1"] and
-	// every one of its requests is HTTP/1.1. Our default Chrome_120 profile offers
-	// ["h2","http/1.1"], so an Anthropic edge that prefers h2 would see an HTTP/2
-	// connection carrying a claude-cli User-Agent — a combination genuine Claude
-	// Code cannot produce, and a cheap binary discriminator. Two observable signals
-	// change with this flag: the JA4 ALPN field (h2 -> h1) and the presence of an
-	// HTTP/2 SETTINGS/Akamai fingerprint at all (real Claude Code exposes none).
+	// Claude Code 2.1.226's captured native Bun ClientHello has no ALPN extension and
+	// its request is HTTP/1.1. A browser profile offers h2, so an Anthropic edge could
+	// otherwise see an HTTP/2 connection carrying a claude-cli User-Agent — a
+	// combination the captured client cannot produce. The custom Claude profile
+	// already omits ALPN; this flag also protects explicit operator profile overrides.
 	//
 	// Left false for every non-Anthropic provider so their fingerprints are untouched.
 	ForceHTTP1 bool
@@ -168,7 +222,7 @@ func New() *Factory {
 // Priority order:
 //  1. JA3Override on the Request — looked up in profiles.MappedTLSClients (e.g. "firefox_133",
 //     "chrome_124") to support explicit operator JA3 overrides without raw-string replay.
-//  2. The Profile constant (ProfileChrome / ProfileNode / ProfileRustls).
+//  2. The Profile constant (ProfileClaude / ProfileChrome / ProfileNode / ProfileRustls).
 //  3. Fallback: Chrome_120 (matches sidecar's impersonate=chrome120 default — the bug-fix
 //     from the earlier Chrome_131 hardcoding is the primary reason for this function).
 //
@@ -184,6 +238,8 @@ func ResolveProfile(profileName, ja3Override string) profiles.ClientProfile {
 		// Unknown name: fall through to profile-based resolution rather than 502.
 	}
 	switch profileName {
+	case ProfileClaude:
+		return claudeBunProfile
 	case ProfileChrome, "":
 		return profiles.Chrome_120
 	case ProfileNode, "node_undici", "undici":
@@ -242,8 +298,9 @@ func (f *Factory) clientFor(r Request) (tls_client.HttpClient, error) {
 		tls_client.WithNotFollowRedirects(),
 	}
 	if r.ForceHTTP1 {
-		// utls rewrites the profile's ALPNExtension to exactly ["http/1.1"]
-		// (u_parrots.go, WithForceHttp1 branch), so h2 can never be negotiated.
+		// utls rewrites an existing ALPNExtension to exactly ["http/1.1"]
+		// (u_parrots.go, WithForceHttp1 branch). The Claude profile has no ALPN
+		// extension, so it remains byte-identical while the transport stays h1-only.
 		opts = append(opts, tls_client.WithForceHttp1())
 	}
 	if r.ProxyURL != "" {
@@ -289,11 +346,7 @@ func (f *Factory) Do(ctx context.Context, r Request) (*Response, error) {
 		req.ContentLength = r.Body.Size()
 		req.GetBody = r.Body.Open
 	}
-	for k, vs := range r.Header {
-		for _, v := range vs {
-			req.Header.Add(k, v)
-		}
-	}
+	copyHeadersPreservingCase(req.Header, r.Header)
 	if order := r.HeaderOrder; len(order) > 0 {
 		req.Header[fhttp.HeaderOrderKey] = lowered(order)
 	}
@@ -572,6 +625,18 @@ func lowered(in []string) []string {
 		out[i] = toLowerASCII(s)
 	}
 	return out
+}
+
+// copyHeadersPreservingCase intentionally bypasses Header.Add/Set. Both helpers
+// canonicalize field names through textproto, which changed the lower-case
+// anthropic-* and x-app/x-api-key names emitted by the native Claude client into
+// Go-style title case. fhttp accepts direct map entries and its explicit order map
+// remains case-insensitive, so a deep direct copy preserves both wire casing and
+// value ownership.
+func copyHeadersPreservingCase(dst fhttp.Header, src stdhttp.Header) {
+	for k, values := range src {
+		dst[k] = append([]string(nil), values...)
+	}
 }
 
 func toLowerASCII(s string) string {

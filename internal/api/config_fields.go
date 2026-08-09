@@ -167,10 +167,10 @@ func configFields() []configField {
 		{Key: "codex_ja3", Label: "Codex JA3 覆盖", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
 			Help: "留空=Chrome(默认，更安全)。设置则 sidecar 尝试重放该 JA3。", boot: func(c config.Config) interface{} { return c.CodexJA3Override }},
 		{Key: "claude_ja3", Label: "Claude JA3 覆盖", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
-			Help: "留空=Chrome(默认)。真实 claude-cli/Node JA3 为显式 opt-in。", boot: func(c config.Config) interface{} { return c.ClaudeJA3Override }},
+			Help: "留空=当前 Claude Code 2.1.226/Bun 指纹（默认）；chrome=显式浏览器兼容。", boot: func(c config.Config) interface{} { return c.ClaudeJA3Override }},
 		{Key: "egress_fingerprint_engine", Label: "出口指纹引擎", Category: catIdentity, Type: fieldSelect, Effect: effectUpstream,
 			Options: []string{"inprocess", "sidecar"},
-			Help:    "inprocess(默认)=进程内 Go tls-client(uTLS+fhttp)复现 JA3 与 HTTP/2 Akamai 指纹(Chrome_120，与边车 chrome120 一致)，无独立进程/本地回环跳/双倍套接字；sidecar=经外部 Python curl_cffi 边车，作为随时可切回的兜底。两引擎默认指纹按构造一致；部署后用 /admin/egress-fingerprint-check 校验。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.EgressFingerprintEngine, "inprocess") }},
+			Help:    "inprocess(默认)=进程内 Go tls-client(uTLS+fhttp)复现分供应商线级指纹（Claude=捕获的 Bun ClientHello，浏览器链路=Chrome_120），无独立进程/本地回环跳/双倍套接字；sidecar=外部 Python curl_cffi 边车兜底。两引擎使用同一供应商指纹；部署后用 /admin/egress-fingerprint-check 校验。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.EgressFingerprintEngine, "inprocess") }},
 		{Key: "codex_cli_version", Label: "Codex CLI 版本覆盖", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
 			Help: "留空=内置默认。覆盖上游 Codex 客户端版本指纹。", boot: func(c config.Config) interface{} { return c.CodexCLIVersionOverride }},
 		{Key: "claude_cli_version", Label: "Claude CLI 版本覆盖", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
@@ -227,7 +227,7 @@ func configFields() []configField {
 		{Key: "claude_cache_lossless_block_split", Label: "Claude 无损块拆分", Category: catBehavior, Type: fieldBool, Effect: effectHot,
 			Help: "开=仅在拼接后逐字节一致时拆分巨型 text block，便于标记稳定上下文。", boot: func(c config.Config) interface{} { return c.ClaudeCacheLosslessBlockSplit }},
 		{Key: "claude_cch_signing", Label: "Claude CCH 签名（已弃用）", Category: catBehavior, Type: fieldBool, Effect: effectUpstream,
-			Help: "兼容旧配置；Claude Code 2.1.220 当前 wire 不含 cch，本设置不再改变请求。", boot: func(c config.Config) interface{} { return c.ClaudeCCHSigning }},
+			Help: "兼容旧配置；Claude Code 2.1.226 当前 wire 不含 cch，本设置不再改变请求。", boot: func(c config.Config) interface{} { return c.ClaudeCCHSigning }},
 		{Key: "claude_cache_ttl", Label: "Claude 缓存 TTL", Category: catBehavior, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"", "1h"}, Help: "注入缓存的 TTL：空=标准(5m)，1h=长缓存。", boot: func(c config.Config) interface{} {
 				if strings.TrimSpace(c.ClaudeCacheTTL) == "1h" {

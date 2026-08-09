@@ -122,7 +122,7 @@ func captureClaudeSidecarMeta(t *testing.T, target string) sidecarMetaCapture {
 	return sidecarMetaCapture{Raw: raw, Fields: fields}
 }
 
-// TestClaudeSidecarMetaCarriesUndiciHeaderOrder is the regression test for the sidecar
+// TestClaudeSidecarMetaCarriesCapturedBunHeaderOrder is the regression test for the sidecar
 // engine emitting headers ALPHABETICALLY.
 //
 // The header map used to be a plain map[string][]string, and encoding/json sorts map keys.
@@ -130,20 +130,20 @@ func captureClaudeSidecarMeta(t *testing.T, target string) sidecarMetaCapture {
 // curl_cffi Headers -> CurlOpt.HTTPHEADER), so Go's map-key sort reached the socket: the
 // sidecar engine put "accept, anthropic-beta, anthropic-version, authorization,
 // content-type, user-agent, x-app, x-stainless-*" on the wire under a claude-cli
-// User-Agent. Real Claude Code (Anthropic TS SDK on Node's undici) emits insertion order,
-// which starts accept, user-agent, x-stainless-retry-count.
-func TestClaudeSidecarMetaCarriesUndiciHeaderOrder(t *testing.T) {
+// User-Agent. Claude Code 2.1.226's native transport starts OAuth requests with
+// accept, authorization, content-type, user-agent.
+func TestClaudeSidecarMetaCarriesCapturedBunHeaderOrder(t *testing.T) {
 	capture := captureClaudeSidecarMeta(t, "https://api.anthropic.com")
 	names := capture.headerNamesInWireOrder(t)
 	if len(names) < 4 {
 		t.Fatalf("sidecar meta carried only %d headers (%v); the capture is not exercising the Claude header set", len(names), names)
 	}
 
-	// The real client's first three headers, per anthropic-sdk-typescript buildHeaders().
-	wantPrefix := []string{"accept", "user-agent", "x-stainless-retry-count"}
+	// The real client's first four headers from the raw OAuth capture.
+	wantPrefix := []string{"accept", "authorization", "content-type", "user-agent"}
 	for i, want := range wantPrefix {
 		if i >= len(names) || names[i] != want {
-			t.Fatalf("sidecar wire header order = %v\nwant it to start with %v (the Anthropic TS SDK insertion order); alphabetical order is a relay tell under a claude-cli User-Agent", names, wantPrefix)
+			t.Fatalf("sidecar wire header order = %v\nwant it to start with captured native order %v; alphabetical order is a relay tell under a claude-cli User-Agent", names, wantPrefix)
 		}
 	}
 
@@ -196,7 +196,7 @@ func TestClaudeSidecarMetaAlsoCarriesAnExplicitHeaderOrder(t *testing.T) {
 // Round one pinned HTTP/1.1 for the in-process engine only (tls_client.WithForceHttp1). The
 // sidecar's curl_cffi impersonation advertises ALPN ["h2","http/1.1"] and Anthropic's edge
 // prefers h2, so a sidecar-engine account emitted a claude-cli User-Agent over HTTP/2 —
-// something Node's bundled undici (allowH2:false) cannot produce.
+// something the captured native client cannot produce.
 func TestClaudeSidecarMetaPinsHTTP11(t *testing.T) {
 	capture := captureClaudeSidecarMeta(t, "https://api.anthropic.com")
 	rawVersion, ok := capture.Fields["http_version"]
@@ -209,6 +209,56 @@ func TestClaudeSidecarMetaPinsHTTP11(t *testing.T) {
 	}
 	if version != sidecarHTTPVersion1 {
 		t.Errorf("http_version = %q, want %q (curl_cffi normalize_http_version's HTTP/1.1 literal)", version, sidecarHTTPVersion1)
+	}
+}
+
+func TestClaudeSidecarMetaCarriesCapturedTransportFields(t *testing.T) {
+	capture := captureClaudeSidecarMeta(t, "https://api.anthropic.com")
+	rawHeaders := string(capture.Fields["headers"])
+	if !strings.Contains(rawHeaders, `"X-Stainless-OS"`) || strings.Contains(rawHeaders, `"X-Stainless-Os"`) {
+		t.Errorf("sidecar header casing does not match captured X-Stainless-OS: %s", rawHeaders)
+	}
+	var acceptEncoding string
+	if raw := capture.Fields["accept_encoding"]; len(raw) == 0 {
+		t.Fatalf("sidecar meta has no request-specific accept_encoding: %s", capture.Raw)
+	} else if err := json.Unmarshal(raw, &acceptEncoding); err != nil {
+		t.Fatalf("unmarshal accept_encoding: %v", err)
+	}
+	if acceptEncoding != claudeAcceptEncoding {
+		t.Errorf("accept_encoding = %q, want captured %q", acceptEncoding, claudeAcceptEncoding)
+	}
+	var preserveConnection bool
+	if raw := capture.Fields["preserve_connection_header"]; len(raw) == 0 {
+		t.Fatalf("sidecar meta has no preserve_connection_header: %s", capture.Raw)
+	} else if err := json.Unmarshal(raw, &preserveConnection); err != nil {
+		t.Fatalf("unmarshal preserve_connection_header: %v", err)
+	}
+	if !preserveConnection {
+		t.Error("preserve_connection_header = false, want true for captured Connection: keep-alive")
+	}
+	var nativeHeaderOrder bool
+	if raw := capture.Fields["native_header_order"]; len(raw) == 0 {
+		t.Fatalf("sidecar meta has no native_header_order: %s", capture.Raw)
+	} else if err := json.Unmarshal(raw, &nativeHeaderOrder); err != nil {
+		t.Fatalf("unmarshal native_header_order: %v", err)
+	}
+	if !nativeHeaderOrder {
+		t.Error("native_header_order = false, so curl would prepend Host/Accept-Encoding")
+	}
+	var signatureAlgorithms []string
+	if raw := capture.Fields["tls_signature_algorithms"]; len(raw) == 0 {
+		t.Fatalf("sidecar meta has no TLS signature payload: %s", capture.Raw)
+	} else if err := json.Unmarshal(raw, &signatureAlgorithms); err != nil {
+		t.Fatalf("unmarshal tls_signature_algorithms: %v", err)
+	}
+	if fmt.Sprint(signatureAlgorithms) != fmt.Sprint(claudeTLSSignatureAlgorithms) {
+		t.Errorf("TLS signature algorithms = %v, want captured %v", signatureAlgorithms, claudeTLSSignatureAlgorithms)
+	}
+	names := capture.headerNamesInWireOrder(t)
+	if len(names) == 0 || names[len(names)-1] != "connection" {
+		// Host/Accept-Encoding/Content-Length are transport-injected and therefore do
+		// not appear in the JSON header object; Connection is the final present field.
+		t.Errorf("sidecar header object tail = %v, want connection last among explicit fields", names)
 	}
 }
 
@@ -248,8 +298,8 @@ func TestAnthropicSidecarCallsAlwaysPassAHeaderOrder(t *testing.T) {
 				return true
 			}
 			fn, _ := orderCall.Fun.(*ast.Ident)
-			if fn == nil || fn.Name != "claudeHeaderOrder" {
-				t.Errorf("%s: postViaSidecarOrdered header order does not come from claudeHeaderOrder", fset.Position(call.Pos()))
+			if fn == nil || (fn.Name != "claudeHeaderOrder" && fn.Name != "claudeOAuthHeaderOrder") {
+				t.Errorf("%s: postViaSidecarOrdered header order does not come from a Claude native-order builder", fset.Position(call.Pos()))
 			}
 		}
 		return true

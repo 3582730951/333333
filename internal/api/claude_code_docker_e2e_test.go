@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	claudeCodeE2EVersion       = "2.1.220"
+	claudeCodeE2EVersion       = "2.1.226"
 	claudeCodeE2EDefaultBytes  = 896 << 10
 	claudeCodeE2EMaxBytes      = 8 << 20
 	claudeCodeE2EBeginSentinel = "CLAUDE_CODE_LONG_CONTEXT_BEGIN_71A0E0F3"

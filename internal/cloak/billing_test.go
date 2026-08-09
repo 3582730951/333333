@@ -24,7 +24,7 @@ func TestClaudeVirtualUserIDMatchesRealShape(t *testing.T) {
 	}
 }
 
-// billingRe extracts the current version, rotating three-hex suffix, and entrypoint.
+// billingRe extracts the current version, native build component, and entrypoint.
 var billingRe = regexp.MustCompile(`^x-anthropic-billing-header: cc_version=([0-9.]+)\.([0-9a-f]{3}); cc_entrypoint=(cli|sdk-cli);$`)
 
 func firstSystemText(t *testing.T, body []byte) string {
@@ -115,24 +115,19 @@ func TestCurrentBillingHeaderMatchesCapturedBuildAndSDKEntrypoint(t *testing.T) 
 	body := []byte(`{"model":"claude","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.100.123; cc_entrypoint=sdk-cli;"}],"messages":[]}`)
 	got := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, identity.ClaudeCLIVersion))
 	m := billingRe.FindStringSubmatch(got)
-	if m == nil || m[1] != identity.ClaudeCLIVersion || m[3] != "sdk-cli" {
+	if m == nil || m[1] != identity.ClaudeCLIVersion || m[2] != identity.ClaudeCodeBuild || m[3] != "sdk-cli" {
 		t.Fatalf("shipping billing fingerprint changed: %q", got)
 	}
 }
 
-func TestBillingHeaderSuffixRotatesForSameVersion(t *testing.T) {
+func TestBillingHeaderUsesCapturedShippingBuild(t *testing.T) {
 	body := []byte(`{"model":"claude","system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[]}`)
-	seen := map[string]bool{}
-	for i := 0; i < 16; i++ {
-		got := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, "2.1.159"))
+	for i := 0; i < 4; i++ {
+		got := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, identity.ClaudeCLIVersion))
 		m := billingRe.FindStringSubmatch(got)
-		if m == nil {
-			t.Fatalf("invalid rotating billing header: %q", got)
+		if m == nil || m[1] != identity.ClaudeCLIVersion || m[2] != identity.ClaudeCodeBuild {
+			t.Fatalf("billing header diverged from shipping build: %q", got)
 		}
-		seen[m[2]] = true
-	}
-	if len(seen) < 2 {
-		t.Fatalf("billing suffix did not rotate across requests: %v", seen)
 	}
 }
 

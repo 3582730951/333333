@@ -299,7 +299,7 @@ func (c *claudeGatewayE2ECapture) serve(w http.ResponseWriter, r *http.Request) 
 			"arch":"amd64",
 			"terminal":"xterm-256color",
 			"node_version":"22",
-			"claude_cli_version":"2.1.220",
+			"claude_cli_version":"2.1.226",
 			"stainless_package_version":"0.94.0",
 			"username":"root",
 			"hostname":"gateway-e2e",

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 )
@@ -52,5 +53,19 @@ func TestPrewarmSkipsShapesAnthropicRejectsWithZeroMaxTokens(t *testing.T) {
 				t.Errorf("prewarm stream = %v, want false (max_tokens:0 with stream:true is rejected)", root["stream"])
 			}
 		})
+	}
+}
+
+func TestPrewarmPreservesClaudeJSONWireShape(t *testing.T) {
+	body := []byte(`{"model":"claude-opus-4","messages":[{"role":"user","content":"<session>&"}],"metadata":{"user_id":"virtual"},"max_tokens":1024,"stream":true}`)
+	out, ok := claudeCachePrewarmBody(body)
+	if !ok {
+		t.Fatal("valid body did not produce a prewarm request")
+	}
+	if !bytes.HasPrefix(out, []byte(`{"model":"claude-opus-4","messages":`)) {
+		t.Fatalf("prewarm changed Claude root order: %s", out)
+	}
+	if !bytes.Contains(out, []byte(`"content":"<session>&"`)) {
+		t.Fatalf("prewarm introduced Go HTML escaping: %s", out)
 	}
 }

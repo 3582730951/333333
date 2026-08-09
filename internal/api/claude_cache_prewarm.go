@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"codex-account-pool/internal/anthropicwire"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
 )
@@ -63,7 +64,9 @@ func (s *Server) maybePrewarmClaudeCache(ctx context.Context, mode string, req u
 
 func claudeCachePrewarmBody(body []byte) ([]byte, bool) {
 	var root map[string]interface{}
-	if json.Unmarshal(body, &root) != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if decoder.Decode(&root) != nil {
 		return nil, false
 	}
 	if !claudeZeroMaxTokensPrewarmSupported(root) {
@@ -71,7 +74,7 @@ func claudeCachePrewarmBody(body []byte) ([]byte, bool) {
 	}
 	root["max_tokens"] = 0
 	root["stream"] = false
-	out, err := json.Marshal(root)
+	out, err := anthropicwire.MarshalPreservingOrder(body, root)
 	if err != nil {
 		return nil, false
 	}

@@ -85,11 +85,10 @@ func (c *Client) applyClaudeCodeCustomHeaders(dst http.Header, spec Request, id 
 	if requestBodySize(spec) > 0 {
 		dst.Set("Content-Type", "application/json")
 	}
-	if stream {
-		dst.Set("Accept", "text/event-stream")
-	} else {
-		dst.Set("Accept", "application/json")
-	}
+	// Claude Code keeps Accept: application/json even when the response body is an
+	// SSE stream; stream=true is carried in JSON. Using text/event-stream here made
+	// custom Anthropic relays distinguishable from the built-in/native route.
+	dst.Set("Accept", "application/json")
 
 	if v := strings.TrimSpace(spec.Headers.Get("Anthropic-Version")); v != "" {
 		dst.Set("Anthropic-Version", v)

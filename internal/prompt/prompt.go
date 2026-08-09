@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"codex-account-pool/internal/anthropicwire"
 )
 
 func ShouldRewrite(systemPrompt string, isCompaction bool, applyToCompaction bool) bool {
@@ -91,7 +93,7 @@ func InjectAnthropicSystemPrompt(raw []byte, systemPrompt string) ([]byte, bool,
 	default:
 		root["system"] = systemPrompt
 	}
-	out, err := json.Marshal(root)
+	out, err := anthropicwire.MarshalPreservingOrder(raw, root)
 	if err != nil {
 		return nil, false, err
 	}

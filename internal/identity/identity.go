@@ -32,12 +32,16 @@ import (
 
 // Current official client versions. Kept here so a single edit updates the
 // fingerprint everywhere. These should track the real shipping clients.
-// Refreshed 2026-07-29 from the shipping Claude Code 2.1.220 binary and the
+// Refreshed 2026-08-09 from the shipping Claude Code 2.1.226 binary and the
 // official Codex rust-v0.146.1 source/release. Claude's shipping tuple remains
 // Node v26.3.0 with Stainless package 0.94.0.
 const (
 	CodexCLIVersion  = "0.146.1"
-	ClaudeCLIVersion = "2.1.220"
+	ClaudeCLIVersion = "2.1.226"
+	// ClaudeCodeBuild is the fourth cc_version component embedded in the
+	// shipping 2.1.226 native binary. The current Bun build emits the fixed
+	// decimal value .503 on every captured request.
+	ClaudeCodeBuild = "503"
 	// CodexOriginator is the interactive Codex CLI entrypoint id; CodexOriginatorExec
 	// is the `codex exec` (non-interactive) entrypoint. The official client sends one
 	// or the other depending on how it was launched, so the relay mirrors whichever
@@ -61,19 +65,13 @@ const (
 	// operator can still paste this string into codex_ja3 to force a best-effort
 	// (SCSV-sanitized) replay, which degrades to Chrome if curl_cffi still can't reproduce it.
 	CodexJA3 = "771,4866-4865-4867-49196-49195-52393-49200-49199-52392-255,11-51-13-35-5-23-43-10-0-45,4588-29-23-24,0"
-	// ClaudeJA3 is the TLS ClientHello fingerprint (ja3 string) of the real Claude
-	// Code CLI (Node/undici) captured against api.anthropic.com — ja3 hash
-	// d871d02cecbde59abbf8f4806134addf (capture/out_v2/manifest.json). It is an OPT-IN
-	// fingerprint for the curl_cffi sidecar (selected via claude_ja3=claude-cli), NOT the
-	// default. The default is Chrome impersonation — see upstream.resolveClaudeJA3 for the
-	// full rationale: reference relays use Chrome, and the best available research shows
-	// Anthropic detects third-party clients by SYSTEM-PROMPT CONTENT (which the cloak layer
-	// already handles), not TLS, so matching this fingerprint buys no measurable
-	// anti-detection benefit while a best-effort replay of a non-native (Node) profile
-	// risks an imperfect third fingerprint. Kept available for operators who want explicit
-	// TLS↔UA coherence. NOTE: JA3 does not encode ALPN (the real client negotiated
-	// http/1.1), so an exact JA4/ALPN match is best-effort.
-	ClaudeJA3 = "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171-49162-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43-21,29-23-24,0"
+	// ClaudeJA3 is the ClientHello emitted by Claude Code 2.1.226's native
+	// Bun 1.4.0 binary. It was captured from the client side of a CONNECT tunnel
+	// to api.anthropic.com on 2026-08-09. The current client sends no ALPN
+	// extension and uses HTTP/1.1; its JA3 hash is
+	// 203503b7023848ab87b9836c336b8e81. This supersedes the stale Node/undici
+	// capture (d871d02c...) whose extra extensions contradicted the current UA.
+	ClaudeJA3 = "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171-49162-49172-156-157-47-53,0-23-65281-10-11-35-13-51-45-43,29-23-24,0"
 )
 
 // DefaultSecret is used when the operator has not configured one. Identity
@@ -231,7 +229,7 @@ type Identity struct {
 	ClaudeCLIVersion string // claude-cli/<v> (User-Agent)
 	// StainlessPackageVersion is the @anthropic-ai/sdk (Stainless) version reported
 	// in X-Stainless-Package-Version. It is a SEPARATE axis from the claude-cli
-	// version (the real client sends claude-cli/2.1.220 with SDK 0.94.0), so
+	// version (the real client sends claude-cli/2.1.226 with SDK 0.94.0), so
 	// it must not be conflated with ClaudeCLIVersion.
 	StainlessPackageVersion string
 	CodexCLIVersion         string // codex_cli_rs/<v>
@@ -302,7 +300,7 @@ var allProfiles = func() []profile {
 // supersedes these.
 var (
 	// Keep the three coupled Claude version axes on the one combination captured
-	// from the shipping 2.1.220 binary. Independently rotating stale values can
+	// from the shipping 2.1.226 binary. Independently rotating stale values can
 	// create a cli/runtime/SDK tuple that no real Claude Code release ever shipped.
 	claudeCLIVersionPool = []string{ClaudeCLIVersion}
 	// Newer Codex models are actively client-version gated, so the Codex UA/version
@@ -581,7 +579,7 @@ func (i Identity) CodexUserAgentForOriginator(originator, version string) string
 }
 
 // ClaudeUserAgent returns the Claude Code CLI User-Agent, e.g.
-// "claude-cli/2.1.220 (external, cli)".
+// "claude-cli/2.1.226 (external, cli)".
 func (i Identity) ClaudeUserAgent() string {
 	return i.ClaudeUserAgentVersion(ClaudeCLIVersion)
 }

@@ -9,17 +9,85 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/ban"
+	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 )
 
 const claudeRefreshWindowSeconds = 5 * 60
+
+const (
+	claudeOAuthUserAgent      = "axios/1.15.2"
+	claudeOAuthAccept         = "application/json, text/plain, */*"
+	claudeOAuthAcceptEncoding = "gzip, compress, deflate, br"
+)
+
+type claudeOAuthAuthorizationCodeGrant struct {
+	GrantType    string `json:"grant_type"`
+	Code         string `json:"code"`
+	RedirectURI  string `json:"redirect_uri"`
+	ClientID     string `json:"client_id"`
+	CodeVerifier string `json:"code_verifier"`
+	State        string `json:"state"`
+}
+
+type claudeOAuthRefreshGrant struct {
+	GrantType    string `json:"grant_type"`
+	RefreshToken string `json:"refresh_token"`
+	ClientID     string `json:"client_id"`
+	Scope        string `json:"scope"`
+}
+
+func marshalClaudeOAuthJSON(value interface{}) ([]byte, error) {
+	var out bytes.Buffer
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(out.Bytes(), []byte("\n")), nil
+}
+
+func claudeOAuthHeaders() http.Header {
+	headers := make(http.Header)
+	headers.Set("Accept", claudeOAuthAccept)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("User-Agent", claudeOAuthUserAgent)
+	headers.Set("Accept-Encoding", claudeOAuthAcceptEncoding)
+	headers.Set("Connection", "keep-alive")
+	return headers
+}
+
+func claudeOAuthRefreshScope(stored, configured, clientID string) string {
+	if strings.TrimSpace(clientID) != config.DefaultClaudeOAuthClientID {
+		if scope := strings.Join(strings.Fields(stored), " "); scope != "" {
+			return scope
+		}
+		return strings.Join(strings.Fields(configured), " ")
+	}
+	ordered := strings.Fields(config.DefaultClaudeOAuthRefreshScope)
+	seen := make(map[string]bool, len(ordered)+3)
+	for _, scope := range ordered {
+		seen[scope] = true
+	}
+	for _, scope := range strings.Fields(stored) {
+		switch scope {
+		case "user:projects:read", "user:projects:write", "user:plugins":
+			if !seen[scope] {
+				ordered = append(ordered, scope)
+				seen[scope] = true
+			}
+		}
+	}
+	return strings.Join(ordered, " ")
+}
 
 type claudeRefreshGates struct {
 	mu    sync.Mutex
@@ -461,34 +529,26 @@ func (h *claudeRefreshSSEHeartbeat) writeError(err error) bool {
 //     changes, and claudeFingerprintEngine picks the in-process engine for any egress
 //     type, so the fingerprint stays coherent. Degrading straight to host-direct here
 //     (the previous behavior) threw away a perfectly good, correctly-bound exit IP.
-//  3. nothing about the account's exit is knowable -> host-direct, so the refresh still
-//     happens. Losing a refresh loses the account outright.
-//
-// Case 3 is a real leak and is NOT silent any more. A failed binding lookup is persistent,
-// not transient, so the pre-existing "it is only a single call" reasoning was wrong: every
-// scheduled refresh for that account would leave from the relay host while its inference
-// leaves from a proxy, which is exactly the per-account IP/binding inconsistency
-// upstream.DoAnthropicOAuth exists to prevent. It is now logged and audited so an operator
-// can see which accounts are refreshing off the host address instead of discovering it
-// from a risk-control action.
-func (s *Server) claudeOAuthEgress(ctx context.Context, accountID string) (storage.EgressProfile, string) {
+//  3. nothing about the account's exit is knowable -> fail closed. Sending a refresh from
+//     the relay host would preserve availability by exposing the relay on a fixed schedule.
+func (s *Server) claudeOAuthEgress(ctx context.Context, accountID string) (storage.EgressProfile, string, error) {
 	binding, err := s.store.GetEgressBinding(ctx, accountID)
 	if err != nil {
 		s.auditClaudeOAuthEgressDegraded(ctx, "binding_lookup_failed", err)
-		return storage.EgressProfile{Type: "direct"}, ""
+		return storage.EgressProfile{}, "", fmt.Errorf("claude oauth egress binding unavailable: %w", err)
 	}
 	primary, err := s.store.GetEgressProfile(ctx, binding.PrimaryEgressID)
 	if err != nil {
 		s.auditClaudeOAuthEgressDegraded(ctx, "primary_egress_lookup_failed", err)
-		return storage.EgressProfile{Type: "direct"}, binding.CookieJarKey
+		return storage.EgressProfile{}, binding.CookieJarKey, fmt.Errorf("claude oauth primary egress unavailable: %w", err)
 	}
 	wrapped, err := s.store.ApplySidecarEgressBinding(ctx, binding, primary)
 	if err != nil {
 		// Keep the account's exit IP; only the sidecar transport is unavailable.
 		s.auditClaudeOAuthEgressDegraded(ctx, "sidecar_wrapper_unavailable", err)
-		return primary, binding.CookieJarKey
+		return primary, binding.CookieJarKey, nil
 	}
-	return wrapped, binding.CookieJarKey
+	return wrapped, binding.CookieJarKey, nil
 }
 
 const claudeOAuthEgressAuditWindow = 10 * time.Minute
@@ -524,7 +584,7 @@ func (s *Server) auditClaudeOAuthEgressDegraded(ctx context.Context, reason stri
 	bucket.suppressed = 0
 	bucket.mu.Unlock()
 
-	state := "host_exit"
+	state := "blocked"
 	if reason == "sidecar_wrapper_unavailable" {
 		state = "bound_exit_kept"
 	}
@@ -539,26 +599,26 @@ func (s *Server) auditClaudeOAuthEgressDegraded(ctx context.Context, reason stri
 	})
 }
 
-// doClaudeOAuthRequest issues one Anthropic OAuth token call. It goes through the upstream
-// client so it inherits the account's egress AND the fingerprint engine; the plain
-// http.Client fallback exists only for embedders/tests that construct a Server without an
-// upstream client.
-//
-// The User-Agent is deliberately left as the browser OAuth UA rather than claude-cli: the
-// authorize step of this flow really is a browser navigation, and there is no verified
-// capture of the CLI's own refresh UA. What made the previous implementation a risk signal
-// was the exit IP and the Go TLS fingerprint, both of which are fixed here.
+// doClaudeOAuthRequest issues one Anthropic OAuth token call through the account's egress
+// and fingerprint engine. The application headers are the Axios wire shape captured from
+// Claude Code 2.1.226's native authorization-code and refresh-token requests.
 func (s *Server) doClaudeOAuthRequest(ctx context.Context, egress storage.EgressProfile, account storage.Account, cookieJarKey, tokenURL string, payload []byte) (*http.Response, error) {
-	headers := http.Header{}
-	headers.Set("Content-Type", "application/json")
-	headers.Set("Accept", "application/json")
-	headers.Set("User-Agent", oauthUserAgent)
+	headers := claudeOAuthHeaders()
 	if s.upstream != nil {
 		resp, err := s.upstream.DoAnthropicOAuth(ctx, egress, account, tokenURL, headers, payload, cookieJarKey)
 		if err != nil {
 			return nil, err
 		}
 		return &http.Response{StatusCode: resp.StatusCode, Header: resp.Header, Body: resp.Body}, nil
+	}
+	parsed, err := url.Parse(tokenURL)
+	if err != nil {
+		return nil, err
+	}
+	switch strings.ToLower(parsed.Hostname()) {
+	case "localhost", "127.0.0.1", "::1":
+	default:
+		return nil, errors.New("claude oauth fingerprint transport is unavailable")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, bytes.NewReader(payload))
 	if err != nil {
@@ -584,20 +644,25 @@ func (s *Server) refreshClaudeToken(ctx context.Context, account storage.Account
 		return result, errors.New(result.Reason)
 	}
 
-	// The token endpoint is api.anthropic.com — the SAME host the account's inference
-	// traffic goes to. Resolve the account's bound egress so the refresh leaves from the
-	// account's own exit IP with the account's own TLS fingerprint (see
-	// upstream.DoAnthropicOAuth); refreshing from the relay host's IP while inferencing
-	// from a proxy IP is a per-account relay signal on a fixed schedule.
-	oauthEgress, oauthCookieKey := s.claudeOAuthEgress(ctx, account.ID)
+	// The token endpoint and inference endpoint are in the same Anthropic account perimeter.
+	// Keep the account on one exit and one TLS family across both domains.
+	oauthEgress, oauthCookieKey, err := s.claudeOAuthEgress(ctx, account.ID)
+	if err != nil {
+		result.Reason = "claude oauth egress unavailable"
+		return result, err
+	}
 
 	backoff := 500 * time.Millisecond
 	for {
-		payload, _ := json.Marshal(map[string]string{
-			"grant_type":    "refresh_token",
-			"refresh_token": token.RefreshToken,
-			"client_id":     s.cfg.ClaudeOAuthClientID,
+		payload, marshalErr := marshalClaudeOAuthJSON(claudeOAuthRefreshGrant{
+			GrantType:    "refresh_token",
+			RefreshToken: token.RefreshToken,
+			ClientID:     s.cfg.ClaudeOAuthClientID,
+			Scope:        claudeOAuthRefreshScope(token.Scopes, s.cfg.ClaudeOAuthScope, s.cfg.ClaudeOAuthClientID),
 		})
+		if marshalErr != nil {
+			return result, marshalErr
+		}
 		resp, err := s.doClaudeOAuthRequest(ctx, oauthEgress, account, oauthCookieKey, tokenURL, payload)
 		if err != nil {
 			if waitErr := waitRefreshBackoff(ctx, nil, backoff); waitErr != nil {

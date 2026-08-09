@@ -225,6 +225,29 @@ func (d oauthProviderDesc) buildAuthorizeURLWithOptions(challenge, state string,
 	if d.provider != "antigravity" && strings.TrimSpace(challenge) == "" {
 		return "", errors.New("OAuth PKCE challenge is empty")
 	}
+	if d.provider == "claude" {
+		// URLSearchParams insertion order is visible to the authorization endpoint.
+		// Claude Code 2.1.226 emits this exact sequence from hqo().
+		params := authEndpoint.Query()
+		for _, key := range []string{"code", "client_id", "response_type", "redirect_uri", "scope", "code_challenge", "code_challenge_method", "state"} {
+			params.Del(key)
+		}
+		ordered := []string{
+			"code=" + url.QueryEscape("true"),
+			"client_id=" + url.QueryEscape(strings.TrimSpace(d.clientID)),
+			"response_type=" + url.QueryEscape("code"),
+			"redirect_uri=" + url.QueryEscape(redirectURI),
+			"scope=" + url.QueryEscape(d.scope),
+			"code_challenge=" + url.QueryEscape(challenge),
+			"code_challenge_method=" + url.QueryEscape("S256"),
+			"state=" + url.QueryEscape(state),
+		}
+		if extras := params.Encode(); extras != "" {
+			ordered = append(ordered, extras)
+		}
+		authEndpoint.RawQuery = strings.Join(ordered, "&")
+		return authEndpoint.String(), nil
+	}
 
 	params := authEndpoint.Query()
 	for key, value := range map[string]string{
@@ -266,8 +289,6 @@ func (d oauthProviderDesc) buildAuthorizeURLWithOptions(challenge, state string,
 	} else if d.provider == "antigravity" {
 		params.Set("access_type", "offline")
 		params.Set("prompt", "consent")
-	} else {
-		params.Set("code", "true")
 	}
 	authEndpoint.RawQuery = params.Encode()
 	return authEndpoint.String(), nil
@@ -652,12 +673,14 @@ func (s *Server) adminOAuthComplete(w http.ResponseWriter, r *http.Request) {
 		parsed, err = s.exchangeCodexCode(r.Context(), desc, redirected.Code, pend.verifier)
 	case "claude":
 		// Run the code→token exchange from the SAME exit the imported account will be
-		// bound to. This exchange is the account's first contact with api.anthropic.com
-		// and it is what mints the refresh token; performing it from the relay host while
-		// every later request arrives from a proxy makes the credential's origin IP
-		// permanently inconsistent with its usage IP.
-		parsed, err = s.exchangeClaudeCode(r.Context(), desc, redirected.Code, firstNonEmpty(redirected.State, pend.state), pend.verifier,
-			s.claudeImportOAuthEgress(r.Context(), groupName, importEgressID), "oauth:claude:"+req.SessionID)
+		// bound to. Minting it from the relay host and then using it from the account's
+		// proxy would make the credential's origin IP permanently inconsistent.
+		var claudeEgress storage.EgressProfile
+		claudeEgress, err = s.claudeImportOAuthEgress(r.Context(), groupName, importEgressID)
+		if err == nil {
+			parsed, err = s.exchangeClaudeCode(r.Context(), desc, redirected.Code, firstNonEmpty(redirected.State, pend.state), pend.verifier,
+				claudeEgress, "oauth:claude:"+req.SessionID)
+		}
 	case "antigravity":
 		parsed, err = s.exchangeAntigravityCode(r.Context(), redirected.Code, desc.redirectURI, antigravityEgress, "oauth:antigravity:"+req.SessionID)
 	default:
@@ -681,11 +704,10 @@ var apiExternalHTTPClient = &http.Client{Timeout: 60 * time.Second}
 // inference hosts: auth.openai.com, chatgpt.com's session endpoint, and the operator's own
 // reauth worker. A finite timeout guards against a hung exchange.
 //
-// It must NOT be used for Anthropic. api.anthropic.com/v1/oauth/token is the same host as
-// the inference endpoint, so a token call from here would put the account's credential
-// lifecycle on the relay host's IP and Go TLS fingerprint while its inference traffic uses
-// the account's bound egress and an impersonated fingerprint. Anthropic OAuth goes through
-// doClaudeOAuthRequest → upstream.DoAnthropicOAuth instead.
+// It must NOT be used for Anthropic. A token call from here would put the account's
+// credential lifecycle on the relay host's IP and Go TLS fingerprint while inference uses
+// the bound egress and native fingerprint. Anthropic OAuth goes through
+// doClaudeOAuthRequest → upstream.DoAnthropicOAuth.
 func oauthHTTPClient() *http.Client {
 	return apiExternalHTTPClient
 }
@@ -728,27 +750,24 @@ func (s *Server) exchangeCodexCode(ctx context.Context, d oauthProviderDesc, cod
 }
 
 // claudeImportOAuthEgress resolves the egress a Claude login/import should use for its
-// token exchange: the egress the account is about to be bound to. It never fails the
-// login — an unresolvable egress degrades to direct, which is the historical behavior.
-//
-// The degradation is audited rather than silent. This exchange hits api.anthropic.com, the
-// same host the account will later inference against, so running it off the relay host's
-// address means the account's very first appearance to the upstream comes from a different
-// network than every request after it. That is worth an operator seeing; it is accepted
-// here (instead of failing closed like the probe paths) only because a login that cannot
-// complete leaves no account at all.
-func (s *Server) claudeImportOAuthEgress(ctx context.Context, groupName, requestedEgressID string) storage.EgressProfile {
+// token exchange: the egress the account is about to be bound to. The exchange hits the
+// same Anthropic account perimeter used by inference, so an unresolved future exit fails
+// closed instead of minting the credential from the relay IP.
+func (s *Server) claudeImportOAuthEgress(ctx context.Context, groupName, requestedEgressID string) (storage.EgressProfile, error) {
 	egressID, err := s.resolveImportPrimaryEgressForGroup(ctx, requestedEgressID, groupName)
 	if err != nil || strings.TrimSpace(egressID) == "" {
 		s.auditClaudeOAuthEgressDegraded(ctx, "import_egress_unresolved", err)
-		return storage.EgressProfile{Type: "direct"}
+		if err == nil {
+			err = errors.New("empty import egress")
+		}
+		return storage.EgressProfile{}, fmt.Errorf("claude import egress unavailable: %w", err)
 	}
 	egress, err := s.store.GetEgressProfile(ctx, egressID)
 	if err != nil {
 		s.auditClaudeOAuthEgressDegraded(ctx, "import_egress_lookup_failed", err)
-		return storage.EgressProfile{Type: "direct"}
+		return storage.EgressProfile{}, fmt.Errorf("claude import egress unavailable: %w", err)
 	}
-	return egress
+	return egress, nil
 }
 
 // exchangeClaudeCode runs the Anthropic authorization-code → tokens exchange
@@ -761,17 +780,17 @@ func (s *Server) exchangeClaudeCode(ctx context.Context, d oauthProviderDesc, co
 			state = parsedState
 		}
 	}
-	payload := map[string]string{
-		"grant_type":    "authorization_code",
-		"client_id":     d.clientID,
-		"code":          code,
-		"redirect_uri":  d.redirectURI,
-		"code_verifier": verifier,
+	raw, err := marshalClaudeOAuthJSON(claudeOAuthAuthorizationCodeGrant{
+		GrantType:    "authorization_code",
+		Code:         code,
+		RedirectURI:  d.redirectURI,
+		ClientID:     d.clientID,
+		CodeVerifier: verifier,
+		State:        state,
+	})
+	if err != nil {
+		return authparse.ParsedAuth{}, err
 	}
-	if state != "" {
-		payload["state"] = state
-	}
-	raw, _ := json.Marshal(payload)
 	resp, err := s.doClaudeOAuthRequest(ctx, egress, storage.Account{}, cookieJarKey, d.tokenURL, raw)
 	if err != nil {
 		return authparse.ParsedAuth{}, err

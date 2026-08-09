@@ -670,17 +670,14 @@ func (s *Server) probeCustomAnthropicModelCandidate(
 	provider storage.CustomProvider,
 	model string,
 ) (bool, bool) {
-	body, _ := json.Marshal(map[string]interface{}{
-		"model": model, "max_tokens": 1, "stream": false,
-		"messages": []map[string]interface{}{{"role": "user", "content": "Reply OK"}},
-	})
+	body, osHint := s.claudeCodeMinimalProbeBody(account, token, egress, model, "Reply OK", 1)
 	headers := http.Header{}
 	headers.Set("Anthropic-Version", "2023-06-01")
 	req := upstream.Request{
 		Method: http.MethodPost, Provider: provider.ID, BaseURL: provider.BaseURL,
-		TransportProfile: provider.TransportProfile, DownstreamPath: "/messages",
+		TransportProfile: provider.TransportProfile, UpstreamProtocol: provider.UpstreamProtocol, DownstreamPath: "/messages",
 		Headers: headers, Account: account, Token: token, Egress: egress,
-		CookieJarKey: binding.CookieJarKey, MinimalProbe: true,
+		CookieJarKey: binding.CookieJarKey, MinimalProbe: true, OSHint: osHint,
 	}
 	req.SetBodyBytes(body)
 	resp, err := s.upstream.Do(ctx, req)

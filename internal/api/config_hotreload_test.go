@@ -128,6 +128,9 @@ func TestSettingsCenterAppliesKiroNoDegradationTemplate(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"id":"resp"}`))
 	})
+	// Start from both deliberately weakened escape hatches so the assertion proves
+	// the recommended template closes them, rather than merely inheriting defaults.
+	patchConfig(t, h, `{"egress_fingerprint_engine":"sidecar","claude_ja3":"chrome","claude_force_direct":true}`)
 
 	status, body := postSettingsTemplate(t, h, `{"template_id":"kiro-no-degradation"}`)
 	if status != http.StatusOK {
@@ -162,6 +165,9 @@ func TestSettingsCenterAppliesKiroNoDegradationTemplate(t *testing.T) {
 		"rate_limit_guard_enabled":        true,
 		"seamless_failover":               true,
 		"leak_scrub":                      true,
+		"egress_fingerprint_engine":       "inprocess",
+		"claude_ja3":                      "native",
+		"claude_force_direct":             false,
 		"stream_keepalive_seconds":        float64(15),
 		"stream_stall_recovery_seconds":   float64(360),
 		"stream_auto_continue_enabled":    true,

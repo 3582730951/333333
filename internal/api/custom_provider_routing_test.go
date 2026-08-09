@@ -119,6 +119,7 @@ func TestCustomClaudeProviderMappingRoutesToRelayAndAdminTest(t *testing.T) {
 		!strings.Contains(requests[0].Body, `"model":"relay-sonnet"`) {
 		t.Fatalf("production relay request = %+v", requests[0])
 	}
+	assertClaudeCodeIdentityWireShape(t, requests[0].Body, "relay-sonnet")
 
 	resp, raw = postJSONForTest(t, h.pool.URL+"/admin/providers/claude-relay/test", map[string]interface{}{
 		"model": "claude-sonnet-5",
@@ -141,6 +142,7 @@ func TestCustomClaudeProviderMappingRoutesToRelayAndAdminTest(t *testing.T) {
 	if len(requests) != 2 || !strings.Contains(requests[1].Body, `"model":"relay-sonnet"`) {
 		t.Fatalf("admin test did not reach mapped relay: %+v", requests)
 	}
+	assertClaudeCodeProbeWireShape(t, requests[1].Body, "relay-sonnet", "Reply OK", 1)
 	caps, err := h.store.ListCapabilities(t.Context(), account.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -189,14 +191,16 @@ func TestCustomClaudeAutoDiscoveryProbesMaintainedModelTable(t *testing.T) {
 		case "/v1/models":
 			http.Error(w, "models endpoint unavailable", http.StatusNotFound)
 		case "/v1/messages":
+			raw, _ := io.ReadAll(r.Body)
 			var body struct {
 				Model string `json:"model"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			if err := json.Unmarshal(raw, &body); err != nil {
 				t.Errorf("decode candidate request: %v", err)
 				http.Error(w, "bad body", http.StatusBadRequest)
 				return
 			}
+			assertClaudeCodeProbeWireShape(t, string(raw), body.Model, "Reply OK", 1)
 			mu.Lock()
 			probed = append(probed, body.Model)
 			mu.Unlock()
@@ -743,14 +747,21 @@ func TestExplicitDisabledCustomProviderReturnsVisibleError(t *testing.T) {
 func TestAdminCustomProviderTestUsesConfiguredProductionEgress(t *testing.T) {
 	var mu sync.Mutex
 	proxyCalls := 0
+	var proxyMethods []string
 	var proxyURI, proxyAuth, proxyBody string
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		mu.Lock()
-		proxyCalls++
-		proxyURI = r.RequestURI
-		proxyAuth = r.Header.Get("Authorization")
-		proxyBody = string(raw)
+		proxyMethods = append(proxyMethods, r.Method+" "+r.RequestURI)
+		// The in-process fingerprint transport establishes a CONNECT tunnel even for
+		// an http:// target. That is proxy control traffic, not a duplicated upstream
+		// request; count only the application request in the delivery assertion.
+		if r.Method != http.MethodConnect {
+			proxyCalls++
+			proxyURI = r.RequestURI
+			proxyAuth = r.Header.Get("Authorization")
+			proxyBody = string(raw)
+		}
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, customClaudeRelayResponse)
@@ -799,11 +810,18 @@ func TestAdminCustomProviderTestUsesConfiguredProductionEgress(t *testing.T) {
 		t.Fatalf("provider egress test result=%+v", result)
 	}
 	mu.Lock()
-	gotCalls, gotURI, gotAuth, gotBody := proxyCalls, proxyURI, proxyAuth, proxyBody
+	gotCalls, gotMethods, gotURI, gotAuth, gotBody := proxyCalls, append([]string(nil), proxyMethods...), proxyURI, proxyAuth, proxyBody
 	mu.Unlock()
-	if gotCalls != 1 || !strings.Contains(gotURI, "relay.invalid/v1/messages") ||
+	connectedToRelay := false
+	for _, method := range gotMethods {
+		if method == "CONNECT relay.invalid:80" {
+			connectedToRelay = true
+			break
+		}
+	}
+	if gotCalls != 1 || !connectedToRelay || !strings.Contains(gotURI, "/v1/messages?beta=true") ||
 		gotAuth != "Bearer admin-test-egress-key" ||
 		!strings.Contains(gotBody, `"model":"claude-sonnet-5"`) {
-		t.Fatalf("configured egress evidence calls=%d uri=%q auth=%q body=%s", gotCalls, gotURI, gotAuth, gotBody)
+		t.Fatalf("configured egress evidence calls=%d methods=%v uri=%q auth=%q body=%s", gotCalls, gotMethods, gotURI, gotAuth, gotBody)
 	}
 }

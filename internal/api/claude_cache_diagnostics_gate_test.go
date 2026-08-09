@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"testing"
@@ -42,5 +43,28 @@ func TestCacheDiagnosticsDefaultsOff(t *testing.T) {
 	s := &Server{cfg: config.Default(), store: apiTestStore(t), claudeCacheDiagPrev: map[string]string{}}
 	if s.claudeCacheDiagnosticsEnabled(context.Background()) {
 		t.Error("claude cache diagnostics is enabled by default; it adds a beta and a body field a stock Claude Code turn does not send")
+	}
+}
+
+func TestCacheDiagnosticsPreservesClaudeJSONWireShape(t *testing.T) {
+	cfg := config.Default()
+	cfg.ClaudeCacheDiagnosticsEnabled = true
+	s := &Server{
+		cfg:                 cfg,
+		store:               apiTestStore(t),
+		claudeCacheDiagPrev: map[string]string{"abc": "msg_previous"},
+	}
+	body := []byte(`{"model":"claude-opus-5","messages":[{"role":"user","content":"<session>&"}],"metadata":{"user_id":"virtual"},"max_tokens":64,"stream":true}`)
+	headers := http.Header{}
+
+	out := s.applyClaudeCacheDiagnostics(context.Background(), headers, body, routing.AffinityKey{Hash: "abc"})
+	if !bytes.HasPrefix(out, []byte(`{"model":"claude-opus-5","messages":`)) {
+		t.Fatalf("cache diagnostics changed Claude root order: %s", out)
+	}
+	if !bytes.Contains(out, []byte(`"content":"<session>&"`)) {
+		t.Fatalf("cache diagnostics introduced Go HTML escaping: %s", out)
+	}
+	if !bytes.Contains(out, []byte(`"diagnostics":{"previous_message_id":"msg_previous"}`)) {
+		t.Fatalf("cache diagnostics field missing: %s", out)
 	}
 }

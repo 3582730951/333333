@@ -11,6 +11,7 @@ import (
 
 	"github.com/tidwall/sjson"
 
+	"codex-account-pool/internal/anthropicwire"
 	"codex-account-pool/internal/storage"
 )
 
@@ -437,7 +438,7 @@ func applyForcedThinkingClaude(body []byte, effort string) []byte {
 		delete(root, "top_p")
 		delete(root, "top_k")
 	}
-	if out, err := json.Marshal(root); err == nil {
+	if out, err := anthropicwire.MarshalPreservingOrder(body, root); err == nil {
 		return out
 	}
 	return body

@@ -15,6 +15,7 @@ import (
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cloak"
+	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
@@ -415,6 +416,7 @@ func (s *Server) callCustom(w http.ResponseWriter, r *http.Request, provider sto
 }
 
 func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provider storage.CustomProvider, body []byte, model, routeGroup, proto, upstreamPath string, exclude map[string]bool, attemptsRemaining int) (customCall, bool) {
+	retryBody := body
 	if strings.TrimSpace(upstreamPath) == "" {
 		upstreamPath = "/chat/completions"
 	}
@@ -440,9 +442,20 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 		writeError(w, http.StatusInternalServerError, err)
 		return customCall{}, false
 	}
-	// Scrub operator sensitive words from the request body, and reuse the same matcher
-	// on the response/stream (zero-cost pass-through when no words are configured).
-	scrub := cloak.ScrubSensitive(body, s.cfg.SensitiveWordsFor(provider.ID))
+	// A custom Anthropic Messages call presents the full claude-cli header/TLS profile,
+	// so its body must belong to that same client family. Normalize/inject the native
+	// system, billing, device and session fields before the last-mile dispatcher. Other
+	// custom protocols keep the generic zero-parse scrub path.
+	var scrub cloak.Result
+	if provider.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages && strings.Contains(strings.ToLower(upstreamPath), "messages") {
+		body = ensureClaudeCodeIdentityBody(body)
+		osHint := s.osHint(body, lease.Egress)
+		id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
+		billingVersion := s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
+		scrub = cloak.VirtualizeClaudeCode(body, id, s.cfg.SensitiveWordsFor(provider.ID), claudeIsOAuth(token), billingVersion)
+	} else {
+		scrub = cloak.ScrubSensitive(body, s.cfg.SensitiveWordsFor(provider.ID))
+	}
 	body = scrub.Body
 	scrubber := scrub.Scrubber
 	holdID := s.createBillingHold(r.Context(), affinity.Hash, lease.Account.ID, lease.RouteEpoch, virtual.EstimateTokensJSON(body))
@@ -469,6 +482,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 			Provider:         provider.ID,
 			BaseURL:          strings.TrimSpace(provider.BaseURL),
 			TransportProfile: provider.TransportProfile,
+			UpstreamProtocol: provider.UpstreamProtocol,
 			DownstreamPath:   upstreamPath,
 			Headers:          r.Header.Clone(),
 			Body:             bodysource.Bytes(body),
@@ -512,7 +526,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 				exclude[lease.Account.ID] = true
 			}
 			lease.Release()
-			return s.callCustomAttempt(w, r, provider, body, model, routeGroup, proto, upstreamPath, exclude, attemptsRemaining-1)
+			return s.callCustomAttempt(w, r, provider, retryBody, model, routeGroup, proto, upstreamPath, exclude, attemptsRemaining-1)
 		}
 		lease.Release()
 		writeError(w, http.StatusBadGateway, requestErr)
@@ -557,7 +571,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 						exclude[lease.Account.ID] = true
 					}
 					lease.Release()
-					return s.callCustomAttempt(w, r, provider, body, model, routeGroup, proto, upstreamPath, exclude, attemptsRemaining-1)
+					return s.callCustomAttempt(w, r, provider, retryBody, model, routeGroup, proto, upstreamPath, exclude, attemptsRemaining-1)
 				}
 				s.writeRuleNeutralError(w)
 				lease.Release()
@@ -583,7 +597,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 				exclude[lease.Account.ID] = true
 			}
 			lease.Release()
-			return s.callCustomAttempt(w, r, provider, body, model, routeGroup, proto, upstreamPath, exclude, attemptsRemaining-1)
+			return s.callCustomAttempt(w, r, provider, retryBody, model, routeGroup, proto, upstreamPath, exclude, attemptsRemaining-1)
 		}
 		s.writeFilteredError(r.Context(), w, proto, resp.StatusCode, resp.Header, errBody, scrubber)
 		lease.Release()

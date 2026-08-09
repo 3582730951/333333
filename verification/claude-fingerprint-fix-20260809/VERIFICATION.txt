@@ -1,0 +1,224 @@
+CLAUDE FINGERPRINT / RELAY-EXPOSURE FIX — VERIFICATION RECORD
+Date: 2026-08-09
+Repository: /workspace
+Branch: cache-hit-optimization
+Scope fields: egress_fingerprint_engine, claude_ja3, claude_force_direct
+Recommended-template result: inprocess / native / false
+
+FINAL ARTIFACTS
+1. /workspace/verification/claude-fingerprint-fix-20260809/MODIFIED_FILE.tar.gz
+2. /workspace/verification/claude-fingerprint-fix-20260809/DIFF_FILE.patch
+3. /workspace/verification/claude-fingerprint-fix-20260809/VERIFICATION.txt
+4. /workspace/verification/claude-fingerprint-fix-20260809/ROLLBACK.sh
+
+GROUND-TRUTH INPUT
+
+Claude Code binary command:
+  /usr/local/bin/claude --version
+  sha256sum /usr/local/bin/claude
+
+Literal output:
+  2.1.226 (Claude Code)
+  4e9bec1177ce9690e8bd988b710ac24105e70da428dd094c5adcbbe786a55555  /usr/local/bin/claude
+
+Result: PASS, exit status 0.
+
+The native 2.1.226/Bun 1.4.0 captures established these observable values:
+  HTTP protocol: HTTP/1.1
+  ALPN extension: absent
+  JA3: 771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171-49162-49172-156-157-47-53,0-23-65281-10-11-35-13-51-45-43,29-23-24,0
+  JA3 MD5: 203503b7023848ab87b9836c336b8e81
+  Message Accept-Encoding: gzip, deflate, br, zstd
+  CLI/User-Agent version: 2.1.226
+  SDK package version: 0.94.0
+  runtime version: v26.3.0
+  billing build: 2.1.226.503
+  JSON string escaping: literal <, >, and &; no Go HTML-safe \\u003c/\\u003e/\\u0026
+
+The native OAuth capture established a different, Axios-specific application shape:
+  endpoint: https://platform.claude.com/v1/oauth/token
+  Accept: application/json, text/plain, */*
+  Content-Type: application/json
+  User-Agent: axios/1.15.2
+  Accept-Encoding: gzip, compress, deflate, br
+  Connection: keep-alive
+  header order: Accept, Content-Type, User-Agent, Content-Length, Accept-Encoding, Host, Connection
+  authorization body order: grant_type, code, redirect_uri, client_id, code_verifier, state
+  refresh body order: grant_type, refresh_token, client_id, scope
+  refresh scope: user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload
+
+Native ClientHello versus both implementations:
+  record_bytes 254 handshake_len 245
+  cipher_raw [4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392, 49161, 49171, 49162, 49172, 156, 157, 47, 53]
+  extension_raw [0, 23, 65281, 10, 11, 35, 13, 51, 45, 43]
+  groups_raw [29, 23, 24]
+  points [0]
+  alpn []
+  native_vs_inprocess_fields_exit=0
+  native_vs_sidecar_fields_exit=0
+
+CAUSES CONFIRMED IN THE BASELINE
+
+1. The Claude identity tuple was stale (2.1.220) and mixed incompatible version/build axes.
+2. encoding/json map serialization exposed sorted Go key order and HTML-safe escaping.
+3. claude-cli headers could ride a Chrome/Go ClientHello or HTTP/2 connection rather than native Bun HTTP/1.1.
+4. header order/case, Accept-Encoding, beta order, billing text, SDK identity, metadata.user_id, probes, prewarms, custom bridges, and count-token calls could diverge from one another.
+5. OAuth login/refresh used old endpoints and non-native headers/body shape; unresolved egress could fall back to the relay host.
+6. The external sidecar could inject Chrome headers, reorder headers, strip Connection, or negotiate h2 under a Claude identity.
+
+BASELINE TEST
+
+Input state: clean cache-hit-optimization source before this fix.
+Command (exact package/test input):
+  docker run --rm -v /workspace:/workspace -w /workspace -e GOTOOLCHAIN=local golang:1.25.12 go test ./internal/anthropicwire ./internal/cloak ./internal/prompt ./internal/upstream ./internal/upstream/tlsclient -count=1
+
+Literal terminal test result after the dependency-download prelude (the complete literal output is logs/BASELINE.output):
+  ?   codex-account-pool/internal/anthropicwire [no test files]
+  ok  codex-account-pool/internal/cloak 0.010s
+  ok  codex-account-pool/internal/prompt 0.012s
+  ok  codex-account-pool/internal/upstream 4.841s
+  ok  codex-account-pool/internal/upstream/tlsclient 0.047s
+
+Exit status: 0.
+Result: PASS as a regression baseline; it did not yet contain the new fingerprint assertions.
+
+BASELINE FINGERPRINT PROBE
+
+Input: the same fixed probe body passed through the baseline Claude cloak/identity code.
+Command:
+  docker run --rm -v /workspace:/workspace -v /root/go/pkg/mod:/go/pkg/mod -v /root/.cache/go-build:/root/.cache/go-build -w /workspace -e GOTOOLCHAIN=local golang:1.25.12 go run ./.run/claude-fingerprint-probe
+
+Literal output:
+  top_keys=context_management,max_tokens,messages,metadata,model,output_config,stream,system,thinking,tools
+  top_order_matches_shipping=false
+  claude_cli_version=2.1.220
+  billing_matches_shipping=false
+  claude_ja3_md5=d871d02cecbde59abbf8f4806134addf
+
+Exit status: 0.
+Result: fingerprint mismatch reproduced.
+
+MODIFIED TEST — SAME PACKAGE/TEST INPUT
+
+Input state: all 60 tracked changes plus 5 added source/test files.
+Command:
+  docker run --rm -v /workspace:/workspace -w /workspace -v claude-fingerprint-gomod:/go/pkg/mod -v claude-fingerprint-gobuild:/root/.cache/go-build -e GOTOOLCHAIN=local golang:1.25.12 go test ./internal/anthropicwire ./internal/cloak ./internal/prompt ./internal/upstream ./internal/upstream/tlsclient -count=1
+
+Literal output:
+  ok  codex-account-pool/internal/anthropicwire 0.004s
+  ok  codex-account-pool/internal/cloak 0.011s
+  ok  codex-account-pool/internal/prompt 0.010s
+  ok  codex-account-pool/internal/upstream 4.881s
+  ok  codex-account-pool/internal/upstream/tlsclient 0.060s
+
+Exit status: 0.
+Result: PASS.
+
+MODIFIED FINGERPRINT PROBE
+
+Input: the exact same probe body used for BASELINE FINGERPRINT PROBE.
+Command:
+  docker run --rm -v /workspace:/workspace -w /workspace -v claude-fingerprint-gomod:/go/pkg/mod -v claude-fingerprint-gobuild:/root/.cache/go-build -e GOTOOLCHAIN=local golang:1.25.12 go run ./.run/claude-fingerprint-probe
+
+Literal output:
+  top_keys=model,messages,system,tools,metadata,max_tokens,thinking,context_management,output_config,stream
+  top_order_matches_shipping=true
+  claude_cli_version=2.1.226
+  billing_matches_shipping=true
+  claude_ja3_md5=203503b7023848ab87b9836c336b8e81
+
+Exit status: 0.
+Result: PASS; all four baseline mismatches are removed.
+
+FOCUSED SECURITY/FINGERPRINT REGRESSION
+
+Command:
+  docker run --rm -v /workspace:/workspace -w /workspace -v claude-fingerprint-gomod:/go/pkg/mod -v claude-fingerprint-gobuild:/root/.cache/go-build -e GOTOOLCHAIN=local golang:1.25.12 go test ./internal/config ./internal/api ./internal/upstream ./internal/upstream/tlsclient -run 'ClaudeOAuth|ClaudeAuthorize|OAuthDefaults|Pre21226|ForceHTTP1|InProcessAcceptEncoding|AnthropicSidecarCalls|SettingsCenterAppliesKiroNoDegradationTemplate|CustomProtocolMatrix(Chat|Responses)ToAnthropicMessages|SensitiveMutationSourcesUseBoundedJSONDecoder|ClaudeUpstreamPathsAlwaysPassAHeaderOrder' -count=1
+
+Literal output:
+  ok  codex-account-pool/internal/config 0.009s
+  ok  codex-account-pool/internal/api 1.245s
+  ok  codex-account-pool/internal/upstream 0.049s
+  ok  codex-account-pool/internal/upstream/tlsclient 0.008s
+
+Exit status: 0.
+Result: PASS. This includes exact OAuth URL/JSON/header tests, fail-closed egress tests, body/header order guards, HTTP/1.1 and Accept-Encoding tests, sidecar shape tests, and the recommended-template reset test. The template test begins with sidecar/chrome/force_direct=true and proves that applying the recommendation persists inprocess/native/false.
+
+FULL REPOSITORY REGRESSION
+
+Command:
+  docker run --rm -v /workspace:/workspace -w /workspace -v claude-fingerprint-gomod:/go/pkg/mod -v claude-fingerprint-gobuild:/root/.cache/go-build -e GOTOOLCHAIN=local golang:1.25.12 go test ./... -count=1
+
+Literal output: logs/FULL_GO.output (all repository packages; 162.743s for internal/api). Final package lines include:
+  ok  codex-account-pool/internal/api 162.743s
+  ok  codex-account-pool/internal/upstream 5.172s
+  ok  codex-account-pool/internal/upstream/tlsclient 0.090s
+  ok  codex-account-pool/tools/e2e/cli-matrix 0.007s
+  ok  codex-account-pool/tools/e2e/codex-multiagent 0.007s
+
+Exit status: 0.
+Result: PASS.
+
+SIDECAR REGRESSION
+
+Command:
+  docker run --rm --entrypoint /usr/local/lib/codex-pool/releases/docker/registrar-python-venv/bin/python -v /workspace:/workspace -w /workspace codex-pool:verification -m unittest sidecar/test_async_sidecar.py
+
+Literal terminal result (complete output is logs/PYTHON.output):
+  ..........
+  ----------------------------------------------------------------------
+  Ran 10 tests in 7.472s
+
+  OK
+
+Exit status: 0.
+Result: PASS.
+
+ROLLBACK TEST ON ANOTHER COPY
+
+Exact input and procedure:
+  1. fixture_dir=$(mktemp -d /tmp/claude-fingerprint-rollback.XXXXXX)
+  2. git archive --format=tar HEAD | tar -x -C "$fixture_dir"
+  3. copy verification/claude-fingerprint-fix-20260809 into the fixture
+  4. git -C "$fixture_dir" init -q
+  5. git -C "$fixture_dir" apply DIFF_FILE.patch
+  6. compare all 65 fixture files byte-for-byte with the modified workspace
+  7. run the MODIFIED TEST command against the fixture
+  8. run ROLLBACK.sh "$fixture_dir"
+  9. verify all 60 tracked files equal original snapshots and all 5 added files are absent
+ 10. run the BASELINE TEST package/test input against the rolled-back fixture
+
+Literal output:
+  forward_patch_apply=ok
+  modified_files_match=65
+  ok  codex-account-pool/internal/anthropicwire 0.003s
+  ok  codex-account-pool/internal/cloak 0.007s
+  ok  codex-account-pool/internal/prompt 0.008s
+  ok  codex-account-pool/internal/upstream 4.792s
+  ok  codex-account-pool/internal/upstream/tlsclient 0.058s
+  modified_fixture_status=0
+  rollback: restored 60 tracked files and removed 5 added files
+  rollback_added_files_absent=5
+  rollback_original_files_match=60
+  ?   codex-account-pool/internal/anthropicwire [no test files]
+  ok  codex-account-pool/internal/cloak 0.006s
+  ok  codex-account-pool/internal/prompt 0.009s
+  ok  codex-account-pool/internal/upstream 4.767s
+  ok  codex-account-pool/internal/upstream/tlsclient 0.038s
+  rollback_fixture_status=0
+
+Exit status: 0.
+Restored behavior/status: the pre-fix package set passes, the 60 tracked files are byte-identical to their preserved originals, and the 5 added files no longer exist. The live /workspace remains modified with the fix.
+
+ARTIFACT INTEGRITY / SCOPE
+
+DIFF_FILE.patch contains 65 file diffs (60 modified + 5 added).
+MODIFIED_FILE.tar.gz contains the same 65 paths.
+ORIGINAL_SHA256.txt contains 60 pre-change hashes; its SHA-256 is:
+  736c9d26c31e93bd9189d27ade4adca4a4f5bf8e1e3b2a9b9fb946ce543c2d94
+
+CONCLUSION AND LIMIT
+
+Under the recommended configuration (inprocess/native/false), every currently known and controllable Claude 2.1.226 wire discriminator covered by this project is normalized across inference, passthrough, probes, prewarm, custom-provider bridges, count-tokens, OAuth exchange/refresh, in-process transport, and the optional updated sidecar. Missing account OAuth egress now fails closed rather than leaking a host-direct token call.
+
+This is a version-scoped result, not a promise that Anthropic can never introduce a new signal. Explicitly selecting claude_force_direct=true or claude_ja3=chrome reopens a known mismatch; selecting an old/external sidecar can also drift from the in-process implementation. A future Claude Code upgrade must be recaptured and compared before changing the pinned tuple.

@@ -163,7 +163,11 @@ func TestCustomProtocolMatrixChatToAnthropicMessages(t *testing.T) {
 				}
 			}
 			call := capturedProtocolMatrixCall(t, h, "/messages")
-			for _, want := range []string{`"system":"Be exact."`, `"type":"tool_use"`, `"type":"tool_result"`, `"input_schema"`} {
+			for _, want := range []string{
+				`"text":"x-anthropic-billing-header: cc_version=2.1.226.503; cc_entrypoint=cli;"`,
+				`"text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."`,
+				`"text":"Be exact."`, `"type":"tool_use"`, `"type":"tool_result"`, `"input_schema"`,
+			} {
 				if !strings.Contains(call.Body, want) {
 					t.Fatalf("Anthropic request missing %q: %s", want, call.Body)
 				}
@@ -232,7 +236,11 @@ func TestCustomProtocolMatrixResponsesToAnthropicMessages(t *testing.T) {
 				}
 			}
 			call := capturedProtocolMatrixCall(t, h, "/messages")
-			for _, want := range []string{`"system":"Be exact."`, `"type":"tool_use"`, `"type":"tool_result"`, `"input_schema"`} {
+			for _, want := range []string{
+				`"text":"x-anthropic-billing-header: cc_version=2.1.226.503; cc_entrypoint=cli;"`,
+				`"text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."`,
+				`"text":"Be exact."`, `"type":"tool_use"`, `"type":"tool_result"`, `"input_schema"`,
+			} {
 				if !strings.Contains(call.Body, want) {
 					t.Fatalf("Anthropic request missing %q: %s", want, call.Body)
 				}

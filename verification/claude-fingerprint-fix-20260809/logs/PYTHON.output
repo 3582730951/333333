@@ -1,0 +1,7 @@
+......Executing <Task pending name='Task-192' coro=<AsyncSidecarIntegrationTest.test_two_hundred_streams_reach_upstream() running at /workspace/sidecar/test_async_sidecar.py:415> wait_for=<Future pending cb=[Task.task_wakeup()] created at /usr/lib/python3.13/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /usr/lib/python3.13/asyncio/base_events.py:181] created at /usr/lib/python3.13/asyncio/runners.py:100> took 0.329 seconds
+Executing <Task pending name='Task-192' coro=<AsyncSidecarIntegrationTest.test_two_hundred_streams_reach_upstream() running at /workspace/sidecar/test_async_sidecar.py:418> wait_for=<_GatheringFuture pending cb=[Task.task_wakeup()] created at /usr/lib/python3.13/asyncio/tasks.py:765> cb=[_run_until_complete_cb() at /usr/lib/python3.13/asyncio/base_events.py:181] created at /usr/lib/python3.13/asyncio/runners.py:100> took 0.161 seconds
+....
+----------------------------------------------------------------------
+Ran 10 tests in 7.472s
+
+OK

@@ -3,6 +3,7 @@
 import asyncio, base64, hashlib, inspect, json, os, resource, shutil, signal, sys, tempfile, time
 from collections import OrderedDict
 from typing import Any
+from urllib.parse import urlsplit
 from curl_cffi.const import CurlOpt
 from curl_cffi.requests import AsyncSession
 
@@ -42,8 +43,39 @@ async def cookie_writer():
     tmp=cookie_path(k)+".tmp";open(tmp,"w",encoding="utf-8").write(json.dumps(_cookies.get(k,{}),sort_keys=True));os.replace(tmp,cookie_path(k));_dirty.discard(k)
    except Exception:pass
 
-def clean_headers(h:dict[str,Any])->dict[str,str]:
- return {k:(str(v[-1]) if isinstance(v,list) and v else str(v)) for k,v in h.items() if k.lower() not in {"host","content-length","connection","accept-encoding"}}
+def clean_headers(h:dict[str,Any],preserve_connection:bool=False)->dict[str,str]:
+ blocked={"host","content-length","accept-encoding"}
+ if not preserve_connection:blocked.add("connection")
+ return {k:(str(v[-1]) if isinstance(v,list) and v else str(v)) for k,v in h.items() if k.lower() not in blocked}
+def request_accept_encoding(payload:dict[str,Any])->str:
+ value=str(payload.get("accept_encoding") or ACCEPT_ENCODING).strip()
+ if not value or len(value)>128 or any(ord(ch)<32 or ord(ch)==127 for ch in value):return ACCEPT_ENCODING
+ return value
+def raw_ja3_extra_fp(payload:dict[str,Any])->dict[str,Any]:
+ out={"tls_grease":False,"tls_permute_extensions":False}
+ algorithms=payload.get("tls_signature_algorithms")
+ if isinstance(algorithms,list) and 0<len(algorithms)<=32 and all(isinstance(v,str) and 0<len(v)<=64 and v.replace("_","").isalnum() for v in algorithms):out["tls_signature_algorithms"]=algorithms
+ return out
+def request_headers(payload:dict[str,Any],url:str,method:str,accept_encoding:str,body_size:int)->dict[str,str]:
+ headers=clean_headers(payload.get("headers") or {},payload.get("preserve_connection_header") is True)
+ if payload.get("native_header_order") is not True:return headers
+ parsed=urlsplit(url);host=parsed.hostname or ""
+ if ":" in host and not host.startswith("["):host=f"[{host}]"
+ if parsed.port is not None and not ((parsed.scheme=="https" and parsed.port==443) or (parsed.scheme=="http" and parsed.port==80)):host=f"{host}:{parsed.port}"
+ injected={"host":("Host",host),"accept-encoding":("Accept-Encoding",accept_encoding)}
+ if method not in {"GET","HEAD"} or body_size>0:injected["content-length"]=("Content-Length",str(body_size))
+ by_lower={k.lower():k for k in headers};out={};order=payload.get("header_order")
+ if not isinstance(order,list) or len(order)>256:order=[]
+ for raw_name in order:
+  name=str(raw_name).strip().lower()
+  actual=by_lower.pop(name,None)
+  if actual is not None:out[actual]=headers[actual]
+  elif name in injected:
+   key,value=injected.pop(name);out[key]=value
+ for key,value in headers.items():
+  if key in by_lower.values():out[key]=value
+ for key,value in injected.values():out[key]=value
+ return out
 async def session_for(key:tuple)->AsyncSession:
  # This returns an active lease.  Reserving it under the same lock as eviction
  # prevents a just-selected session from being closed by a competing new key.
@@ -59,7 +91,11 @@ async def session_for(key:tuple)->AsyncSession:
     victim=next((k for k in _sessions if not _session_active.get(k,0)),None)
     if victim is None:raise SidecarCapacityError("sidecar_session_capacity","sidecar session capacity exhausted")
     old,_=_sessions.pop(victim);_session_active.pop(victim,None);await old.close()
-   s=AsyncSession(impersonate=IMPERSONATE,max_clients=MAX_CLIENTS);_sessions[key]=(s,now)
+   # A raw JA3 must start from libcurl/BoringSSL's un-impersonated baseline. Applying
+   # Chrome first leaves Chrome-only GREASE/padding behavior behind even after set_ja3,
+   # producing a ClientHello that contradicts the requested Claude/Bun fingerprint.
+   impersonate=None if len(key)>1 and key[1] else IMPERSONATE
+   s=AsyncSession(impersonate=impersonate,max_clients=MAX_CLIENTS);_sessions[key]=(s,now)
   _session_active[key]=_session_active.get(key,0)+1
   return s
 
@@ -190,33 +226,36 @@ async def proxy(writer,payload:dict[str,Any],body:Any):
  try:
   method=str(payload.get("method") or "POST").upper();url=str(payload["url"]);jar=str(payload.get("cookie_jar_key") or "default");proxy_url=str(payload.get("proxy") or "").strip();ja3=str(payload.get("ja3") or "").strip();akamai=str(payload.get("akamai") or "").strip()
   # http_version pins the ALPN/protocol version for callers whose impersonated client cannot
-  # speak HTTP/2. Claude Code reaches Anthropic through the Anthropic TS SDK on Node's bundled
-  # undici, which forces allowH2:false, so a real claude-cli request is always HTTP/1.1 and its
-  # ClientHello offers only http/1.1. Our chrome impersonation offers ["h2","http/1.1"] and
-  # Anthropic's edge prefers h2, which would put a claude-cli User-Agent on an h2 connection —
-  # a combination the real client cannot produce. Only the literals curl_cffi's
+  # speak HTTP/2. A capture of Claude Code 2.1.226's native Bun binary contains no ALPN
+  # extension and its request is HTTP/1.1. Our chrome impersonation offers
+  # ["h2","http/1.1"] and Anthropic's edge prefers h2, which would put a claude-cli
+  # User-Agent on an h2 connection — a combination the real client cannot produce. Only
+  # the literals curl_cffi's
   # normalize_http_version accepts are forwarded; anything else is ignored rather than raising.
   # It is part of the session key because connection reuse is per session: a pooled h2
   # connection must never be handed to a request that asked for 1.1.
   http_version=str(payload.get("http_version") or "").strip().lower()
   if http_version not in {"v1","v2","v2tls","v2_prior_knowledge","v3","v3only"}:http_version=""
   if isinstance(body,SpoolBody):
-   body.rewind();options={CurlOpt.POST:0,CurlOpt.UPLOAD:1,CurlOpt.CUSTOMREQUEST:method.encode(),CurlOpt.INFILESIZE_LARGE:body.size,CurlOpt.READDATA:body.file,CurlOpt.UPLOAD_BUFFERSIZE:64<<10}
-   upload_session=AsyncSession(impersonate=IMPERSONATE,max_clients=1,curl_options=options);session=upload_session;request_data=None
+   body_size=body.size;body.rewind();options={CurlOpt.POST:0,CurlOpt.UPLOAD:1,CurlOpt.CUSTOMREQUEST:method.encode(),CurlOpt.INFILESIZE_LARGE:body.size,CurlOpt.READDATA:body.file,CurlOpt.UPLOAD_BUFFERSIZE:64<<10}
+   upload_session=AsyncSession(impersonate=None if ja3 else IMPERSONATE,max_clients=1,curl_options=options);session=upload_session;request_data=None
   else:
+   body_size=len(body or b"")
    key=(proxy_url,ja3,akamai,jar,http_version);session=await session_for(key);request_data=body or None
-  kwargs={"headers":clean_headers(payload.get("headers") or {}),"data":request_data,"cookies":load_cookies(jar),"timeout":TIMEOUT,"accept_encoding":ACCEPT_ENCODING}
+  accept_encoding=request_accept_encoding(payload)
+  kwargs={"headers":request_headers(payload,url,method,accept_encoding,body_size),"data":request_data,"cookies":load_cookies(jar),"timeout":TIMEOUT,"accept_encoding":accept_encoding}
   if http_version:kwargs["http_version"]=http_version
   if proxy_url:kwargs["proxy"]=proxy_url
   # default_headers gates curl-impersonate's INJECTION of the browser's own header set
   # (sec-ch-ua*, sec-fetch-*, accept-language, upgrade-insecure-requests, …) ON TOP of the
   # caller-supplied headers. An explicit ja3 already disables it (exact-header replay). When
   # no ja3 is set the caller may still opt out via {"default_headers": false}: the Go layer
-  # builds a complete, authentic client header set from scratch (e.g. the claude-cli/Node
+  # builds a complete, authentic client header set from scratch (e.g. the native claude-cli/Bun
   # fingerprint), so the browser extras are pure noise that would out the request as an
-  # impersonation relay — while the TLS/HTTP2 impersonation (session impersonate=) is kept.
+  # impersonation relay — while the selected TLS fingerprint is kept.
   # Absent field => True (curl default), so existing Codex/registration callers are unchanged.
-  if ja3:kwargs.update(ja3=ja3,default_headers=False)
+  if ja3:
+   kwargs.update(ja3=ja3,default_headers=False,extra_fp=raw_ja3_extra_fp(payload))
   elif payload.get("default_headers") is False:kwargs["default_headers"]=False
   if akamai:kwargs["akamai"]=akamai
   if payload.get("allow_redirects") is False:kwargs["allow_redirects"]=False

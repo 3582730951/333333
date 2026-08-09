@@ -29,8 +29,8 @@ const (
 	claudeAgentIDHeaderLower     = "x-claude-code-agent-id"
 	claudeParentAgentHeaderLower = "x-claude-code-parent-agent-id"
 	// OAuth (Claude Pro/Max) carries the oauth beta; API keys must not.
-	claudeOAuthBetas             = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11"
-	claudeAPIKeyBetas            = "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01"
+	claudeOAuthBetas             = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,extended-cache-ttl-2025-04-11"
+	claudeAPIKeyBetas            = "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24"
 	claudeCacheDiagnosticsBeta   = "cache-diagnosis-2026-04-07"
 	claudeCacheDiagnosticsHeader = "X-Codex-Claude-Cache-Diagnostics"
 )
@@ -121,7 +121,7 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 	// Route Anthropic traffic through a real client TLS/JA3 + HTTP2 fingerprint instead
 	// of the Go standard library's. Although Anthropic (unlike chatgpt.com) has no
 	// Cloudflare challenge wall, the stdlib transport's fingerprint is itself a
-	// relay-detection signal: a request whose headers claim claude-cli/Node but whose
+	// relay-detection signal: a request whose headers claim native claude-cli/Bun but whose
 	// ClientHello and HTTP/2 SETTINGS are Go's is self-contradicting, and every pooled
 	// account would share that same contradiction.
 	//
@@ -140,18 +140,18 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 		built := http.Header{}
 		applyHeaders(built, spec, id, stream)
 		// The fingerprint transport negotiates and auto-decompresses encoding itself
-		// (and a real Node/Chrome client never asks for "identity"), so drop our
+		// (and the captured native client never asks for "identity"), so drop our
 		// identity hint and let the impersonated transport present its native
 		// Accept-Encoding.
 		built.Del("Accept-Encoding")
 		claudeSpec := spec
 		claudeSpec.Method = firstNonEmpty(spec.Method, http.MethodPost)
-		// JA3 the sidecar replays for Claude. DEFAULT IS CHROME (""): see resolveClaudeJA3
-		// — the real claude-cli/Node JA3 is an explicit opt-in, not the default. When a
-		// JA3 is set, the sidecar disables its impersonation default headers and uses
-		// exactly the header set built above.
-		ja3 := resolveClaudeJA3(c.cfgSnapshot().ClaudeJA3Override)
-		// In-process fingerprint engine: route through tls-client (Chrome_120) instead of
+		// JA3 the sidecar replays for Claude. The default is the ClientHello captured
+		// from the shipping native Bun build, so TLS and HTTP fingerprints describe the
+		// same client. An explicit browser alias remains available for compatibility.
+		claudeJA3Override := c.cfgSnapshot().ClaudeJA3Override
+		ja3 := resolveClaudeJA3(claudeJA3Override)
+		// In-process fingerprint engine: route through tls-client's captured Bun profile instead of
 		// the external curl_cffi sidecar. The sidecar stays the fallback on engine "sidecar".
 		//
 		// The idle budget is the plain request timeout here. The sidecar branch below adds
@@ -160,7 +160,7 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 		// silently weaken the idle watchdog and let a hung upstream hold a slot for the
 		// sidecar window instead of the configured request timeout.
 		if c.claudeFingerprintEngine(spec.Egress) == claudeEngineInProcess {
-			return c.postInProcessOrdered(ctx, claudeSpec, target, built, c.cfg.RequestTimeout(), ja3, tlsclient.ProfileChrome, claudeHeaderOrder(built))
+			return c.postInProcessOrdered(ctx, claudeSpec, target, built, c.cfg.RequestTimeout(), ja3, resolveClaudeTLSProfile(claudeJA3Override), claudeHeaderOrder(built))
 		}
 		// Sidecar path: allow the larger of the request timeout and the sidecar budget,
 		// since this call crosses an extra process hop before it reaches the upstream.
@@ -176,6 +176,9 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 		return nil, err
 	}
 	applyHeaders(req.Header, spec, id, stream)
+	if forceHTTP1ForClaudeImpersonation(target, req.Header) {
+		req.Header = claudeWireHeaders(req.Header)
+	}
 
 	// Bound the call by an IDLE-timeout guard (reset on every read), released on the
 	// response body's Close — NOT a `defer cancel()` on this function's return, and NOT
@@ -198,7 +201,7 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 	// already Go's — but the request still carries the full claude-cli identity built by
 	// applyHeaders above, and net/http's default ForceAttemptHTTP2 negotiates h2 against
 	// Anthropic's edge. "claude-cli User-Agent arriving over HTTP/2" is by construction
-	// never the real client (Node's bundled undici forces allowH2:false), so it is a
+	// never the captured native client (its ClientHello has no ALPN), so it is a
 	// free-standing discriminator that survives the operator's decision to skip TLS
 	// impersonation. The same predicate the fingerprint engines use decides it, so all
 	// three engines agree on the wire protocol for one account.
@@ -215,20 +218,15 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 	return &Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: guard.Wrap(resp.Body)}, nil
 }
 
-// DoAnthropicOAuth carries an Anthropic OAuth token-endpoint call (authorization-code
-// exchange and refresh_token grant) on the SAME account egress and the SAME TLS
-// fingerprint engine as that account's inference traffic.
+// DoAnthropicOAuth carries a Claude OAuth token-endpoint call (authorization-code
+// exchange and refresh_token grant) on the same account egress and TLS fingerprint
+// engine as that account's inference traffic.
 //
 // Why this exists instead of a plain http.Client:
 //
-// api.anthropic.com/v1/oauth/token is the SAME HOST as the inference endpoint. Refreshing
-// account A's credential from the relay host's own IP while every inference turn for
-// account A arrives from the account's bound proxy IP tells the upstream, per account and
-// on a fixed schedule, that one machine holds the credentials for N accounts that
-// otherwise appear to live on N different networks. It also mixes two TLS fingerprints on
-// one account: a Go stdlib ClientHello on the token call, an impersonated one on the
-// messages call. Both are relay signals independent of anything in the request body, and
-// the refresh loop guarantees they are emitted repeatedly for every pooled account.
+// platform.claude.com and api.anthropic.com share the same Anthropic account perimeter.
+// Mixing the relay host IP/Go ClientHello on token calls with a bound proxy/native
+// ClientHello on inference creates a stable per-account relay signal.
 //
 // The caller supplies the fully-built header set; nothing is inherited from a downstream
 // request. Only the identity-neutral OAuth grant travels in the body.
@@ -245,13 +243,12 @@ func (c *Client) DoAnthropicOAuth(ctx context.Context, egress storage.EgressProf
 		CookieJarKey: cookieJarKey,
 	}
 	timeout := c.cfg.RequestTimeout()
+	claudeJA3Override := c.cfgSnapshot().ClaudeJA3Override
 	switch c.claudeFingerprintEngine(egress) {
 	case claudeEngineInProcess:
-		built.Del("Accept-Encoding")
-		return c.postInProcessOrdered(ctx, spec, target, built, timeout, resolveClaudeJA3(c.cfgSnapshot().ClaudeJA3Override), tlsclient.ProfileChrome, claudeHeaderOrder(built))
+		return c.postInProcessOrdered(ctx, spec, target, built, timeout, resolveClaudeJA3(claudeJA3Override), resolveClaudeTLSProfile(claudeJA3Override), claudeOAuthHeaderOrder(built))
 	case claudeEngineSidecar:
-		built.Del("Accept-Encoding")
-		return c.postViaSidecarOrdered(ctx, spec, target, built, timeout, resolveClaudeJA3(c.cfgSnapshot().ClaudeJA3Override), false, claudeHeaderOrder(built))
+		return c.postViaSidecarOrdered(ctx, spec, target, built, timeout, resolveClaudeJA3(claudeJA3Override), false, claudeOAuthHeaderOrder(built))
 	}
 	// Explicit ClaudeForceDirect (or no fingerprint engine available): still keep the
 	// account's egress so the token call and the inference calls share an exit IP.
@@ -262,9 +259,12 @@ func (c *Client) DoAnthropicOAuth(ctx context.Context, egress storage.EgressProf
 		return nil, err
 	}
 	req.Header = built
+	if forceHTTP1ForClaudeImpersonation(target, req.Header) {
+		req.Header = claudeWireHeaders(req.Header)
+	}
 	directCtx, guard := newRequestGuard(ctx, timeout)
 	req = req.WithContext(directCtx)
-	client, err := c.httpClientForEgress(directSpec)
+	client, err := c.httpClientForEgressMode(directSpec, forceHTTP1ForClaudeImpersonation(target, req.Header))
 	if err != nil {
 		guard.Fail()
 		return nil, err
@@ -330,8 +330,8 @@ const (
 // claudeFingerprintEngine picks the transport for an Anthropic request.
 //
 // Ordering matters for risk control: the in-process engine is preferred for EVERY egress
-// type because it is the only option that can present a coherent browser/Node fingerprint
-// regardless of how the account exits. Falling back to the stdlib transport is reported as
+// type because it can present the captured native fingerprint regardless of how the account
+// exits. Falling back to the stdlib transport is reported as
 // such by the caller rather than silently accepted, because that fallback is the one path
 // that leaks a Go fingerprint to api.anthropic.com.
 func (c *Client) claudeFingerprintEngine(egress storage.EgressProfile) claudeEngine {
@@ -355,78 +355,51 @@ func (c *Client) claudeFingerprintEngine(egress storage.EgressProfile) claudeEng
 	return claudeEngineStdlib
 }
 
-// claudeUpstreamHeaderOrder is the wire order of the headers the real Anthropic
-// TypeScript SDK (which Claude Code embeds) emits, derived from the SDK + undici
-// sources rather than guessed:
+// claudeUpstreamHeaderOrder is the observed HTTP/1.1 wire order of Claude Code
+// 2.1.226's native Bun 1.4.0 build. It comes from direct
+// ANTHROPIC_BASE_URL captures of API-key, OAuth and full-tools requests rather
+// than from the TypeScript SDK's pre-bundle insertion order. The native build
+// emits canonical-cased application headers, lower-case Anthropic/default
+// headers, and finally Bun's transport headers.
 //
-//   - anthropic-sdk-typescript src/client.ts buildHeaders() inserts, in this order:
-//     accept, user-agent, x-stainless-retry-count, x-stainless-timeout, then the
-//     getPlatformHeaders() block, then anthropic-dangerous-direct-browser-access, then
-//     anthropic-version, then the auth header, then the client's defaultHeaders, and
-//     finally the body's content-type.
-//   - src/internal/detect-platform.ts getPlatformProperties() defines the platform block
-//     in exactly this order: x-stainless-lang, x-stainless-package-version,
-//     x-stainless-os, x-stainless-arch, x-stainless-runtime, x-stainless-runtime-version.
-//   - undici hands request.headersList.entries to the dispatcher unsorted (lib/web/fetch/
-//     index.js dispatch()), i.e. INSERTION order reaches the socket, and appends
-//     accept-language (step 13 of fetch) plus content-length/accept-encoding after the
-//     caller's own headers.
-//
-// This matters because fhttp, with no HeaderOrderKey set, sorts header names
-// lexicographically (fhttp/header.go headerSorter.Less: "If the order isn't defined, sort
-// lexicographically"). Alphabetical header order is not something any real client emits,
-// so leaving it unset replaces one fingerprint mismatch with another — and it also differs
-// from what the curl_cffi sidecar sends, so the same account would drift between engines.
-//
-// Names are lowercase because fhttp's headerSorter lowercases before consulting the order
-// map (fhttp/header.go headerSorter.Less), so this table matches regardless of the case in
-// the header set.
-//
-// NOTE ON CASE: Claude traffic is now pinned to HTTP/1.1 (see
-// forceHTTP1ForClaudeImpersonation), where field case IS visible on the wire — h2 lowercases
-// by protocol, h1 does not. fhttp writes each map key verbatim (header.go writeSubset), and
-// our keys arrive canonicalized (`User-Agent`) because tlsclient.Do inserts them with
-// Header.Add. Real undici emits lowercase. We do NOT try to match that, because fhttp's
-// transferWriter injects `Content-Length` with a hard-coded canonical literal
-// (fhttp/transfer.go:287) that we cannot reach without patching the dependency: the
-// achievable outcomes are "all canonical" or "all lowercase except a canonical
-// Content-Length in the middle", and the latter is a mixed-case wire no real client
-// produces. Uniform canonical is the less anomalous of the two. This is a KNOWN residual
-// divergence.
+// Names in this order table are lower-case because fhttp's sorter lowercases
+// before lookup. claudeWireHeaders separately reproduces the observed h1 field
+// casing; Content-Length remains canonical exactly as Bun emits it.
 var claudeUpstreamHeaderOrder = []string{
 	"accept",
-	"user-agent",
-	"x-stainless-retry-count",
-	"x-stainless-timeout",
-	"x-stainless-lang",
-	"x-stainless-package-version",
-	"x-stainless-os",
-	"x-stainless-arch",
-	"x-stainless-runtime",
-	"x-stainless-runtime-version",
-	"anthropic-dangerous-direct-browser-access",
-	"anthropic-version",
 	"authorization",
-	"x-api-key",
-	// Claude Code's own client-level defaultHeaders block.
-	"x-app",
-	"anthropic-beta",
-	"x-claude-code-session-id",
+	"content-type",
+	"user-agent",
 	claudeAgentIDHeaderLower,
 	claudeParentAgentHeaderLower,
-	// Body-derived and fetch-appended headers come last.
-	"content-type",
-	"accept-language",
-	"content-length",
+	"x-claude-code-session-id",
+	"x-stainless-arch",
+	"x-stainless-lang",
+	"x-stainless-os",
+	"x-stainless-package-version",
+	"x-stainless-retry-count",
+	"x-stainless-runtime",
+	"x-stainless-runtime-version",
+	"x-stainless-timeout",
+	"anthropic-beta",
+	"anthropic-dangerous-direct-browser-access",
+	"anthropic-version",
+	"x-api-key",
+	"x-app",
+	"connection",
+	"host",
 	"accept-encoding",
+	"content-length",
 }
 
 // transportInjectedHeaderOrder marks entries of claudeUpstreamHeaderOrder that the
 // transport adds on our behalf, so claudeHeaderOrder keeps their slot even though they are
 // absent from the header set we build. See claudeHeaderOrder for the per-header detail.
 var transportInjectedHeaderOrder = map[string]bool{
-	"host":           true,
-	"content-length": true,
+	"connection":      true,
+	"host":            true,
+	"accept-encoding": true,
+	"content-length":  true,
 }
 
 // claudeHeaderOrder projects claudeUpstreamHeaderOrder onto the headers actually present
@@ -442,17 +415,12 @@ var transportInjectedHeaderOrder = map[string]bool{
 // real position. Listing a name that ends up absent is harmless: fhttp's headerSorter
 // only consults the order map for headers it is actually writing.
 //
-//   - host: fhttp sets it in Request.write (request.go:618) from the URL.  undici emits it
-//     FIRST on the h1 wire (client-h1.js writes `host:` before anything else), so without
-//     this it would land last-ish among the alphabetical leftovers.
-//   - content-length: folded into the header map by transferWriter.addHeaders
-//     (transfer.go:287), i.e. it participates in the ordering rather than being appended.
+// Host and Content-Length are folded into fhttp's header map before sorting.
+// Connection and Accept-Encoding are applied by the provider-neutral transport
+// helpers after this order is computed. All four therefore need reserved slots.
 func claudeHeaderOrder(built http.Header) []string {
 	order := make([]string, 0, len(built)+len(claudeUpstreamHeaderOrder)+1)
 	placed := make(map[string]bool, len(built))
-	// host leads the h1 wire.
-	placed["host"] = true
-	order = append(order, "host")
 	for _, name := range claudeUpstreamHeaderOrder {
 		if placed[name] {
 			continue
@@ -476,40 +444,101 @@ func claudeHeaderOrder(built http.Header) []string {
 	return append(order, extra...)
 }
 
+// claudeOAuthHeaderOrder is the HTTP/1.1 order captured from Claude Code 2.1.226's
+// Axios 1.15.2 authorization-code and refresh-token calls. OAuth does not use the
+// messages SDK's x-stainless/anthropic header sequence.
+func claudeOAuthHeaderOrder(built http.Header) []string {
+	native := []string{
+		"accept",
+		"content-type",
+		"user-agent",
+		"content-length",
+		"accept-encoding",
+		"host",
+		"connection",
+	}
+	injected := map[string]bool{"content-length": true, "host": true}
+	order := make([]string, 0, len(native)+len(built))
+	placed := make(map[string]bool, len(native)+len(built))
+	for _, name := range native {
+		_, present := built[http.CanonicalHeaderKey(name)]
+		if !present && !injected[name] {
+			continue
+		}
+		order = append(order, name)
+		placed[name] = true
+	}
+	var extra []string
+	for name := range built {
+		lower := strings.ToLower(name)
+		if !placed[lower] {
+			extra = append(extra, lower)
+		}
+	}
+	sort.Strings(extra)
+	return append(order, extra...)
+}
+
+// claudeWireHeaders projects net/http's canonical map keys onto the exact case
+// observed from the native client. The returned clone is transport-only: keeping
+// the builders canonical lets Header.Get/Values and policy code stay
+// case-insensitive without creating duplicate logical keys.
+func claudeWireHeaders(built http.Header) http.Header {
+	wire := built.Clone()
+	for _, name := range []string{
+		"Anthropic-Beta",
+		"Anthropic-Dangerous-Direct-Browser-Access",
+		"Anthropic-Version",
+		"X-Api-Key",
+		"X-App",
+	} {
+		values := append([]string(nil), wire.Values(name)...)
+		wire.Del(name)
+		if len(values) > 0 {
+			wire[strings.ToLower(name)] = values
+		}
+	}
+	// net/textproto canonicalizes the acronym to X-Stainless-Os, while Bun keeps
+	// the SDK's literal X-Stainless-OS spelling on HTTP/1.1.
+	osValues := append([]string(nil), wire.Values("X-Stainless-OS")...)
+	wire.Del("X-Stainless-OS")
+	if len(osValues) > 0 {
+		wire["X-Stainless-OS"] = osValues
+	}
+	if wire.Get("Connection") == "" {
+		wire.Set("Connection", "keep-alive")
+	}
+	return wire
+}
+
 // resolveClaudeJA3 resolves the TLS/JA3 fingerprint the curl_cffi sidecar replays for
 // Claude/Anthropic traffic from the operator's claude_ja3 setting.
 //
-// THE DEFAULT IS CHROME (""), i.e. the sidecar's native impersonation — NOT the real
-// claude-cli JA3. This is a deliberate, evidence-based choice:
-//   - The mature reference relays (e.g. justlovemaki/AIClient2API, a Go uTLS sidecar)
-//     impersonate Chrome for upstreams that validate JA3/JA4, rather than replaying each
-//     client's real fingerprint — Chrome is what curl_cffi/uTLS reproduce natively and
-//     what Cloudflare edges whitelist.
-//   - Empirical research into Anthropic's third-party-client detection (mrcattusdev,
-//     tested by routing OpenCode's TLS through Node vs Bun) found the block is keyed on
-//     SYSTEM-PROMPT CONTENT, not TLS — changing the TLS stack did not change the outcome.
-//     We already neutralize that surface in the cloak layer (the Claude Code identity
-//     system block), so matching the real claude-cli JA3 buys no measurable
-//     anti-detection benefit, while a best-effort replay of a non-native (Node/undici)
-//     profile risks presenting an imperfect THIRD fingerprint that is neither Chrome nor
-//     real claude-cli.
-//   - api.anthropic.com plainly accepts the Chrome impersonation today (it has no
-//     aggressive CF challenge wall for the API), and accepts the real Node fingerprint
-//     too (the real CLI uses it), so Chrome is the lower-risk default.
-//
-// Operators who specifically want TLS↔UA coherence can OPT IN: the sentinels
-// "claude-cli"/"claude_cli"/"real"/"native"/"node" select identity.ClaudeJA3 (the
-// captured real claude-cli fingerprint, ja3 hash d871d02c…), or set claude_ja3 to an
-// explicit JA3 string. "" / "off"/"none"/"disabled"/"-"/"chrome"/"browser" all keep
-// Chrome.
+// The default is the captured native Bun fingerprint. Chrome remains an
+// explicit escape hatch, but using it by default puts a Chrome ClientHello
+// beneath a claude-cli/Bun HTTP shape and exposes the relay through that
+// contradiction.
 func resolveClaudeJA3(override string) string {
 	switch strings.ToLower(strings.TrimSpace(override)) {
-	case "", "off", "none", "disabled", "-", "chrome", "browser":
-		return "" // sidecar's native Chrome impersonation (default)
-	case "claude-cli", "claude_cli", "real", "native", "node":
+	case "", "claude-cli", "claude_cli", "real", "native", "node", "bun":
 		return identity.ClaudeJA3
+	case "off", "none", "disabled", "-", "chrome", "browser":
+		return ""
 	default:
 		return strings.TrimSpace(override)
+	}
+}
+
+// resolveClaudeTLSProfile selects the complete in-process ClientHello profile. The raw
+// JA3 string alone cannot describe extension payloads (signature schemes, key shares,
+// ALPN absence), so the default/native aliases use the captured Bun ClientHelloSpec.
+// Browser aliases are the only values that deliberately select Chrome.
+func resolveClaudeTLSProfile(override string) string {
+	switch strings.ToLower(strings.TrimSpace(override)) {
+	case "off", "none", "disabled", "-", "chrome", "browser":
+		return tlsclient.ProfileChrome
+	default:
+		return tlsclient.ProfileClaude
 	}
 }
 
@@ -537,7 +566,7 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 		}
 		dst.Set("Anthropic-Beta", mergeBetas(claudeOAuthBetas, spec.Headers, false))
 	}
-	// Claude Code 2.1.220 sends this in both API-key and third-party Bearer
+	// Claude Code 2.1.226 sends this in both API-key and third-party Bearer
 	// configurations (verified through ANTHROPIC_BASE_URL captures).
 	dst.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
 	if strings.TrimSpace(spec.Headers.Get(claudeCacheDiagnosticsHeader)) != "" {
@@ -555,7 +584,7 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 	// OS/device/session axes still provide fleet diversity. An explicit operator
 	// override wins globally. The claude-cli version (UA) and the @anthropic-ai/sdk
 	// "Stainless" package version are separate axes — the real client sends
-	// claude-cli/2.1.220 with X-Stainless-Package-Version: 0.94.0.
+	// claude-cli/2.1.226 with X-Stainless-Package-Version: 0.94.0.
 	claudeVer := c.cfgSnapshot().ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
 	dst.Set("X-Stainless-Package-Version", c.cfgSnapshot().ClaudeStainlessVersionOrDefault(id.StainlessPackageVersion))
 	dst.Set("X-Stainless-Runtime-Version", c.cfgSnapshot().ClaudeNodeVersionOrDefault(id.NodeVersion))
@@ -566,13 +595,9 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 	applyClaudeFetchHeaders(dst)
 }
 
-// applyClaudeFetchHeaders adds the headers Node's fetch (undici) appends to EVERY request
-// on the client's behalf. Claude Code does not set them itself, so a request that claims
-// to be claude-cli on Node while missing them is missing part of that client's signature.
-//
-// Accept-Language: undici appends `accept-language: *` unconditionally when the caller did
-// not set one (lib/web/fetch/index.js, step 13 of the fetch algorithm). Its absence is a
-// stable, trivially checkable divergence from any real Node client.
+// applyClaudeFetchHeaders removes caller-controlled content coding. Claude Code
+// 2.1.226 is a native Bun binary: direct captures show no Accept-Language header,
+// so injecting undici's historical `Accept-Language: *` is itself a relay tell.
 //
 // Accept-Encoding is deliberately NOT set here:
 //   - the fingerprint engines strip it and emit the impersonated transport's own value
@@ -581,14 +606,10 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 //     `Accept-Encoding: gzip` AND transparently decompress the response, so the SSE
 //     scanner still reads plaintext lines.
 //
-// The previous behavior — `Accept-Encoding: identity` on streaming turns — was a real
-// signal: no browser and no Node/undici client ever asks an HTTPS endpoint for `identity`
-// (undici sends `br, gzip, deflate, zstd`), so it marked the request as machine-generated
-// by something that wanted to read the stream itself, i.e. a relay.
+// The transport installs Bun's exact `gzip, deflate, br, zstd` value after the
+// header order is computed.
 func applyClaudeFetchHeaders(dst http.Header) {
-	if dst.Get("Accept-Language") == "" {
-		dst.Set("Accept-Language", "*")
-	}
+	dst.Del("Accept-Language")
 	dst.Del("Accept-Encoding")
 }
 
@@ -688,7 +709,7 @@ func (c *Client) applyClaudePassthroughHeaders(dst http.Header, spec Request, id
 	applyClaudeFetchHeaders(dst)
 }
 
-// forwardClaudeAgentContextHeaders preserves Claude Code 2.1.220's subagent
+// forwardClaudeAgentContextHeaders preserves Claude Code 2.1.226's subagent
 // ancestry only when it was supplied by the downstream client. Values are
 // protocol metadata rather than identity fields: the relay does not invent them.
 // Keep the validation stricter than net/http's generic header validation so an
@@ -715,7 +736,7 @@ func validClaudeAgentContextValue(raw string) string {
 }
 
 // claudeEntrypoint projects the real downstream launch mode while discarding
-// the downstream version. Claude 2.1.220 uses sdk-cli for `claude -p`/Agent SDK
+// the downstream version. Claude 2.1.226 uses sdk-cli for `claude -p`/Agent SDK
 // and cli for the interactive terminal.
 func claudeEntrypoint(headers http.Header, body []byte) string {
 	if strings.Contains(strings.ToLower(headers.Get("User-Agent")), "(external, sdk-cli)") ||
@@ -865,35 +886,27 @@ func (c *Client) normalizeClaudeMessagesSpec(spec Request) Request {
 		return spec
 	}
 
-	changed := c.normalizeClaudeMessagesMetadata(root, spec)
+	c.normalizeClaudeMessagesMetadata(root, spec)
 	if betas := extractClaudeBodyBetas(root["betas"]); len(betas) > 0 {
 		delete(root, "betas")
 		spec.Headers = cloneHeaders(spec.Headers)
 		spec.Headers.Add("Anthropic-Beta", strings.Join(betas, ","))
-		changed = true
 	} else if _, ok := root["betas"]; ok {
 		delete(root, "betas")
-		changed = true
 	}
 
-	if sanitizeClaudeWebSearchTools(root) {
-		changed = true
-	}
-	if sanitizeClaudeHistory(root) {
-		changed = true
-	}
-	if normalizeClaudeThinkingCompatibility(root, claudeMessagesModel(root, spec.Model)) {
-		changed = true
-	}
-	if anthropicwire.NormalizeCacheControlTTL(root) {
-		changed = true
-	}
+	sanitizeClaudeWebSearchTools(root)
+	sanitizeClaudeHistory(root)
+	normalizeClaudeThinkingCompatibility(root, claudeMessagesModel(root, spec.Model))
+	anthropicwire.NormalizeCacheControlTTL(root)
 
 	body := requestBody(spec)
-	if changed {
-		if marshaled, err := json.Marshal(root); err == nil {
-			body = marshaled
-		}
+	// Always perform the final Claude serializer pass, even when no semantic
+	// normalizer changed the request. Earlier sjson/continuation/moderation steps
+	// may have appended fields or used Go's map order; allowing that body through
+	// unchanged exposes a stable non-Bun wire signature on otherwise native calls.
+	if marshaled, err := anthropicwire.MarshalPreservingOrder(body, root); err == nil {
+		body = marshaled
 	}
 	setRequestBody(&spec, body)
 	return spec
@@ -919,7 +932,7 @@ func decodeClaudeJSONObject(body []byte, root *map[string]interface{}) error {
 }
 
 // normalizeClaudeMessagesMetadata preserves the exact current Claude Code
-// metadata surface while replacing downstream identity. Captured 2.1.220 sends
+// metadata surface while replacing downstream identity. Captured 2.1.226 sends
 // exactly metadata.user_id, whose value is a JSON string; its session_id is the
 // same UUID as X-Claude-Code-Session-Id. Generic API-key SDK traffic keeps a plain
 // opaque user id, while OAuth and native Claude Code requests use the JSON shape.

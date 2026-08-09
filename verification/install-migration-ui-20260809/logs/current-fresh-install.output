@@ -1,0 +1,50 @@
+================================
+ Pool Server 安装 / 更新
+================================
+==> Codex skills 兼容提示：完整官方 skills/plugins/Browser Use 体验请使用官方 Codex 账号通道；第三方 API 通道为 best-effort。
+
+==> 受管源码同步完成：移除 0 个旧文件；配置、数据与插件目录未触碰
+==> 转交给规范安装器 scripts/install.sh（构建内嵌 UI 的二进制、安装 sidecar/注册 worker、写入 systemd）
+==> Codex skills compatibility: full official skills/plugins/Browser Use support requires the official Codex account path; custom providers are best-effort.
+==> Using Go 1.25.12: /usr/local/go1.25.12/bin/go
+==> Downloading Go modules
+WARN: Skipping go test ./...
+==> Building codex-pool-server release 20260809T120849Z-source-399004
+==> Building downloadable gateway binaries
+==> Staging immutable release 20260809T120849Z-source-399004
+codex-pool-server self-test ok
+codex-pool-handoff self-test ok
+==> Installing default config to /tmp/codex-pool-install-fixture-20260809/current-fresh/etc/config.json
+WARN: Skipping systemd unit install
+
+Install complete.
+
+Binary:        /tmp/codex-pool-install-fixture-20260809/current-fresh/bin/codex-pool-server
+Handoff:       /tmp/codex-pool-install-fixture-20260809/current-fresh/bin/codex-pool-handoff
+Release:       20260809T120849Z-source-399004 (/tmp/codex-pool-install-fixture-20260809/current-fresh/app/releases/20260809T120849Z-source-399004)
+Context clear: /tmp/codex-pool-install-fixture-20260809/current-fresh/bin/codex-pool-clear-context
+Config:        /tmp/codex-pool-install-fixture-20260809/current-fresh/etc/config.json
+Data:          /tmp/codex-pool-install-fixture-20260809/current-fresh/data/data
+Database:      /tmp/codex-pool-install-fixture-20260809/current-fresh/data/pool.sqlite3
+Listen:        127.0.0.1:18788
+Frontend:      http://127.0.0.1:18788/
+Handoff svc:  codex-pool-handoff.service
+Compat svc:   codex-pool.service
+Sidecar:       disabled
+Super-Instruct: bundled; enabled per API-key install choice within user-group policy
+Registration:  disabled
+Group migration: disabled (account-pool groups stay separate)
+WARP:          disabled
+Admin token:   <configured in /tmp/codex-pool-install-fixture-20260809/current-fresh/data/data/keys/admin.token>
+
+Manual run:
+  CODEX_POOL_DATABASE=/tmp/codex-pool-install-fixture-20260809/current-fresh/data/pool.sqlite3 CODEX_POOL_MIGRATE_USER_GROUPS=0 CODEX_POOL_LISTEN_ADDR=127.0.0.1:18788 CODEX_POOL_SUPER_INSTRUCT_DIR=/tmp/codex-pool-install-fixture-20260809/current-fresh/app/current/super-instruct/codex-skills CODEX_POOL_SUPER_INSTRUCT_BRIDGE_FILE=/tmp/codex-pool-install-fixture-20260809/current-fresh/app/current/super-instruct/bridge.md CODEX_POOL_ADMIN_TOKEN_FILE=/tmp/codex-pool-install-fixture-20260809/current-fresh/data/data/keys/admin.token /tmp/codex-pool-install-fixture-20260809/current-fresh/bin/codex-pool-server --config /tmp/codex-pool-install-fixture-20260809/current-fresh/etc/config.json
+
+Useful service commands:
+  systemctl status codex-pool-handoff.service
+  systemctl status codex-pool.socket
+  systemctl status codex-pool-worker@20260809T120849Z-source-399004.service
+  systemctl status codex-pool-reauth.service
+  /tmp/codex-pool-install-fixture-20260809/current-fresh/bin/codex-pool-rollback
+  journalctl -u codex-pool-handoff.service -f
+  systemctl status codex-pool-sidecar.service

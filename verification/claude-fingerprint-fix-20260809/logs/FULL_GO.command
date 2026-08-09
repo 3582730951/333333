@@ -1,0 +1,1 @@
+docker run --rm -v /workspace:/workspace -w /workspace -v claude-fingerprint-gomod:/go/pkg/mod -v claude-fingerprint-gobuild:/root/.cache/go-build -e GOTOOLCHAIN=local golang:1.25.12 go test ./... -count=1

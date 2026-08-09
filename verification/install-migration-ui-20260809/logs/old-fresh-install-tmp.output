@@ -1,0 +1,47 @@
+================================
+ Pool Server 安装 / Install
+================================
+==> 转交给规范安装器 scripts/install.sh（构建内嵌 UI 的二进制、安装 sidecar/注册 worker、写入 systemd）
+==> Codex skills 兼容提示：完整官方 skills/plugins/Browser Use 体验请使用官方 Codex 账号通道；第三方 API 通道为 best-effort。
+
+==> Codex skills compatibility: full official skills/plugins/Browser Use support requires the official Codex account path; custom providers are best-effort.
+==> Using Go 1.25.12: /usr/local/go1.25.12/bin/go
+==> Downloading Go modules
+WARN: Skipping go test ./...
+==> Building codex-pool-server release 20260809T115804Z-source-396887
+==> Building downloadable gateway binaries
+==> Staging immutable release 20260809T115804Z-source-396887
+codex-pool-server self-test ok
+codex-pool-handoff self-test ok
+==> Installing default config to /tmp/codex-pool-install-fixture-20260809/old/etc/config.json
+WARN: Skipping systemd unit install
+
+Install complete.
+
+Binary:        /tmp/codex-pool-install-fixture-20260809/old/bin/codex-pool-server
+Handoff:       /tmp/codex-pool-install-fixture-20260809/old/bin/codex-pool-handoff
+Release:       20260809T115804Z-source-396887 (/tmp/codex-pool-install-fixture-20260809/old/app/releases/20260809T115804Z-source-396887)
+Context clear: /tmp/codex-pool-install-fixture-20260809/old/bin/codex-pool-clear-context
+Config:        /tmp/codex-pool-install-fixture-20260809/old/etc/config.json
+Data:          /tmp/codex-pool-install-fixture-20260809/old/data/data
+Database:      /tmp/codex-pool-install-fixture-20260809/old/data/pool.sqlite3
+Listen:        127.0.0.1:18787
+Frontend:      http://127.0.0.1:18787/
+Handoff svc:  codex-pool-handoff.service
+Compat svc:   codex-pool.service
+Sidecar:       disabled
+Registration:  disabled
+Group migration: disabled (account-pool groups stay separate)
+WARP:          disabled
+Admin token:   <configured in /tmp/codex-pool-install-fixture-20260809/old/data/data/keys/admin.token>
+
+Manual run:
+  CODEX_POOL_DATABASE=/tmp/codex-pool-install-fixture-20260809/old/data/pool.sqlite3 CODEX_POOL_MIGRATE_USER_GROUPS=0 CODEX_POOL_LISTEN_ADDR=127.0.0.1:18787 CODEX_POOL_ADMIN_TOKEN_FILE=/tmp/codex-pool-install-fixture-20260809/old/data/data/keys/admin.token /tmp/codex-pool-install-fixture-20260809/old/bin/codex-pool-server --config /tmp/codex-pool-install-fixture-20260809/old/etc/config.json
+
+Useful service commands:
+  systemctl status codex-pool-handoff.service
+  systemctl status codex-pool.socket
+  systemctl status codex-pool-worker@20260809T115804Z-source-396887.service
+  /tmp/codex-pool-install-fixture-20260809/old/bin/codex-pool-rollback
+  journalctl -u codex-pool-handoff.service -f
+  systemctl status codex-pool-sidecar.service

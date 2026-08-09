@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 
+	"codex-account-pool/internal/anthropicwire"
 	"codex-account-pool/internal/storage"
 )
 
@@ -141,7 +142,12 @@ func (s *Server) moderateHistory(ctx context.Context, raw []byte, shape string) 
 	if !changed {
 		return raw
 	}
-	out, err := json.Marshal(root)
+	var out []byte
+	if shape == "anthropic" {
+		out, err = anthropicwire.MarshalPreservingOrder(raw, root)
+	} else {
+		out, err = json.Marshal(root)
+	}
 	if err != nil {
 		return raw
 	}

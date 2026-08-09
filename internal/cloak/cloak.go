@@ -23,7 +23,6 @@ package cloak
 
 import (
 	"bytes"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -51,10 +50,10 @@ const (
 )
 
 // claudeBillingHeaderPrefix marks the x-anthropic-billing-header system block that
-// real Claude Code prepends to every request (carrying cc_version + the per-request
-// per-request three-hex build suffix). Captured 2026-07-10 ground truth: it is the
-// FIRST system block, type text, has NO cache_control, and has NO cch member. The
-// suffix rotates independently on every request.
+// real Claude Code prepends to every request (carrying cc_version + the native
+// build component). Captured 2026-08-09 ground truth for 2.1.226: it is the FIRST
+// system block, type text, has NO cache_control and NO cch member, and uses the
+// fixed .503 build component on every request.
 const claudeBillingHeaderPrefix = "x-anthropic-billing-header:"
 
 // claudeCodeToolNames maps OpenCode/lowercase tool names to Claude Code's
@@ -88,7 +87,7 @@ type ClaudeCodeCacheOptions struct {
 // body. The billing block carries no cache_control and is placed at system[0] (ahead
 // of any identity block), matching the captured real client shape, and is added AFTER
 // capCacheControlBreakpoints so it neither consumes a breakpoint nor is affected by
-// the cap. Its three-hex suffix is generated afresh for this request.
+// the cap. Its build component is the one captured from the shipping binary.
 func VirtualizeClaudeCode(body []byte, id identity.Identity, sensitiveWords []string, oauth bool, billingVersion string) Result {
 	return VirtualizeClaudeCodeWithCache(body, id, sensitiveWords, oauth, billingVersion, ClaudeCodeCacheOptions{})
 }
@@ -138,7 +137,7 @@ func VirtualizeClaudeCodeWithCache(body []byte, id identity.Identity, sensitiveW
 		if (oauth || nativeClaudeCode) && strings.TrimSpace(billingVersion) != "" {
 			setClaudeBillingBlock(root, billingVersion)
 		}
-		if b, err := json.Marshal(root); err == nil {
+		if b, err := anthropicwire.MarshalPreservingOrder(body, root); err == nil {
 			out = b
 		}
 	}
@@ -602,9 +601,9 @@ func capCacheControlBreakpoints(root map[string]interface{}, max int) {
 // x-anthropic-billing-header system block as system[0], matching captured ground truth
 // (capture/out_v2): a text block, NO cache_control, of the form
 //
-//	x-anthropic-billing-header: cc_version=<version>.<3hex>; cc_entrypoint=cli;
+//	x-anthropic-billing-header: cc_version=<version>.503; cc_entrypoint=cli;
 //
-// It runs after other virtualization/cache-control injection so the rotating
+// It runs after other virtualization/cache-control injection so the attribution
 // attribution block is the final request shape.
 // Behavior:
 //   - real Claude Code (block already present): the block is REPLACED so cc_version is
@@ -623,7 +622,7 @@ func EnsureClaudeCodeBillingHeader(body []byte, version string) []byte {
 	if !setClaudeBillingBlock(root, version) {
 		return body
 	}
-	if out, err := json.Marshal(root); err == nil {
+	if out, err := anthropicwire.MarshalPreservingOrder(body, root); err == nil {
 		return out
 	}
 	return body
@@ -704,7 +703,7 @@ type claudeBillingAttrs struct {
 // subagent (a Task-tool invocation) rather than the main conversation; an observed real
 // block reads:
 //
-//	x-anthropic-billing-header: cc_version=2.1.226.be8; cc_entrypoint=cli; cc_is_subagent=true;
+//	x-anthropic-billing-header: cc_version=2.1.226.503; cc_entrypoint=cli; cc_is_subagent=true;
 //
 // Dropping it was a coherence leak in the same class the cc_entrypoint projection already
 // guards against. A subagent request is independently recognizable from its body (subagent
@@ -751,7 +750,7 @@ func claudeBillingHeaderTextForAttrs(version string, attrs claudeBillingAttrs) s
 }
 
 // claudeBillingHeaderText builds the billing-header block for a claude-cli version.
-// Shipping 2.1.220 emits a fresh three-hex suffix on every request and no cch field.
+// Shipping 2.1.226 emits the fixed .503 build component and no cch field.
 // The launch entrypoint is projected from an existing native billing block.
 func claudeBillingHeaderText(version string) string {
 	return claudeBillingHeaderTextForEntrypoint(version, "cli")
@@ -764,20 +763,8 @@ func claudeBillingHeaderTextForEntrypoint(version, entrypoint string) string {
 	if entrypoint != "sdk-cli" {
 		entrypoint = "cli"
 	}
-	build := claudeRandomHex(3)
 	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s;",
-		version, build, entrypoint)
-}
-
-func claudeRandomHex(n int) string {
-	if n <= 0 {
-		return ""
-	}
-	raw := make([]byte, (n+1)/2)
-	if _, err := rand.Read(raw); err != nil {
-		return strings.Repeat("0", n)
-	}
-	return hex.EncodeToString(raw)[:n]
+		version, identity.ClaudeCodeBuild, entrypoint)
 }
 
 // nodePlatform maps a virtual OS name to the Node.js process.platform value

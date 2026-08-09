@@ -115,12 +115,14 @@ func (c *Client) EgressHTTPClient(egress storage.EgressProfile) (*http.Client, e
 
 // rawProfileForHeaders picks the in-process tls-client profile for a provider-neutral
 // DoRaw call from its User-Agent. Kiro's traffic (KiroIDE Node and ksk_ Amazon Q alike)
-// is emitted by aws-sdk-js over Node.js, so it maps to ProfileNode; everything else
-// (Codex/WHAM reset-credit, quota, agent registration) keeps the Chrome default. Node
-// currently resolves to Chrome_120 in tlsclient.ResolveProfile — a safe placeholder until
-// a validated aws-sdk-js capture replaces it (the non-negotiable fingerprint gate).
+// is emitted by aws-sdk-js over Node.js, so it maps to ProfileNode. A claude-cli UA maps
+// to the byte-captured native Bun profile; everything else (Codex/WHAM reset-credit,
+// quota, agent registration) keeps the Chrome default.
 func rawProfileForHeaders(headers http.Header) string {
 	ua := strings.ToLower(headers.Get("User-Agent") + " " + headers.Get("x-amz-user-agent"))
+	if strings.Contains(ua, "claude-cli/") {
+		return tlsclient.ProfileClaude
+	}
 	if strings.Contains(ua, "aws-sdk-js") || strings.Contains(ua, "kiroide") {
 		return tlsclient.ProfileNode
 	}

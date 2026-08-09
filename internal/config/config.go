@@ -65,22 +65,24 @@ const (
 	// now makes a request WAIT for headroom (see AdmissionWait), never fail downstream.
 	DefaultAccountTokenBudget = 0
 	// Standard Claude Code OAuth client (Claude Pro/Max). Operators may override
-	// via config if Anthropic rotates these.
-	DefaultClaudeOAuthTokenURL = "https://api.anthropic.com/v1/oauth/token"
+	// via config if Anthropic rotates these. These values are from the shipping
+	// Claude Code 2.1.226 sa()/Ydc configuration.
+	DefaultClaudeOAuthTokenURL = "https://platform.claude.com/v1/oauth/token"
 	DefaultClaudeOAuthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	// Web-login (paste-back) OAuth defaults. These drive the "generate a login URL →
 	// log in in the browser → paste the redirected URL / code back" import flow for
 	// both providers (internal/api/oauth.go). They mirror the official clients so the
 	// authorize/token endpoints accept the request; every value is config-overridable
 	// in case OpenAI/Anthropic rotate the client or move an endpoint.
-	DefaultCodexOAuthAuthURL      = "https://auth.openai.com/oauth/authorize"
-	DefaultCodexOAuthTokenURL     = "https://auth.openai.com/oauth/token"
-	DefaultCodexOAuthClientID     = "app_EMoamEEZ73f0CkXaXp7hrann"
-	DefaultCodexOAuthRedirectURI  = "http://localhost:1455/auth/callback"
-	DefaultCodexOAuthScope        = "openid profile email offline_access api.connectors.read api.connectors.invoke"
-	DefaultClaudeOAuthAuthURL     = "https://claude.ai/oauth/authorize"
-	DefaultClaudeOAuthRedirectURI = "http://localhost:54545/callback"
-	DefaultClaudeOAuthScope       = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+	DefaultCodexOAuthAuthURL       = "https://auth.openai.com/oauth/authorize"
+	DefaultCodexOAuthTokenURL      = "https://auth.openai.com/oauth/token"
+	DefaultCodexOAuthClientID      = "app_EMoamEEZ73f0CkXaXp7hrann"
+	DefaultCodexOAuthRedirectURI   = "http://localhost:1455/auth/callback"
+	DefaultCodexOAuthScope         = "openid profile email offline_access api.connectors.read api.connectors.invoke"
+	DefaultClaudeOAuthAuthURL      = "https://claude.com/cai/oauth/authorize"
+	DefaultClaudeOAuthRedirectURI  = "https://platform.claude.com/oauth/code/callback"
+	DefaultClaudeOAuthScope        = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+	DefaultClaudeOAuthRefreshScope = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 	// Antigravity (Google Cloud Code) OAuth defaults for web-login import flow.
 	DefaultAntigravityOAuthAuthURL      = "https://accounts.google.com/o/oauth2/v2/auth"
 	DefaultAntigravityOAuthTokenURL     = "https://oauth2.googleapis.com/token"
@@ -91,7 +93,7 @@ const (
 	// DefaultClaudeNodeVersion is the Node runtime version reported in
 	// X-Stainless-Runtime-Version. Kept here (not in the identity package) so the
 	// upstream Node fingerprint can be bumped from one place / overridden by config.
-	// Reconfirmed 2026-07-29 from the Claude Code 2.1.220 shipping binary.
+	// Reconfirmed 2026-08-09 from the Claude Code 2.1.226 shipping binary.
 	DefaultClaudeNodeVersion = "v26.3.0"
 	// DefaultModelProbeIntervalHours refreshes each account's last-good model
 	// catalog every six hours. The worker adds per-account jitter.
@@ -107,7 +109,11 @@ const (
 	DefaultGeoProbeURL          = "https://ipapi.co/json/"
 	DefaultCodexReauthWorkerURL = "http://127.0.0.1:8802"
 
-	legacyClaudeOAuthTokenURL = "https://console.anthropic.com/v1/oauth/token"
+	legacyClaudeOAuthTokenURL       = "https://console.anthropic.com/v1/oauth/token"
+	legacyClaudeOAuthTokenURLAPI    = "https://api.anthropic.com/v1/oauth/token"
+	legacyClaudeOAuthAuthURL        = "https://claude.ai/oauth/authorize"
+	legacyClaudeOAuthRedirectURI    = "http://localhost:54545/callback"
+	legacyClaudeOAuthAuthorizeScope = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 )
 
 var (
@@ -267,12 +273,11 @@ type Config struct {
 	SidecarImpersonate string `json:"sidecar_impersonate"`
 	// EgressFingerprintEngine selects how upstream JA3/TLS+HTTP2 fingerprinting is done:
 	// "inprocess" (default) uses the in-process Go tls-client (uTLS fork + fhttp) which
-	// reproduces the same TLS JA3 AND HTTP/2 Akamai fingerprint (Chrome_120, matching the
-	// sidecar's impersonate=chrome120 default) without a separate process, localhost hop, or
+	// reproduces each provider's validated wire profile (Claude's captured Bun ClientHello;
+	// Chrome_120 for browser-shaped traffic) without a separate process, localhost hop, or
 	// doubled sockets; "sidecar" routes fingerprinted egress through the external Python
-	// curl_cffi sidecar and remains a fully-supported switchable fallback. The default was
-	// flipped to inprocess once the two engines were verified to present the same Chrome_120
-	// fingerprint by construction; validate with /admin/egress-fingerprint-check after deploy.
+	// curl_cffi sidecar and remains a fully-supported switchable fallback. Both engines carry
+	// the same provider profile; validate with /admin/egress-fingerprint-check after deploy.
 	EgressFingerprintEngine string `json:"egress_fingerprint_engine"`
 	// IdentitySecret seeds the deterministic per-account virtual identity
 	// (User-Agent, session ids, device profile, env values). Set a unique value
@@ -293,12 +298,11 @@ type Config struct {
 	// the direct/proxy (Go stdlib) transport even when the serving account is bound
 	// to a curl_cffi_sidecar egress or has an account-level sidecar transport wrapper.
 	// A wrapper is removed while its underlying HTTP/SOCKS/WARP exit is retained; a
-	// legacy primary sidecar falls back to true direct. This is an ESCAPE HATCH only: by default a
-	// sidecar-bound Claude account IS routed through the sidecar, because the sidecar
-	// is the sole way to present a real client TLS/JA3/HTTP2 fingerprint instead of
-	// the Go standard library's (which is itself a relay-detection signal even though
-	// Anthropic, unlike chatgpt.com, has no Cloudflare challenge wall). Leave false
-	// unless a deployment cannot run the sidecar against api.anthropic.com.
+	// legacy primary sidecar falls back to true direct. This is an ESCAPE HATCH only:
+	// the default in-process engine and the optional sidecar both present the captured
+	// Claude/Bun fingerprint, whereas forced direct exposes the Go standard library's
+	// ClientHello (itself a relay-detection signal). Leave false unless a deployment
+	// explicitly accepts that weaker transport shape.
 	ClaudeForceDirect bool `json:"claude_force_direct"`
 	// ClaudeOAuthTokenURL / ClaudeOAuthClientID drive Claude OAuth (sk-ant-oat)
 	// token refresh. Defaults target the standard Claude Code OAuth client.
@@ -345,18 +349,14 @@ type Config struct {
 	// "disabled"/"-"/"chrome" also keep Chrome. Only applies to the curl_cffi_sidecar
 	// egress (the direct/proxy stdlib transport cannot set a JA3).
 	CodexJA3Override string `json:"codex_ja3"`
-	// ClaudeJA3 selects the TLS ClientHello fingerprint the curl_cffi sidecar replays
-	// for Claude/Anthropic traffic. Empty (DEFAULT) = the sidecar's native Chrome
-	// impersonation — the proven, Cloudflare-friendly choice used by reference relays;
-	// the best available research shows Anthropic detects third-party clients by
-	// system-prompt content (handled in the cloak layer), not TLS, so the real
-	// claude-cli fingerprint is an opt-in rather than the default. Set to
-	// "claude-cli"/"real"/"native" to opt into the captured real claude-cli/Node JA3
-	// (identity.ClaudeJA3), or to an explicit JA3 string. "off"/"none"/"disabled"/"-"/
-	// "chrome" also keep Chrome. Only applies to the curl_cffi_sidecar egress.
+	// ClaudeJA3 selects the TLS ClientHello fingerprint for Claude/Anthropic traffic.
+	// Empty (DEFAULT) and "claude-cli"/"real"/"native" use the ClientHello captured
+	// from Claude Code 2.1.226's native Bun binary (identity.ClaudeJA3 plus the complete
+	// in-process extension spec). An explicit JA3/named profile overrides it. "off"/
+	// "none"/"disabled"/"-"/"chrome" select the browser compatibility profile.
 	ClaudeJA3Override string `json:"claude_ja3"`
 	// ClaudeNodeVersion is the Node runtime version reported in
-	// X-Stainless-Runtime-Version (real Claude Code runs on Node). Empty = default.
+	// X-Stainless-Runtime-Version (the current native build reports runtime=node). Empty = default.
 	ClaudeNodeVersion string `json:"claude_node_version"`
 	// Kiro CLI wire version and regional service planes. These are hot-reloadable
 	// through the settings registry; endpoint overrides on an individual credential
@@ -494,7 +494,7 @@ type Config struct {
 	// route" behavior. TTL is retention only; it never changes model, context, or reasoning.
 	ClaudeCacheTTLRouteAware bool `json:"claude_cache_ttl_route_aware"`
 	// ClaudeCCHSigning is retained only so older config files continue to parse.
-	// Claude Code 2.1.206 no longer emits cch, so the request path ignores this
+	// Claude Code 2.1.226 emits no cch, so the request path ignores this
 	// deprecated setting and the default is false.
 	ClaudeCCHSigning bool `json:"claude_cch_signing"`
 	// BanDetectionEnabled turns on automatic classification of upstream responses
@@ -1224,7 +1224,7 @@ func (c *Config) FingerprintWarnings() []string {
 	}
 	// Shape: a set override must look like the real header value the client sends.
 	if cli != "" && !looksLikeDotVersion(cli) {
-		w = append(w, "claude_cli_version "+strconv.Quote(cli)+" does not look like a semver (e.g. 2.1.206)")
+		w = append(w, "claude_cli_version "+strconv.Quote(cli)+" does not look like a semver (e.g. 2.1.226)")
 	}
 	if sdk != "" && !looksLikeDotVersion(sdk) {
 		w = append(w, "claude_stainless_version "+strconv.Quote(sdk)+" does not look like a semver (e.g. 0.94.0)")
@@ -1235,7 +1235,7 @@ func (c *Config) FingerprintWarnings() []string {
 	return w
 }
 
-// looksLikeDotVersion reports whether s is a dotted, digits-only version like "2.1.206"
+// looksLikeDotVersion reports whether s is a dotted, digits-only version like "2.1.226"
 // or "0.94.0" (≥2 segments, every segment a non-empty run of digits).
 func looksLikeDotVersion(s string) bool {
 	parts := strings.Split(s, ".")
@@ -1711,7 +1711,7 @@ func (c *Config) normalize() {
 	if c.WebSearchEnabled && c.WebSearchToolType == "" {
 		c.WebSearchToolType = "web_search"
 	}
-	if c.ClaudeOAuthTokenURL == "" || sameURL(c.ClaudeOAuthTokenURL, legacyClaudeOAuthTokenURL) {
+	if c.ClaudeOAuthTokenURL == "" || sameURL(c.ClaudeOAuthTokenURL, legacyClaudeOAuthTokenURL) || sameURL(c.ClaudeOAuthTokenURL, legacyClaudeOAuthTokenURLAPI) {
 		c.ClaudeOAuthTokenURL = DefaultClaudeOAuthTokenURL
 	}
 	if c.ClaudeOAuthClientID == "" {
@@ -1765,13 +1765,13 @@ func (c *Config) normalize() {
 	default:
 		c.ClaudeGatewayUnknownTargetPolicy = "forward"
 	}
-	if c.ClaudeOAuthAuthURL == "" {
+	if c.ClaudeOAuthAuthURL == "" || sameURL(c.ClaudeOAuthAuthURL, legacyClaudeOAuthAuthURL) {
 		c.ClaudeOAuthAuthURL = DefaultClaudeOAuthAuthURL
 	}
-	if c.ClaudeOAuthRedirectURI == "" {
+	if c.ClaudeOAuthRedirectURI == "" || sameURL(c.ClaudeOAuthRedirectURI, legacyClaudeOAuthRedirectURI) {
 		c.ClaudeOAuthRedirectURI = DefaultClaudeOAuthRedirectURI
 	}
-	if c.ClaudeOAuthScope == "" {
+	if c.ClaudeOAuthScope == "" || strings.Join(strings.Fields(c.ClaudeOAuthScope), " ") == legacyClaudeOAuthAuthorizeScope {
 		c.ClaudeOAuthScope = DefaultClaudeOAuthScope
 	}
 	if c.GeoProbeURL == "" {

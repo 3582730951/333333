@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"codex-account-pool/internal/anthropicwire"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/config"
@@ -674,14 +675,11 @@ func (s *Server) modelQualityUpstreamRequest(ctx context.Context, combo modelQua
 			"thinking":      map[string]interface{}{"type": "adaptive", "display": "omitted"},
 			"output_config": map[string]interface{}{"effort": effort},
 		}
-		raw, _ := json.Marshal(payload)
+		raw, _ := anthropicwire.MarshalPreservingOrder(nil, payload)
 		osHint := s.osHint(raw, lease.Egress)
 		id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
 		oauth := claudeIsOAuth(token)
-		billingVersion := ""
-		if oauth {
-			billingVersion = s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
-		}
+		billingVersion := s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
 		spec.SetBodyBytes(cloak.VirtualizeClaudeCode(raw, id, s.cfg.SensitiveWordsFor("claude"), oauth, billingVersion).Body)
 		spec.OSHint = osHint
 		spec.DownstreamPath = "/v1/messages"
@@ -691,7 +689,10 @@ func (s *Server) modelQualityUpstreamRequest(ctx context.Context, combo modelQua
 			return upstream.Request{}, fmt.Errorf("custom provider %s is unavailable", combo.Provider)
 		}
 		spec.BaseURL = provider.BaseURL
-		if provider.UpstreamProtocol == storage.CustomProviderProtocolResponses {
+		spec.TransportProfile = provider.TransportProfile
+		spec.UpstreamProtocol = provider.UpstreamProtocol
+		switch provider.UpstreamProtocol {
+		case storage.CustomProviderProtocolResponses:
 			payload := map[string]interface{}{
 				"model":             combo.Model,
 				"input":             []interface{}{map[string]interface{}{"role": "developer", "content": commonInstruction}, map[string]interface{}{"role": "user", "content": probe.Prompt}},
@@ -700,7 +701,19 @@ func (s *Server) modelQualityUpstreamRequest(ctx context.Context, combo modelQua
 			raw, _ := json.Marshal(payload)
 			spec.SetBodyBytes(raw)
 			spec.DownstreamPath = "/responses"
-		} else {
+		case storage.CustomProviderProtocolAnthropicMessages:
+			raw, osHint := s.claudeCodeMinimalProbeBody(
+				lease.Account,
+				token,
+				lease.Egress,
+				combo.Model,
+				commonInstruction+"\n\n"+probe.Prompt,
+				32,
+			)
+			spec.SetBodyBytes(raw)
+			spec.OSHint = osHint
+			spec.DownstreamPath = "/messages"
+		default:
 			payload := map[string]interface{}{
 				"model":      combo.Model,
 				"messages":   []interface{}{map[string]interface{}{"role": "system", "content": commonInstruction}, map[string]interface{}{"role": "user", "content": probe.Prompt}},

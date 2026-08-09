@@ -33,7 +33,10 @@ func TestClaudeOAuthEgressKeepsBoundExitWhenSidecarBreaks(t *testing.T) {
 		t.Fatalf("upsert binding: %v", err)
 	}
 
-	egress, jar := s.claudeOAuthEgress(ctx, "acct-1")
+	egress, jar, err := s.claudeOAuthEgress(ctx, "acct-1")
+	if err != nil {
+		t.Fatalf("claudeOAuthEgress: %v", err)
+	}
 	if egress.Endpoint != proxyEndpoint {
 		t.Errorf("Endpoint = %q, want %q: a broken sidecar row must not discard the account's exit IP", egress.Endpoint, proxyEndpoint)
 	}
@@ -48,23 +51,24 @@ func TestClaudeOAuthEgressKeepsBoundExitWhenSidecarBreaks(t *testing.T) {
 	assertClaudeOAuthEgressAudited(t, store, "sidecar_wrapper_unavailable", "bound_exit_kept")
 }
 
-// TestClaudeOAuthEgressAuditsHostExitFallback: when nothing about the account's exit is
-// knowable the refresh still runs (losing it loses the account), but the host-IP exposure
-// must be recorded. Silence here is the actual defect: a missing binding row is persistent,
-// so every scheduled refresh for that account would leak, indefinitely and unnoticed.
-func TestClaudeOAuthEgressAuditsHostExitFallback(t *testing.T) {
+// TestClaudeOAuthEgressBlocksUnknownExit ensures a missing binding cannot turn a scheduled
+// refresh into a relay-host request.
+func TestClaudeOAuthEgressBlocksUnknownExit(t *testing.T) {
 	ctx := context.Background()
 	store := apiTestStore(t)
 	s := &Server{store: store}
 
-	egress, jar := s.claudeOAuthEgress(ctx, "acct-with-no-binding")
-	if !strings.EqualFold(strings.TrimSpace(egress.Type), "direct") {
-		t.Errorf("Type = %q, want direct: an unknown binding has no exit to use", egress.Type)
+	egress, jar, err := s.claudeOAuthEgress(ctx, "acct-with-no-binding")
+	if err == nil {
+		t.Fatal("claudeOAuthEgress succeeded without a binding; refresh would expose the relay exit")
+	}
+	if strings.TrimSpace(egress.Type) != "" {
+		t.Errorf("Type = %q, want empty on fail-closed path", egress.Type)
 	}
 	if jar != "" {
 		t.Errorf("cookieJarKey = %q, want empty", jar)
 	}
-	assertClaudeOAuthEgressAudited(t, store, "binding_lookup_failed", "host_exit")
+	assertClaudeOAuthEgressAudited(t, store, "binding_lookup_failed", "blocked")
 }
 
 // TestClaudeOAuthEgressUsesBoundExitWhenHealthy pins the non-degraded path so the two
@@ -87,7 +91,10 @@ func TestClaudeOAuthEgressUsesBoundExitWhenHealthy(t *testing.T) {
 		t.Fatalf("upsert binding: %v", err)
 	}
 
-	egress, jar := s.claudeOAuthEgress(ctx, "acct-ok")
+	egress, jar, err := s.claudeOAuthEgress(ctx, "acct-ok")
+	if err != nil {
+		t.Fatalf("claudeOAuthEgress: %v", err)
+	}
 	if egress.Endpoint != proxyEndpoint {
 		t.Errorf("Endpoint = %q, want %q", egress.Endpoint, proxyEndpoint)
 	}

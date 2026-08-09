@@ -7,6 +7,7 @@ package api
 import (
 	"bytes"
 	"codex-account-pool/internal/accountprovider"
+	"codex-account-pool/internal/anthropicwire"
 	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/identity"
@@ -506,17 +507,24 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		req.Provider = "claude"
 		req.DownstreamPath = "/v1/messages/count_tokens"
 		req.MinimalProbe = true
-		base := []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"ping"}]}`)
+		base, _ := anthropicwire.MarshalPreservingOrder(nil, map[string]interface{}{
+			"model": model,
+			"messages": []interface{}{map[string]interface{}{
+				"role": "user", "content": "ping",
+			}},
+			"system": []interface{}{map[string]interface{}{
+				"type": "text", "text": claudeCodeProbeIdentityLine,
+				"cache_control": map[string]interface{}{"type": "ephemeral"},
+			}},
+			"tools": []interface{}{},
+		})
 		osHint := s.osHint(base, egress)
 		id := identity.ForOS(s.identitySecret(), account.ID, osHint)
 		// Keep the probe byte-shaped like live traffic: cloak + (for OAuth) the
 		// x-anthropic-billing-header real Claude Code sends on count_tokens too, folded
 		// into the one virtualization pass exactly as messages.go does.
 		probeOAuth := claudeIsOAuth(token)
-		probeBillingVer := ""
-		if probeOAuth {
-			probeBillingVer = s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
-		}
+		probeBillingVer := s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
 		result := cloak.VirtualizeClaudeCode(base, id, s.cfg.SensitiveWordsFor("claude"), probeOAuth, probeBillingVer)
 		req.SetBodyBytes(claudeCountTokensProbeBody(result.Body))
 		req.OSHint = osHint
@@ -530,10 +538,19 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		}
 		req.Provider = provider
 		req.BaseURL = prov.BaseURL
-		if prov.UpstreamProtocol == storage.CustomProviderProtocolResponses {
+		req.TransportProfile = prov.TransportProfile
+		req.UpstreamProtocol = prov.UpstreamProtocol
+		req.MinimalProbe = true
+		switch prov.UpstreamProtocol {
+		case storage.CustomProviderProtocolResponses:
 			req.DownstreamPath = "/responses"
 			req.SetBodyBytes([]byte(`{"model":"` + model + `","input":[{"role":"user","content":"ping"}],"max_output_tokens":1,"stream":false}`))
-		} else {
+		case storage.CustomProviderProtocolAnthropicMessages:
+			req.DownstreamPath = "/messages"
+			body, osHint := s.claudeCodeMinimalProbeBody(account, token, egress, model, "ping", 1)
+			req.SetBodyBytes(body)
+			req.OSHint = osHint
+		default:
 			req.DownstreamPath = "/chat/completions"
 			req.SetBodyBytes([]byte(`{"model":"` + model + `","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"stream":false}`))
 		}
@@ -731,15 +748,15 @@ func codexLivenessProbeBody(model string) []byte {
 }
 
 func claudeCountTokensProbeBody(body []byte) []byte {
-	var root map[string]json.RawMessage
-	if err := json.Unmarshal(body, &root); err != nil {
+	root, err := decodeJSONMapUseNumber(body)
+	if err != nil {
 		return body
 	}
 	if _, present := root["metadata"]; !present {
 		return body
 	}
 	delete(root, "metadata")
-	normalized, err := json.Marshal(root)
+	normalized, err := anthropicwire.MarshalPreservingOrder(body, root)
 	if err != nil {
 		return body
 	}

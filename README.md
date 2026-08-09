@@ -318,12 +318,15 @@ curl -sS http://127.0.0.1:8787/admin/accounts/<account_id>/browser-repair \
    官方身份 system 块、`x-anthropic-billing-header`、`X-Stainless-*` / `User-Agent` 版本轴、敏感词擦除，
    以及**响应侧泄露过滤**（剥离 `x-codex-*`、`x-ratelimit-*`、`anthropic-ratelimit-*`、`anthropic-organization-*`
    等暴露逐账号配额/组织的头）。
-2. **传输层（TLS/JA3、HTTP/2 SETTINGS、header 顺序）** — **只有 `curl_cffi_sidecar` 出口能伪装**。
-   Go 标准库 transport 无法定制 cipher/curve 顺序、HTTP/2 SETTINGS 帧或 header 发送顺序，这些本身
-   就是「非官方客户端」的信号；直连/普通代理出口因此在传输层是**不完整**的。
+2. **传输层（TLS/JA3、HTTP 协议、header 大小写/顺序）** — 默认 `inprocess` 指纹引擎可在直连、
+   HTTP/SOCKS/WARP 代理以及 sidecar 链式出口上复现供应商线级形状；Claude 使用从 Claude Code
+   2.1.226 / Bun 1.4.0 捕获的无 ALPN ClientHello 与 HTTP/1.1 请求，浏览器链路使用 Chrome_120。
+   `curl_cffi_sidecar` 是可切换的等价后端。只有显式 `claude_force_direct` 的 Go 标准库逃生路径
+   无法定制 cipher/curve 与 header 顺序，因此传输层是**不完整**的。
 
-> **生产建议**：对敏感上游（尤其 chatgpt.com / api.anthropic.com），给账号绑定 `curl_cffi_sidecar`
-> 传输（可叠加 WARP/HTTP/SOCKS 代理 IP），以同时获得真实 JA3 + 代理出口 IP。账号详情支持把
+> **生产建议**：保持 `egress_fingerprint_engine=inprocess`（默认），并按账号绑定所需的真实 IP
+> 出口；指纹引擎会保留 WARP/HTTP/SOCKS 代理出口。也可以绑定 `curl_cffi_sidecar` 并把
+> `egress_fingerprint_engine` 切为 `sidecar` 作为外部后端。账号详情支持把
 > `primary_egress_id`（真实 IP 出口）和 `sidecar_egress_id`（TLS/HTTP2 包装层）分别选择；运行时链路为
 > `sidecar → primary/standby proxy → upstream`，出口健康、冷却、并发与 CF 审计仍归属真实出口。也可调用：
 >
@@ -333,12 +336,13 @@ curl -sS http://127.0.0.1:8787/admin/accounts/<account_id>/browser-repair \
 > ```
 >
 > 显式绑定的 sidecar 丢失或无效时会失败关闭，不会静默退回 Go 直连。`claude_force_direct` 可紧急绕过
-> sidecar（保留基础代理出口），`claude_ja3` 可覆盖 Claude 的 sidecar JA3。用
+> 指纹引擎（保留基础代理出口，但会暴露 Go TLS）；`claude_ja3` 留空使用当前 Claude/Bun 指纹，
+> `chrome` 是显式兼容逃生阀。用
 > `POST /admin/groups/<name>/assign-egress` 可一次把整组账号切到 sidecar/WARP 出口。直连出口适合
-> 无法运行 sidecar 的部署或对传输层指纹不敏感的上游。
+> 配合默认进程内指纹引擎；不需要为 Claude 单独部署 Python sidecar。
 >
-> 备注：直连 Claude 流式请求当前发送 `Accept-Encoding: identity`（让下游 SSE 扫描器逐行读取），这是
-> 刻意权衡——它是一个弱信号，且无论如何都被上面的传输层局限盖过；真正要传输层一致就走 sidecar。
+> 当前 Claude 线级形状固定为 `Accept-Encoding: gzip, deflate, br, zstd`，两种指纹引擎均透明解压，
+> SSE 扫描器读取的仍是明文；不会再通过 `identity` 编码暴露中转实现。
 
 ### 下游 Claude Code 降噪（防遥测，重要）
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/anthropicwire"
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/streamrewrite"
@@ -381,7 +382,7 @@ func buildClaudeContinueBody(originalBody []byte, partialText, continueText stri
 	out = append(out, map[string]interface{}{"role": "user", "content": continueText})
 	root["messages"] = out
 	root["stream"] = true
-	b, err := json.Marshal(root)
+	b, err := anthropicwire.MarshalPreservingOrder(originalBody, root)
 	return b, err == nil
 }
 

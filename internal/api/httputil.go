@@ -87,6 +87,26 @@ func decodeJSONRequestBody(r io.Reader, dst interface{}, max int64) error {
 	return nil
 }
 
+// decodeJSONMapUseNumber decodes an already-bounded JSON value without turning
+// integer fields into float64. It is used by internal request shapers that must
+// preserve the caller's numeric wire representation while changing one field.
+func decodeJSONMapUseNumber(raw []byte) (map[string]interface{}, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var root map[string]interface{}
+	if err := dec.Decode(&root); err != nil {
+		return nil, err
+	}
+	var extra interface{}
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New("JSON input must contain a single value")
+		}
+		return nil, err
+	}
+	return root, nil
+}
+
 func readUpstreamErrorBody(r io.Reader) []byte {
 	body, _ := io.ReadAll(io.LimitReader(r, upstreamErrorBodyLimit))
 	return body

@@ -217,8 +217,8 @@ func TestOAuthProviderDescriptors(t *testing.T) {
 	if claude.provider != "claude" || claude.clientID != config.DefaultClaudeOAuthClientID {
 		t.Errorf("claude descriptor wrong: %+v", claude)
 	}
-	if claude.tokenURL != "https://api.anthropic.com/v1/oauth/token" {
-		t.Errorf("claude token endpoint = %q, want api.anthropic.com endpoint", claude.tokenURL)
+	if claude.tokenURL != config.DefaultClaudeOAuthTokenURL {
+		t.Errorf("claude token endpoint = %q, want current Claude Code endpoint %q", claude.tokenURL, config.DefaultClaudeOAuthTokenURL)
 	}
 	cq := mustQuery(t, claude.authorizeURL("CHAL", "STATE"))
 	if cq.Get("code") != "true" {
@@ -548,6 +548,7 @@ func stableAntigravityAccountIDForTest(t *testing.T, email string) string {
 
 func TestExchangeClaudeCodeSplitsInlineState(t *testing.T) {
 	var got map[string]string
+	var rawBody string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("method = %s, want POST", r.Method)
@@ -555,7 +556,17 @@ func TestExchangeClaudeCodeSplitsInlineState(t *testing.T) {
 		if ct := r.Header.Get("Content-Type"); ct != "application/json" {
 			t.Errorf("content-type = %q, want application/json", ct)
 		}
+		if accept := r.Header.Get("Accept"); accept != claudeOAuthAccept {
+			t.Errorf("accept = %q, want %q", accept, claudeOAuthAccept)
+		}
+		if ua := r.Header.Get("User-Agent"); ua != claudeOAuthUserAgent {
+			t.Errorf("user-agent = %q, want %q", ua, claudeOAuthUserAgent)
+		}
+		if encoding := r.Header.Get("Accept-Encoding"); encoding != claudeOAuthAcceptEncoding {
+			t.Errorf("accept-encoding = %q, want %q", encoding, claudeOAuthAcceptEncoding)
+		}
 		body, _ := io.ReadAll(r.Body)
+		rawBody = string(body)
 		if err := json.Unmarshal(body, &got); err != nil {
 			t.Errorf("request body is not JSON: %v", err)
 		}
@@ -580,6 +591,10 @@ func TestExchangeClaudeCodeSplitsInlineState(t *testing.T) {
 	}
 	if parsed.AccessToken != "sk-ant-oat-test" || parsed.RefreshToken != "refresh" || parsed.Email != "claude@example.com" {
 		t.Fatalf("parsed auth mismatch: %+v", parsed)
+	}
+	wantRaw := `{"grant_type":"authorization_code","code":"CODE","redirect_uri":"http://localhost:54545/callback","client_id":"client","code_verifier":"VERIFIER","state":"INLINE_STATE"}`
+	if rawBody != wantRaw {
+		t.Fatalf("wire body = %s, want exact Claude order %s", rawBody, wantRaw)
 	}
 	for k, want := range map[string]string{
 		"grant_type":    "authorization_code",

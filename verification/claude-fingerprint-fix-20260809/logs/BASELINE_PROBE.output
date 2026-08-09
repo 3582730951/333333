@@ -1,0 +1,5 @@
+top_keys=context_management,max_tokens,messages,metadata,model,output_config,stream,system,thinking,tools
+top_order_matches_shipping=false
+claude_cli_version=2.1.220
+billing_matches_shipping=false
+claude_ja3_md5=d871d02cecbde59abbf8f4806134addf

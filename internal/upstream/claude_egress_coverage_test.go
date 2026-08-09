@@ -153,8 +153,8 @@ func TestClaudeUpstreamPathsAlwaysPassAHeaderOrder(t *testing.T) {
 				return true
 			}
 			fn, _ := orderCall.Fun.(*ast.Ident)
-			if fn == nil || fn.Name != "claudeHeaderOrder" {
-				t.Errorf("%s: postInProcessOrdered header order does not come from claudeHeaderOrder", fset.Position(call.Pos()))
+			if fn == nil || (fn.Name != "claudeHeaderOrder" && fn.Name != "claudeOAuthHeaderOrder") {
+				t.Errorf("%s: postInProcessOrdered header order does not come from a Claude wire-order helper", fset.Position(call.Pos()))
 			}
 		}
 		return true
