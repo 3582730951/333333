@@ -57,6 +57,7 @@ type codexRequestMetadata struct {
 	sessionID          string
 	threadID           string
 	turnID             string
+	parentTurnID       string
 	windowID           string
 	parentThreadID     string
 	forkedFromThreadID string
@@ -67,6 +68,7 @@ type codexRequestMetadata struct {
 	// HTTP/WebSocket headers. The full value remains in client_metadata.
 	turnMetadataHeader string
 	responsesLite      bool
+	profile            codexProtocolProfile
 	// mappedIdentity marks a CPA-v2 snapshot. In that path hierarchy correlators
 	// must come solely from the persisted mapping; falling back to a derived value
 	// from a raw downstream fork id would create an untracked relationship.
@@ -90,6 +92,7 @@ func (c *Client) newCodexRequestMetadata(spec Request) codexRequestMetadata {
 }
 
 func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, responsesLite bool) codexRequestMetadata {
+	profile := c.codexProtocolProfileForRequest(spec)
 	if snapshot := spec.CodexIdentity; snapshot != nil && strings.TrimSpace(snapshot.SessionID) != "" && strings.TrimSpace(snapshot.ThreadID) != "" {
 		bodyMetadata := requestCodexBodyClientMetadata(spec)
 		incomingTurn := codexIncomingTurnMetadata(spec, bodyMetadata)
@@ -111,6 +114,7 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 			forkedFromThreadID: strings.TrimSpace(snapshot.ForkedFromThreadID),
 			turnState:          strings.TrimSpace(snapshot.TurnState),
 			responsesLite:      responsesLite,
+			profile:            profile,
 			mappedIdentity:     true,
 			subagent: firstNonEmpty(
 				getHeaderFold(spec.Headers, codexSubagentHeader),
@@ -120,8 +124,9 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 		if requestKind == "prewarm" {
 			metadata.turnID = ""
 		}
+		metadata.parentTurnID = codexParentTurnID(spec, bodyMetadata, incomingTurn, metadata.installationID, profile)
 		metadata.turnMetadata = buildCodexTurnMetadata(metadata, incomingTurn, requestKind, startedAt)
-		metadata.turnMetadataHeader = codexTurnMetadataCompatibilityHeader(metadata.turnMetadata)
+		metadata.turnMetadataHeader = codexTurnMetadataCompatibilityHeader(metadata.turnMetadata, profile.codeModeToolNames)
 		return metadata
 	}
 	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
@@ -201,9 +206,11 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 			codexMetadataString(bodyMetadata, "x-codex-turn-state"),
 		),
 		responsesLite: responsesLite,
+		profile:       profile,
 	}
+	metadata.parentTurnID = codexParentTurnID(spec, bodyMetadata, incomingTurn, metadata.installationID, profile)
 	metadata.turnMetadata = buildCodexTurnMetadata(metadata, incomingTurn, requestKind, startedAt)
-	metadata.turnMetadataHeader = codexTurnMetadataCompatibilityHeader(metadata.turnMetadata)
+	metadata.turnMetadataHeader = codexTurnMetadataCompatibilityHeader(metadata.turnMetadata, profile.codeModeToolNames)
 	return metadata
 }
 
@@ -287,6 +294,7 @@ func applyCodexClientMetadataWithFields(raw []byte, fields map[string]json.RawMe
 		"session_id",
 		"thread_id",
 		"turn_id",
+		"parent_turn_id",
 		"window_id",
 		"x-codex-window-id",
 		codexSubagentHeader,
@@ -314,6 +322,7 @@ func applyCodexClientMetadataWithFields(raw []byte, fields map[string]json.RawMe
 	}
 	for _, field := range []struct{ path, value string }{
 		{"turn_id", metadata.turnID},
+		{"parent_turn_id", metadata.parentTurnID},
 		{codexSubagentHeader, metadata.subagent},
 		{"x-codex-parent-thread-id", metadata.parentThreadID},
 		{"x-codex-turn-metadata", metadata.turnMetadata},
@@ -374,6 +383,7 @@ func stripCodexTopLevelTransportCorrelatorsWithFields(raw []byte, fields map[str
 		"conversation_id",
 		"window_id",
 		"parent_thread_id",
+		"parent_turn_id",
 		"forked_from_thread_id",
 		"turn_metadata",
 		"turn_state",
@@ -410,6 +420,7 @@ func buildCodexTurnMetadata(metadata codexRequestMetadata, incoming map[string]i
 		"turn_started_at_unix_ms",
 		"forked_from_thread_id",
 		"parent_thread_id",
+		"parent_turn_id",
 	} {
 		delete(turn, key)
 	}
@@ -430,6 +441,12 @@ func buildCodexTurnMetadata(metadata codexRequestMetadata, incoming map[string]i
 	if metadata.parentThreadID != "" {
 		turn["parent_thread_id"] = metadata.parentThreadID
 	}
+	if metadata.profile.parentTurnID && metadata.parentTurnID != "" {
+		turn["parent_turn_id"] = metadata.parentTurnID
+	}
+	if !metadata.profile.codeModeToolNames {
+		delete(turn, "code_mode_tool_names")
+	}
 	if metadata.forkedFromThreadID != "" {
 		turn["forked_from_thread_id"] = metadata.forkedFromThreadID
 	} else if !metadata.mappedIdentity {
@@ -449,7 +466,7 @@ func buildCodexTurnMetadata(metadata codexRequestMetadata, incoming map[string]i
 // direct header omits the potentially unbounded Code Mode tool-name map. Header
 // JSON is ASCII escaped exactly so workspace labels cannot make net/http reject
 // an otherwise valid request.
-func codexTurnMetadataCompatibilityHeader(full string) string {
+func codexTurnMetadataCompatibilityHeader(full string, omitCodeModeToolNames bool) string {
 	if strings.TrimSpace(full) == "" {
 		return ""
 	}
@@ -457,12 +474,71 @@ func codexTurnMetadataCompatibilityHeader(full string) string {
 	if err := json.Unmarshal([]byte(full), &fields); err != nil {
 		return ""
 	}
-	delete(fields, "code_mode_tool_names")
+	if omitCodeModeToolNames {
+		delete(fields, "code_mode_tool_names")
+	}
 	raw, err := json.Marshal(fields)
 	if err != nil {
 		return ""
 	}
 	return asciiJSON(raw)
+}
+
+func codexParentTurnID(spec Request, bodyMetadata, incomingTurn map[string]interface{}, installationID string, profile codexProtocolProfile) string {
+	if !profile.parentTurnID {
+		return ""
+	}
+	raw := firstNonEmpty(
+		codexMetadataString(bodyMetadata, "parent_turn_id"),
+		codexMapString(incomingTurn, "parent_turn_id"),
+		requestCodexBodyString(spec, "parent_turn_id"),
+	)
+	if raw == "" {
+		return ""
+	}
+	return identity.DerivedUUIDv7(strings.TrimSpace(installationID)+"\x00parent-turn", raw)
+}
+
+func normalizeCodexPromptCacheKeyForProfileWithFields(raw []byte, fields map[string]json.RawMessage, metadata codexRequestMetadata) []byte {
+	if fields == nil {
+		return raw
+	}
+	encoded, present := fields["prompt_cache_key"]
+	if !present {
+		return raw
+	}
+	var current string
+	if json.Unmarshal(encoded, &current) != nil || !looksLikeCodexGeneratedUUID(current) {
+		return raw
+	}
+	replacement := metadata.threadID
+	if metadata.profile.promptCacheKeyBySession {
+		replacement = metadata.sessionID
+	}
+	if strings.TrimSpace(replacement) == "" || replacement == current {
+		return raw
+	}
+	out, err := sjson.SetBytes(raw, "prompt_cache_key", replacement)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+func looksLikeCodexGeneratedUUID(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
+		return false
+	}
+	for i, r := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			continue
+		}
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 func asciiJSON(raw []byte) string {

@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import {
-  Modal, Tabs, TabPane, Form, Input, Select, Button, Typography, Toast, Divider, Tooltip, Tag,
+  Modal, Tabs, TabPane, Form, Input, Textarea, Select, Button, Typography, Toast, Divider, Tooltip, Tag,
 } from './pool/index.jsx';
 import {
   IconCopy, IconTick, IconRefresh, IconLink,
@@ -371,6 +371,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   };
 
   const currentInfo = providerInfo[tab] || providerInfo.chatgpt;
+  const isClaudeOAuth = tab === 'claude';
 
   // Manual import tab content
   const manualTabContent = (
@@ -750,24 +751,42 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
               <br />
               2. 在打开的页面登录您的账号
               <br />
-              3. 登录成功后，复制浏览器地址栏的完整网址
+              {isClaudeOAuth
+                ? '3. 登录后找到 Authentication code / Paste this into Claude Code'
+                : '3. 登录成功后，复制浏览器地址栏的完整网址'}
               <br />
-              4. 粘贴到下方输入框完成授权
+              {isClaudeOAuth
+                ? '4. 复制整段提示、Authentication code，或 platform.claude.com 回调网址到下方'
+                : '4. 粘贴到下方输入框完成授权'}
             </Text>
           </div>
 
           {/* Manual callback input */}
           <div style={{ marginBottom: 16 }}>
             <Text strong style={{ marginBottom: 8, display: 'block' }}>
-              粘贴回调地址
+              {isClaudeOAuth ? '粘贴 Authentication code 或回调地址' : '粘贴回调地址'}
             </Text>
             <div style={{ display: 'flex', gap: 8 }}>
-              <Input
-                placeholder="粘贴登录后的完整网址，或页面显示的 code#state"
-                value={redirected}
-                onChange={setRedirected}
-                style={{ flex: 1 }}
-              />
+              {isClaudeOAuth ? (
+                <div style={{ flex: 1 }}>
+                  <Textarea
+                    aria-label="Claude Authentication code 或回调地址"
+                    placeholder="粘贴 Paste this into Claude Code 后的码、整段提示或完整回调网址"
+                    value={redirected}
+                    onChange={setRedirected}
+                    rows={2}
+                    style={{ width: '100%', minHeight: 58, resize: 'vertical' }}
+                  />
+                </div>
+              ) : (
+                <Input
+                  aria-label="授权回调地址或授权码"
+                  placeholder="粘贴登录后的完整网址，或页面显示的 code#state"
+                  value={redirected}
+                  onChange={setRedirected}
+                  style={{ flex: 1 }}
+                />
+              )}
               <Button
                 type="primary"
                 theme="solid"

@@ -172,7 +172,7 @@ func configFields() []configField {
 			Options: []string{"inprocess", "sidecar"},
 			Help:    "inprocess(默认)=进程内 Go tls-client(uTLS+fhttp)复现分供应商线级指纹（Claude=捕获的 Bun ClientHello，浏览器链路=Chrome_120），无独立进程/本地回环跳/双倍套接字；sidecar=外部 Python curl_cffi 边车兜底。两引擎使用同一供应商指纹；部署后用 /admin/egress-fingerprint-check 校验。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.EgressFingerprintEngine, "inprocess") }},
 		{Key: "codex_cli_version", Label: "Codex CLI 版本覆盖", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
-			Help: "留空=内置默认。覆盖上游 Codex 客户端版本指纹。", boot: func(c config.Config) interface{} { return c.CodexCLIVersionOverride }},
+			Help: "留空=最新 0.147.0；已验证兼容 0.144.6 / 0.145.0 / 0.146.0 / 0.146.1 / 0.147.0。", boot: func(c config.Config) interface{} { return c.CodexCLIVersionOverride }},
 		{Key: "claude_cli_version", Label: "Claude CLI 版本覆盖", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
 			Help: "留空=内置默认。覆盖上游 claude-cli 版本指纹。", boot: func(c config.Config) interface{} { return c.ClaudeCLIVersionOverride }},
 		{Key: "claude_node_version", Label: "Claude Node 版本", Category: catIdentity, Type: fieldString, Effect: effectUpstream,

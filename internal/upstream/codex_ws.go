@@ -429,7 +429,8 @@ func applyCodexWebSocketHeaders(dst http.Header, ids codexWebSocketIDs) {
 	setHeaderPreserveCase(dst, "x-client-request-id", ids.threadID)
 	setHeaderPreserveCase(dst, "x-codex-window-id", ids.windowID)
 	// `version` and `x-codex-beta-features` are installed by applyCodexHeaders and
-	// deliberately survive here; both remain present in the 0.146.0 protocol.
+	// deliberately survive here; both remain present throughout the verified
+	// 0.144.6..0.147.0 compatibility window.
 	if ids.parentThreadID != "" {
 		setHeaderPreserveCase(dst, "x-codex-parent-thread-id", ids.parentThreadID)
 	}

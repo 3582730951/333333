@@ -48,6 +48,7 @@ describe('OAuth authorization link copy', () => {
   beforeEach(() => {
     mocks.get.mockResolvedValue([]);
     mocks.oauthStart.mockResolvedValue({ session_id: 'session-1', auth_url: authURL, expires_in: 900 });
+    mocks.oauthComplete.mockReset();
     mocks.writeClipboard.mockReset();
     mocks.showErrorToast.mockReset();
   });
@@ -101,5 +102,24 @@ describe('OAuth authorization link copy', () => {
     expect(input.value).toBe(authURL);
     fireEvent.click(screen.getByRole('button', { name: '复制授权链接' }));
     await waitFor(() => expect(mocks.writeClipboard).toHaveBeenCalledWith(authURL));
+  });
+
+  it('shows where Claude Authentication code goes and submits the complete copied block', async () => {
+    mocks.oauthComplete.mockResolvedValue({ id: 'claude-account', label: 'Claude OAuth' });
+    renderLoginModal();
+    const claudeTab = screen.getByRole('tab', { name: /Claude/ });
+    fireEvent.mouseDown(claudeTab, { button: 0, ctrlKey: false });
+    await waitFor(() => expect(claudeTab).toHaveAttribute('aria-selected', 'true'));
+    fireEvent.click(screen.getByRole('button', { name: '生成授权链接' }));
+
+    const callback = await screen.findByRole('textbox', { name: 'Claude Authentication code 或回调地址' });
+    const copiedBlock = 'Authentication code\nPaste this into Claude Code: CLAUDE-CODE#CLAUDE-STATE';
+    fireEvent.change(callback, { target: { value: copiedBlock } });
+    expect(screen.getByText(/3\. 登录后找到 Authentication code/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '完成授权' }));
+
+    await waitFor(() => expect(mocks.oauthComplete).toHaveBeenCalledWith(
+      'session-1', copiedBlock, '', '',
+    ));
   });
 });

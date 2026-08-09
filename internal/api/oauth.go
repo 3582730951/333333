@@ -334,15 +334,19 @@ func parseRedirected(raw string) (code, state string) {
 
 // parseOAuthRedirected accepts the callback forms operators can realistically
 // paste from a browser: a URL, a raw query, code#state, a bare code, a quoted or
-// HTML-escaped value, or surrounding browser error text containing the URL.
+// HTML-escaped value, surrounding browser error text containing the URL, or the
+// complete Claude success-page text containing "Paste this into Claude Code:".
 func parseOAuthRedirected(raw string) oauthRedirected {
 	raw = trimOAuthCallbackWrapper(html.UnescapeString(strings.TrimSpace(raw)))
 	if raw == "" {
 		return oauthRedirected{}
 	}
-	candidates := make([]string, 0, 2)
+	candidates := make([]string, 0, 3)
 	if embedded := embeddedOAuthCallbackURL(raw); embedded != "" && embedded != raw {
 		candidates = append(candidates, embedded)
+	}
+	if authenticationCode := embeddedOAuthAuthenticationCode(raw); authenticationCode != "" && authenticationCode != raw {
+		candidates = append(candidates, authenticationCode)
 	}
 	candidates = append(candidates, raw)
 	for _, candidate := range candidates {
@@ -482,6 +486,41 @@ func embeddedOAuthCallbackURL(raw string) string {
 	return strings.TrimRight(tail[:end], ".,;)")
 }
 
+// embeddedOAuthAuthenticationCode extracts the value rendered by Claude's
+// platform.claude.com OAuth success page. Operators commonly copy the whole block:
+//
+//	Authentication code
+//	Paste this into Claude Code: CODE#STATE
+//
+// rather than selecting only CODE#STATE. Keep this label-specific so arbitrary
+// prose is not reinterpreted as a credential. The returned token is fed back into
+// parseOAuthCallbackCandidate, which applies the normal code#state validation.
+func embeddedOAuthAuthenticationCode(raw string) string {
+	lower := strings.ToLower(raw)
+	for _, marker := range []string{"paste this into claude code", "authentication code"} {
+		start := strings.Index(lower, marker)
+		if start < 0 {
+			continue
+		}
+		tail := raw[start+len(marker):]
+		tail = strings.TrimLeftFunc(tail, func(r rune) bool {
+			return unicode.IsSpace(r) || r == ':' || r == '：'
+		})
+		if tail == "" {
+			continue
+		}
+		token := strings.Fields(tail)[0]
+		token = strings.Trim(token, "\"'`<>()[]{}")
+		if token == "" {
+			continue
+		}
+		if parsed, recognized := parseOAuthCallbackCandidate(token); recognized && parsed.Code != "" {
+			return token
+		}
+	}
+	return ""
+}
+
 func oauthCallbackFailure(parsed oauthRedirected) error {
 	code := compactOAuthErrorText(parsed.Error, 100)
 	description := compactOAuthErrorText(parsed.ErrorDescription, 300)
@@ -618,7 +657,7 @@ func (s *Server) adminOAuthComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	redirected := parseOAuthRedirected(req.Redirected)
 	if redirected.Code == "" && redirected.Error == "" && redirected.ErrorDescription == "" {
-		writeError(w, http.StatusBadRequest, errors.New("未能从粘贴内容中解析出授权码（请粘贴登录后地址栏的完整网址，或页面显示的 code）"))
+		writeError(w, http.StatusBadRequest, errors.New("未能从粘贴内容中解析出授权码（请粘贴完整回调网址，或 Claude 页面显示的 Authentication code）"))
 		return
 	}
 	pend, ok := s.oauth.get(req.SessionID)

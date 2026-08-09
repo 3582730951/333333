@@ -2,8 +2,10 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -207,6 +209,29 @@ func TestLoadKeepsNewerCodexClientVersions(t *testing.T) {
 	}
 	if cfg.CodexCLIVersionOverride != "0.199.0" {
 		t.Fatalf("CodexCLIVersionOverride = %q, want preserved newer override", cfg.CodexCLIVersionOverride)
+	}
+}
+
+func TestLoadKeepsFiveSupportedCodexCLIVersions(t *testing.T) {
+	wantVersions := []string{"0.147.0", "0.146.1", "0.146.0", "0.145.0", "0.144.6"}
+	if got := SupportedCodexCLIVersions(); !reflect.DeepEqual(got, wantVersions) {
+		t.Fatalf("SupportedCodexCLIVersions() = %v, want %v", got, wantVersions)
+	}
+	for _, version := range wantVersions {
+		t.Run(version, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			raw := []byte(fmt.Sprintf(`{"codex_cli_version":%q}`, version))
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.CodexCLIVersionOverride != version {
+				t.Fatalf("CodexCLIVersionOverride = %q, want supported %q", cfg.CodexCLIVersionOverride, version)
+			}
+		})
 	}
 }
 

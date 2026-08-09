@@ -3773,16 +3773,21 @@ func (s *Server) recoverWarpExit(ctx context.Context, account storage.Account, e
 }
 
 // solveAndInject asks the solver to clear Cloudflare for the account's upstream host
-// THROUGH the exit's proxy, then persists the cf_clearance via the existing injected-
-// cookie plumbing (DB record + Go jar + sidecar store) and clears the binding cooldown
-// so the account retries with the clearance. cf_clearance is only valid replayed with
-// the same UA + exit IP, which is why the solver UA + exit IP are stored alongside it.
+// THROUGH the exit's proxy. A browser solve alone is not sufficient: FlareSolverr's
+// clearance is UA-bound, while the live request must retain the official Codex/Claude
+// application UA. The cookie is therefore imported under a temporary jar key first
+// and promoted to the live jar/sidecar/DB only after a real application-shaped model
+// probe replays it through the same egress without meeting another CF challenge.
 func (s *Server) solveAndInject(ctx context.Context, account storage.Account, egress storage.EgressProfile) error {
 	token, err := s.store.GetToken(ctx, account.ID)
 	if err != nil {
 		return err
 	}
-	host := s.cfHostForProvider(scheduler.ProviderFromToken(token))
+	provider := strings.TrimSpace(account.Provider)
+	if provider == "" {
+		provider = scheduler.ProviderFromToken(token)
+	}
+	host := s.cfHostForAccount(provider, token)
 	if host == "" {
 		return errors.New("no upstream host for cf solve")
 	}
@@ -3793,25 +3798,121 @@ func (s *Server) solveAndInject(ctx context.Context, account storage.Account, eg
 	}
 	upstreamHost := "https://" + host
 	fallbackKey := account.ID + ":" + egress.ID
-	_ = s.store.UpsertInjectedCookie(ctx, storage.InjectedCookie{
+	verifyKey := fmt.Sprintf("%s:cf-verify:%d", fallbackKey, time.Now().UnixNano())
+	if err := s.importSolvedCookies(ctx, account, egress, upstreamHost, verifyKey, sol.CookieHeader); err != nil {
+		return fmt.Errorf("seed temporary cf clearance: %w", err)
+	}
+	if err := s.verifySolvedClearance(ctx, account, token, egress, provider, verifyKey); err != nil {
+		return fmt.Errorf("verify cf clearance with application profile: %w", err)
+	}
+	if err := s.importSolvedCookies(ctx, account, egress, upstreamHost, fallbackKey, sol.CookieHeader); err != nil {
+		return fmt.Errorf("promote cf clearance: %w", err)
+	}
+	if err := s.store.UpsertInjectedCookie(ctx, storage.InjectedCookie{
 		AccountID:    account.ID,
 		EgressID:     egress.ID,
 		UpstreamHost: upstreamHost,
 		CookieHeader: sol.CookieHeader,
 		UserAgent:    sol.UserAgent,
 		ExitIP:       egress.ExitIP,
-	})
-	_ = s.upstream.ImportCookies(account.ID, egress.ID, upstreamHost, fallbackKey, sol.CookieHeader)
+	}); err != nil {
+		return fmt.Errorf("persist verified cf clearance: %w", err)
+	}
+	if err := s.store.SetBindingCooldown(ctx, account.ID, 0); err != nil {
+		return fmt.Errorf("clear binding cooldown: %w", err)
+	}
+	log.Printf("warp: cf clearance replay verified exit=%s account=%s solver_version=%s mode=%s attempt=%d status=%d", egress.ID, account.ID, sol.SolverVersion, sol.Mode, sol.Attempt, sol.StatusCode)
+	if s.scheduler != nil {
+		s.scheduler.NotifyStateChanged()
+	}
+	return nil
+}
+
+func (s *Server) importSolvedCookies(ctx context.Context, account storage.Account, egress storage.EgressProfile, upstreamHost, fallbackKey, cookieHeader string) error {
+	if s.upstream == nil {
+		return errors.New("upstream client is unavailable")
+	}
+	if err := s.upstream.ImportCookies(account.ID, egress.ID, upstreamHost, fallbackKey, cookieHeader); err != nil {
+		return err
+	}
 	sidecarEndpoint := strings.TrimSpace(s.cfg.DefaultSidecarEndpoint)
 	if storage.IsSidecarEgress(egress) {
 		sidecarEndpoint = strings.TrimSpace(egress.Endpoint)
 	}
 	if sc := sidecarEndpoint; sc != "" {
-		_ = s.upstream.SeedSidecarCookies(ctx, sc, account.ID, egress.ID, upstreamHost, fallbackKey, upstream.CookieMapFromHeader(sol.CookieHeader))
+		if err := s.upstream.SeedSidecarCookies(ctx, sc, account.ID, egress.ID, upstreamHost, fallbackKey, upstream.CookieMapFromHeader(cookieHeader)); err != nil {
+			return err
+		}
 	}
-	_ = s.store.SetBindingCooldown(ctx, account.ID, 0)
-	s.scheduler.NotifyStateChanged()
 	return nil
+}
+
+func (s *Server) verifySolvedClearance(ctx context.Context, account storage.Account, token storage.AccountToken, egress storage.EgressProfile, provider, cookieJarKey string) error {
+	if s.upstream == nil {
+		return errors.New("upstream client is unavailable")
+	}
+	versions := []string{s.cfg.ClientVersion}
+	path := capability.ProbePath(s.cfg.ClientVersion)
+	requestProvider := ""
+	if provider == "claude" {
+		path = "/v1/models"
+		versions = []string{""}
+		requestProvider = "claude"
+	} else if upstream.AccountUsesAPIKey(token) {
+		path = "/v1/models"
+		versions = []string{""}
+	} else {
+		// A promoted jar is shared by the account+egress+host, while the live Codex
+		// profile follows any of the supported downstream versions. Prove that the
+		// clearance survives every UA/version tuple before making it global; one
+		// successful latest-version probe is not evidence for a 0.144.6 client.
+		versions = config.SupportedCodexCLIVersions()
+	}
+	for _, clientVersion := range versions {
+		probePath := path
+		if provider == "codex" && !upstream.AccountUsesAPIKey(token) {
+			probePath = capability.ProbePath(clientVersion)
+		}
+		resp, err := s.upstream.Do(ctx, upstream.Request{
+			Method:             http.MethodGet,
+			Provider:           requestProvider,
+			DownstreamPath:     probePath,
+			Headers:            http.Header{},
+			Account:            account,
+			Token:              token,
+			Egress:             egress,
+			CookieJarKey:       cookieJarKey,
+			CodexClientVersion: clientVersion,
+		})
+		if err != nil {
+			return err
+		}
+		body, err := upstream.DrainAndClose(resp.Body)
+		if err != nil {
+			return err
+		}
+		if detection := cf.Detect(resp.StatusCode, resp.Header, body); detection.Matched {
+			return fmt.Errorf("application replay remained challenged (version=%s status=%d category=%s)", firstNonEmpty(clientVersion, "provider-default"), resp.StatusCode, detection.Category)
+		}
+	}
+	// A non-CF 4xx still proves that the request crossed the edge and reached the
+	// application/auth layer. The account's normal auth handling owns that result;
+	// this probe only decides whether the clearance is safe to promote.
+	return nil
+}
+
+func (s *Server) cfHostForAccount(provider string, token storage.AccountToken) string {
+	if provider != "codex" && provider != "claude" {
+		return ""
+	}
+	if provider == "codex" && upstream.AccountUsesAPIKey(token) {
+		base := firstNonEmpty(s.cfg.OpenAIAPIUpstreamBaseURL, config.DefaultOpenAIAPIUpstreamBaseURL)
+		if u, err := url.Parse(base); err == nil && u.Host != "" {
+			return u.Host
+		}
+		return ""
+	}
+	return s.cfHostForProvider(provider)
 }
 
 // cfHostForProvider returns the upstream host whose Cloudflare wall a provider sits

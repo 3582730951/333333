@@ -190,6 +190,17 @@ func normalizeCodexSource(client *Client, spec *Request, upstreamBaseURL string,
 		}
 		metadata := client.newCodexRequestMetadataWithResponsesLite(*spec, responsesLite)
 		spec.codexMetadata = &metadata
+		if looksLikeCodexGeneratedUUID(meta.PromptCacheKey) {
+			promptCacheKey := metadata.threadID
+			if metadata.profile.promptCacheKeyBySession {
+				promptCacheKey = metadata.sessionID
+			}
+			encoded, marshalErr := json.Marshal(promptCacheKey)
+			if marshalErr != nil {
+				return false, marshalErr
+			}
+			patches = append(patches, bodysource.JSONFieldPatch{Name: "prompt_cache_key", Value: encoded})
+		}
 		if !compact {
 			clientMetadata, ok, err := codexClientMetadataSourceValue(*spec, metadata)
 			if err != nil {
@@ -209,7 +220,7 @@ func normalizeCodexSource(client *Client, spec *Request, upstreamBaseURL string,
 			patches = append(patches, bodysource.JSONFieldPatch{Name: "generate", Delete: true})
 		}
 	}
-	for _, name := range []string{"thread_id", "session_id", "conversation_id", "window_id", "parent_thread_id", "forked_from_thread_id", "turn_metadata", "turn_state"} {
+	for _, name := range []string{"thread_id", "session_id", "conversation_id", "window_id", "parent_thread_id", "parent_turn_id", "forked_from_thread_id", "turn_metadata", "turn_state"} {
 		if _, present := meta.Fields[name]; present {
 			patches = append(patches, bodysource.JSONFieldPatch{Name: name, Delete: true})
 		}
@@ -342,7 +353,7 @@ func codexClientMetadataSourceValue(spec Request, metadata codexRequestMetadata)
 		out = bytes.TrimSpace(raw)
 	}
 	var err error
-	for _, key := range []string{"installation_id", codexInstallationIDMetadataKey, "session_id", "thread_id", "turn_id", "window_id", "x-codex-window-id", codexSubagentHeader, "parent_thread_id", "x-codex-parent-thread-id", "forked_from_thread_id", "x-codex-turn-metadata", "x-codex-turn-state", codexWSResponsesLiteMetadata, codexWSRequestStartMetadata} {
+	for _, key := range []string{"installation_id", codexInstallationIDMetadataKey, "session_id", "thread_id", "turn_id", "parent_turn_id", "window_id", "x-codex-window-id", codexSubagentHeader, "parent_thread_id", "x-codex-parent-thread-id", "forked_from_thread_id", "x-codex-turn-metadata", "x-codex-turn-state", codexWSResponsesLiteMetadata, codexWSRequestStartMetadata} {
 		out, err = sjson.DeleteBytes(out, key)
 		if err != nil {
 			return nil, false, nil
@@ -354,7 +365,7 @@ func codexClientMetadataSourceValue(spec Request, metadata codexRequestMetadata)
 			return nil, false, nil
 		}
 	}
-	for _, field := range []struct{ path, value string }{{"turn_id", metadata.turnID}, {codexSubagentHeader, metadata.subagent}, {"x-codex-parent-thread-id", metadata.parentThreadID}, {"x-codex-turn-metadata", metadata.turnMetadata}} {
+	for _, field := range []struct{ path, value string }{{"turn_id", metadata.turnID}, {"parent_turn_id", metadata.parentTurnID}, {codexSubagentHeader, metadata.subagent}, {"x-codex-parent-thread-id", metadata.parentThreadID}, {"x-codex-turn-metadata", metadata.turnMetadata}} {
 		if field.value == "" {
 			continue
 		}

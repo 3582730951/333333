@@ -400,6 +400,90 @@ func TestCodexVersionHeaderMatchesUA(t *testing.T) {
 	}
 }
 
+func TestCodexFiveVersionCompatibility(t *testing.T) {
+	c, _ := fixedSecretClient(t, config.Default())
+	for _, version := range config.SupportedCodexCLIVersions() {
+		t.Run(version, func(t *testing.T) {
+			downstream := http.Header{}
+			downstream.Set("version", version)
+			downstream.Set("User-Agent", "codex_cli_rs/"+version+" (Linux 6.8.0; x86_64) unknown")
+			headers := http.Header{}
+			if err := c.applyCodexHeaders(headers, Request{
+				DownstreamPath: "/v1/responses",
+				Account:        storage.Account{ID: "acc-five-" + version},
+				Token:          storage.AccountToken{AccessToken: "oauth-access-token"},
+				Headers:        downstream,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if got := getHeaderFold(headers, "version"); got != version {
+				t.Fatalf("version header = %q, want %q", got, version)
+			}
+			if ua := headers.Get("User-Agent"); !strings.HasPrefix(ua, "codex_cli_rs/"+version+" ") {
+				t.Fatalf("User-Agent = %q, want coherent %s prefix", ua, version)
+			}
+		})
+	}
+}
+
+func TestCodexRejectsMismatchedVersionPair(t *testing.T) {
+	cfg := config.Default()
+	cfg.CodexCLIVersionOverride = "0.146.1"
+	c, _ := fixedSecretClient(t, cfg)
+	downstream := http.Header{}
+	downstream.Set("version", "0.147.0")
+	downstream.Set("User-Agent", "codex_cli_rs/0.146.0 (Linux 6.8.0; x86_64) unknown")
+	headers := http.Header{}
+	if err := c.applyCodexHeaders(headers, Request{
+		DownstreamPath: "/v1/responses",
+		Account:        storage.Account{ID: "acc-mismatch"},
+		Token:          storage.AccountToken{AccessToken: "oauth-access-token"},
+		Headers:        downstream,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getHeaderFold(headers, "version"); got != "0.146.1" {
+		t.Fatalf("mismatched downstream pair selected version %q, want configured fallback", got)
+	}
+	if ua := headers.Get("User-Agent"); !strings.Contains(ua, "/0.146.1 ") {
+		t.Fatalf("mismatched downstream pair produced incoherent UA %q", ua)
+	}
+}
+
+func TestCodexDropsRelayAndBrowserHeaderNoise(t *testing.T) {
+	c, _ := fixedSecretClient(t, config.Default())
+	downstream := http.Header{}
+	for name, value := range map[string]string{
+		"Forwarded":         "for=198.51.100.8;proto=https",
+		"Via":               "1.1 pool-relay",
+		"X-Forwarded-For":   "198.51.100.8",
+		"X-Forwarded-Host":  "relay.example",
+		"X-Real-IP":         "198.51.100.8",
+		"X-Pool-Account-ID": "internal-account",
+		"X-Sidecar-Meta":    "internal-envelope",
+		"Sec-CH-UA":         `"Chromium";v="120"`,
+		"Sec-Fetch-Site":    "same-origin",
+		"Accept-Language":   "en-US,en;q=0.9",
+		"Cookie":            "relay_session=secret",
+	} {
+		downstream.Set(name, value)
+	}
+	headers := http.Header{}
+	if err := c.applyCodexHeaders(headers, Request{
+		DownstreamPath: "/v1/responses",
+		Account:        storage.Account{ID: "acc-no-relay-noise"},
+		Token:          storage.AccountToken{AccessToken: "oauth-access-token"},
+		Headers:        downstream,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for name := range downstream {
+		if got := getHeaderFold(headers, name); got != "" {
+			t.Errorf("relay/browser header %s survived as %q", name, got)
+		}
+	}
+}
+
 // TestCodexClientVersionOverrideCoherent locks in the model-probe fix: a per-request
 // CodexClientVersion override drives the UA (and the `?client_version=` query the probe
 // sends), so the newest models are not version-gated away. The override must win over

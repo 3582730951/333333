@@ -211,6 +211,11 @@ type Request struct {
 	// discovery and version-gated live models use the current client version; empty
 	// keeps the normal per-account/default version. Has no effect on API-key traffic.
 	CodexClientVersion string
+	// codexResolvedClientVersion freezes the effective downstream/config/model
+	// version at the request choke point. Every application fingerprint projection
+	// consumes this value so headers and body metadata cannot select different
+	// protocol releases during one request.
+	codexResolvedClientVersion string
 	// CodexResponsesWebSocket sends a Codex Responses turn over the official
 	// responses WebSocket beta transport, returning the upstream events as an SSE
 	// body to the gateway. It is intended for streaming /v1/responses turns only.
@@ -510,6 +515,7 @@ func (c *Client) Do(ctx context.Context, req Request) (resp *Response, err error
 	if IsCustomProvider(req.Provider) {
 		return c.doOpenAICompatible(ctx, req)
 	}
+	req.codexResolvedClientVersion = c.resolveCodexClientVersion(req)
 	// Codex /responses: normalize the two fields the WHAM backend hard-validates so
 	// every transport (WS/sidecar/HTTP) sends the real-client shape. (1) "instructions"
 	// must be a non-empty string — else 400 {"detail":"Instructions are required"}; the
@@ -569,6 +575,7 @@ func (c *Client) Do(ctx context.Context, req Request) (resp *Response, err error
 			setRequestBody(&req, stripCodexResponsesMaxOutputTokensWithFields(req.bodyBytes, codexFields))
 			metadata := c.newCodexRequestMetadataWithResponsesLite(req, responsesLite)
 			req.codexMetadata = &metadata
+			setRequestBody(&req, normalizeCodexPromptCacheKeyForProfileWithFields(req.bodyBytes, codexFields, metadata))
 			// ApiCompactionInput projects the same identity through headers; only
 			// normal Responses turns serialize client_metadata in the request body.
 			if !isCompact {
@@ -810,10 +817,13 @@ func (c *Client) doSidecar(ctx context.Context, spec Request) (*Response, error)
 	if !AccountUsesAPIKey(spec.Token) {
 		ja3 = resolveCodexJA3(c.cfgSnapshot().CodexJA3Override)
 	}
-	// Preserve the historical browser-shaped defaults for ChatGPT OAuth. Platform
-	// API keys are ordinary SDK traffic, so their complete header set must not be
-	// mixed with injected sec-ch-ua/sec-fetch browser headers.
-	defaultHeaders := !AccountUsesAPIKey(spec.Token)
+	// applyCodexHeaders already constructs the complete Codex application header
+	// set. The official reqwest client does not add browser-only sec-ch-ua,
+	// sec-fetch-*, accept-language, or upgrade-insecure-requests fields. Letting
+	// curl-impersonate inject them next to codex_cli_rs/<version> exposes a hybrid
+	// browser/CLI shape, so suppress browser defaults for OAuth and API-key paths.
+	// TLS/HTTP2 profile selection is independent from this switch.
+	defaultHeaders := false
 	// In-process fingerprint engine: route through tls-client (Chrome_120, matching the
 	// sidecar's chrome120 default) instead of the external Python process. The sidecar
 	// remains the fallback whenever the engine is left on "sidecar".
@@ -1440,12 +1450,7 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) error {
 	// interactive CLI when the downstream sent nothing recognizable.
 	threadOriginator := codexThreadOriginator(spec.Headers)
 	processOriginator := codexProcessOriginator(spec.Headers, threadOriginator)
-	version := c.cfgSnapshot().CodexCLIVersionOrDefault(id.CodexCLIVersion)
-	// A per-request override (model-discovery probe or version-gated live model) wins,
-	// so the UA/`version` header agree with the client version required upstream.
-	if v := strings.TrimSpace(spec.CodexClientVersion); v != "" {
-		version = v
-	}
+	version := c.codexClientVersionForRequest(spec)
 	if dst.Get("User-Agent") == "" {
 		dst.Set("User-Agent", id.CodexUserAgentForOriginator(processOriginator, version))
 	}
@@ -1550,6 +1555,38 @@ func codexUserAgentOriginator(value string) string {
 		return ""
 	}
 	return strings.TrimSpace(value[:slash])
+}
+
+func codexUserAgentVersion(value string) string {
+	value = strings.TrimSpace(value)
+	slash := strings.IndexByte(value, '/')
+	if slash < 0 || slash+1 >= len(value) {
+		return ""
+	}
+	version := value[slash+1:]
+	if end := strings.IndexAny(version, " \t("); end >= 0 {
+		version = version[:end]
+	}
+	return strings.TrimSpace(version)
+}
+
+// codexSupportedClientVersion resolves the downstream's application version only
+// inside the five-release compatibility window. If both official version-bearing
+// fields are present they must agree; a mismatched pair is discarded rather than
+// synthesizing another impossible fingerprint.
+func codexSupportedClientVersion(h http.Header) string {
+	headerVersion := strings.TrimSpace(getHeaderFold(h, "version"))
+	if !config.IsSupportedCodexCLIVersion(headerVersion) {
+		headerVersion = ""
+	}
+	userAgentVersion := codexUserAgentVersion(getHeaderFold(h, "User-Agent"))
+	if !config.IsSupportedCodexCLIVersion(userAgentVersion) {
+		userAgentVersion = ""
+	}
+	if headerVersion != "" && userAgentVersion != "" && headerVersion != userAgentVersion {
+		return ""
+	}
+	return firstNonEmpty(headerVersion, userAgentVersion)
 }
 
 func isRecognizedCodexOriginator(value string) bool {
@@ -1807,9 +1844,29 @@ func sidecarCookieKey(accountID, egressID, target, fallback string) string {
 }
 
 func (c *Client) cookieJarFor(spec Request) *cookiejar.Jar {
-	target := ComputeURL(c.codexBaseURL(spec), spec.DownstreamPath)
+	target := c.cookieTargetForRequest(spec)
 	key := sidecarCookieKey(spec.Account.ID, spec.Egress.ID, target, spec.CookieJarKey)
 	return c.cookieJarForKey(key)
+}
+
+// cookieTargetForRequest keeps the direct/proxy cookie-jar namespace aligned
+// with the URL actually dialed. The old implementation always derived this key
+// from the Codex base URL, so a Claude cf_clearance imported for
+// api.anthropic.com was silently looked up under chatgpt.com and never replayed.
+// Sidecar requests already key from their concrete target; this makes the
+// in-process/stdlib path use the same account+egress+host contract.
+func (c *Client) cookieTargetForRequest(spec Request) string {
+	if spec.Provider == "claude" {
+		path := spec.DownstreamPath
+		if path == "" {
+			path = "/v1/messages"
+		}
+		return strings.TrimRight(claudeBaseURL(c.cfg), "/") + "/" + strings.TrimLeft(path, "/")
+	}
+	if IsCustomProvider(spec.Provider) && strings.TrimSpace(spec.BaseURL) != "" {
+		return ComputeURL(spec.BaseURL, spec.DownstreamPath)
+	}
+	return ComputeURL(c.codexBaseURL(spec), spec.DownstreamPath)
 }
 
 // codexBaseURL keeps ChatGPT OAuth/access-token traffic on the WHAM backend while

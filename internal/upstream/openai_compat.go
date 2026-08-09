@@ -147,9 +147,11 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 		}
 	}
 
-	// Non-Claude sidecar egress keeps the browser profile used by generic custom
-	// providers and may chain through a proxy/WARP exit. Claude-shaped calls have
-	// already returned through the provider-coherent branch above.
+	// Non-Claude sidecar egress keeps the transport profile used by generic custom
+	// providers and may chain through a proxy/WARP exit. A custom provider explicitly
+	// using the Codex CLI profile already has a complete CLI application header set,
+	// so it must suppress curl's browser headers just like the built-in Codex path.
+	// Claude-shaped calls have already returned through the provider-coherent branch.
 	if spec.Egress.Type == "curl_cffi_sidecar" && !claudeTransport {
 		built.Del("Accept-Encoding")
 		timeout := c.cfg.RequestTimeout()
@@ -158,7 +160,8 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 		}
 		sidecarSpec := spec
 		sidecarSpec.Method = method
-		return c.postViaSidecarOrdered(ctx, sidecarSpec, target, built, timeout, "", true, nil)
+		defaultHeaders := spec.TransportProfile != storage.CustomProviderTransportCodexCLI
+		return c.postViaSidecarOrdered(ctx, sidecarSpec, target, built, timeout, "", defaultHeaders, nil)
 	}
 
 	ctx, guard := newRequestGuard(ctx, c.cfg.RequestTimeout())
@@ -202,10 +205,7 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 func (c *Client) applyOpenAICompatCodexIdentity(dst http.Header, spec Request) {
 	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
 	originator := codexThreadOriginator(spec.Headers)
-	version := c.cfgSnapshot().CodexCLIVersionOrDefault(id.CodexCLIVersion)
-	if value := strings.TrimSpace(spec.CodexClientVersion); value != "" {
-		version = value
-	}
+	version := c.codexClientVersionForRequest(spec)
 	dst.Set("User-Agent", id.CodexUserAgentForOriginator(originator, version))
 	setHeaderPreserveCase(dst, "Originator", originator)
 	setHeaderPreserveCase(dst, "version", version)

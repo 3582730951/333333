@@ -28,9 +28,9 @@ type sidecarCapture struct {
 	headerOrder    []string
 	httpVersion    string
 	// defaultHeaders mirrors the meta's "default_headers" field: nil = absent (sidecar
-	// keeps curl's browser defaults), non-nil = the caller pinned it. The Claude path
-	// pins it false to stop curl-impersonate injecting sec-ch-ua/sec-fetch browser headers
-	// on top of the native claude-cli/Bun identity.
+	// keeps curl's browser defaults), non-nil = the caller pinned it. Native CLI/SDK
+	// paths pin it false to stop curl-impersonate injecting sec-ch-ua/sec-fetch browser
+	// headers on top of their complete application identity.
 	defaultHeaders *bool
 	hit            bool
 }
@@ -501,11 +501,10 @@ func TestClaudeSidecarSuppressesBrowserDefaultHeaders(t *testing.T) {
 	}
 }
 
-// TestCodexOAuthSidecarKeepsBrowserDefaultHeaders guards the deliberate asymmetry: a
-// ChatGPT-OAuth Codex account behind Cloudflare KEEPS curl's browser defaults (no
-// default_headers pin in the meta), because chatgpt.com's CF edge is validated against
-// the Chrome-shaped request. Only Claude (no CF wall) and API-key SDK traffic suppress.
-func TestCodexOAuthSidecarKeepsBrowserDefaultHeaders(t *testing.T) {
+// TestCodexOAuthSidecarSuppressesBrowserDefaultHeaders locks the relay-leak fix:
+// curl may still supply the selected TLS/HTTP2 transport profile, but it must not
+// add browser application headers beside a codex_cli_rs User-Agent.
+func TestCodexOAuthSidecarSuppressesBrowserDefaultHeaders(t *testing.T) {
 	var cap sidecarCapture
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
@@ -524,7 +523,7 @@ func TestCodexOAuthSidecarKeepsBrowserDefaultHeaders(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if cap.defaultHeaders != nil {
-		t.Fatalf("Codex OAuth (CF-walled) must keep curl browser defaults; meta pinned default_headers=%v", *cap.defaultHeaders)
+	if cap.defaultHeaders == nil || *cap.defaultHeaders {
+		t.Fatalf("Codex OAuth must pin default_headers=false, got %v", cap.defaultHeaders)
 	}
 }

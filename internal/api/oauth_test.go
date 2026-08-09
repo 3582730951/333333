@@ -50,6 +50,7 @@ func TestParseRedirected(t *testing.T) {
 	}{
 		{"openai localhost redirect", "http://localhost:1455/auth/callback?code=ABC&state=XYZ", "ABC", "XYZ"},
 		{"anthropic console redirect", "https://console.anthropic.com/oauth/code/callback?code=ABC&state=XYZ", "ABC", "XYZ"},
+		{"claude platform redirect", "https://platform.claude.com/oauth/code/callback?code=PLATFORM-CODE%23PLATFORM-STATE", "PLATFORM-CODE", "PLATFORM-STATE"},
 		{"claude localhost redirect", "http://localhost:54545/callback?code=ABC&state=XYZ", "ABC", "XYZ"},
 		{"url fragment plain state", "http://localhost:54545/callback?code=ABC#XYZ", "ABC", "XYZ"},
 		{"url fragment params", "http://localhost:54545/callback#code=ABC&state=XYZ", "ABC", "XYZ"},
@@ -66,6 +67,8 @@ func TestParseRedirected(t *testing.T) {
 		{"html escaped callback", "http://localhost:51121/oauth-callback?code=ABC&amp;state=XYZ", "ABC", "XYZ"},
 		{"localhost without scheme", "localhost:51121/oauth-callback?code=ABC&state=XYZ", "ABC", "XYZ"},
 		{"browser error page text", "This site cannot be reached\nhttp://localhost:51121/oauth-callback?code=ABC&state=XYZ\nERR_CONNECTION_REFUSED", "ABC", "XYZ"},
+		{"claude authentication code page", "Authentication code\nPaste this into Claude Code:\nCLAUDE-CODE#CLAUDE-STATE\nYou can close this window.", "CLAUDE-CODE", "CLAUDE-STATE"},
+		{"claude authentication code single line", "Paste this into Claude Code: CLAUDE-CODE-ONLY", "CLAUDE-CODE-ONLY", ""},
 		{"unparseable prose", "This is not an OAuth callback", "", ""},
 		{"empty", "", "", ""},
 	}

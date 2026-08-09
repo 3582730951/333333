@@ -27,16 +27,17 @@ import (
 	"sync"
 	"time"
 
+	"codex-account-pool/internal/config"
 	"github.com/google/uuid"
 )
 
 // Current official client versions. Kept here so a single edit updates the
 // fingerprint everywhere. These should track the real shipping clients.
 // Refreshed 2026-08-09 from the shipping Claude Code 2.1.226 binary and the
-// official Codex rust-v0.146.1 source/release. Claude's shipping tuple remains
+// official Codex rust-v0.147.0 source/release. Claude's shipping tuple remains
 // Node v26.3.0 with Stainless package 0.94.0.
 const (
-	CodexCLIVersion  = "0.146.1"
+	CodexCLIVersion  = config.DefaultClientVersion
 	ClaudeCLIVersion = "2.1.226"
 	// ClaudeCodeBuild is the fourth cc_version component embedded in the
 	// shipping 2.1.226 native binary. The current Bun build emits the fixed

@@ -93,6 +93,36 @@ done
 }
 ```
 
+**升级 CF 求解器（已对齐 FlareSolverr v3.5.0）：**
+
+v3.5.0 包含新的 Turnstile 处理修复。本项目现在优先使用
+`sessions.create → request.get → sessions.destroy`，把代理（含账号密码）、浏览器实例、
+cookie 和出口固定在同一会话中；旧的 FlareSolverr-compatible 实现不支持 session 时会自动
+退回 stateless `request.get`。推荐固定版本标签，不使用漂移的 `latest`：
+
+```bash
+# Docker Compose 部署
+docker compose pull flaresolverr
+docker compose up -d --no-deps flaresolverr
+
+# Docker CLI 部署（首次安装或按原参数重建）
+docker pull ghcr.io/flaresolverr/flaresolverr:v3.5.0
+docker rm -f flaresolverr 2>/dev/null || true
+docker run -d --name flaresolverr \
+  -p 127.0.0.1:8191:8191 \
+  -e LOG_LEVEL=info \
+  --restart unless-stopped \
+  ghcr.io/flaresolverr/flaresolverr:v3.5.0
+
+# 健康检查；服务只绑定本机，pool 使用 http://127.0.0.1:8191
+curl -fsS http://127.0.0.1:8191/health
+```
+
+浏览器拿到 `cf_clearance` 后，pool 会先用临时 jar 在**同一出口**发送真实
+Codex/Claude 应用指纹的模型探测（Codex 会覆盖全部五个兼容版本）。只有这些探测确认不再是 CF challenge，cookie 才会进入
+正式 jar/sidecar/数据库并清 cooldown；浏览器 UA 与 CLI UA 不可复用时会继续执行 WARP
+换 IP，避免把浏览器 UA 混进 Codex/Claude 请求。
+
 **手动操作（无 install.sh）：**
 ```bash
 # 预置 8 个出口（需出网到 Cloudflare 注册 WARP）

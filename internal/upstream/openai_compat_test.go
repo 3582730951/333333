@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"codex-account-pool/internal/identity"
@@ -34,5 +35,33 @@ func TestIsCustomProviderExcludesBuiltIns(t *testing.T) {
 	}
 	if !IsCustomProvider("openrouter") {
 		t.Fatal("real custom provider was not classified as custom")
+	}
+}
+
+func TestCustomCodexCLISidecarSuppressesBrowserDefaultHeaders(t *testing.T) {
+	var capture sidecarCapture
+	sidecar := newFakeSidecar(t, &capture)
+	defer sidecar.Close()
+
+	client := NewClient(sidecarEngineConfig())
+	response, err := client.Do(nilContext(t), Request{
+		Provider:         "custom-codex",
+		BaseURL:          "https://custom-codex.example/v1",
+		TransportProfile: storage.CustomProviderTransportCodexCLI,
+		DownstreamPath:   "/responses",
+		Body:             testBody([]byte(`{"model":"gpt","stream":true}`)),
+		Account:          storage.Account{ID: "acc-custom-codex", Provider: "custom-codex"},
+		Token:            storage.AccountToken{OpenAIAPIKey: "custom-provider-key"},
+		Egress:           storage.EgressProfile{ID: "sidecar", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if capture.defaultHeaders == nil || *capture.defaultHeaders {
+		t.Fatalf("custom Codex CLI sidecar must pin default_headers=false, got %v", capture.defaultHeaders)
+	}
+	if ua := capture.headers.Get("User-Agent"); !strings.HasPrefix(ua, "codex_cli_rs/") {
+		t.Fatalf("custom Codex CLI User-Agent = %q", ua)
 	}
 }

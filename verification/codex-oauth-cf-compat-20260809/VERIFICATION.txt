@@ -1,0 +1,92 @@
+CHANGED_BRANCH_FIELD=cache-hit-optimization / oauth.redirected + Request.codexResolvedClientVersion/codexProtocolProfile + cfsolve session/replay_promotion_gate
+
+ORIGINAL
+commit=b4863db70c24ddf113bc004448c91ad55b796cc9
+tree=97caa7525bd56915504b622382678b8d04e530cb
+remote_commit_time=2026-08-09T21:44:04+08:00
+example_zip_sha256=33cc82c6085b7be71a45719f79a3c4ad188e3a787fee06a3d679092887fc2d6d
+
+MODIFIED_PAYLOAD
+index_tree=78fa1cff894690ef23d70cde72f4ef64ee2d0515
+modified_file_sha256=3eed679c602bc3169e9eb6ee3236ac0ac647ffaaf4be3d1fa6f8af100b6a279c
+diff_file_sha256=b27619b85deee51057df6a22856e16bfa4f5609bd88d9ac1d2bc3b9b8a092533
+modified_file_entries=79
+diff_lines=3370
+state=MODIFIED_FILE contains the changed payload; /workspace remains on the changed implementation.
+
+FOUR_ARTIFACT_PATHS
+MODIFIED_FILE=/workspace/verification/codex-oauth-cf-compat-20260809/MODIFIED_FILE
+DIFF_FILE=/workspace/verification/codex-oauth-cf-compat-20260809/DIFF_FILE
+VERIFICATION=/workspace/verification/codex-oauth-cf-compat-20260809/VERIFICATION.txt
+ROLLBACK=/workspace/verification/codex-oauth-cf-compat-20260809/ROLLBACK.sh
+
+BASELINE
+command=cd /tmp/codex-oauth-cf-rollback-copy && /usr/local/go1.25.12/bin/go test -count=1 ./internal/api -run "Test(ParseRedirected|ParseOAuthRedirectedPreservesAuthorizationError)$" && /usr/local/go1.25.12/bin/go test -count=1 ./internal/upstream -run "Test(CodexOAuthSidecarKeepsBrowserDefaultHeaders|CodexVersionHeaderMatchesUA|CodexClientVersionOverrideCoherent|CodexBetaAndSemanticHeadersAreValidatedAndMerged)$"
+input=rolled-back copy at HEAD b4863db70c24ddf113bc004448c91ad55b796cc9, tree 97caa7525bd56915504b622382678b8d04e530cb
+literal_output:
+ok  	codex-account-pool/internal/api	0.132s
+ok  	codex-account-pool/internal/upstream	0.032s
+EXIT_STATUS=0
+exit_status=0
+result=original OAuth parsing and original Codex sidecar/version behavior pass their baseline regression set.
+
+MODIFIED
+command=cd /workspace && /usr/local/go1.25.12/bin/go test -count=1 ./internal/api ./internal/upstream ./internal/identity ./internal/config ./internal/cf ./internal/cfsolve
+input=changed payload tree 78fa1cff894690ef23d70cde72f4ef64ee2d0515; Claude callback/code fixtures; Codex 0.144.6/0.145.0/0.146.0/0.146.1/0.147.0 header+body fixtures; FlareSolverr v3 session/stateless/challenge fixtures
+literal_output:
+ok  	codex-account-pool/internal/api	195.194s
+ok  	codex-account-pool/internal/upstream	5.169s
+ok  	codex-account-pool/internal/identity	0.021s
+ok  	codex-account-pool/internal/config	0.028s
+ok  	codex-account-pool/internal/cf	0.119s
+ok  	codex-account-pool/internal/cfsolve	0.105s
+EXIT_STATUS=0
+exit_status=0
+result=OAuth complete-page parsing, frozen downstream Codex profiles on byte/source/WS paths, header suppression, CF v3 sessions, fresh-browser retry, and five-version application replay promotion all pass.
+
+MODIFIED_COPY_APPLY
+command=git -C /tmp/codex-oauth-cf-rollback-copy apply --index --binary /workspace/verification/codex-oauth-cf-compat-20260809/DIFF_FILE && /usr/local/go1.25.12/bin/go test -count=1 ./internal/cfsolve ./internal/upstream ./internal/api -run "Test(SolveUsesV3SessionAndParsesClearance|CodexFiveVersionsDriveHeadersAndBodyProfile|CodexSourcePathUsesFrozenVersionProfile|SolveAndInjectPromotesOnlyAfterApplicationReplay)$"
+input=independent bundle clone of original HEAD plus DIFF_FILE
+literal_output:
+PATCH_APPLY_RESULT=applied
+MODIFIED_INDEX_TREE=78fa1cff894690ef23d70cde72f4ef64ee2d0515
+ok  	codex-account-pool/internal/cfsolve	0.032s
+ok  	codex-account-pool/internal/upstream	0.011s
+ok  	codex-account-pool/internal/api	0.278s
+EXIT_STATUS=0
+exit_status=0
+result=DIFF_FILE reproduces the modified behavior in an independent copy.
+
+ROLLBACK
+command=/workspace/verification/codex-oauth-cf-compat-20260809/ROLLBACK.sh /tmp/codex-oauth-cf-rollback-copy /workspace/verification/codex-oauth-cf-compat-20260809/DIFF_FILE
+input=independent copy with modified index tree 78fa1cff894690ef23d70cde72f4ef64ee2d0515
+literal_output:
+ROLLBACK_RESULT=restored
+HEAD=b4863db70c24ddf113bc004448c91ad55b796cc9
+INDEX_TREE=97caa7525bd56915504b622382678b8d04e530cb
+STATUS=clean
+EXIT_STATUS=0
+exit_status=0
+restored_behavior_status=the copy has the exact original tree, a clean index/worktree, and the BASELINE command again exits 0; /workspace/verification/codex-oauth-cf-compat-20260809/MODIFIED_FILE remains the changed payload artifact.
+
+FRONTEND
+command=cd /workspace && npm --prefix web-spa run check:parse && VITEST_MAX_WORKERS=1 npm --prefix web-spa test -- --run tests/oauth-copy.test.tsx && npm --prefix web-spa run build
+input=OAuthLoginModal Claude textarea/full Authentication-code block fixture and generated embedded console
+literal_result=check-parse: 121 source files parse cleanly; Test Files 1 passed (1), Tests 8 passed (8); TypeScript/Vite built 2797 modules; build budget passed; embedded console release verified: 58 files, 3 entry assets
+exit_status=0
+
+INSTALL_UPDATE
+command=cd /workspace && bash -n scripts/install.sh scripts/test-upgrade-safety.sh scripts/test-install-single-worker.sh && bash scripts/test-upgrade-safety.sh && bash scripts/test-install-single-worker.sh
+input=current cache-hit-optimization install/update scripts
+literal_output:
+PASS: install dispatch, bounded backups, managed-source convergence, console release closure, and manifest freshness
+test warning: Keeping existing config: /tmp/tmp.2m1HK4fxHM/release-perms.pzwB8F/etc/config.json
+single-worker installer lifecycle: OK
+EXIT_STATUS=0
+exit_status=0
+
+CF_SOLVER_IMAGE
+command=docker manifest inspect ghcr.io/flaresolverr/flaresolverr:v3.5.0
+input=official pinned v3.5.0 image tag
+literal_result=application/vnd.oci.image.index.v1+json; manifests=8
+exit_status=0

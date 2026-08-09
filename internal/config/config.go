@@ -22,9 +22,9 @@ const (
 	// discovery and on version-gated live Codex requests. ChatGPT gates the returned
 	// model catalog and some live models by this value, so old preserved config
 	// values are floored to this default during normalization.
-	// Refreshed 2026-08-05 from the official Codex rust-v0.146.1 release and
+	// Refreshed 2026-08-09 from the official Codex rust-v0.147.0 release and
 	// matching source tree.
-	DefaultClientVersion                  = "0.146.1"
+	DefaultClientVersion                  = "0.147.0"
 	DefaultStickyWaitMillis               = 100
 	DefaultStrictStickyMaxCooldownSeconds = 60
 	DefaultCooldownWaitMaxSeconds         = 30
@@ -115,6 +115,38 @@ const (
 	legacyClaudeOAuthRedirectURI    = "http://localhost:54545/callback"
 	legacyClaudeOAuthAuthorizeScope = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 )
+
+// supportedCodexCLIVersions is the five-release compatibility window verified
+// against the matching official openai/codex tags. Keep latest first: callers use
+// the head as the default while accepting an exact downstream/configured version
+// from this window so User-Agent and the `version` header remain coherent.
+var supportedCodexCLIVersions = [...]string{
+	"0.147.0",
+	"0.146.1",
+	"0.146.0",
+	"0.145.0",
+	"0.144.6",
+}
+
+// SupportedCodexCLIVersions returns a copy so callers cannot mutate the process-
+// wide compatibility contract.
+func SupportedCodexCLIVersions() []string {
+	versions := make([]string, len(supportedCodexCLIVersions))
+	copy(versions, supportedCodexCLIVersions[:])
+	return versions
+}
+
+// IsSupportedCodexCLIVersion reports whether value is one of the five official
+// stable versions covered by this build.
+func IsSupportedCodexCLIVersion(value string) bool {
+	value = strings.TrimSpace(value)
+	for _, version := range supportedCodexCLIVersions {
+		if value == version {
+			return true
+		}
+	}
+	return false
+}
 
 var (
 	defaultClaudeGatewayInterceptHosts = []string{
@@ -711,8 +743,9 @@ type Config struct {
 	// IP) via the existing injected-cookie plumbing before re-registering the exit.
 	CFSolverEnabled bool `json:"cf_solver_enabled"`
 	// CFSolverURL is the solver's FlareSolverr-compatible base URL (e.g.
-	// http://127.0.0.1:8191). The /v1 {cmd:request.get} contract is shared by
-	// FlareSolverr / Byparr / Solvearr.
+	// http://127.0.0.1:8191). FlareSolverr v3 uses sessions.create/request.get/
+	// sessions.destroy; implementations exposing only the historical stateless
+	// /v1 {cmd:request.get} contract remain supported as a compatibility fallback.
 	CFSolverURL string `json:"cf_solver_url"`
 	// ── Registration (auto phone registration) ──
 	RegistrationEnabled     bool `json:"registration_enabled"`
@@ -1556,7 +1589,9 @@ func (c *Config) normalize() {
 	if c.ClientVersion == "" || dottedVersionLess(c.ClientVersion, DefaultClientVersion) {
 		c.ClientVersion = DefaultClientVersion
 	}
-	if c.CodexCLIVersionOverride != "" && dottedVersionLess(c.CodexCLIVersionOverride, DefaultClientVersion) {
+	if c.CodexCLIVersionOverride != "" &&
+		dottedVersionLess(c.CodexCLIVersionOverride, DefaultClientVersion) &&
+		!IsSupportedCodexCLIVersion(c.CodexCLIVersionOverride) {
 		c.CodexCLIVersionOverride = DefaultClientVersion
 	}
 	if c.DefaultGroup == "" {
