@@ -1253,6 +1253,16 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 
 	group := requestUserGroupPolicy(r.Context())
 	includeGroupPrompt := prompt.ShouldRewrite(group.SystemPrompt, isCompact, group.SystemPromptApplyToCompaction)
+	if superPolicy, _ := superInstructPolicyForModel(group, model); !superPolicy.Enabled {
+		// Native Codex does not pass through applyModelInstructionsForEntrypoint.
+		// Remove an exact gateway-owned M1 carrier here as well, covering old local
+		// model_instructions_file bindings and recovered CPA/Goal request bodies.
+		raw, err = stripLegacySuperInstructCarriers(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
 	instructionPlan, err := s.codexInstructionPlan(r.Context(), group, codexMapping, strictNativeCPA, model, includeGroupPrompt)
 	if err != nil {
 		// A configured instruction file is part of the administrator's session
@@ -1370,6 +1380,14 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 				if recovered {
 					codexMapping = migration.Mapping
 					goalQuotaGrace := codexMapping.observeGoalTurn(migration.Retry.Header, migration.Retry.Raw)
+					if superPolicy, _ := superInstructPolicyForModel(group, routing.Model(migration.Retry.Raw)); !superPolicy.Enabled {
+						var stripErr error
+						migration.Retry.Raw, stripErr = stripLegacySuperInstructCarriers(migration.Retry.Raw)
+						if stripErr != nil {
+							writeError(w, http.StatusBadRequest, stripErr)
+							return
+						}
+					}
 					freshPlan, planErr := s.codexInstructionPlan(r.Context(), group, codexMapping, strictNativeCPA, routing.Model(migration.Retry.Raw), includeGroupPrompt)
 					if planErr != nil {
 						writeCodexInstructionConfigurationError(w, planErr)

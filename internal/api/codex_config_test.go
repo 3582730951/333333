@@ -478,6 +478,35 @@ name = "client provider"
 	}
 }
 
+func TestCodexOnlyConfigMergeRemovesAllHistoricalPoolInstructionBasenames(t *testing.T) {
+	for _, basename := range []string{
+		"gpt-5.6-sol-unrestricted.md",
+		"gpt-5.6-sol-unrestricted-v7.md",
+		"gpt-5.6-sol-unrestricted-v999.md",
+	} {
+		t.Run(basename, func(t *testing.T) {
+			home := t.TempDir()
+			configPath := filepath.Join(home, "config.toml")
+			existing := "model_instructions_file = \"/root/.codex/" + basename + "\" # historical Pool binding\n" +
+				"model = \"old\"\nmodel_provider = \"old\"\n"
+			if err := os.WriteFile(configPath, []byte(existing), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			runCodexSetupScript(t, home, buildCodexConfigScript(
+				"https://pool.example", "cap_historical_cleanup", "gpt-5.6-sol", "", "", "",
+				CodexSetupScriptOptions{CodexOnly: true},
+			))
+			got, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(got), basename) || strings.Contains(string(got), "model_instructions_file") {
+				t.Fatalf("historical Pool binding %q survived merge:\n%s", basename, got)
+			}
+		})
+	}
+}
+
 func TestCodexOnlyConfigFreshInstallManagesMinimalKeys(t *testing.T) {
 	home := t.TempDir()
 	runCodexSetupScript(t, home, buildCodexConfigScript(

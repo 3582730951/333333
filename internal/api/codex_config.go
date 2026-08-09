@@ -658,9 +658,9 @@ EOF
       }
 	      skip { next }
 	      section == "" && $0 ~ ("^[[:space:]]*(" managed_root_keys ")[[:space:]]*=") { next }
-	      # Remove only the precisely identified legacy Pool base
-      # instructions binding. Arbitrary user-owned instruction files survive.
-      section == "" && $0 ~ /^[[:space:]]*model_instructions_file[[:space:]]*=[[:space:]]*["\047]([^"\047]*\/)?gpt-5[.]6-sol-unrestricted-v42[.]md["\047][[:space:]]*(#.*)?$/ { next }
+	      # Remove only the project-owned historical Pool base-instruction
+	      # basename (versioned or pre-versioned). Arbitrary user files survive.
+      section == "" && $0 ~ /^[[:space:]]*model_instructions_file[[:space:]]*=[[:space:]]*["\047]([^"\047]*\/)?gpt-5[.]6-sol-unrestricted(-v[0-9]+)?[.]md["\047][[:space:]]*(#.*)?$/ { next }
       { print }
     ' "$CONFIG" >> "$CONFIG_TMP"
   fi
@@ -868,9 +868,9 @@ if [ -f "$CONFIG" ]; then
     }
     skip { next }
     section == "" && $0 ~ ("^[[:space:]]*(" managed_root_keys ")[[:space:]]*=") { next }
-	    # Remove only the precisely identified legacy Pool base
-    # instructions binding. Arbitrary user-owned instruction files survive.
-    section == "" && $0 ~ /^[[:space:]]*model_instructions_file[[:space:]]*=[[:space:]]*["\047]([^"\047]*\/)?gpt-5[.]6-sol-unrestricted-v42[.]md["\047][[:space:]]*(#.*)?$/ { next }
+	    # Remove only the project-owned historical Pool base-instruction
+	    # basename (versioned or pre-versioned). Arbitrary user files survive.
+    section == "" && $0 ~ /^[[:space:]]*model_instructions_file[[:space:]]*=[[:space:]]*["\047]([^"\047]*\/)?gpt-5[.]6-sol-unrestricted(-v[0-9]+)?[.]md["\047][[:space:]]*(#.*)?$/ { next }
     { print }
   ' "$CONFIG" >> "$CONFIG_TMP"
 fi

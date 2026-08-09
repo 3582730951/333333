@@ -1,7 +1,6 @@
 {
   "note": "Class names emitted by components with no rule in src/styles. Fix one, delete its line.",
   "classes": [
-    "pool-account-drawer",
     "pool-account-import-modal",
     "pool-accounts-table",
     "pool-ai-settings-page",

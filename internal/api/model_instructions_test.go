@@ -285,6 +285,53 @@ func TestSuperInstructRequiresUserGroupAndExplicitClientOptIn(t *testing.T) {
 	}
 }
 
+func TestDisabledSuperInstructStripsOnlyLegacyM1Carriers(t *testing.T) {
+	marker := legacySuperInstructBundleHeader + "\n\nCYBER SKILL MUST NOT REPLAY"
+	raw, err := json.Marshal(map[string]interface{}{
+		"model":         "gpt-5.6-sol",
+		"instructions":  marker,
+		"system":        []map[string]string{{"type": "text", "text": marker}},
+		"system_prompt": marker,
+		"personality":   marker,
+		"messages": []map[string]interface{}{
+			{"role": "system", "content": marker},
+			{"role": "user", "content": "user is discussing " + marker},
+			{"role": "developer", "content": "developer keeps " + marker},
+		},
+		"input": []map[string]interface{}{
+			{"role": "system", "content": []map[string]string{{"type": "input_text", "text": marker}}},
+			{"role": "user", "content": "input keeps " + marker},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := (&Server{}).applyModelInstructionsForEntrypoint(t.Context(), storage.Group{}, "gpt-5.6-sol", "/v1/responses", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(got, &root); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"instructions", "system", "system_prompt", "personality"} {
+		if _, exists := root[field]; exists {
+			t.Fatalf("stale direct carrier %q survived: %s", field, got)
+		}
+	}
+	messages, _ := root["messages"].([]interface{})
+	input, _ := root["input"].([]interface{})
+	if len(messages) != 2 || len(input) != 1 {
+		t.Fatalf("only system-role carriers may be removed: messages=%d input=%d body=%s", len(messages), len(input), got)
+	}
+	for _, retained := range []string{"user is discussing", "developer keeps", "input keeps"} {
+		if !strings.Contains(string(got), retained) {
+			t.Fatalf("ordinary %q content was removed: %s", retained, got)
+		}
+	}
+}
+
 func TestSuperInstructUserGroupAndClientHeaderGateEndToEnd(t *testing.T) {
 	const (
 		bridgeMarker = "END TO END GATE BRIDGE MARKER"

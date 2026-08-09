@@ -31,6 +31,13 @@ type modelInstructionFileView struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// legacySuperInstructBundleHeader is the stable marker emitted by every
+// pre-profile and current Super-Instruct skill bundle.  It lets a request whose
+// group/client gate is now closed remove only gateway-owned M1 carriers that may
+// have survived in an old Codex config, CPA recovery body, or Messages goal
+// checkpoint.  Ordinary client prompts are otherwise left byte-for-byte alone.
+const legacySuperInstructBundleHeader = "# Super-Instruct Codex 5.6"
+
 func (s *Server) adminModelInstructions(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
 		return
@@ -456,6 +463,15 @@ func (s *Server) applyModelInstructionsForEntrypoint(ctx context.Context, group 
 		groupPrompt = strings.TrimSpace(group.SystemPrompt)
 	}
 	superPolicy, _ := superInstructPolicyForModel(group, model)
+	if !superPolicy.Enabled {
+		// M1 replaces complete system carriers while it is active.  A carrier with
+		// our exact bundle marker is therefore stale gateway state, not a client
+		// fragment to retain after the group/client gate has closed.
+		raw, err = stripLegacySuperInstructCarriers(raw)
+		if err != nil {
+			return raw, err
+		}
+	}
 	if superPolicy.Enabled {
 		bridge, bridgeErr := superinstruct.LoadBridge()
 		if bridgeErr != nil {
@@ -489,6 +505,51 @@ func (s *Server) applyModelInstructionsForEntrypoint(ctx context.Context, group 
 	default:
 		return setResponsesInstructionParts(raw, groupPrompt, components.Administrator, components.SuperInstruct), nil
 	}
+}
+
+// stripLegacySuperInstructCarriers removes only complete carriers previously
+// owned by Super-Instruct M1.  It intentionally does not search ordinary user,
+// assistant, developer, or tool content: a user discussing the marker must not
+// lose their message.  Deleting array entries from the end keeps indices stable.
+func stripLegacySuperInstructCarriers(raw []byte) ([]byte, error) {
+	if !bytes.Contains(raw, []byte(legacySuperInstructBundleHeader)) {
+		return raw, nil
+	}
+	if !gjson.ValidBytes(raw) {
+		return raw, errors.New("invalid JSON while removing stale Super-Instruct carriers")
+	}
+	out := raw
+	for _, field := range []string{"instructions", "system", "system_prompt", "personality"} {
+		value := gjson.GetBytes(out, field)
+		if !value.Exists() || !strings.Contains(value.Raw, legacySuperInstructBundleHeader) {
+			continue
+		}
+		updated, err := sjson.DeleteBytes(out, field)
+		if err != nil {
+			return raw, fmt.Errorf("remove stale Super-Instruct %s carrier: %w", field, err)
+		}
+		out = updated
+	}
+	for _, field := range []string{"messages", "input"} {
+		items := gjson.GetBytes(out, field)
+		if !items.IsArray() {
+			continue
+		}
+		values := items.Array()
+		for index := len(values) - 1; index >= 0; index-- {
+			item := values[index]
+			if !strings.EqualFold(strings.TrimSpace(item.Get("role").String()), "system") ||
+				!strings.Contains(item.Raw, legacySuperInstructBundleHeader) {
+				continue
+			}
+			updated, err := sjson.DeleteBytes(out, fmt.Sprintf("%s.%d", field, index))
+			if err != nil {
+				return raw, fmt.Errorf("remove stale Super-Instruct %s carrier: %w", field, err)
+			}
+			out = updated
+		}
+	}
+	return out, nil
 }
 
 func stripAnthropicSystemCarriers(raw []byte) ([]byte, error) {
@@ -825,11 +886,10 @@ func setResponsesInstructions(raw []byte, instructions string) []byte {
 
 func splitLegacyInstructionBundle(instructions string) (string, string) {
 	trimmed := strings.TrimSpace(instructions)
-	const superHeader = "# Super-Instruct Codex 5.6"
-	if strings.HasPrefix(trimmed, superHeader) {
+	if strings.HasPrefix(trimmed, legacySuperInstructBundleHeader) {
 		return "", trimmed
 	}
-	if index := strings.Index(trimmed, "\n\n"+superHeader); index >= 0 {
+	if index := strings.Index(trimmed, "\n\n"+legacySuperInstructBundleHeader); index >= 0 {
 		return strings.TrimSpace(trimmed[:index]), strings.TrimSpace(trimmed[index+2:])
 	}
 	return trimmed, ""

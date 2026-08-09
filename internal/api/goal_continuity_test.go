@@ -281,6 +281,75 @@ func TestGoalContinuityScopesSharedKeyByNativeClientSession(t *testing.T) {
 	}
 }
 
+func TestMessagesGoalPersistenceNeverStoresInjectedSuperInstructSystem(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	h.app.cfg.GoalContinuityEnabled = true
+	const (
+		keyHash   = "messages-clean-checkpoint-key"
+		sessionID = "messages-clean-checkpoint-session"
+	)
+	original := []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"keep the client task"}]}`)
+	injected := []byte(`{"model":"claude-sonnet-4-6","system":"M1 BRIDGE\n\n# Super-Instruct Codex 5.6\n\nCYBER SKILL","messages":[{"role":"user","content":"keep the client task"}]}`)
+	response := []byte(`{"id":"msg-clean-checkpoint","type":"message","role":"assistant","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`)
+	req, _ := http.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(original)))
+	req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+	ctx := withDownstreamKey(withGoalOriginalBody(context.Background(), original), downstreamPolicy{KeyHash: keyHash})
+	goal, err := h.app.persistGoalContinuity(ctx, req, "claude", injected, response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durable, _, err := h.store.BuildGoalReplay(context.Background(), goal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(durable), legacySuperInstructBundleHeader) || strings.Contains(string(durable), "CYBER SKILL") {
+		t.Fatalf("gateway-owned M1 system became durable: %s", durable)
+	}
+	if !strings.Contains(string(durable), "keep the client task") {
+		t.Fatalf("client history was not retained: %s", durable)
+	}
+}
+
+func TestMessagesGoalReplayScrubsHistoricalSuperInstructSystemWhenGateIsClosed(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	h.app.cfg.GoalContinuityEnabled = true
+	const (
+		keyHash   = "messages-legacy-checkpoint-key"
+		sessionID = "messages-legacy-checkpoint-session"
+	)
+	legacy := []byte(`{"model":"claude-sonnet-4-6","system":"OLD M1 BRIDGE\n\n# Super-Instruct Codex 5.6\n\nLEGACY CYBER SKILL","messages":[{"role":"user","content":"historical task"}]}`)
+	response := []byte(`{"id":"msg-legacy-checkpoint","type":"message","role":"assistant","content":[{"type":"text","text":"historical answer"}],"stop_reason":"end_turn"}`)
+	req, _ := http.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(legacy)))
+	req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+	// No goalOriginalBody models a checkpoint written by a version that persisted
+	// the already-injected upstream envelope.
+	ctx := withDownstreamKey(context.Background(), downstreamPolicy{KeyHash: keyHash})
+	if _, err := h.app.persistGoalContinuity(ctx, req, "claude", legacy, response); err != nil {
+		t.Fatal(err)
+	}
+
+	current := []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"continue safely"}]}`)
+	currentReq, _ := http.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(current)))
+	currentReq.Header.Set("X-Claude-Code-Session-Id", sessionID)
+	entitled := storage.Group{SuperInstructEnabled: true}
+	masked := superInstructPolicyForClient(entitled, currentReq) // missing opt-in header closes the gate
+	replayCtx := withRequestAccountGroupPolicy(withDownstreamKey(context.Background(), downstreamPolicy{KeyHash: keyHash}), masked)
+	replay := h.app.goalReplayBody(replayCtx, currentReq, "claude", current)
+	if replay.Kind != goalResumeFound {
+		t.Fatalf("historical goal did not replay: %+v", replay)
+	}
+	for _, forbidden := range []string{legacySuperInstructBundleHeader, "LEGACY CYBER SKILL", "OLD M1 BRIDGE"} {
+		if strings.Contains(string(replay.Body), forbidden) {
+			t.Fatalf("closed gate replayed %q upstream: %s", forbidden, replay.Body)
+		}
+	}
+	for _, retained := range []string{"historical task", "historical answer", "continue safely"} {
+		if !strings.Contains(string(replay.Body), retained) {
+			t.Fatalf("durable client history %q was lost: %s", retained, replay.Body)
+		}
+	}
+}
+
 func TestGoalNamespaceUsesNativeClaudeAndCodexHeadersWithoutExtraConfig(t *testing.T) {
 	const keyHash = "shared-native-header-key"
 	claudeA, _ := http.NewRequest(http.MethodPost, "/v1/messages", nil)

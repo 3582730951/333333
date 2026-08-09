@@ -1245,6 +1245,15 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 		return storage.GoalSession{}, nil
 	}
 	segmentRequestBody := goalOriginalBody(ctx, requestBody)
+	checkpointRequestBody := requestBody
+	if family == storage.GoalFamilyMessages && len(segmentRequestBody) > 0 {
+		// Messages checkpoints retain the request envelope (not only history), so
+		// persisting the already-transformed upstream body used to make an M1
+		// system prompt durable.  A later request could then replay it after the
+		// user group or client opt-in was disabled.  Store the client body instead;
+		// the current request policy is reapplied before every future replay.
+		checkpointRequestBody = segmentRequestBody
+	}
 	// Keep the model-visible request before removing an already durable prefix.
 	// HTTP Responses sends the complete prompt without previous_response_id, while
 	// WebSocket reuse sends only a delta with previous_response_id. Persistence may
@@ -1271,7 +1280,7 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 		// compaction turn, so the replacement rule follows the family, not the vendor.
 		semantics.ReplacementHistory, _ = claudeCodeCompactionReplacement(logicalRequestBody, responseBody)
 	}
-	checkpoint, segment, responseID, awaitingTool, err := goalCheckpointAndSegment(requestBody, segmentRequestBody, responseBody, semantics)
+	checkpoint, segment, responseID, awaitingTool, err := goalCheckpointAndSegment(checkpointRequestBody, segmentRequestBody, responseBody, semantics)
 	if err != nil {
 		return storage.GoalSession{}, err
 	}
@@ -1535,6 +1544,16 @@ func (s *Server) goalReplayBody(ctx context.Context, r *http.Request, protocol s
 			return goalResumeResult{Kind: goalResumeStorageExhausted, Reason: err.Error()}
 		}
 		return goalResumeResult{Kind: goalResumeUnidentified, Reason: err.Error()}
+	}
+	if family == storage.GoalFamilyMessages {
+		// Backward compatibility for checkpoints written before Messages persisted
+		// the original client envelope.  Strip only exact M1-owned carriers from
+		// the historical base; the already policy-processed current request below
+		// remains authoritative and may add a fresh system carrier when enabled.
+		base, err = stripLegacySuperInstructCarriers(base)
+		if err != nil {
+			return goalResumeResult{Kind: goalResumeUnidentified, Reason: err.Error()}
+		}
 	}
 	cur, err := decodeContextJSONMap(current)
 	if err != nil {

@@ -1348,3 +1348,46 @@ body {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* Account details can be substantially taller than the viewport.  Keep the
+   title fixed and expose a persistent, draggable vertical rail for the body;
+   the stable gutter also prevents the panel content from shifting as it grows. */
+.pool-drawer-content.pool-account-drawer {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
+}
+
+.pool-account-drawer > .pool-drawer-body {
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: scroll;
+  overscroll-behavior: contain;
+  scrollbar-color: var(--pool-border-strong) var(--pool-bg-surface-2);
+  scrollbar-gutter: stable;
+  scrollbar-width: auto;
+}
+
+.pool-account-drawer > .pool-drawer-body::-webkit-scrollbar {
+  width: 12px;
+}
+
+.pool-account-drawer > .pool-drawer-body::-webkit-scrollbar-track {
+  background: var(--pool-bg-surface-2);
+  border-left: 1px solid var(--pool-border-subtle);
+}
+
+.pool-account-drawer > .pool-drawer-body::-webkit-scrollbar-thumb {
+  min-height: 48px;
+  background: var(--pool-border-strong);
+  background-clip: padding-box;
+  border: 3px solid transparent;
+  border-radius: 999px;
+}
+
+.pool-account-drawer > .pool-drawer-body::-webkit-scrollbar-thumb:hover {
+  background: var(--pool-accent);
+  background-clip: padding-box;
+}
