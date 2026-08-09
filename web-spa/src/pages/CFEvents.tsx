@@ -28,7 +28,8 @@ export default function CFEvents() {
   const serverErrorCount = rows.filter((row) => Number(row.status) >= 500).length;
   const challengeCount = rows.filter((row) => String(row.category || '').toLowerCase().includes('challenge')).length;
   const passedCount = rows.filter((row) => Number(row.status) < 400).length;
-  const share = (part: number) => (rows.length ? part / rows.length : 0);
+  // undefined, not 0, on an empty list -- see the MetricRail contract in DisplayPrimitives.jsx.
+  const share = (part: number) => (rows.length ? part / rows.length : undefined);
   const cfMetrics = [
     { label: t('cf.events'), value: rows.length },
     { label: t('cf.passed'), value: passedCount, share: share(passedCount), tone: 'success' },

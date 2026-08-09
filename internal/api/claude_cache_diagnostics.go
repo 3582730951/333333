@@ -11,8 +11,22 @@ import (
 
 const claudeCacheDiagnosticsHeader = "X-Codex-Claude-Cache-Diagnostics"
 
+// applyClaudeCacheDiagnostics opts the turn into Anthropic's cache-diagnosis beta.
+//
+// claudeCacheDiagnosticsHeader is an INTERNAL control header: the upstream builder reads it
+// off the downstream header set (upstream/anthropic.go applyClaudeHeaders) to decide whether
+// to append the cache-diagnosis beta. It is never written into the upstream request itself —
+// both Claude header builders construct their header set from scratch — so the gateway's own
+// header name does not reach api.anthropic.com.
+//
+// It must still be stripped when the feature is disabled. Otherwise a downstream client can
+// set it and drive the account's anthropic-beta set from outside the operator's control; the
+// active beta set is part of what Anthropic fingerprints per request (it is called out as a
+// prompt-affecting parameter in the cache-diagnostics docs), so letting an untrusted caller
+// toggle it makes an account's beta set vary for reasons the operator never configured.
 func (s *Server) applyClaudeCacheDiagnostics(ctx context.Context, headers http.Header, body []byte, affinity routing.AffinityKey) []byte {
 	if !s.claudeCacheDiagnosticsEnabled(ctx) {
+		headers.Del(claudeCacheDiagnosticsHeader)
 		return body
 	}
 	headers.Set(claudeCacheDiagnosticsHeader, "1")

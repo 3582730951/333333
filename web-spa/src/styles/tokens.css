@@ -67,6 +67,15 @@ html[data-theme='dark'] {
   --pool-radius-portal: 20px;
   --pool-material-blur: saturate(180%) blur(18px);
   --pool-hit-target: 44px;
+  /* The KPI legend dot. Referenced by its own rule and by the first-line offset that
+     keeps it level with line 1 of a wrapped label, so it lives here rather than inline. */
+  --pool-kpi-dot: 7px;
+  /* Height of a .pool-delta pill: 11.5px font x 1.35 leading + 2px x 2 padding.
+     .pool-kpi__head reserves this much whether or not the tile carries a badge,
+     so the KPI value baseline is identical across a strip. Measured before the
+     fix: heads were 14.39px without a badge and 19.52px with one, which pushed
+     the value down 5.13px on exactly the tiles that had a delta. */
+  --pool-delta-height: calc(11.5px * 1.35 + 4px);
   --pool-space-1: 4px;
   --pool-space-2: 8px;
   --pool-space-3: 12px;
@@ -98,7 +107,24 @@ html[data-theme='dark'] {
   --pool-chart-green: #5ddf91;
   --pool-chart-orange: #ffbd5a;
   --pool-chart-red: #ff7b73;
-  --pool-chart-purple: #c99aff;
+  /* Was #c99aff (hsl 271). That read as a clean lavender but collapsed onto --pool-chart-blue
+     for a protanope at dE 1.2 -- the worst collision in either theme, and one the original
+     deuteranopia-only audit never looked for. Held at full saturation and pushed lighter to
+     hsl(292,100%,83%), which is where a vivid purple separates from both blue and teal under
+     both dichromacies: deuter 7.1, protan 7.1, 7.93:1 on --pool-bg-elevated. */
+  --pool-chart-purple: #f3a8ff;
+  /* Dedicated series hues. The chart palette used to borrow --pool-info, --pool-purple and
+     --pool-success for its last three slots, which put two near-identical colours in one
+     palette (green vs success at CIEDE2000 dE 5.0, purple vs pool-purple at dE 5.5). These
+     are seeded from Apple's systemTeal/systemPink/systemIndigo/systemCyan and then solved for
+     dE >= 12 against every colour they appear beside, and >= 3:1 on --pool-bg-elevated. */
+  --pool-chart-teal: #40c8e0;
+  --pool-chart-pink: #fb365d;
+  --pool-chart-indigo: #6863ef;
+  /* Pale by necessity: it is squeezed from both sides by chart-blue and chart-teal, so the
+     only room left in the cyan hue band is upward in lightness. Reads as ice-blue, which
+     suits the "cooling" and "network" meanings it carries. */
+  --pool-chart-cyan: #a6e1ff;
   --pool-chart-gray: #98989d;
   --pool-chart-grid: rgba(255, 255, 255, 0.10);
   --pool-chart-tick: rgba(235, 235, 245, 0.64);
@@ -133,6 +159,12 @@ html[data-theme='dark'] {
   --chart-orange: var(--pool-chart-orange);
   --chart-red: var(--pool-chart-red);
   --chart-purple: var(--pool-chart-purple);
+  /* Aliased once here, not per theme: the value is a var() reference, so it re-resolves
+     against whichever --pool-chart-* the active theme block last set. */
+  --chart-teal: var(--pool-chart-teal);
+  --chart-pink: var(--pool-chart-pink);
+  --chart-indigo: var(--pool-chart-indigo);
+  --chart-cyan: var(--pool-chart-cyan);
   --chart-gray: var(--pool-chart-gray);
 }
 
@@ -197,7 +229,20 @@ html[data-theme='light'] {
   --pool-chart-green: #248a3d;
   --pool-chart-orange: #c97800;
   --pool-chart-red: #d70015;
-  --pool-chart-purple: #7d5fff;
+  /* Moved off systemPurple (#7d5fff, hsl 251) to hsl(284,100%,56%). At 251deg a deuteranope saw
+     this and --pool-chart-blue as one colour -- both collapse near #7066ff, dE 1.8 -- and slot
+     assignment is hashed, so any two series can land on that pair. Rotating hue alone is not
+     enough: a protanope separates purple from blue almost entirely by lightness, so the lighter
+     284deg candidates scored *worse* there (dE 0.6). This is 284deg and darker, which clears
+     both: deuter 6.4, protan 6.6, 4.23:1 on white, mid-band for this family (3.12-6.54:1). */
+  --pool-chart-purple: #c31fff;
+  /* Darker than Apple's light-theme values: systemTeal (#30b0c7), systemCyan (#32ade6) and
+     systemMint all land near 2.2-2.6:1 on white, so they were pushed down in L* until they
+     clear 3:1. Pink is Apple's #ff2d55 unchanged -- it already passes. */
+  --pool-chart-teal: #0aa0b7;
+  --pool-chart-pink: #ff2d55;
+  --pool-chart-indigo: #4c4dc9;
+  --pool-chart-cyan: #1387b7;
   --pool-chart-gray: #8e8e93;
   --pool-chart-grid: rgba(60, 60, 67, 0.10);
   --pool-chart-tick: rgba(60, 60, 67, 0.62);

@@ -194,8 +194,12 @@ export default function PublicChat() {
     return `账号池分组：${link.route_label || optionLabel(accountGroupOptions, link.group_name)}`;
   };
 
+  // The outer div below carries no class on purpose. `public-chat-admin-page` used to sit on it with
+  // no rule anywhere behind it, which is the drift check-class-drift.mjs exists to catch: a name that
+  // reads as intent while doing nothing. Spacing is owned one level down by .public-chat-layout
+  // (grid + margin-top), so there is nothing for this element to style.
   return (
-    <div className="public-chat-admin-page">
+    <div>
       <PageHeader
         title="在线聊天"
         subtitle="生成无需登录的网页聊天 URL；管理员指定由哪个用户分组或账号池分组承接流量。"

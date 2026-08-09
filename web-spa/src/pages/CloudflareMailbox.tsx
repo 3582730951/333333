@@ -121,10 +121,15 @@ export default function CloudflareMailbox() {
 
   const healthy = profiles.filter((profile) => profile.health?.last_status === 'healthy').length;
   const defaults = profiles.filter((profile) => profile.default_for_registration || profile.default_for_team).length;
+  // healthy and defaults are both counts of profiles, so they are parts of profiles.length and
+  // the track shows the proportion directly. profiles is the denominator itself and domains is a
+  // distinct-value count -- a "domains over profiles" bar would technically compute but measures
+  // domain reuse, not coverage, so neither gets a track. No profiles means no share rather than
+  // a zero-width one, which would read as a measured zero instead of nothing to measure.
   const metrics = useMemo(() => [
     { key: 'profiles', label: t('cf_mail.profiles'), value: profiles.length, detail: t('cf_mail.profiles_detail'), tone: 'accent' },
-    { key: 'healthy', label: t('cf_mail.healthy'), value: healthy, detail: t('cf_mail.health_detail'), tone: healthy ? 'success' : 'neutral' },
-    { key: 'defaults', label: t('cf_mail.defaults'), value: defaults, detail: t('cf_mail.defaults_detail') },
+    { key: 'healthy', label: t('cf_mail.healthy'), value: healthy, detail: t('cf_mail.health_detail'), tone: healthy ? 'success' : 'neutral', share: profiles.length ? healthy / profiles.length : undefined },
+    { key: 'defaults', label: t('cf_mail.defaults'), value: defaults, detail: t('cf_mail.defaults_detail'), share: profiles.length ? defaults / profiles.length : undefined },
     { key: 'domains', label: t('cf_mail.domains'), value: new Set(profiles.map((profile) => profile.domain)).size, detail: t('cf_mail.same_domain_detail') },
   ], [profiles, healthy, defaults]);
 

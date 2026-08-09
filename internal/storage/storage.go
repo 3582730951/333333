@@ -6701,6 +6701,33 @@ ON CONFLICT(account_id, model_slug) DO UPDATE SET
 	return err
 }
 
+// AccountsWithModelAndContext answers a single question: which accounts in this
+// group can serve this model at all. It deliberately does NOT consider transient
+// health (cooldown, recheck_pending, quarantine, primary-egress breaker state).
+//
+// Mixing health into this query produced two operator-visible lies, both recorded
+// in production diagnostics:
+//
+//  1. The scheduler's only use of this map is the "does this account support the
+//     model" gate, so a benched-but-capable account fell out of the map and was
+//     reported as `model_unsupported`. An operator whose one provider account was
+//     cooling was told their admin-verified model was unsupported — 716 audit rows
+//     of `Routing rejected normalized model … model_unsupported=1` for a model the
+//     capability table listed as `verified`.
+//  2. shortestCooldown/shortestCooldownBatch skip accounts outside this map before
+//     they account for cooldowns, so an account excluded *because* it was cooling
+//     could never become a wait target. "All accounts cooling" degraded into
+//     "no capable account", and the request failed immediately instead of waiting
+//     out a cooldown that was about to elapse.
+//
+// Every caller re-checks liveness independently and with correct attribution
+// (evaluateIndexedCandidate, pressureModelEligible, tryLeaseAccountDetailed), so
+// the predicates removed here were redundant as well as misattributed.
+//
+// The bound-sidecar clause stays: an account whose declared curl_cffi transport is
+// missing, malformed, or disabled has no usable path to the upstream at all, so it
+// must not advertise the capability (fail closed — see
+// TestUnavailableSidecarDoesNotAdvertiseRoutableCapabilities).
 func (s *Store) AccountsWithModelAndContext(ctx context.Context, group, model, contextMode string) (map[string]bool, error) {
 	if model == "" {
 		return nil, nil
@@ -6708,19 +6735,14 @@ func (s *Store) AccountsWithModelAndContext(ctx context.Context, group, model, c
 	now := Now()
 	query := `SELECT DISTINCT c.account_id FROM account_model_capabilities c
 JOIN accounts a ON a.id = c.account_id
-JOIN account_egress_bindings b ON b.account_id = a.id
-JOIN egress_profiles e ON e.id = b.primary_egress_id
+LEFT JOIN account_egress_bindings b ON b.account_id = a.id
 LEFT JOIN egress_profiles se ON se.id = b.sidecar_egress_id
-WHERE a.group_name = ? AND a.status = 'active'
-  AND (a.quarantine_until <= ? OR a.ignore_rate_limit_controls = 1)
+WHERE a.group_name = ?
   AND c.model_slug = ? AND c.availability_state = 'verified'
-  AND (b.recheck_pending = 0 OR a.ignore_rate_limit_controls = 1)
-  AND (b.cooldown_until <= ? OR a.ignore_rate_limit_controls = 1)
-  AND e.health NOT IN ('disabled','tripped') AND e.cooldown_until <= ?
-  AND (b.sidecar_egress_id = '' OR
+  AND (b.account_id IS NULL OR b.sidecar_egress_id = '' OR
        (se.id IS NOT NULL AND lower(se.type) = 'curl_cffi_sidecar' AND trim(se.endpoint) <> ''
         AND se.health NOT IN ('disabled','tripped') AND se.cooldown_until <= ?))`
-	args := []interface{}{group, now, model, now, now, now}
+	args := []interface{}{group, model, now}
 	if strings.EqualFold(strings.TrimSpace(contextMode), "1m") {
 		query += ` AND c.context_1m_state = 'supported'`
 	}
@@ -9511,10 +9533,17 @@ func finalizeUsageDiagnostics(model string, prompt, cached, cacheRead, cacheCrea
 		diag.DiagnosticsMissReason = "upstream_reported_zero_cache_read"
 	}
 	if diag.MaxPossibleCacheReadTokens <= 0 && prompt > 0 && diag.CacheReadPresent &&
-		(strings.EqualFold(diag.UsageProvider, "codex") || strings.EqualFold(diag.UsageProvider, "openai")) {
-		// Codex does not expose Anthropic-style breakpoint metadata.  Its reported
-		// input total is therefore the only lossless upper bound available for the
-		// same request and is strictly >= the observed cached-token count.
+		!isAnthropicUsageMap(usageMap, cacheCreation) {
+		// Only Anthropic bodies carry breakpoint metadata, from which the real ceiling is
+		// derived. For every other shape the reported input total is the only lossless
+		// upper bound available for the same request, and is strictly >= the observed
+		// cached-token count.
+		//
+		// This was gated to codex and openai by name, so antigravity and every custom
+		// relay stored 0 here while still reporting a real cache read. Zero is not
+		// distinguishable from "no cache was reusable", so a read/max ratio computed over
+		// a mixed pool divided by zero on those rows: one export summed to a 1.06 ratio
+		// against a bound that is by definition never exceeded.
 		diag.MaxPossibleCacheReadTokens = prompt
 	}
 	if diag.CacheCreation5mTokens == 0 {

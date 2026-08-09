@@ -24,6 +24,10 @@ const viewports = [
   { name: '360x800', width: 360, height: 800, mobile: true },
 ];
 
+// Twelve of the twenty-six admin routes were listed here, and the omissions were not the quiet
+// ones: Registration, EmailPool and Egress all carry dense multi-column tables next to a metric
+// aside, which is the exact shape that collides first. A page absent from this list has never been
+// checked for overlap at any viewport.
 const adminPages = [
   ['Dashboard', '/'],
   ['Accounts', '/accounts'],
@@ -37,6 +41,27 @@ const adminPages = [
   ['Groups', '/groups'],
   ['Providers', '/providers'],
   ['Settings', '/settings-v2'],
+  ['Registration', '/registration'],
+  ['EmailPool', '/email-pool'],
+  ['Egress', '/egress'],
+  ['Models', '/models'],
+  ['TeamLifecycle', '/team-lifecycle'],
+  ['CFEvents', '/cf-events'],
+  ['UpstreamErrorRules', '/upstream-error-rules'],
+  // The last eight admin routes, none of which had ever been overlap-checked. The six AI provider
+  // routes are one component (AISettings) reached with different params, but each renders a
+  // different field set, so one standing in for the others would not prove much: a long label
+  // collides on the provider that has it. Kept complete rather than sampled -- this list is now
+  // every route in routeDefinitions.ts with role: 'admin', which is the only version of it that
+  // can be trusted without re-deriving the diff.
+  ['CloudflareMailbox', '/email-pool/cloudflare'],
+  ['PublicChat', '/public-chat'],
+  ['AIChatGPT', '/settings/ai/chatgpt'],
+  ['AIClaude', '/settings/ai/claude'],
+  ['AIKiro', '/settings/ai/kiro'],
+  ['AIAntigravity', '/settings/ai/antigravity'],
+  ['AICodex', '/settings/ai/codex'],
+  ['AIClaudeCode', '/settings/ai/claude-code'],
 ];
 const userPages = [
   ['PortalDashboard', '/portal'],
@@ -44,6 +69,39 @@ const userPages = [
   ['PortalModels', '/portal/models'],
   ['PortalProfile', '/portal/profile'],
 ];
+
+// The two lists above are hand-maintained, and for a while eight admin routes were missing from
+// them -- not because anyone removed them, but because adding a route to routeDefinitions.ts has
+// never required touching this file. A page absent here is not reported as unchecked; it is simply
+// silent, which reads exactly like a pass. So compare against the route table and fail loudly.
+// Paths, not screenshot names: the names here and in capture-ui-review.mjs deliberately differ
+// (UpstreamErrors vs UpstreamErrorRules) because they are output filenames.
+function assertRouteCoverage() {
+  const source = fs.readFileSync(path.join(root, 'src', 'app', 'routeDefinitions.ts'), 'utf8');
+  const declared = { admin: new Set(), user: new Set() };
+  for (const match of source.matchAll(/\{\s*path:\s*'([^']+)'\s*,\s*role:\s*'(admin|user)'/g)) {
+    declared[match[2]].add(match[1]);
+  }
+  const covered = {
+    admin: new Set(adminPages.map(([, route]) => route)),
+    user: new Set(userPages.map(([, route]) => route)),
+  };
+  const problems = [];
+  for (const role of ['admin', 'user']) {
+    if (!declared[role].size) problems.push(`could not parse any ${role} routes out of routeDefinitions.ts`);
+    for (const route of declared[role]) {
+      if (!covered[role].has(route)) problems.push(`${role} route ${route} is declared but never overlap-checked`);
+    }
+    for (const route of covered[role]) {
+      if (!declared[role].has(route)) problems.push(`${role} route ${route} is checked here but no longer declared`);
+    }
+  }
+  if (problems.length) {
+    console.error('route coverage:');
+    for (const problem of problems) console.error(`  - ${problem}`);
+    process.exit(1);
+  }
+}
 
 function pick(list, envName) {
   const values = String(process.env[envName] || '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -104,7 +162,13 @@ async function stopServer(child) {
 // The overlap probe runs inside the page.
 const PROBE = `(() => {
   const EPS = 1.0;                 // sub-pixel tolerance
-  const results = { textOverlaps: [], overflow: [], clipped: [], scrollable: [], pageOverflow: null };
+  // selectsSeen exists for the same reason the probes counter does further down this file
+  // (see the note above expectedVisits): a rule that
+  // reaches nothing prints the same clean zero as a rule that reaches everything and finds
+  // nothing. The select-text-cut rule below was added precisely because the text-cut rule
+  // silently exempted every native select on every page, so leaving its own coverage
+  // unmeasured would rebuild that bug one level up.
+  const results = { textOverlaps: [], overflow: [], clipped: [], scrollable: [], pageOverflow: null, selectsSeen: 0 };
 
   const intersectRect = (a, b) => {
     const left = Math.max(a.left, b.left);
@@ -159,12 +223,29 @@ const PROBE = `(() => {
     return layer;
   };
 
+  // A closed <details> renders only its <summary>; the rest of the subtree is never painted.
+  // Chrome still answers getBoundingClientRect() for those skipped descendants, laid out where
+  // they would sit if opened, while the collapsed <details> box does not grow to contain them --
+  // so a disclosure's hidden body reads as text lying on top of whatever follows it. That is
+  // what produced twelve "overlaps" on UpstreamErrorRules against an empty state two elements
+  // below. display/visibility/opacity cannot see this: the skipping happens on
+  // ::details-content, not on the children's own computed style.
+  const inCollapsedDetails = (el) => {
+    for (let node = el; node; node = node.parentElement) {
+      const parent = node.parentElement;
+      if (!parent || parent.tagName !== 'DETAILS' || parent.open) continue;
+      if (node.tagName !== 'SUMMARY') return true;
+    }
+    return false;
+  };
+
   const visible = (el, style) => {
     if (style.visibility === 'hidden' || style.display === 'none') return false;
     if (Number(style.opacity) < 0.05) return false;
     if (el.closest('[aria-hidden="true"]')) return false;
     if (el.closest('[hidden]')) return false;
     if (el.closest('[inert]')) return false;
+    if (inCollapsedDetails(el)) return false;
     return true;
   };
 
@@ -268,6 +349,51 @@ const PROBE = `(() => {
     }
   }
 
+  // A native select is invisible to the text-cut rule below by construction: its children are
+  // option elements (nodeType 1), not text nodes, so that loop's own-text accumulator stays
+  // empty and the element is skipped -- and the options themselves are then dropped by its
+  // box.width <= 2 guard, because a closed select's options have zero-size rects. That
+  // exempted every native select on every page. Found via Registration's 邮箱提供商, which
+  // clips "自动选择（优先使用自建默认邮箱）" 37px short under text-overflow: clip with no
+  // ellipsis, while the sweep reported "clipped data: 0".
+  // NOTE: this whole PROBE is a template literal. No backticks and no dollar-brace
+  // interpolation below -- both are consumed when the string is defined, not in the page.
+  for (const el of document.querySelectorAll('select')) {
+    const style = getComputedStyle(el);
+    if (!visible(el, style)) continue;
+    const box = el.getBoundingClientRect();
+    if (box.width <= 2 || box.height <= 2) continue;
+    const opt = el.options[el.selectedIndex] || el.options[0];
+    const label = opt ? (opt.textContent || '').trim() : '';
+    if (!label) continue;
+    // Measure the label's intrinsic width in the select's own font rather than trusting
+    // scrollWidth: a select renders its text in shadow DOM, so scrollWidth is reliable on
+    // some engines and not others. An explicit span is engine-independent.
+    const ruler = document.createElement('span');
+    ruler.style.cssText = 'position:absolute;top:-9999px;left:-9999px;visibility:hidden;'
+      + 'white-space:nowrap;font:' + style.font + ';letter-spacing:' + style.letterSpacing;
+    ruler.textContent = label;
+    document.body.appendChild(ruler);
+    const textWidth = ruler.getBoundingClientRect().width;
+    ruler.remove();
+    // Counted here, after every guard above, so the number means "actually measured" rather
+    // than "matched the selector". A select that is hidden, zero-size or empty-labelled is
+    // legitimately skipped and must not inflate the coverage figure.
+    results.selectsSeen += 1;
+    // Native selects reserve room for their own dropdown arrow on top of padding. Subtract a
+    // conservative allowance so a label that merely touches the arrow is not reported.
+    const avail = box.width - parseFloat(style.paddingLeft || 0) - parseFloat(style.paddingRight || 0);
+    if (textWidth - avail > 4) {
+      results.clipped.push({
+        kind: 'select-text-cut',
+        selector: el.className || 'select',
+        text: label.slice(0, 50),
+        scrollWidth: Math.round(textWidth),
+        clientWidth: Math.round(avail),
+      });
+    }
+  }
+
   // Text hidden without an ellipsis affordance: the string is simply cut in half.
   for (const el of all) {
     if (el.closest('svg')) continue;
@@ -310,10 +436,51 @@ async function toggleSidebar(page) {
   });
   if (!visible) return false;
   await button.click();
-  // Let the width transition settle before re-measuring.
-  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
-  await new Promise((r) => setTimeout(r, 350));
+  // A fixed sleep here reported a phantom overlap: the sidebar's own width had already jumped to
+  // its expanded 248px (so React had rendered the brand label) while .pool-main-layout still
+  // carried the collapsed 68px margin, and the header title measured at x=92 under a label
+  // reaching x=124. Nothing was ever painted that way -- it was one unsettled frame, sampled
+  // because 350ms is a guess that only usually holds. Under the load of the full matrix it did
+  // not. Wait for the geometry to agree with itself instead of for the clock: the rail's width,
+  // the CSS variable driving it and the content's offset all have to match, twice in a row.
+  await page.evaluate(async () => {
+    const settled = () => {
+      const layout = document.querySelector('.pool-app-layout');
+      const sider = document.querySelector('.pool-shell-sider');
+      const main = document.querySelector('.pool-main-layout');
+      if (!layout || !sider || !main) return true;
+      const declared = parseFloat(getComputedStyle(layout).getPropertyValue('--pool-sidebar-width'));
+      const width = sider.getBoundingClientRect().width;
+      const offset = parseFloat(getComputedStyle(main).marginLeft);
+      return Math.abs(width - declared) < 1 && Math.abs(offset - declared) < 1;
+    };
+    const frame = () => new Promise((r) => requestAnimationFrame(r));
+    let stable = 0;
+    for (let i = 0; i < 120 && stable < 2; i += 1) {
+      await frame();
+      stable = settled() ? stable + 1 : 0;
+    }
+  });
   return true;
+}
+
+// A page that never mounted has no elements, and no elements produce no findings, which this
+// script printed as a clean zero. That is how a JSX syntax error in EmailPool.tsx sat through a
+// full 31-page matrix while the summary line read "clipped data: 0": Vite failed the module
+// transform, React never rendered, PROBE measured an empty document, and the page's silence was
+// indistinguishable from a pass. The waits above are deliberately forgiving because some pages
+// are legitimately sparse, so the assertion here is not about how much rendered -- it is that the
+// app mounted at all and that the dev server is not showing a build error in place of the app.
+async function assertAppRendered(page, route) {
+  const state = await page.evaluate(() => ({
+    overlay: Boolean(document.querySelector('vite-error-overlay')),
+    rootChildren: document.getElementById('root')?.childElementCount ?? 0,
+    hasShell: Boolean(document.querySelector('.pool-app-layout, .pool-route-content')),
+    overlayText: document.querySelector('vite-error-overlay')?.shadowRoot?.querySelector('.message')?.textContent?.trim().slice(0, 300) || '',
+  }));
+  if (state.overlay) throw new Error(`vite build error overlay on ${route}: ${state.overlayText || 'see dev server output'}`);
+  if (!state.rootChildren) throw new Error(`react never mounted on ${route} (#root is empty) -- module transform or runtime failure`);
+  if (!state.hasShell) throw new Error(`app shell missing on ${route} -- routed content did not render`);
 }
 
 async function gotoApp(page, baseURL, route) {  await page.goto(`${baseURL}${route}`, { waitUntil: 'domcontentloaded', timeout: 45000 });
@@ -324,15 +491,30 @@ async function gotoApp(page, baseURL, route) {  await page.goto(`${baseURL}${rou
   await page.waitForNetworkIdle({ idleTime: 300, timeout: 6000 }).catch(() => {});
   await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
   await new Promise((r) => setTimeout(r, 250));
+  await assertAppRendered(page, route);
 }
 
 async function main() {
+  // Before spending four minutes in a browser, confirm the list being checked is the real one.
+  assertRouteCoverage();
   fs.rmSync(outDir, { recursive: true, force: true });
   fs.mkdirSync(outDir, { recursive: true });
   const port = await findPort(Number(process.env.OVERLAP_PORT || 5292));
   const baseURL = `http://127.0.0.1:${port}/console`;
   const server = startServer(port);
   const findings = [];
+  // A zero here used to be unfalsifiable: "nothing overlaps" and "nothing was measured" printed
+  // the same clean summary, which is how a JSX syntax error in EmailPool.tsx once passed. Counting
+  // the probes and comparing against the count the loop bounds demand makes the zero mean
+  // something -- a skipped role, an empty viewport list or a page that never loaded now fails loudly
+  // instead of improving the score. assertAppRendered covers "loaded but blank"; this covers
+  // "never visited at all".
+  const expectedVisits = activeThemes.length * pickViewports().length
+    * (pick(adminPages, 'OVERLAP_PAGES').length + pick(userPages, 'OVERLAP_PAGES').length);
+  let routeVisits = 0;
+  let probes = 0;
+  let selectsSeen = 0;
+  const pagesWithSelects = new Set();
   try {
     await waitForServer(server);
     const { installMocks } = await import('./capture-ui-review.mjs');
@@ -357,7 +539,11 @@ async function main() {
             for (const [name, route] of pages) {
               try {
                 await gotoApp(page, baseURL, route);
+                routeVisits += 1;
                 const res = await page.evaluate(PROBE);
+                probes += 1;
+                selectsSeen += res.selectsSeen;
+                if (res.selectsSeen) pagesWithSelects.add(name);
                 if (res.textOverlaps.length || res.overflow.length || res.clipped.length || res.scrollable.length || res.pageOverflow) {
                   findings.push({ role, theme, viewport: viewport.name, page: name, route, ...res });
                 }
@@ -368,6 +554,9 @@ async function main() {
                 const toggled = await toggleSidebar(page);
                 if (toggled) {
                   const res2 = await page.evaluate(PROBE);
+                  probes += 1;
+                  selectsSeen += res2.selectsSeen;
+                  if (res2.selectsSeen) pagesWithSelects.add(name);
                   if (res2.textOverlaps.length || res2.overflow.length || res2.clipped.length || res2.scrollable.length || res2.pageOverflow) {
                     findings.push({ role, theme, viewport: `${viewport.name}+toggled-sidebar`, page: name, route, ...res2 });
                   }
@@ -394,6 +583,8 @@ async function main() {
   const totalScrollable = findings.reduce((s, f) => s + (f.scrollable?.length || 0), 0);
   const totalPageOverflow = findings.filter((f) => f.pageOverflow).length;
   const errors = findings.filter((f) => f.error);
+  console.log(`probed: ${probes} measurements across ${routeVisits}/${expectedVisits} route visits`);
+  console.log(`native selects measured: ${selectsSeen} on ${pagesWithSelects.size} distinct pages`);
   console.log(`text overlaps: ${totalOverlaps}`);
   console.log(`container overflow: ${totalOverflow}`);
   console.log(`clipped data: ${totalClipped}`);
@@ -415,6 +606,13 @@ async function main() {
     }
   }
   console.log(`\nreport: ${path.relative(workspaceRoot, path.join(outDir, 'findings.json'))}`);
+  // Fail on a short sweep even when every measurement taken came back clean. Skipping work must
+  // never look like passing: without this, dropping a role or mistyping OVERLAP_PAGES quietly
+  // shrinks coverage and still prints "text overlaps: 0".
+  if (routeVisits !== expectedVisits) {
+    console.log(`\nincomplete sweep: visited ${routeVisits} of ${expectedVisits} expected route visits`);
+    process.exit(1);
+  }
   if (totalOverlaps || totalOverflow || totalClipped || totalPageOverflow || errors.length) process.exit(1);
 }
 

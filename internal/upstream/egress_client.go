@@ -127,6 +127,37 @@ func rawProfileForHeaders(headers http.Header) string {
 	return tlsclient.ProfileChrome
 }
 
+// egressProxyURL resolves the proxy URL the in-process TLS engine must dial for an
+// egress profile, for ANY egress type — not just a sidecar's chain.
+//
+// The stdlib path (transportForEgressMode) reads the exit from Endpoint for the proxy
+// types and from ChainProxy only for a sidecar wrapper. The fingerprint engine has to
+// agree with it exactly: if it read ChainProxy alone, an account bound to a plain
+// http_proxy/socks5_proxy egress would silently connect from the HOST IP while the
+// scheduler, quota accounting and cooldowns all believe it left through the proxy. That
+// mismatch puts one account's traffic on two different exit IPs, which is precisely the
+// binding inconsistency upstream risk control looks for.
+//
+// Returns "" for direct egress (no proxy), which the engine dials natively.
+func egressProxyURL(egress storage.EgressProfile) string {
+	switch strings.ToLower(strings.TrimSpace(egress.Type)) {
+	case "http_proxy", "https_proxy", "warp_proxy", "socks5_proxy", "socks5h_proxy":
+		if endpoint := strings.TrimSpace(egress.Endpoint); endpoint != "" {
+			return endpoint
+		}
+		// A proxy-typed profile with no endpoint is a misconfiguration; fall through to
+		// any chain hint rather than inventing a host-direct exit.
+		return strings.TrimSpace(egress.ChainProxy)
+	case storage.CurlCFFISidecarEgressType:
+		// Sidecar wrapper: ChainProxy carries the real selected exit (WrapEgressWithSidecar
+		// copies the base Endpoint into it).
+		return strings.TrimSpace(egress.ChainProxy)
+	default:
+		// "" / "direct" and unknown types: honor an explicit chain if one is set.
+		return strings.TrimSpace(egress.ChainProxy)
+	}
+}
+
 // proxyTypeForURL maps a proxy URL scheme onto the egress Type that
 // transportForEgress understands. Defaults to http_proxy for unknown/empty schemes.
 func proxyTypeForURL(raw string) string {

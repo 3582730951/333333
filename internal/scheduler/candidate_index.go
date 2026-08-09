@@ -33,7 +33,13 @@ type routeCandidateIndex struct {
 	selectionGeneration uint64
 	candidates          []indexedCandidate
 	staticCounters      NoAccountCounters
-	builtAt             time.Time
+	// poolSize is how many accounts the group held before any filtering. Zero means the
+	// group itself is empty, which every counter-based explanation is blind to: with no
+	// rows to skip, nothing increments and the failure is indistinguishable from
+	// transient saturation. A production export showed 120+ requests routed to two such
+	// groups over 14 hours, each reported only as "no active account available".
+	poolSize int
+	builtAt  time.Time
 }
 
 func candidateIndexKey(route Route, cfg config.Config) string {
@@ -112,7 +118,7 @@ func (s *Scheduler) buildCandidateIndex(ctx context.Context, selection *accountS
 			capable = loaded
 		}
 	}
-	index := &routeCandidateIndex{key: key, selectionGeneration: selection.generation, candidates: make([]indexedCandidate, 0, len(selection.rows)), builtAt: time.Now()}
+	index := &routeCandidateIndex{key: key, selectionGeneration: selection.generation, candidates: make([]indexedCandidate, 0, len(selection.rows)), poolSize: len(selection.rows), builtAt: time.Now()}
 	for _, snapshot := range selection.rows {
 		account := snapshot.Account
 		provider := s.providerOfAccountCached(ctx, account)
@@ -387,7 +393,7 @@ func (s *Scheduler) selectFreshIndexed(ctx context.Context, route Route) (Lease,
 	}
 	counters := index.staticCounters
 	if len(index.candidates) == 0 {
-		return Lease{}, s.noAccountError(route, counters)
+		return Lease{}, s.noAccountErrorForPool(route, counters, index.poolSize)
 	}
 	evaluation := s.newCandidateEvaluationContext(ctx, route, selection)
 	if !cfg.SchedulerIndexEnabled {
@@ -405,7 +411,7 @@ func (s *Scheduler) selectFreshIndexed(ctx context.Context, route Route) (Lease,
 		return lease, nil
 	}
 	if len(index.candidates) <= 3 {
-		return Lease{}, s.noAccountError(route, counters)
+		return Lease{}, s.noAccountErrorForPool(route, counters, index.poolSize)
 	}
 	atomic.AddInt64(&s.metrics.CandidateFallbacks, 1)
 	counters = index.staticCounters
@@ -419,7 +425,7 @@ func (s *Scheduler) selectFreshIndexed(ctx context.Context, route Route) (Lease,
 	if lease, ok := s.tryCandidateChoices(ctx, route, best, &counters); ok {
 		return lease, nil
 	}
-	return Lease{}, s.noAccountError(route, counters)
+	return Lease{}, s.noAccountErrorForPool(route, counters, index.poolSize)
 }
 
 func (s *Scheduler) selectFreshFullScan(ctx context.Context, route Route, index *routeCandidateIndex, evaluation *candidateEvaluationContext, counters NoAccountCounters) (Lease, error) {
@@ -433,5 +439,5 @@ func (s *Scheduler) selectFreshFullScan(ctx context.Context, route Route, index 
 	if lease, ok := s.tryCandidateChoices(ctx, route, best, &counters); ok {
 		return lease, nil
 	}
-	return Lease{}, s.noAccountError(route, counters)
+	return Lease{}, s.noAccountErrorForPool(route, counters, index.poolSize)
 }

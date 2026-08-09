@@ -110,6 +110,37 @@ func TestClientForPoolsByKey(t *testing.T) {
 	}
 }
 
+// TestForceHTTP1FragmentsTheClientPool: ForceHTTP1 is baked into a client's ALPN at
+// construction time, so an h1-pinned and a non-pinned request that share profile+proxy must
+// NOT share a cached client. If they did, whichever request created it first would silently
+// decide the other's protocol — either putting h2 on Claude traffic (the exact leak the pin
+// exists to remove) or dragging another provider down to HTTP/1.1.
+func TestForceHTTP1FragmentsTheClientPool(t *testing.T) {
+	f := New()
+	h2Client, err := f.clientFor(Request{Profile: ProfileChrome})
+	if err != nil {
+		t.Fatalf("clientFor: %v", err)
+	}
+	h1Client, err := f.clientFor(Request{Profile: ProfileChrome, ForceHTTP1: true})
+	if err != nil {
+		t.Fatalf("clientFor: %v", err)
+	}
+	if h2Client == h1Client {
+		t.Fatal("ForceHTTP1 is not part of the client cache key: an h1-pinned request reused an h2 client, so the ALPN pin is silently lost")
+	}
+	// Each variant still pools with its own kind.
+	h1Again, err := f.clientFor(Request{Profile: ProfileChrome, ForceHTTP1: true})
+	if err != nil {
+		t.Fatalf("clientFor: %v", err)
+	}
+	if h1Again != h1Client {
+		t.Fatal("two h1-pinned requests did not share a client; keep-alive pooling is broken")
+	}
+	if got, want := cacheKey(Request{Profile: ProfileChrome, ForceHTTP1: true}), cacheKey(Request{Profile: ProfileChrome}); got == want {
+		t.Fatalf("cacheKey ignores ForceHTTP1: %q == %q", got, want)
+	}
+}
+
 func TestCookieJarReusesOnlyKeyedState(t *testing.T) {
 	f := New()
 	a := f.cookieJar("k")

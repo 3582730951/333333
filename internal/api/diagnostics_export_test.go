@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"slices"
@@ -16,6 +17,7 @@ import (
 
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/upstream"
 )
 
 func awaitLegacyDiagnosticExport(t *testing.T, h *testHarness) []byte {
@@ -452,6 +454,161 @@ func TestDiagnosticSanitizerPreservesSchemaAndEnumText(t *testing.T) {
 	}
 }
 
+// Versioned identifiers are the ones an operator most needs to read, and they were
+// the ones being destroyed: the identifier exemption rejected any value containing a
+// digit, so every long key carrying a `v3`/`v4`/`1gib` version fell through to the
+// entropy test and was replaced by a `TOKEN-…` alias. Both keys below are real,
+// taken from an exported production package where they appeared only as aliases.
+func TestDiagnosticSanitizerPreservesVersionedIdentifiers(t *testing.T) {
+	codebook := buildDiagnosticCodebookWithKey(
+		[]byte("stable-diagnostic-alias-key"),
+		nil, nil, nil, nil, nil, nil,
+	)
+	// Every snake_case literal of 40+ characters in internal/ — the exact population the
+	// high-entropy catch-all can reach. Harvested rather than hand-picked so that a future
+	// tightening of the exemption fails here instead of silently aliasing a setting key,
+	// reason code, or window counter in a production export.
+	for _, identifier := range []string{
+		"goal_policy_defaults_v3_1gib_no_legacy_dual_write",
+		"usage_cache_diagnostics_v4_openai_nested_cache_backfilled",
+		"codex_prompt_cache_key_affinity_v2_rollout_percent",
+		"account_failure_streak_cooldown_seconds_v1_default",
+		"bounded_reclaim_exact_current_consolidation",
+		"codex_reset_credits_unknown_consume_enabled",
+		"codex_stateless_continuation_unavailable",
+		"http_insufficient_quota_is_not_fixed_type",
+		"idx_codex_upstream_attempt_recent_egress",
+		"internal_chat_message_metadata_passthrough",
+		"kiro_model_absent_from_static_capabilities",
+		"known_expired_token_uses_account_failover",
+		"known_missing_scope_uses_account_failover",
+		"legacy_lifecycle_account_requires_review",
+		"model_available_but_account_not_capable_after_catalog_refresh",
+		"non_codex_provider_does_not_receive_grace",
+		"official_codex_or_custom_native_responses",
+		"provider_api_key_inference_probe_pending",
+		"same_account_same_egress_https_sse_bridge",
+		"sse_usage_limit_reached_is_not_fixed_code",
+		"stateful_cf_can_rotate_egress_without_alternate",
+		"stateful_expired_token_rebuilds_for_alternate",
+		"stateful_expired_token_without_alternate_stays_native",
+		"structured_error_overrides_retryable_status",
+		"team_personal_access_token_persist_failed",
+		"window_account_model_cache_point_accepted_requests",
+		"window_account_model_cache_point_injected_requests",
+		"window_account_model_cache_point_unsupported_requests",
+		"window_account_model_credits_reported_requests",
+	} {
+		if got := codebook.sanitize(identifier); got != identifier {
+			t.Fatalf("versioned identifier was aliased: %q -> %q", identifier, got)
+		}
+	}
+	// The exemption must stay narrow: real secrets of the same length are still aliased.
+	for _, secret := range []string{
+		strings.Repeat("0123456789abcdef", 4),
+		"AKIAIOSFODNN7EXAMPLE_wJalrXUtnFEMI_K7MDENGbPxRfiCYEXAMPLEKEY",
+		"9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a3928",
+		// Lowercase base64url-ish blob with underscores, but digit-leading segments.
+		"a1b2c3d4e5f6a7b8_9c0d1e2f3a4b5c6d_7e8f9a0b1c2d3e4f_5a6b7c8d9e0f",
+		// Shaped to imitate an identifier: lowercase alnum words, underscore-joined, and
+		// a 24% digit share that clears the digit-rate ceiling. It is caught because
+		// every word carries a digit, which no real key does. Taken verbatim from a run
+		// where a digit-share bound alone exempted 14% of such blobs.
+		"5v04qsbs1qrg_4mdd2dup4ji_ew45rritydl_oc4vffo6lis",
+	} {
+		if got := codebook.sanitize(secret); !strings.HasPrefix(got, "TOKEN-") || strings.Contains(got, secret) {
+			t.Fatalf("secret was not aliased: %q -> %q", secret, got)
+		}
+	}
+}
+
+// A relay's transport profile is the field that decides how we frame every request to
+// it, and per-route overrides mean the provider-level protocol is not authoritative for
+// a given downstream path. The export carried neither, so a package from a relay that
+// failed under `claude_code` framing looked identical to one that never used it.
+func TestDiagnosticsExportRecordsCustomProviderTransport(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	if err := h.store.UpsertCustomProvider(ctx, storage.CustomProvider{
+		ID:               "relay-claude-code",
+		Name:             "Relay",
+		BaseURL:          "https://user:pass@relay.example.com/v1",
+		UpstreamProtocol: "anthropic_messages",
+		TransportProfile: "claude_code",
+		EgressIDs:        []string{"egress-jp-1", "egress-jp-2"},
+		Routes: []storage.CustomProviderRoute{{
+			ID:               "route-messages",
+			DownstreamPath:   storage.CustomProviderDownstreamMessages,
+			BaseURL:          "https://route-user:route-pass@messages.example.com/v1",
+			UpstreamProtocol: "anthropic_messages",
+			TransportProfile: "claude_code",
+		}, {
+			ID:               "route-chat",
+			DownstreamPath:   storage.CustomProviderDownstreamChat,
+			UpstreamProtocol: "chat_completions",
+			TransportProfile: "generic",
+		}},
+		Enabled: true,
+		Models:  []string{"claude-sonnet-4-5"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	files := readZipFiles(t, awaitLegacyDiagnosticExport(t, h))
+	rows, err := csv.NewReader(strings.NewReader(files["custom_providers.csv"])).ReadAll()
+	if err != nil {
+		t.Fatalf("custom_providers.csv: %v", err)
+	}
+	if len(rows) < 2 {
+		t.Fatalf("custom_providers.csv has no data rows: %v", rows)
+	}
+	column := map[string]int{}
+	for i, name := range rows[0] {
+		column[name] = i
+	}
+	for _, name := range []string{"transport_profile", "routes", "egress_ids"} {
+		if _, ok := column[name]; !ok {
+			t.Fatalf("custom_providers.csv is missing the %q column: %v", name, rows[0])
+		}
+	}
+	var row []string
+	for _, candidate := range rows[1:] {
+		if candidate[column["id"]] == "relay-claude-code" {
+			row = candidate
+			break
+		}
+	}
+	if row == nil {
+		t.Fatalf("custom_providers.csv has no row for the relay: %v", rows)
+	}
+	if got := row[column["transport_profile"]]; got != "claude_code" {
+		t.Fatalf("transport_profile = %q, want claude_code", got)
+	}
+	if got := row[column["egress_ids"]]; got != "egress-jp-1 egress-jp-2" {
+		t.Fatalf("egress_ids = %q", got)
+	}
+	var routes []storage.CustomProviderRoute
+	if err := json.Unmarshal([]byte(row[column["routes"]]), &routes); err != nil {
+		t.Fatalf("routes column is not JSON: %v (%q)", err, row[column["routes"]])
+	}
+	byPath := map[string]storage.CustomProviderRoute{}
+	for _, route := range routes {
+		byPath[route.DownstreamPath] = route
+	}
+	if got := byPath[storage.CustomProviderDownstreamChat]; got.TransportProfile != "generic" ||
+		got.UpstreamProtocol != "chat_completions" {
+		t.Fatalf("per-route override lost: %+v", got)
+	}
+	if got := byPath[storage.CustomProviderDownstreamMessages]; got.TransportProfile != "claude_code" {
+		t.Fatalf("messages route profile = %q, want claude_code", got.TransportProfile)
+	}
+	// Route base URLs go through the same userinfo redaction as the provider's own.
+	if strings.Contains(files["custom_providers.csv"], "route-pass") ||
+		strings.Contains(files["custom_providers.csv"], "pass@") {
+		t.Fatalf("custom_providers.csv leaked URL credentials: %s", files["custom_providers.csv"])
+	}
+}
+
 func TestDiagnosticWholeFileSanitizationPreservesCSVHeader(t *testing.T) {
 	codebook := buildDiagnosticCodebookWithKey(
 		[]byte("stable-diagnostic-alias-key"),
@@ -708,4 +865,172 @@ func zipFileNames(files map[string]string) []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+// provider_attempts is the table that explains provider wire failures, but only the
+// antigravity path ever wrote to it, so the column could hold exactly one value. A
+// production export whose largest failure cluster was 1512 relay 5xx had zero rows for
+// the relay that produced them.
+func TestCustomProviderWireAttemptsAreRecorded(t *testing.T) {
+	var calls int
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"deepseek-chat"}]}`))
+			return
+		}
+		calls++
+		if calls == 1 {
+			// A terminal 400, not a 429: with one account in the pool a rate limit puts it
+			// into cooldown and the next request blocks in the scheduler wait, which would
+			// make this test about failover timing rather than about recording.
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"unknown model"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(dsChatResp))
+	})
+	acc := setupDeepSeek(t, h, []string{"deepseek-chat"}, false)
+
+	for i := 0; i < 2; i++ {
+		resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	rows := h.app.diagnosticProviderAttempts()
+	byClass := map[string]diagnosticProviderAttempt{}
+	for _, row := range rows {
+		if row.Provider != "deepseek" {
+			t.Fatalf("provider = %q, want the custom provider id: %+v", row.Provider, row)
+		}
+		if row.AccountID != acc {
+			t.Fatalf("attempt not attributed to the leased account: %+v", row)
+		}
+		byClass[row.ErrorClass] = row
+	}
+	rejected, ok := byClass["client_error"]
+	if !ok {
+		t.Fatalf("400 attempt was not recorded as client_error: %+v", rows)
+	}
+	if rejected.Status != http.StatusBadRequest {
+		t.Fatalf("rejected row status = %d: %+v", rejected.Status, rejected)
+	}
+	success, ok := byClass["none"]
+	if !ok {
+		t.Fatalf("successful attempt was not recorded: %+v", rows)
+	}
+	if success.Status != http.StatusOK {
+		t.Fatalf("success row status = %d: %+v", success.Status, success)
+	}
+	// The digest must be present and must not be the body itself.
+	if len(success.BodyHash) != 64 || strings.Contains(success.BodyHash, "hi") {
+		t.Fatalf("body hash is not a bare sha256 digest: %q", success.BodyHash)
+	}
+}
+
+func TestDiagnosticWireErrorClassSeparatesPermanentFromTransient(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		err    error
+		want   string
+	}{
+		{status: 200, want: "none"},
+		{status: 401, want: "auth"},
+		{status: 403, want: "auth"},
+		{status: 429, want: "rate_limit"},
+		{status: 503, want: "capacity"},
+		{status: 529, want: "capacity"},
+		{status: 500, want: "transient"},
+		{status: 408, want: "transient"},
+		// A relay answering 400 for an unmapped model is misconfigured, not busy;
+		// classifying it transient would advertise a permanent failure as retryable.
+		{status: 400, want: "client_error"},
+		{status: 404, want: "client_error"},
+		{status: 0, err: errors.New("dial tcp: connection refused"), want: "transient"},
+	} {
+		if got := diagnosticWireErrorClass(tc.status, tc.err); got != tc.want {
+			t.Fatalf("class(%d, %v) = %q, want %q", tc.status, tc.err, got, tc.want)
+		}
+	}
+}
+
+// A sidecar with runtime state used to be reported twice: once from its profile with
+// every runtime column blank, once from its adaptive status. Both rows carried the same
+// sidecar id and health, so an export of one sidecar read as two, and the blank row
+// looked like a second instance stuck outside the circuit breaker.
+func TestSidecarStatusRowsDoNotDuplicateSidecarsWithRuntimeState(t *testing.T) {
+	sidecar := func(id string) storage.EgressProfile {
+		return storage.EgressProfile{ID: id, Type: storage.CurlCFFISidecarEgressType, Health: "healthy", MaxConcurrency: 16}
+	}
+	profiles := []storage.EgressProfile{
+		sidecar("warp-1-ja3"),
+		sidecar("egress_sidecar"),
+		{ID: "plain-http", Type: "http", Health: "healthy"},
+	}
+	adaptive := []upstream.SidecarAdaptiveStatus{
+		{SidecarEgressID: "warp-1-ja3", RealEgressID: "warp-1-ja3", Limit: 1, CircuitState: "half_open", UpdatedAt: 1785994568},
+	}
+
+	rows := sidecarStatusRows(profiles, nil, adaptive)
+
+	counts := map[string]int{}
+	for _, row := range rows {
+		counts[row[0]]++
+	}
+	if counts["warp-1-ja3"] != 1 {
+		t.Fatalf("sidecar with runtime state emitted %d rows, want 1: %v", counts["warp-1-ja3"], rows)
+	}
+	// A sidecar with no runtime state is still reported, otherwise a configured but
+	// never-exercised sidecar would vanish from the export entirely.
+	if counts["egress_sidecar"] != 1 {
+		t.Fatalf("idle sidecar emitted %d rows, want 1: %v", counts["egress_sidecar"], rows)
+	}
+	if counts["plain-http"] != 0 {
+		t.Fatalf("non-sidecar egress leaked into sidecar_status: %v", rows)
+	}
+	for _, row := range rows {
+		if row[0] == "warp-1-ja3" && row[8] != "half_open" {
+			t.Fatalf("surviving row lost its runtime circuit state: %v", row)
+		}
+	}
+}
+
+// Adaptive state is keyed by (sidecar, real egress), so one sidecar fronting several
+// exits legitimately holds several statuses. Collapsing on sidecar id alone would hide
+// all but one exit's circuit state.
+func TestSidecarStatusRowsKeepEveryRealEgressAndOrphanedStatus(t *testing.T) {
+	profiles := []storage.EgressProfile{
+		{ID: "shared-ja3", Type: storage.CurlCFFISidecarEgressType, Health: "healthy", MaxConcurrency: 8},
+	}
+	adaptive := []upstream.SidecarAdaptiveStatus{
+		{SidecarEgressID: "shared-ja3", RealEgressID: "exit-jp", CircuitState: "closed"},
+		{SidecarEgressID: "shared-ja3", RealEgressID: "exit-us", CircuitState: "open"},
+		// Runtime state whose profile has since been deleted must not be dropped: it is
+		// the only record that the sidecar was tripped before it disappeared.
+		{SidecarEgressID: "removed-ja3", RealEgressID: "exit-de", CircuitState: "bypass"},
+	}
+
+	rows := sidecarStatusRows(profiles, nil, adaptive)
+
+	seen := map[string]string{}
+	for _, row := range rows {
+		seen[row[0]+"|"+row[1]] = row[8]
+	}
+	for key, want := range map[string]string{
+		"shared-ja3|exit-jp":  "closed",
+		"shared-ja3|exit-us":  "open",
+		"removed-ja3|exit-de": "bypass",
+	} {
+		if seen[key] != want {
+			t.Fatalf("row %q circuit_state = %q, want %q: %v", key, seen[key], want, rows)
+		}
+	}
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want exactly the 3 runtime rows: %v", len(rows), rows)
+	}
 }

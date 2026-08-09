@@ -189,12 +189,24 @@ async def proxy(writer,payload:dict[str,Any],body:Any):
  upload_session=None;key=None
  try:
   method=str(payload.get("method") or "POST").upper();url=str(payload["url"]);jar=str(payload.get("cookie_jar_key") or "default");proxy_url=str(payload.get("proxy") or "").strip();ja3=str(payload.get("ja3") or "").strip();akamai=str(payload.get("akamai") or "").strip()
+  # http_version pins the ALPN/protocol version for callers whose impersonated client cannot
+  # speak HTTP/2. Claude Code reaches Anthropic through the Anthropic TS SDK on Node's bundled
+  # undici, which forces allowH2:false, so a real claude-cli request is always HTTP/1.1 and its
+  # ClientHello offers only http/1.1. Our chrome impersonation offers ["h2","http/1.1"] and
+  # Anthropic's edge prefers h2, which would put a claude-cli User-Agent on an h2 connection —
+  # a combination the real client cannot produce. Only the literals curl_cffi's
+  # normalize_http_version accepts are forwarded; anything else is ignored rather than raising.
+  # It is part of the session key because connection reuse is per session: a pooled h2
+  # connection must never be handed to a request that asked for 1.1.
+  http_version=str(payload.get("http_version") or "").strip().lower()
+  if http_version not in {"v1","v2","v2tls","v2_prior_knowledge","v3","v3only"}:http_version=""
   if isinstance(body,SpoolBody):
    body.rewind();options={CurlOpt.POST:0,CurlOpt.UPLOAD:1,CurlOpt.CUSTOMREQUEST:method.encode(),CurlOpt.INFILESIZE_LARGE:body.size,CurlOpt.READDATA:body.file,CurlOpt.UPLOAD_BUFFERSIZE:64<<10}
    upload_session=AsyncSession(impersonate=IMPERSONATE,max_clients=1,curl_options=options);session=upload_session;request_data=None
   else:
-   key=(proxy_url,ja3,akamai,jar);session=await session_for(key);request_data=body or None
+   key=(proxy_url,ja3,akamai,jar,http_version);session=await session_for(key);request_data=body or None
   kwargs={"headers":clean_headers(payload.get("headers") or {}),"data":request_data,"cookies":load_cookies(jar),"timeout":TIMEOUT,"accept_encoding":ACCEPT_ENCODING}
+  if http_version:kwargs["http_version"]=http_version
   if proxy_url:kwargs["proxy"]=proxy_url
   # default_headers gates curl-impersonate's INJECTION of the browser's own header set
   # (sec-ch-ua*, sec-fetch-*, accept-language, upgrade-insecure-requests, …) ON TOP of the

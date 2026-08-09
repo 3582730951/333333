@@ -1006,9 +1006,77 @@ func safeTerminalErrorClass(failure leakfilter.CodexFailureFrame) string {
 		}
 	}
 	if failure.BuiltinRetryable {
+		// Deliberately keeps precedence over the structured code below: retryable_terminal
+		// is a retry-semantics answer operators query on, and narrowing it to a code would
+		// silently change what an existing query counts.
 		return "retryable_terminal"
 	}
+	// Everything past here used to collapse into other_terminal, a class that names no
+	// cause. In one export it absorbed 442 of 445 terminal failures, every one of them on
+	// an HTTP 200: statusless response.failed frames whose reason was unrecoverable from
+	// the package. The frame already carries the structured upstream code, and the field
+	// exists precisely so a terminal SSE response can be classified without exporting the
+	// upstream message, so the code is what the class should say.
+	//
+	// cyber_policy above is itself an upstream code emitted verbatim, so this widens an
+	// established pattern rather than opening a new one. What it must not do is widen the
+	// data that reaches the artifact: ErrorCode is upstream-controlled and only trimmed,
+	// so it passes a shape gate first and otherwise falls back to the old catch-all.
+	if code, ok := safeUpstreamErrorCodeClass(failure.ErrorCode); ok {
+		return code
+	}
+	if strings.TrimSpace(failure.ErrorCode) == "" {
+		// A terminal frame that carried no code at all is a different finding from one whose
+		// code was unusable, and only the first is upstream sending nothing to classify.
+		return "unclassified_stream_failure"
+	}
 	return "other_terminal"
+}
+
+// reservedTerminalErrorClasses are the class names that already carry meaning in
+// terminal_error_class. An upstream code equal to one of them would make a failure read
+// as a different failure, or -- for "none" -- as a success, so those fall back to the
+// catch-all instead.
+var reservedTerminalErrorClasses = map[string]bool{
+	"none": true, "other_terminal": true, "retryable_terminal": true,
+	"unclassified_stream_failure": true, "cyber_policy": true,
+	"context_length_exceeded": true, "orphaned_tool_output": true,
+	"encrypted_function_output": true, "previous_response_not_found": true,
+}
+
+// safeUpstreamErrorCodeClass admits an upstream error code as a diagnostic class only
+// when it looks like the short snake_case identifier upstream error codes are. The gate
+// is deliberately narrow rather than an allowlist of known codes: a new upstream code is
+// the case worth seeing in an export, and an allowlist would answer it with the same
+// catch-all this change exists to remove. Anything carrying whitespace, punctuation, an
+// upper-case byte, a non-ASCII byte, or more than 64 bytes is not a code -- it is a
+// message, a URL, or a blob -- and never reaches the artifact.
+//
+// The length bound is tied to diagnosticHighEntropyCandidate, which only inspects values
+// of 40 bytes or more and exempts snake_case identifiers from aliasing. Staying under
+// that threshold means an admitted code is never long enough for the entropy rule to
+// consider, so it cannot ride the identifier exemption into the export as an unaliased
+// secret-shaped blob. Real upstream codes are far shorter -- context_length_exceeded,
+// the longest this code path names, is 23 bytes.
+func safeUpstreamErrorCodeClass(raw string) (string, bool) {
+	code := strings.TrimSpace(raw)
+	if code == "" || len(code) >= 40 {
+		return "", false
+	}
+	if code[0] < 'a' || code[0] > 'z' {
+		return "", false
+	}
+	for index := 0; index < len(code); index++ {
+		c := code[index]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' {
+			continue
+		}
+		return "", false
+	}
+	if reservedTerminalErrorClasses[code] {
+		return "", false
+	}
+	return code, true
 }
 
 func userGroupRouteStatusClass(attempt *userGroupAttemptWriter) string {

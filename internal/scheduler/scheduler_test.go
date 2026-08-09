@@ -67,6 +67,50 @@ func TestAdaptiveZeroLimitsDoNotReject(t *testing.T) {
 	}
 }
 
+// The candidate score is float64(accountInflight) + normalizedLoad(egress) +
+// normalizedLoad(sidecar) + tokenLoad + latencyPenalty, lowest wins. That layering only
+// holds while the outlet terms stay under 1: account fairness is the primary axis and
+// outlet load the tiebreaker. max_concurrency=0 means unlimited in concurrencyLimited,
+// in the in-process lease coordinator and in the Redis acquire script, so it must not
+// score as maximally loaded here.
+func TestUncappedEgressLoadStaysInTheTiebreakerBand(t *testing.T) {
+	// An uncapped outlet can never outrank a one-request account inflight difference.
+	// This is the property that broke: the raw count made a busy uncapped egress worth
+	// more than any realistic account imbalance.
+	for _, load := range []int{1, 2, 8, 64, 10_000} {
+		if got := normalizedLoad(load, 0); got >= 1 {
+			t.Fatalf("uncapped load %d scored %v, must stay below one account inflight", load, got)
+		}
+	}
+	if normalizedLoad(0, 0) != 0 {
+		t.Fatal("an idle uncapped outlet must contribute nothing")
+	}
+
+	// Both spellings of unlimited must land in the same band. Before the fix an outlet
+	// at max_concurrency=0 scored 8.0 against 8/9999999999 for one meaning the same thing.
+	huge := normalizedLoad(8, 9_999_999_999)
+	zero := normalizedLoad(8, 0)
+	if zero >= 1 || huge >= 1 {
+		t.Fatalf("unlimited spellings escaped the band: zero-cap=%v huge-cap=%v", zero, huge)
+	}
+
+	// A near-saturated bounded outlet must not beat a lightly loaded uncapped one.
+	if !(normalizedLoad(15, 16) > normalizedLoad(2, 0)) {
+		t.Fatalf("a 15/16 outlet must score worse than an uncapped outlet holding 2: %v vs %v",
+			normalizedLoad(15, 16), normalizedLoad(2, 0))
+	}
+
+	// Spreading across two uncapped outlets is still preserved.
+	if !(normalizedLoad(2, 0) < normalizedLoad(8, 0)) {
+		t.Fatal("the less loaded of two uncapped outlets must still win")
+	}
+
+	// A positive cap keeps exact fractional saturation.
+	if got := normalizedLoad(4, 16); got != 0.25 {
+		t.Fatalf("bounded saturation=%v want 0.25", got)
+	}
+}
+
 func TestSelectRecordsRouteLatencyMetrics(t *testing.T) {
 	store := testStore(t)
 	ctx, cancel := context.WithCancel(context.Background())

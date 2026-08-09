@@ -149,6 +149,13 @@ func (s *Server) describeNoAccount(ctx context.Context, group, provider, model s
 	return errors.New(strings.TrimSpace(b.String()))
 }
 
+// noAccountEmptyPool reports whether a selection failure was caused by the routed group
+// holding no accounts at all, rather than by its accounts each being skipped.
+func noAccountEmptyPool(err error) bool {
+	var noAccount *scheduler.NoAccountError
+	return errors.As(err, &noAccount) && noAccount.EmptyPool
+}
+
 func noAccountRouteDiagnostics(provider, model string, err error) ([]string, string, scheduler.NoAccountCounters) {
 	providers := []string{}
 	normalizedModel := strings.TrimSpace(model)
@@ -226,7 +233,15 @@ func (s *Server) writePublicNoAccountError(ctx context.Context, w http.ResponseW
 	allowedProviders, normalizedModel, counters := noAccountRouteDiagnostics(provider, model, err)
 	counterJSON, _ := json.Marshal(counters)
 	reason := "no_public_account_detail"
-	if counters.ModelUnsupported > 0 {
+	switch {
+	// An empty group gets its own reason so it is queryable. It was previously
+	// indistinguishable from every other selection failure: the counters are all zero,
+	// so the row read `no_public_account_detail` with the real cause buried in free-text
+	// detail that the diagnostics aliaser truncates. A production package had 120+
+	// requests routed to two empty groups over 14 hours and no way to filter for them.
+	case noAccountEmptyPool(err):
+		reason = "group_has_no_accounts"
+	case counters.ModelUnsupported > 0:
 		reason = "model_unsupported"
 	}
 	auditKey := shortHash(fmt.Sprintf("%d|%s|%s|%s|%s|%s", status, group,

@@ -14,6 +14,13 @@ export interface RegistrationJob {
   succeeded?: number;
   failed?: number;
   created_at?: number;
+  // HandleJobList marshals these three and the UI ignored all of them: platform is currently
+  // always "chatgpt" (the handler rejects anything else), but the timestamps are 0-until-set and
+  // `error` is the only record of why a batch failed.
+  platform?: string;
+  started_at?: number;
+  completed_at?: number;
+  error?: string;
   [key: string]: unknown;
 }
 

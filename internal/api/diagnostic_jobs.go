@@ -791,7 +791,7 @@ func diagnosticDLPMatch(value string) bool {
 		diagnosticContainsUnsafeRequestID(value) || diagnosticEmailRE.MatchString(value) ||
 		diagnosticURLRE.MatchString(value) || diagnosticIPv4RE.MatchString(value) ||
 		diagnosticIPv6RE.MatchString(value) || diagnosticWindowsPathRE.MatchString(value) ||
-		diagnosticUnixPathRE.MatchString(value) {
+		diagnosticContainsUnixPath(value) {
 		return true
 	}
 	return diagnosticContainsHighEntropy(value)

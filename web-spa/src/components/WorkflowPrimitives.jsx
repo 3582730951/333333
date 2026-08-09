@@ -178,6 +178,9 @@ export function TaskDetailDrawer({
   width = 620,
 }) {
   const active = open ?? visible ?? !!task;
+  // started_at / completed_at are 0 until the task reaches each state, so they are read through
+  // a guard rather than handed to fmtDateTime -- otherwise an unstarted task reports 1970.
+  const stamp = (value) => (Number(value) > 0 ? fmtDateTime(value) : undefined);
   const details = task && typeof task === 'object' ? [
     [t('workflow.task_id'), task.id],
     [t('workflow.type'), task.task_type || task.method],
@@ -188,8 +191,14 @@ export function TaskDetailDrawer({
     [t('workflow.success'), task.succeeded ?? task.success_count],
     [t('workflow.failed'), task.failed ?? task.failed_count],
     [t('workflow.created_at'), fmtDateTime(task.created_at)],
+    [t('workflow.started_at'), stamp(task.started_at)],
+    [t('workflow.completed_at'), stamp(task.completed_at)],
     [t('common.updated_at'), fmtDateTime(task.updated_at)],
   ].filter(([, value]) => value !== undefined && value !== null && value !== '') : [];
+  // The reason a task failed was the one field the payload carried that this drawer dropped, so a
+  // failed job offered a red tag and nothing else, in the table or here. It sits outside the
+  // definition grid because it is prose, not a value, and wraps rather than being clamped.
+  const failureReason = task && typeof task === 'object' ? String(task.error || task.last_error || '') : '';
 
   return (
     <Drawer
@@ -213,6 +222,12 @@ export function TaskDetailDrawer({
               </div>
             ))}
           </dl>
+          {failureReason ? (
+            <div className="pool-task-detail__failure">
+              <span className="pool-task-detail__failure-label">{t('workflow.failure_reason')}</span>
+              <p>{failureReason}</p>
+            </div>
+          ) : null}
           {children}
           {logs !== undefined || logError ? (
             <LogStream logs={logs} streaming={logStreaming} error={logError} onRetry={onRetryLogs} />

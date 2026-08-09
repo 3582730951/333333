@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/anthropicwire"
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/routing"
@@ -23,6 +25,9 @@ const (
 	claudeAnthropicVersion  = "2023-06-01"
 	claudeAgentIDHeader     = "X-Claude-Code-Agent-Id"
 	claudeParentAgentHeader = "X-Claude-Code-Parent-Agent-Id"
+	// Lowercase forms used by the wire header-order table (HTTP/2 field names).
+	claudeAgentIDHeaderLower     = "x-claude-code-agent-id"
+	claudeParentAgentHeaderLower = "x-claude-code-parent-agent-id"
 	// OAuth (Claude Pro/Max) carries the oauth beta; API keys must not.
 	claudeOAuthBetas             = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11"
 	claudeAPIKeyBetas            = "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01"
@@ -85,7 +90,21 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 	// 1. Not in passthrough mode (passthrough = opaque body, no thinking injection)
 	// 2. Thinking is enabled in config
 	// 3. Path is a messages endpoint (not files/skills/agents)
-	if !spec.PassThrough && !spec.MinimalProbe && c.cfgSnapshot().ThinkingEnabled && strings.Contains(path, "/v1/messages") {
+	// 4. The request is not a max_tokens:0 cache pre-warm. Anthropic documents
+	//    max_tokens:0 as "reads your prompt into the model and writes the cache at any
+	//    cache_control breakpoint, then returns immediately without generating any
+	//    output", and documents that it is rejected with invalid_request_error when
+	//    extended thinking is enabled on the request. A pre-warm's whole purpose is to
+	//    carry the client's own parameters unchanged so that the cache entry it writes
+	//    matches the real turn that follows it; a thinking block this relay added, which
+	//    the downstream client never sent, makes the pre-warm and the real turn disagree
+	//    and risks the documented rejection on every warmed turn — a repeating,
+	//    self-similar 400 pattern against the account. Note the observable injection here
+	//    is thinking.type=adaptive (every Claude model in the local registry is
+	//    level-only, so budget mode is converted to level mode before the applier runs);
+	//    max_tokens itself is left at 0 in that branch. The narrower claim is the one
+	//    that holds: the relay must not add a thinking block to a pre-warm at all.
+	if !spec.PassThrough && !spec.MinimalProbe && !claudeZeroMaxTokensPrewarm(requestBody(spec)) && c.cfgSnapshot().ThinkingEnabled && strings.Contains(path, "/v1/messages") {
 		setRequestBody(&spec, c.applyThinkingConfig(requestBody(spec), "claude", spec.Model, spec.Account))
 	}
 	if !spec.PassThrough && !spec.MinimalProbe && strings.Contains(path, "/v1/messages") {
@@ -99,30 +118,34 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 		applyHeaders = c.applyClaudePassthroughHeaders
 	}
 
-	// Route through the curl_cffi sidecar when the account is bound to one, so the
-	// Anthropic upstream sees a real client TLS/JA3 + HTTP2 fingerprint instead of
-	// the Go standard library's. Although Anthropic (unlike chatgpt.com) has no
+	// Route Anthropic traffic through a real client TLS/JA3 + HTTP2 fingerprint instead
+	// of the Go standard library's. Although Anthropic (unlike chatgpt.com) has no
 	// Cloudflare challenge wall, the stdlib transport's fingerprint is itself a
-	// relay-detection signal — which is exactly what binding "curl_cffi_sidecar"
-	// out on an account is meant to defeat (and what the admin UI advertises). The
-	// ClaudeForceDirect escape hatch forces the direct/proxy transport for
-	// deployments that cannot run the sidecar against api.anthropic.com.
-	if spec.Egress.Type == "curl_cffi_sidecar" && !c.cfgSnapshot().ClaudeForceDirect {
+	// relay-detection signal: a request whose headers claim claude-cli/Node but whose
+	// ClientHello and HTTP/2 SETTINGS are Go's is self-contradicting, and every pooled
+	// account would share that same contradiction.
+	//
+	// The in-process engine (tls-client/uTLS) needs no external process and can dial ANY
+	// egress type — direct, http(s)/warp/socks5(h) proxy, or a sidecar's chain — so it is
+	// applied to every egress, not only "curl_cffi_sidecar". Gating it on the sidecar
+	// egress type (the historical behavior) meant an account bound to a plain proxy or to
+	// direct silently fell back to the stdlib fingerprint; that is exactly the "escaped
+	// request" case that puts one account's traffic behind two different fingerprints.
+	//
+	// The external curl_cffi sidecar keeps its previous scope: it is a separate process
+	// reachable only through a sidecar-typed egress, so it stays limited to that type.
+	// The ClaudeForceDirect escape hatch still forces the plain stdlib transport for
+	// deployments that must not use either engine.
+	if c.claudeFingerprintEngine(spec.Egress) != claudeEngineStdlib {
 		built := http.Header{}
 		applyHeaders(built, spec, id, stream)
-		// The sidecar negotiates and auto-decompresses encoding itself (and a real
-		// Node/Chrome client never asks for "identity"), so drop our identity hint
-		// and let the impersonated transport present its native Accept-Encoding.
+		// The fingerprint transport negotiates and auto-decompresses encoding itself
+		// (and a real Node/Chrome client never asks for "identity"), so drop our
+		// identity hint and let the impersonated transport present its native
+		// Accept-Encoding.
 		built.Del("Accept-Encoding")
 		claudeSpec := spec
 		claudeSpec.Method = firstNonEmpty(spec.Method, http.MethodPost)
-		// Bound the call by the full request timeout (like the direct path), not the
-		// shorter sidecar connect budget, so a long streaming completion is not cut
-		// off mid-stream.
-		timeout := c.cfg.RequestTimeout()
-		if st := c.cfg.SidecarTimeout(); st > timeout {
-			timeout = st
-		}
 		// JA3 the sidecar replays for Claude. DEFAULT IS CHROME (""): see resolveClaudeJA3
 		// — the real claude-cli/Node JA3 is an explicit opt-in, not the default. When a
 		// JA3 is set, the sidecar disables its impersonation default headers and uses
@@ -130,10 +153,22 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 		ja3 := resolveClaudeJA3(c.cfgSnapshot().ClaudeJA3Override)
 		// In-process fingerprint engine: route through tls-client (Chrome_120) instead of
 		// the external curl_cffi sidecar. The sidecar stays the fallback on engine "sidecar".
-		if c.inProcessFingerprint() {
-			return c.postInProcess(ctx, claudeSpec, target, built, timeout, ja3, tlsclient.ProfileChrome)
+		//
+		// The idle budget is the plain request timeout here. The sidecar branch below adds
+		// its own headroom because that path crosses an extra process hop; the in-process
+		// engine has no such hop, so borrowing the sidecar's (much larger) budget would
+		// silently weaken the idle watchdog and let a hung upstream hold a slot for the
+		// sidecar window instead of the configured request timeout.
+		if c.claudeFingerprintEngine(spec.Egress) == claudeEngineInProcess {
+			return c.postInProcessOrdered(ctx, claudeSpec, target, built, c.cfg.RequestTimeout(), ja3, tlsclient.ProfileChrome, claudeHeaderOrder(built))
 		}
-		return c.postViaSidecar(ctx, claudeSpec, target, built, timeout, ja3, false)
+		// Sidecar path: allow the larger of the request timeout and the sidecar budget,
+		// since this call crosses an extra process hop before it reaches the upstream.
+		sidecarTimeout := c.cfg.RequestTimeout()
+		if st := c.cfg.SidecarTimeout(); st > sidecarTimeout {
+			sidecarTimeout = st
+		}
+		return c.postViaSidecarOrdered(ctx, claudeSpec, target, built, sidecarTimeout, ja3, false, claudeHeaderOrder(built))
 	}
 
 	req, err := newReplayableHTTPRequest(ctx, firstNonEmpty(spec.Method, http.MethodPost), target, spec)
@@ -155,10 +190,80 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 	req = req.WithContext(directCtx)
 	// Direct/proxy fallback. A sidecar egress only reaches here when ClaudeForceDirect
 	// is set. For the account-level two-layer binding, restore the selected HTTP/SOCKS
-	// exit and bypass only its sidecar wrapper. A legacy account whose primary egress
-	// is itself a sidecar retains the historical true-direct fallback.
+	// exit and bypass only its sidecar wrapper.
 	directSpec := spec
-	directSpec.Egress = storage.WithoutSidecarTransport(directSpec.Egress)
+	directSpec.Egress = claudeDirectFallbackEgress(directSpec.Egress)
+	// Pin HTTP/1.1 here too. This is the stdlib escape hatch (ClaudeForceDirect, or an
+	// engine that resolved to stdlib because no TLS factory exists), so the ClientHello is
+	// already Go's — but the request still carries the full claude-cli identity built by
+	// applyHeaders above, and net/http's default ForceAttemptHTTP2 negotiates h2 against
+	// Anthropic's edge. "claude-cli User-Agent arriving over HTTP/2" is by construction
+	// never the real client (Node's bundled undici forces allowH2:false), so it is a
+	// free-standing discriminator that survives the operator's decision to skip TLS
+	// impersonation. The same predicate the fingerprint engines use decides it, so all
+	// three engines agree on the wire protocol for one account.
+	client, err := c.httpClientForEgressMode(directSpec, forceHTTP1ForClaudeImpersonation(target, req.Header))
+	if err != nil {
+		guard.Fail()
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		guard.Fail()
+		return nil, err
+	}
+	return &Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: guard.Wrap(resp.Body)}, nil
+}
+
+// DoAnthropicOAuth carries an Anthropic OAuth token-endpoint call (authorization-code
+// exchange and refresh_token grant) on the SAME account egress and the SAME TLS
+// fingerprint engine as that account's inference traffic.
+//
+// Why this exists instead of a plain http.Client:
+//
+// api.anthropic.com/v1/oauth/token is the SAME HOST as the inference endpoint. Refreshing
+// account A's credential from the relay host's own IP while every inference turn for
+// account A arrives from the account's bound proxy IP tells the upstream, per account and
+// on a fixed schedule, that one machine holds the credentials for N accounts that
+// otherwise appear to live on N different networks. It also mixes two TLS fingerprints on
+// one account: a Go stdlib ClientHello on the token call, an impersonated one on the
+// messages call. Both are relay signals independent of anything in the request body, and
+// the refresh loop guarantees they are emitted repeatedly for every pooled account.
+//
+// The caller supplies the fully-built header set; nothing is inherited from a downstream
+// request. Only the identity-neutral OAuth grant travels in the body.
+func (c *Client) DoAnthropicOAuth(ctx context.Context, egress storage.EgressProfile, account storage.Account, target string, headers http.Header, body []byte, cookieJarKey string) (*Response, error) {
+	built := headers.Clone()
+	if built == nil {
+		built = http.Header{}
+	}
+	spec := Request{
+		Method:       http.MethodPost,
+		Body:         bodysource.Bytes(body),
+		Account:      account,
+		Egress:       egress,
+		CookieJarKey: cookieJarKey,
+	}
+	timeout := c.cfg.RequestTimeout()
+	switch c.claudeFingerprintEngine(egress) {
+	case claudeEngineInProcess:
+		built.Del("Accept-Encoding")
+		return c.postInProcessOrdered(ctx, spec, target, built, timeout, resolveClaudeJA3(c.cfgSnapshot().ClaudeJA3Override), tlsclient.ProfileChrome, claudeHeaderOrder(built))
+	case claudeEngineSidecar:
+		built.Del("Accept-Encoding")
+		return c.postViaSidecarOrdered(ctx, spec, target, built, timeout, resolveClaudeJA3(c.cfgSnapshot().ClaudeJA3Override), false, claudeHeaderOrder(built))
+	}
+	// Explicit ClaudeForceDirect (or no fingerprint engine available): still keep the
+	// account's egress so the token call and the inference calls share an exit IP.
+	directSpec := spec
+	directSpec.Egress = claudeDirectFallbackEgress(egress)
+	req, err := newReplayableHTTPRequest(ctx, http.MethodPost, target, directSpec)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = built
+	directCtx, guard := newRequestGuard(ctx, timeout)
+	req = req.WithContext(directCtx)
 	client, err := c.httpClientForEgress(directSpec)
 	if err != nil {
 		guard.Fail()
@@ -170,6 +275,205 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 		return nil, err
 	}
 	return &Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: guard.Wrap(resp.Body)}, nil
+}
+
+// claudeDirectFallbackEgress maps an egress onto the transport the stdlib fallback
+// must dial, WITHOUT ever inventing a host-direct exit for an account that has one
+// configured.
+//
+// storage.WithoutSidecarTransport alone is not sufficient here. For the two-layer
+// binding (proxy wrapped by a sidecar) it correctly restores TransportBase*, but for a
+// LEGACY account whose primary egress is itself a curl_cffi_sidecar profile there are no
+// TransportBase* fields, so it rewrites the profile to Type="direct" with Endpoint and
+// ChainProxy cleared. Such a profile can still carry an explicit ChainProxy — that chain
+// IS the account's intended exit IP. Degrading it to a host-direct connection means the
+// inference turns for that account arrive from the proxy IP while the ClaudeForceDirect
+// turns (and the OAuth refresh) arrive from the relay host's own address: one account
+// observed on two networks, which is the IP/account binding inconsistency upstream risk
+// control looks for, and it happens silently.
+//
+// client.go's sidecarBypassEgress already applies this rescue for the sidecar
+// pre-header retry path; this keeps the Claude direct/OAuth fallbacks consistent with it
+// instead of leaving one of the three sidecar-unwrapping sites leaking.
+func claudeDirectFallbackEgress(egress storage.EgressProfile) storage.EgressProfile {
+	base := storage.WithoutSidecarTransport(egress)
+	if strings.TrimSpace(base.Endpoint) != "" {
+		return base
+	}
+	// No restored endpoint: only a legacy sidecar-primary profile can land here with an
+	// exit that WithoutSidecarTransport just discarded.
+	if strings.TrimSpace(egress.TransportSidecarID) == "" && storage.IsSidecarEgress(egress) {
+		if chain := strings.TrimSpace(egress.ChainProxy); chain != "" {
+			base.Type = proxyTypeForURL(chain)
+			base.Endpoint = chain
+			base.ChainProxy = ""
+		}
+	}
+	return base
+}
+
+// claudeEngine names the transport that carries an Anthropic request.
+type claudeEngine int
+
+const (
+	// claudeEngineStdlib is the Go net/http transport. It emits Go's TLS ClientHello
+	// and HTTP/2 SETTINGS, which contradict the claude-cli headers we send, so it is
+	// only ever selected by the explicit ClaudeForceDirect escape hatch (or when the
+	// in-process engine is unavailable and the egress cannot reach the sidecar).
+	claudeEngineStdlib claudeEngine = iota
+	// claudeEngineInProcess is the tls-client/uTLS engine inside this process.
+	claudeEngineInProcess
+	// claudeEngineSidecar is the external curl_cffi sidecar process.
+	claudeEngineSidecar
+)
+
+// claudeFingerprintEngine picks the transport for an Anthropic request.
+//
+// Ordering matters for risk control: the in-process engine is preferred for EVERY egress
+// type because it is the only option that can present a coherent browser/Node fingerprint
+// regardless of how the account exits. Falling back to the stdlib transport is reported as
+// such by the caller rather than silently accepted, because that fallback is the one path
+// that leaks a Go fingerprint to api.anthropic.com.
+func (c *Client) claudeFingerprintEngine(egress storage.EgressProfile) claudeEngine {
+	if c.cfgSnapshot().ClaudeForceDirect {
+		return claudeEngineStdlib
+	}
+	if c.inProcessFingerprint() && c.tlsFactory != nil {
+		return claudeEngineInProcess
+	}
+	// Engine "sidecar": only a sidecar-typed egress can reach the external process.
+	if storage.IsSidecarEgress(egress) {
+		return claudeEngineSidecar
+	}
+	// Engine is pinned to "sidecar" but this egress has no sidecar to talk to. Prefer a
+	// real fingerprint from the in-process engine over the stdlib's Go fingerprint when
+	// the factory exists; the operator's engine choice is about which impersonation
+	// backend to use, not a license to emit a Go ClientHello at Anthropic.
+	if c.tlsFactory != nil {
+		return claudeEngineInProcess
+	}
+	return claudeEngineStdlib
+}
+
+// claudeUpstreamHeaderOrder is the wire order of the headers the real Anthropic
+// TypeScript SDK (which Claude Code embeds) emits, derived from the SDK + undici
+// sources rather than guessed:
+//
+//   - anthropic-sdk-typescript src/client.ts buildHeaders() inserts, in this order:
+//     accept, user-agent, x-stainless-retry-count, x-stainless-timeout, then the
+//     getPlatformHeaders() block, then anthropic-dangerous-direct-browser-access, then
+//     anthropic-version, then the auth header, then the client's defaultHeaders, and
+//     finally the body's content-type.
+//   - src/internal/detect-platform.ts getPlatformProperties() defines the platform block
+//     in exactly this order: x-stainless-lang, x-stainless-package-version,
+//     x-stainless-os, x-stainless-arch, x-stainless-runtime, x-stainless-runtime-version.
+//   - undici hands request.headersList.entries to the dispatcher unsorted (lib/web/fetch/
+//     index.js dispatch()), i.e. INSERTION order reaches the socket, and appends
+//     accept-language (step 13 of fetch) plus content-length/accept-encoding after the
+//     caller's own headers.
+//
+// This matters because fhttp, with no HeaderOrderKey set, sorts header names
+// lexicographically (fhttp/header.go headerSorter.Less: "If the order isn't defined, sort
+// lexicographically"). Alphabetical header order is not something any real client emits,
+// so leaving it unset replaces one fingerprint mismatch with another — and it also differs
+// from what the curl_cffi sidecar sends, so the same account would drift between engines.
+//
+// Names are lowercase because fhttp's headerSorter lowercases before consulting the order
+// map (fhttp/header.go headerSorter.Less), so this table matches regardless of the case in
+// the header set.
+//
+// NOTE ON CASE: Claude traffic is now pinned to HTTP/1.1 (see
+// forceHTTP1ForClaudeImpersonation), where field case IS visible on the wire — h2 lowercases
+// by protocol, h1 does not. fhttp writes each map key verbatim (header.go writeSubset), and
+// our keys arrive canonicalized (`User-Agent`) because tlsclient.Do inserts them with
+// Header.Add. Real undici emits lowercase. We do NOT try to match that, because fhttp's
+// transferWriter injects `Content-Length` with a hard-coded canonical literal
+// (fhttp/transfer.go:287) that we cannot reach without patching the dependency: the
+// achievable outcomes are "all canonical" or "all lowercase except a canonical
+// Content-Length in the middle", and the latter is a mixed-case wire no real client
+// produces. Uniform canonical is the less anomalous of the two. This is a KNOWN residual
+// divergence.
+var claudeUpstreamHeaderOrder = []string{
+	"accept",
+	"user-agent",
+	"x-stainless-retry-count",
+	"x-stainless-timeout",
+	"x-stainless-lang",
+	"x-stainless-package-version",
+	"x-stainless-os",
+	"x-stainless-arch",
+	"x-stainless-runtime",
+	"x-stainless-runtime-version",
+	"anthropic-dangerous-direct-browser-access",
+	"anthropic-version",
+	"authorization",
+	"x-api-key",
+	// Claude Code's own client-level defaultHeaders block.
+	"x-app",
+	"anthropic-beta",
+	"x-claude-code-session-id",
+	claudeAgentIDHeaderLower,
+	claudeParentAgentHeaderLower,
+	// Body-derived and fetch-appended headers come last.
+	"content-type",
+	"accept-language",
+	"content-length",
+	"accept-encoding",
+}
+
+// transportInjectedHeaderOrder marks entries of claudeUpstreamHeaderOrder that the
+// transport adds on our behalf, so claudeHeaderOrder keeps their slot even though they are
+// absent from the header set we build. See claudeHeaderOrder for the per-header detail.
+var transportInjectedHeaderOrder = map[string]bool{
+	"host":           true,
+	"content-length": true,
+}
+
+// claudeHeaderOrder projects claudeUpstreamHeaderOrder onto the headers actually present
+// in built, then appends any remaining header in a deterministic (sorted) position. The
+// projection keeps the emitted order stable when an optional header is absent (e.g. an
+// OAuth account has authorization but no x-api-key) instead of leaving a gap, and the
+// deterministic tail guarantees two requests from the same account never reorder — header
+// order drift on one account is itself a risk-control signal.
+//
+// transportInjectedHeaderOrder names headers the TRANSPORT adds after we compute this
+// order, so they are never present in built and a presence-gated projection would drop
+// them — leaving them to be sorted into the alphabetical tail instead of held at their
+// real position. Listing a name that ends up absent is harmless: fhttp's headerSorter
+// only consults the order map for headers it is actually writing.
+//
+//   - host: fhttp sets it in Request.write (request.go:618) from the URL.  undici emits it
+//     FIRST on the h1 wire (client-h1.js writes `host:` before anything else), so without
+//     this it would land last-ish among the alphabetical leftovers.
+//   - content-length: folded into the header map by transferWriter.addHeaders
+//     (transfer.go:287), i.e. it participates in the ordering rather than being appended.
+func claudeHeaderOrder(built http.Header) []string {
+	order := make([]string, 0, len(built)+len(claudeUpstreamHeaderOrder)+1)
+	placed := make(map[string]bool, len(built))
+	// host leads the h1 wire.
+	placed["host"] = true
+	order = append(order, "host")
+	for _, name := range claudeUpstreamHeaderOrder {
+		if placed[name] {
+			continue
+		}
+		_, present := built[http.CanonicalHeaderKey(name)]
+		if !present && !transportInjectedHeaderOrder[name] {
+			continue
+		}
+		placed[name] = true
+		order = append(order, name)
+	}
+	var extra []string
+	for name := range built {
+		lower := strings.ToLower(name)
+		if placed[lower] {
+			continue
+		}
+		extra = append(extra, lower)
+	}
+	sort.Strings(extra)
+	return append(order, extra...)
 }
 
 // resolveClaudeJA3 resolves the TLS/JA3 fingerprint the curl_cffi sidecar replays for
@@ -259,10 +563,33 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 	forwardClaudeAgentContextHeaders(dst, spec.Headers)
 	dst.Set("User-Agent", id.ClaudeUserAgentVersionForEntrypoint(claudeVer, claudeEntrypoint(spec.Headers, requestBody(spec))))
 	dst.Set("Accept", "application/json")
-	if stream {
-		// Uncompressed so the downstream SSE scanner can read it line-by-line.
-		dst.Set("Accept-Encoding", "identity")
+	applyClaudeFetchHeaders(dst)
+}
+
+// applyClaudeFetchHeaders adds the headers Node's fetch (undici) appends to EVERY request
+// on the client's behalf. Claude Code does not set them itself, so a request that claims
+// to be claude-cli on Node while missing them is missing part of that client's signature.
+//
+// Accept-Language: undici appends `accept-language: *` unconditionally when the caller did
+// not set one (lib/web/fetch/index.js, step 13 of the fetch algorithm). Its absence is a
+// stable, trivially checkable divergence from any real Node client.
+//
+// Accept-Encoding is deliberately NOT set here:
+//   - the fingerprint engines strip it and emit the impersonated transport's own value
+//     (see postInProcess / the sidecar path), which is what keeps TLS↔header coherence;
+//   - on the plain stdlib fallback, leaving it unset lets net/http add its own
+//     `Accept-Encoding: gzip` AND transparently decompress the response, so the SSE
+//     scanner still reads plaintext lines.
+//
+// The previous behavior — `Accept-Encoding: identity` on streaming turns — was a real
+// signal: no browser and no Node/undici client ever asks an HTTPS endpoint for `identity`
+// (undici sends `br, gzip, deflate, zstd`), so it marked the request as machine-generated
+// by something that wanted to read the stream itself, i.e. a relay.
+func applyClaudeFetchHeaders(dst http.Header) {
+	if dst.Get("Accept-Language") == "" {
+		dst.Set("Accept-Language", "*")
 	}
+	dst.Del("Accept-Encoding")
 }
 
 // applyClaudePassthroughHeaders builds headers for a TRANSPARENT proxy of the extra
@@ -304,10 +631,6 @@ func (c *Client) applyClaudePassthroughHeaders(dst http.Header, spec Request, id
 		dst.Set("Accept", "text/event-stream")
 	} else {
 		dst.Set("Accept", "application/json")
-	}
-	if stream {
-		// Uncompressed so a streamed body can be scanned line-by-line downstream.
-		dst.Set("Accept-Encoding", "identity")
 	}
 
 	// Anthropic-Beta: prefer the client's own set verbatim (it knows the endpoint's
@@ -362,6 +685,7 @@ func (c *Client) applyClaudePassthroughHeaders(dst http.Header, spec Request, id
 	dst.Set("X-Claude-Code-Session-Id", claudeSessionID(spec.Headers, nil, id))
 	forwardClaudeAgentContextHeaders(dst, spec.Headers)
 	dst.Set("User-Agent", id.ClaudeUserAgentVersionForEntrypoint(claudeVer, claudeEntrypoint(spec.Headers, nil)))
+	applyClaudeFetchHeaders(dst)
 }
 
 // forwardClaudeAgentContextHeaders preserves Claude Code 2.1.220's subagent
@@ -499,6 +823,38 @@ func appendClaudeBeta(h http.Header, beta string) {
 	}
 	current = append(current, beta)
 	h.Set("Anthropic-Beta", strings.Join(current, ","))
+}
+
+// claudeZeroMaxTokensPrewarm reports whether body is an Anthropic cache pre-warm, i.e.
+// carries an explicit "max_tokens": 0.
+//
+// Anthropic documents this exact shape for pre-warming the prompt cache: the API reads the
+// prompt, writes the cache at each cache_control breakpoint, and returns an empty content
+// array with stop_reason "max_tokens" and zero output tokens billed. It is deliberately NOT
+// inferred from anything else (a caller flag, the path, a header) because the zero is the
+// whole contract — any code that then treats max_tokens:0 as "unset" and substitutes a
+// default silently turns a free zero-output call into a full billable generation.
+func claudeZeroMaxTokensPrewarm(body []byte) bool {
+	var root map[string]interface{}
+	if decodeClaudeJSONObject(body, &root) != nil {
+		return false
+	}
+	raw, ok := root["max_tokens"]
+	if !ok {
+		return false
+	}
+	// decodeClaudeJSONObject uses json.Number, so match that first; float64 covers a caller
+	// that decoded the body itself. A string "0" is deliberately NOT a match: Anthropic
+	// requires a number here, so a string is a malformed body, not a pre-warm.
+	switch value := raw.(type) {
+	case json.Number:
+		parsed, err := value.Float64()
+		return err == nil && parsed == 0
+	case float64:
+		return value == 0
+	default:
+		return false
+	}
 }
 
 const claudeBillingHeaderPrefix = "x-anthropic-billing-header:"

@@ -435,7 +435,10 @@ function ModelRoutingEditor({ draft, setDraft, targetOptions, providers }) {
             </div>
           </Card>
         );
-      }) : <Banner type="info" title="默认等权路由" description="未配置模型规则时，所有兼容目标处于同一等权层。" />}
+        // 下面那个 Banner 只在规则列表为空时出现，所以"未配置模型规则时"这个前提就是它自己的
+        // 出现条件，写出来等于复述；"所有兼容目标处于同一等权层"又和 384 行的段落说明重合。
+        // 两句合成一个标题，描述整个去掉。
+      }) : <Banner type="info" title="默认等权路由：所有兼容目标同层" />}
     </section>
   );
 }
@@ -817,10 +820,16 @@ function UserGroupEditor({
         />
       ) : null}
       <Card title="流量接收策略" className="pool-card">
+        {/* Only the consequences a reader cannot see live here. The old copy also opened with
+            "默认不屏蔽任何目标" and restated that the scope is the current user group -- but the
+            default is already the placeholder of the field right below (line ~834), and the scope
+            is this banner's own title plus both field labels ("...流量跳过的账号池分组"). What is
+            genuinely invisible is what happens after a skip: failover, the 10-minute hold, and
+            that the pool stays enabled globally. Those three stay. */}
         <Banner
           type="info"
           title="策略只属于当前用户分组"
-          description="默认不屏蔽任何目标。勾选后会跳过当前用户分组里的指定账号池，并把请求转移给其他可承载目标；全部暂不可用时保持连接并动态等待最多 10 分钟。底层账号池本身不会被全局禁用。"
+          description="跳过的请求会转移给其他可承载账号池；全部不可用时保持连接并等待最多 10 分钟，不会全局禁用底层账号池。"
         />
         <div className="pool-user-group-grid">
           <div className="pool-field pool-field--top">
@@ -968,7 +977,10 @@ function UserGroupEditor({
             );
           })}
         </div>
-        <div className="pool-field__help">已迁移 {superSkills?.length || 0} 个技能；留空时热加载全部技能的 SKILL.md（渐进披露，不附带资源），显式选择时加载所选 SKILL.md 及其配套资源。</div>
+        {/* 留空的行为已经写在上面那个 Select 的 placeholder 里（"留空 = 全部技能（仅 SKILL.md）"），
+            这里不再重复，也不用"渐进披露"这种术语。留下的两件事都是读者看不到的：技能总数，
+            以及显式选择会额外带上配套资源——后者是两种模式唯一的实际差别。 */}
+        <div className="pool-field__help">已迁移 {superSkills?.length || 0} 个技能；显式选择会连同该技能的配套资源一起加载。</div>
       </Card>
       <ModelRoutingEditor draft={draft} setDraft={setDraft} targetOptions={selectedTargetOptions} providers={providers} />
       <Card title="最终路由摘要" className="pool-card pool-routing-summary">
@@ -1268,18 +1280,37 @@ export default function Groups() {
     },
   ];
 
+  // Both rails were five bare numbers, and on this page the numbers that matter are ratios:
+  // "健康账号 41" answers nothing without 账号总数 beside it, and four of the five user metrics
+  // are counts of user groups that have some feature switched on -- all over the same
+  // denominator. `share` draws the proportion the reader was doing in their head. The two
+  // denominators differ (accounts vs groups), so each share is taken against its own total
+  // rather than one page-wide figure.
+  const accountTotal = data.groups.reduce((sum, row) => sum + (Number(row.account_count) || 0), 0);
+  const healthyTotal = data.groups.reduce((sum, row) => sum + (Number(row.active_account_count) || 0), 0);
+  const multiEgressCount = data.groups.filter((row) => groupEgressIDs(row).length > 1).length;
+  // undefined, not 0, when there is no denominator: MetricRail draws a track for any finite share,
+  // so returning 0 here put an empty track under 健康账号 while 账号总数 was still 0 -- reading as
+  // "measured 0% healthy" when the truth is that no accounts exist to measure. This keeps the
+  // honest zeros: 多出口分组 over 2 groups is 0/2, a real measurement, and still draws its 0% track.
+  const ratio = (part, whole) => (whole ? part / whole : undefined);
   const accountMetrics = [
     { label: '账号池分组', value: data.groups.length },
-    { label: '账号总数', value: data.groups.reduce((sum, row) => sum + (Number(row.account_count) || 0), 0) },
-    { label: '健康账号', value: data.groups.reduce((sum, row) => sum + (Number(row.active_account_count) || 0), 0), tone: 'success' },
-    { label: '多出口分组', value: data.groups.filter((row) => groupEgressIDs(row).length > 1).length },
+    { label: '账号总数', value: accountTotal },
+    { label: '健康账号', value: healthyTotal, share: ratio(healthyTotal, accountTotal), tone: 'success' },
+    { label: '多出口分组', value: multiEgressCount, share: ratio(multiEgressCount, data.groups.length) },
   ];
+  const userGroupCount = data.userGroups.length;
+  const mixedTargetCount = data.userGroups.filter((row) => new Set((row.targets || []).map((target) => canonicalTarget(target).kind)).size > 1).length;
+  const modelRoutingCount = data.userGroups.filter((row) => row.model_routing?.length).length;
+  const fallbackCount = data.userGroups.filter((row) => FALLBACK_FAMILIES.some(({ key }) => row.traffic_fallback_groups?.[key]?.length)).length;
+  const superInstructCount = data.userGroups.filter((row) => superInstructAnyEnabled(row)).length;
   const userMetrics = [
-    { label: '用户分组', value: data.userGroups.length },
-    { label: '混合目标', value: data.userGroups.filter((row) => new Set((row.targets || []).map((target) => canonicalTarget(target).kind)).size > 1).length },
-    { label: '模型分层', value: data.userGroups.filter((row) => row.model_routing?.length).length, tone: 'success' },
-    { label: '流量兜底', value: data.userGroups.filter((row) => FALLBACK_FAMILIES.some(({ key }) => row.traffic_fallback_groups?.[key]?.length)).length, tone: 'success' },
-    { label: 'Super-Instruct', value: data.userGroups.filter((row) => superInstructAnyEnabled(row)).length, tone: 'success' },
+    { label: '用户分组', value: userGroupCount },
+    { label: '混合目标', value: mixedTargetCount, share: ratio(mixedTargetCount, userGroupCount) },
+    { label: '模型分层', value: modelRoutingCount, share: ratio(modelRoutingCount, userGroupCount), tone: 'success' },
+    { label: '流量兜底', value: fallbackCount, share: ratio(fallbackCount, userGroupCount), tone: 'success' },
+    { label: 'Super-Instruct', value: superInstructCount, share: ratio(superInstructCount, userGroupCount), tone: 'success' },
   ];
 
   return (
@@ -1303,16 +1334,22 @@ export default function Groups() {
       />
       <Tabs activeKey={activeTab} onChange={setActiveTab} type="line">
         <TabPane key="account_pool" tab="账号池分组" itemKey="account_pool">
-          <Banner type="info" title="动态出口继承" description="账号记录不保存分组出口副本。出口列表首项为主出口，其余按顺序备用；用户指令与模型策略请在用户分组中配置。" />
+          {/* Was 48 chars. The second half ("用户指令与模型策略请在用户分组中配置") is the page subtitle
+              two lines up, and the primary/backup ordering is stated again in the editor beside the
+              list it describes. What is left is the one claim a reader cannot deduce from either. */}
+          <Banner type="info" title="动态出口继承" description="账号记录不保存出口副本，请求时按分组当前顺序继承。" />
           <div className="pool-resource-split pool-group-resource-split">
             <ResourceTable error={groupsResource.error} onRetry={groupsResource.reload} loading={groupsResource.loading} lastRefresh={groupsResource.lastRefresh} dataSource={data.groups} columns={accountColumns} rowKey="name" pagination={false} density="compact" scroll={false} rowHeight={68} emptyTitle="暂无账号池分组" skeletonRows={5} />
             {!groupsResource.error || groupsResource.lastRefresh ? <MetricRail items={accountMetrics} /> : null}
           </div>
         </TabPane>
         <TabPane key="user" tab="用户分组" itemKey="user">
-          <Banner type="info" title="Super-Instruct：分组授权 + API Key 安装选择" description="列表开关默认关闭并设置分组能力上限；API Key 用户运行一键安装命令时，还需在 Codex 配置步骤选择启用，两项同时开启才生效。响应改写、Memory、Monitor 请在“编辑完整策略”中逐项授权。" />
+          {/* Was 65 chars restating, verbatim in substance, the banner inside the Super-Instruct
+              editor -- which is where the reader is when the distinction matters. Kept only the
+              part that changes what they expect from the switch in the list below. */}
+          <Banner type="info" title="Super-Instruct 需两端同时开启" description="此处授权分组上限，API Key 用户还需在安装脚本的 Codex 步骤选择启用。" />
           <div className="pool-resource-split pool-group-resource-split">
-            <ResourceTable error={userGroupsResource.error} onRetry={userGroupsResource.reload} loading={userGroupsResource.loading} lastRefresh={userGroupsResource.lastRefresh} dataSource={data.userGroups} columns={userColumns} rowKey="id" pagination={false} density="compact" scroll={false} rowHeight={68} emptyTitle="暂无用户分组" emptyDescription="创建后可混合选择账号池分组与模型提供商，并按模型设置优先层级。" skeletonRows={5} />
+            <ResourceTable error={userGroupsResource.error} onRetry={userGroupsResource.reload} loading={userGroupsResource.loading} lastRefresh={userGroupsResource.lastRefresh} dataSource={data.userGroups} columns={userColumns} rowKey="id" pagination={false} density="compact" scroll={false} rowHeight={68} emptyTitle="暂无用户分组" emptyDesc="创建后可混合选择账号池分组与模型提供商，并按模型设置优先层级。" skeletonRows={5} />
             {!userGroupsResource.error || userGroupsResource.lastRefresh ? <MetricRail items={userMetrics} /> : null}
           </div>
         </TabPane>

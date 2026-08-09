@@ -570,7 +570,11 @@ func TestExchangeClaudeCodeSplitsInlineState(t *testing.T) {
 		clientID:    "client",
 		redirectURI: "http://localhost:54545/callback",
 	}
-	parsed, err := (&Server{}).exchangeClaudeCode(context.Background(), desc, "CODE#INLINE_STATE", "ISSUED_STATE", "VERIFIER")
+	// A Server with no upstream client falls back to the direct http.Client inside
+	// doClaudeOAuthRequest, so the exchange still lands on ts.URL; the egress/cookie-jar
+	// arguments only matter once an upstream client is present.
+	parsed, err := (&Server{}).exchangeClaudeCode(context.Background(), desc, "CODE#INLINE_STATE", "ISSUED_STATE", "VERIFIER",
+		storage.EgressProfile{Type: "direct"}, "oauth:claude:test")
 	if err != nil {
 		t.Fatalf("exchangeClaudeCode: %v", err)
 	}

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -919,6 +920,74 @@ func canonicalizeHeaders(raw map[string][]string) http.Header {
 	return canon
 }
 
+// sidecarHTTPVersion1 is the curl_cffi http_version literal for HTTP/1.1
+// (curl_cffi/requests/utils.py normalize_http_version: "v1" -> CurlHttpVersion.V1_1).
+const sidecarHTTPVersion1 = "v1"
+
+// orderedHeaders serializes an http.Header to a JSON object whose KEY ORDER is the wire
+// order we intend, instead of encoding/json's map-key sort.
+//
+// This exists because JSON object order is the only header-order channel the sidecar
+// protocol has: the sidecar json.loads's the meta, and every stage after that preserves
+// order (Python dict -> clean_headers comprehension -> curl_cffi Headers, an ordered list
+// -> CurlOpt.HTTPHEADER). Encoding the same map with encoding/json's default mapEncoder put
+// the headers on the socket alphabetically.
+//
+// Order names are matched case-insensitively against the header's canonical keys. Any
+// header not named in Order is emitted after the ordered ones in sorted order, so two
+// requests from the same account never reorder — order drift on one account is itself a
+// risk-control signal. A nil/empty Order therefore reproduces the previous sorted output
+// byte-for-byte, which keeps every non-Claude sidecar caller's wire meta unchanged.
+type orderedHeaders struct {
+	Header http.Header
+	Order  []string
+}
+
+func (o orderedHeaders) MarshalJSON() ([]byte, error) {
+	remaining := make(map[string][]string, len(o.Header))
+	for k, values := range o.Header {
+		remaining[k] = values
+	}
+	keys := make([]string, 0, len(o.Header))
+	for _, name := range o.Order {
+		canonical := http.CanonicalHeaderKey(strings.TrimSpace(name))
+		if _, ok := remaining[canonical]; !ok {
+			// Ordered names that are absent (e.g. host/content-length, which the transport
+			// adds) or already consumed are skipped rather than emitted empty.
+			continue
+		}
+		keys = append(keys, canonical)
+		delete(remaining, canonical)
+	}
+	tail := make([]string, 0, len(remaining))
+	for k := range remaining {
+		tail = append(tail, k)
+	}
+	sort.Strings(tail)
+	keys = append(keys, tail...)
+
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		encodedKey, err := json.Marshal(k)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(encodedKey)
+		buf.WriteByte(':')
+		encodedValues, err := json.Marshal(o.Header[k])
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(encodedValues)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
+
 // defaultHeaders controls whether the sidecar lets curl-impersonate INJECT the
 // impersonated browser's own header set (sec-ch-ua*, sec-fetch-*, accept-language,
 // upgrade-insecure-requests, …) on top of `built`. Pass false whenever `built` is a
@@ -930,13 +999,33 @@ func canonicalizeHeaders(raw map[string][]string) http.Header {
 // OpenAI signup flow, or a path validated to need them). An explicit ja3 already forces
 // them off in the sidecar regardless.
 func (c *Client) postViaSidecar(ctx context.Context, spec Request, target string, built http.Header, timeout time.Duration, ja3 string, defaultHeaders bool) (*Response, error) {
+	return c.postViaSidecarOrdered(ctx, spec, target, built, timeout, ja3, defaultHeaders, nil)
+}
+
+// postViaSidecarOrdered is postViaSidecar with an explicit wire header order, and is what
+// every Anthropic-bound sidecar call must use.
+//
+// Without an order the sidecar emits headers ALPHABETICALLY, and nothing in the sidecar is
+// to blame: `headers` used to be a plain map[string][]string, and encoding/json sorts map
+// keys (encode.go mapEncoder sorts by key before emitting). The sidecar then parses that
+// JSON object, keeps its order (Python dicts preserve insertion order, and clean_headers is
+// an order-preserving comprehension), hands it to curl_cffi — whose Headers type is an
+// ordered list and whose set_curl_options writes CurlOpt.HTTPHEADER in exactly that order.
+// So Go's map-key sort propagated all the way to the socket: the in-process engine got the
+// real undici order in round one while the sidecar engine kept emitting `accept,
+// anthropic-beta, anthropic-version, authorization, content-type, user-agent, x-app,
+// x-stainless-*` — alphabetical, which no Node/undici client produces.
+//
+// Passing the order makes the meta JSON an ORDERED object, so the same claudeHeaderOrder
+// projection that drives the in-process engine reaches the wire through the sidecar too.
+// The explicit "header_order" list is emitted alongside it as a belt-and-braces signal for
+// a sidecar that reorders internally; a sidecar that ignores the key still gets the right
+// order from the object itself, so no sidecar change is required for this to work.
+func (c *Client) postViaSidecarOrdered(ctx context.Context, spec Request, target string, built http.Header, timeout time.Duration, ja3 string, defaultHeaders bool, headerOrder []string) (*Response, error) {
 	if spec.Egress.Endpoint == "" {
 		return nil, errors.New("curl_cffi_sidecar endpoint required")
 	}
-	headers := map[string][]string{}
-	for k, values := range built {
-		headers[k] = append([]string(nil), values...)
-	}
+	headers := orderedHeaders{Header: built, Order: headerOrder}
 	// The request body travels as the raw HTTP body; only the small routing metadata is
 	// base64'd, into the X-Sidecar-Meta header. This avoids base64-inflating a large
 	// (1M-context) body by ~33% plus a full encode here and decode in the sidecar on
@@ -948,6 +1037,19 @@ func (c *Client) postViaSidecar(ctx context.Context, spec Request, target string
 		"headers":        headers,
 		"cookie_jar_key": sidecarCookieKey(spec.Account.ID, spec.Egress.ID, target, spec.CookieJarKey),
 		"stream":         true,
+	}
+	if len(headerOrder) > 0 {
+		meta["header_order"] = headerOrder
+	}
+	// HTTP/1.1 pin for Claude impersonation. The in-process engine gets this through
+	// tls_client.WithForceHttp1(); the sidecar's curl_cffi impersonation offers ALPN
+	// ["h2","http/1.1"] and Anthropic's edge prefers h2, so without this the sidecar engine
+	// puts a claude-cli User-Agent on an HTTP/2 connection — a combination the real client
+	// (Node's bundled undici, allowH2:false) cannot produce. Emitted only when pinning, so
+	// the wire meta of every existing Codex/registration caller is byte-identical and an
+	// older sidecar simply ignores the unknown key during a rolling deploy.
+	if forceHTTP1ForClaudeImpersonation(target, built) {
+		meta["http_version"] = sidecarHTTPVersion1
 	}
 	if !defaultHeaders {
 		// Tell the sidecar NOT to let curl-impersonate inject the browser's own header set
@@ -1116,6 +1218,16 @@ func sidecarPreHeaderFailure(resp *http.Response) (string, bool) {
 	return "", false
 }
 
+// isHTTPSTarget reports whether a request URL negotiates TLS, i.e. whether it has a
+// TLS/H2 fingerprint that could contradict the impersonated header set.
+func isHTTPSTarget(rawURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed.Scheme, "https")
+}
+
 // sidecarDirectBypassAllowed is intentionally narrow. A bypass must keep using
 // the selected account's real chained proxy and must not discard a custom TLS
 // fingerprint request (JA3/Akamai), otherwise it would silently leak traffic
@@ -1149,6 +1261,40 @@ func (c *Client) postDirectThroughSidecarChain(ctx context.Context, spec Request
 	egress, ok := sidecarBypassEgress(spec.Egress)
 	if !ok {
 		return nil, errors.New("sidecar direct bypass requires the selected chain proxy")
+	}
+	// The bypass preserves the exit IP, but on the stdlib transport it does NOT preserve
+	// the fingerprint: the request keeps its impersonated header set (claude-cli/2.x,
+	// x-stainless-*, x-app: cli) while the ClientHello and HTTP/2 SETTINGS become Go's.
+	// A request whose headers claim one client and whose TLS claims another is a stronger
+	// relay signal than an imperfect impersonation, and this path fires exactly when the
+	// sidecar is unhealthy — i.e. for a burst of consecutive requests on one account,
+	// silently, because the bypass succeeds.
+	//
+	// So when the in-process TLS engine exists, use it instead of the stdlib. This is the
+	// same principle claudeFingerprintEngine already applies to a sidecar-pinned engine
+	// with no reachable sidecar: the operator's engine choice selects which impersonation
+	// backend to use, not a license to emit a Go ClientHello at the upstream. The exit IP
+	// is unchanged either way (egressProxyURL reads the bypass profile's Endpoint, which
+	// sidecarBypassEgress just set to the selected chain proxy).
+	//
+	// Gated on tlsFactory rather than inProcessFingerprint(): reaching this function means
+	// the configured sidecar backend has already failed, so the engine preference has been
+	// exhausted, and the only remaining question is whether a real fingerprint is available
+	// at all. Every caller has already passed sidecarDirectBypassAllowed, which refuses a
+	// custom JA3/Akamai request, so nothing the named-profile engine cannot honor gets here.
+	//
+	// Restricted to https targets: a cleartext target has no ClientHello and no H2 SETTINGS,
+	// so there is no fingerprint to preserve, and the stdlib transport's absolute-form proxy
+	// request is the more conventional wire shape for one. Every real provider upstream is
+	// https, so this does not narrow the protection in practice.
+	if c.tlsFactory != nil && isHTTPSTarget(target) {
+		bypassSpec := spec
+		bypassSpec.Egress = egress
+		var order []string
+		if isAnthropicTarget(target) {
+			order = claudeHeaderOrder(built)
+		}
+		return c.postInProcessOrdered(ctx, bypassSpec, target, built, timeout, "", rawProfileForHeaders(built), order)
 	}
 	ctx, guard := newRequestGuard(ctx, timeout)
 	req, err := newReplayableHTTPRequest(ctx, firstNonEmpty(spec.Method, http.MethodPost), target, spec)

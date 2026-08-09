@@ -392,6 +392,53 @@ diagnostics_miss_reason FROM usage_records WHERE account_id='codex-cache-miss'`)
 	}
 }
 
+// The prompt-total upper bound was gated to the provider names "codex" and "openai", so
+// antigravity and every custom relay stored 0 while reporting a real cache read. Zero is
+// indistinguishable from "nothing was reusable", and a read/max ratio over a mixed pool
+// then divided by zero on those rows: one export summed to 1.06 against a bound that
+// cannot be exceeded.
+func TestNonAnthropicProvidersGetAPromptTotalCacheCeiling(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	openAIShaped := json.RawMessage(`{"usage":{"input_tokens":32248,"output_tokens":40,"total_tokens":32288,"input_tokens_details":{"cached_tokens":28327}}}`)
+	for _, provider := range []string{"antigravity", "relay-deepseek", "codex", "openai"} {
+		if err := store.InsertUsageRecordWithDiagnostics(ctx, "ceiling-"+provider, "route-"+provider, "", "", "some-model",
+			32248, 40, 32288, 28327, 28327, 0, openAIShaped,
+			UsageDiagnostics{UsageProvider: provider, UsageSource: "upstream"}); err != nil {
+			t.Fatal(err)
+		}
+		var possible, cacheRead int64
+		if err := store.DB().QueryRowContext(ctx, `SELECT max_possible_cache_read_tokens,cache_read_tokens
+FROM usage_records WHERE account_id=?`, "ceiling-"+provider).Scan(&possible, &cacheRead); err != nil {
+			t.Fatal(err)
+		}
+		if possible != 32248 {
+			t.Fatalf("provider %q ceiling = %d, want the prompt total 32248", provider, possible)
+		}
+		// The whole point of the column: it must actually bound the observed read.
+		if cacheRead > possible {
+			t.Fatalf("provider %q reported read %d above its own ceiling %d", provider, cacheRead, possible)
+		}
+	}
+
+	// Anthropic bodies keep deriving the ceiling from breakpoint metadata. Falling back to
+	// the prompt total there would overstate it, since a breakpoint can sit mid-prompt.
+	if err := store.InsertUsageRecordWithDiagnostics(ctx, "ceiling-anthropic", "route-anthropic", "", "", "claude-sonnet-4-5",
+		900, 20, 920, 800, 800, 100,
+		json.RawMessage(`{"usage":{"input_tokens":900,"output_tokens":20,"cache_read_input_tokens":800,"cache_creation_input_tokens":100}}`),
+		UsageDiagnostics{UsageProvider: "claude", UsageSource: "upstream"}); err != nil {
+		t.Fatal(err)
+	}
+	var anthropicPossible int64
+	if err := store.DB().QueryRowContext(ctx, `SELECT max_possible_cache_read_tokens FROM usage_records
+WHERE account_id='ceiling-anthropic'`).Scan(&anthropicPossible); err != nil {
+		t.Fatal(err)
+	}
+	if anthropicPossible == 900 {
+		t.Fatal("Anthropic ceiling was overwritten with the prompt total instead of breakpoint metadata")
+	}
+}
+
 func TestDeferredOpenAICacheDiagnosticsBackfillsV3MarkedRowsOnce(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

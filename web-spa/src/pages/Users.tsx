@@ -51,7 +51,8 @@ export default function Users() {
   const disabledCount = rows.filter((row) => row.status && row.status !== 'active').length;
   // Each of these is a slice of the user count, so the rail can show the proportion
   // rather than leaving the reader to divide four numbers in their head.
-  const share = (part: number) => (rows.length ? part / rows.length : 0);
+  // undefined, not 0, on an empty list -- see the MetricRail contract in DisplayPrimitives.jsx.
+  const share = (part: number) => (rows.length ? part / rows.length : undefined);
   const userMetrics = [
     { label: t('users.total'), value: rows.length },
     { label: t('users.admins'), value: adminCount, share: share(adminCount), tone: 'info' },

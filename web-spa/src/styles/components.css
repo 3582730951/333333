@@ -318,16 +318,6 @@
   gap: 12px;
 }
 
-.pool-system-stat-grid {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-}
-
-@media (max-width: 900px) {
-  .pool-system-stat-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
 .pool-grid.cols-2 {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -1563,18 +1553,42 @@ so the mark owns the size
   gap: 6px;
 }
 
+/* Readiness reads as a band above the form, not a column beside it. Measured at 1440x900:
+   the panel is ~98px tall (title, one line, five tags) while the form is 436px, so a
+   two-column split left 274px of dead space in the left track and squeezed the form into
+   649px -- 207px per field, which clipped 邮箱提供商 outright. Stacking gives the form the
+   full 1086px. Sticky was the alternative and does not apply: the whole form is 436px inside
+   a 900px viewport, so readiness never scrolls away while the form is being filled. The
+   page's 2266px height comes from the 接码国家排名 card below, which is a separate task. */
 .pool-registration-start-layout {
   display: grid;
-  grid-template-columns: minmax(280px, 0.78fr) minmax(0, 1.22fr);
-  gap: 22px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 18px;
   align-items: start;
 }
 
+/* Four columns, because that is what the markup already groups: count / group / egress /
+   method are the four choices, and the engine summary that explains `method` spans 1/-1
+   directly after them. At three columns the summary forced a row break that stranded 引擎
+   beside a 704px hole. Four also keeps fields at a sane 261px rather than the 352px a
+   3-column band would give a field that holds "1". */
 .pool-registration-start-form {
   display: grid;
-  grid-template-columns: repeat(3, minmax(140px, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px 14px;
   align-items: end;
+}
+
+/* Step 4 -> 2, never 3. The config group is 4 fields (count/group/egress/method), so three
+   columns stranded 引擎 alone on row 2 with two empty cells, directly above the summary card
+   that explains it. A gap mid-form reads as missing content; two columns splits those four
+   into two whole rows and removes it. Trailing cells are a different matter and are left
+   alone: at four columns the identity row still holds 2 of 4, but it sits immediately above
+   the submit button with nothing after it, which is what every form looks like. */
+@media (max-width: 1180px) {
+  .pool-registration-start-form {
+    grid-template-columns: repeat(2, minmax(140px, 1fr));
+  }
 }
 
 .pool-registration-start-form .pool-field {
@@ -1704,87 +1718,29 @@ so the mark owns the size
   text-align: right;
 }
 
-.pool-sms-market-grid {
+/* Success rate and price side by side. Both are rankings of the same rows, so they share a
+   column width and the eye can travel horizontally between the two orderings. */
+.pool-sms-market-charts {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-  border: 0;
+  gap: 18px;
 }
 
-.pool-sms-market-item {
-  display: grid;
-  grid-template-columns: 28px minmax(88px, 1fr) minmax(72px, auto) minmax(72px, auto) auto;
-  gap: 10px;
-  align-items: center;
+.pool-sms-market-chart {
   min-width: 0;
-  padding: 12px;
-  border: 1px solid var(--pool-border-subtle);
-  border-radius: 12px;
-  background: var(--pool-bg-surface-2);
-  transition: background-color var(--pool-motion-fast) var(--pool-motion-ease);
 }
 
-.pool-sms-market-item:hover {
-  transform: none;
-  background: var(--pool-bg-hover);
-}
-
-.pool-sms-market-item.is-ineligible {
-  opacity: 0.55;
-}
-
-.pool-sms-market-rank {
-  display: grid;
-  place-items: center;
-  width: 26px;
-  height: 26px;
-  border-radius: 9px;
-  background: color-mix(in srgb, var(--pool-accent) 10%, var(--pool-bg-surface-2));
-  color: var(--pool-accent);
+.pool-sms-market-chart h3 {
+  margin: 0 0 12px;
+  color: var(--pool-text-2);
   font-size: 12px;
-  font-variant-numeric: tabular-nums;
-  font-weight: 700;
+  font-weight: 600;
+  letter-spacing: 0.02em;
 }
 
-.pool-sms-market-country,
-.pool-sms-market-stat {
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-}
-
-.pool-sms-market-country strong,
-.pool-sms-market-stat strong {
-  color: var(--pool-text);
-  font-size: 14px;
-  font-variant-numeric: tabular-nums;
-}
-
-.pool-sms-market-country span,
-.pool-sms-market-stat span,
-.pool-sms-market-stat small {
-  overflow: hidden;
-  color: var(--pool-text-3);
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.pool-sms-market-empty {
-  grid-column: 1 / -1;
-  padding: 26px;
-  border: 1px dashed var(--pool-border-strong);
-  border-radius: 12px;
-  background: var(--pool-bg-surface-2);
-  color: var(--pool-text-3);
-  text-align: center;
-}
-
-@media (max-width: 1180px) {
-  .pool-registration-start-layout {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
+/* The .pool-registration-start-layout collapse that stood here is gone: the base rule is now
+   single-column at every width, so this set the value it already had. The 1180 breakpoint
+   still exists for that layout's form, declared beside the base rule rather than here. */
 
 @media (max-width: 900px) {
   .pool-sms-price-policy {
@@ -1796,8 +1752,11 @@ so the mark owns the size
     text-align: left;
   }
 
-  .pool-sms-market-grid {
-    grid-template-columns: 1fr;
+  /* Two ranked lists abreast stop being comparable once each is under ~260px: the country
+     label and its meta line both wrap, and a wrapped label next to an unwrapped one puts the
+     two bars on different baselines. */
+  .pool-sms-market-charts {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -1808,14 +1767,6 @@ so the mark owns the size
 
   .pool-sms-price-policy {
     grid-template-columns: 1fr;
-  }
-
-  .pool-sms-market-item {
-    grid-template-columns: 28px minmax(0, 1fr) auto;
-  }
-
-  .pool-sms-market-item .pool-sms-market-stat {
-    grid-column: 2;
   }
 }
 
@@ -2300,6 +2251,33 @@ so the mark owns the size
   white-space: pre-wrap;
 }
 
+/* Full-width and outside the two-column definition grid: an upstream error message is a
+   sentence, and half the drawer's width would wrap it into six lines inside a bordered cell
+   that every other row uses for a single value. */
+.pool-task-detail__failure {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--pool-danger) 32%, var(--pool-border));
+  border-radius: var(--pool-radius-sm);
+  background: color-mix(in srgb, var(--pool-danger) 7%, var(--pool-bg-surface-2));
+}
+
+.pool-task-detail__failure-label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--pool-danger);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pool-task-detail__failure p {
+  margin: 0;
+  color: var(--pool-text);
+  font-size: 13px;
+  line-height: var(--pool-leading-body);
+  overflow-wrap: anywhere;
+}
+
 .pool-log-stream {
   display: grid;
   gap: 10px;
@@ -2380,11 +2358,12 @@ so the mark owns the size
     padding-right: 0;
   }
 
-  .pool-registration-start-layout,
-.pool-registration-start-form,
-.pool-registration-strategy-row {
-    grid-template-columns: 1fr;
-  }
+  /* A 1fr rule for .pool-registration-start-layout / -start-form / -strategy-row stood here
+     and did nothing. The layout half is now redundant (its base rule is single-column at every
+     width), and the form and strategy-row halves were already dead: the (max-width: 767px)
+     block further down this file sets both to 2 columns at equal specificity, and being later
+     in source order it won at every width this block could match. Both are set to 1fr for real
+     by the (max-width: 390px) block, which is later still. */
 
   .pool-field--left {
     display: block;
@@ -2526,11 +2505,48 @@ so the mark owns the size
   border-bottom: 1px solid var(--pool-border);
 }
 
+/* Column captions for the card list below. Deliberately quiet -- they are a reading aid for a
+   grid that already reads in columns, not a heading, so they sit at the size of the meta text
+   they label and never compete with the rule names. */
+.upstream-rule-head {
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--pool-border);
+  color: var(--pool-text-3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.upstream-rule-head > span:first-child {
+  text-align: center;
+}
+
 .upstream-rule-row {
   display: grid;
   grid-template-columns: 64px minmax(180px, 1.3fr) minmax(180px, 1fr) minmax(170px, 0.9fr) auto;
   gap: 14px;
-  align-items: center;
+  /* Centring every cell only looks right while all five are one line tall. Once a long rule
+     name wraps the row to three lines, the priority number floats to the middle of it and ends
+     up beside the scope chips rather than beside the name it numbers, and each column's first
+     line starts at a different height -- four ragged entry points across one row. Top alignment
+     gives them a shared baseline; the controls keep centring because they are a fixed-height
+     cluster with nothing to align to. */
+  align-items: start;
+}
+
+.upstream-rule-row > .upstream-rule-ops {
+  align-self: center;
+}
+
+/* The 48px square is left over from when this number was a filled badge; the background and
+   radius are gone and only its centring remained, which dropped the number 13px below the
+   title it labels. Two classes of specificity to override the height below, and the number
+   now starts on the title's own first line whatever the row does. */
+.upstream-rule-row > .upstream-rule-priority {
+  height: auto;
+  min-height: 0;
+  place-items: start center;
+  padding-top: 1px;
 }
 
 .upstream-rule-priority {
@@ -2558,10 +2574,41 @@ so the mark owns the size
 .upstream-rule-title strong {
   color: var(--pool-text);
   font-size: 15px;
+  /* Rule names and model patterns are free text, and an unbreakable one used to print straight
+     across the next column. Measured at 1280px: a 120-char token ended at x=1117 while the
+     condition column's text starts at x=548 -- 569px of text sitting on text, and past ~200 chars
+     it scrolled the whole page sideways.
+
+     `anywhere` and not `break-word`: only `anywhere` reduces the min-content contribution, which is
+     what lets the flex item inside .upstream-rule-meta shrink at all. `break-word` measured
+     identical to no rule (still 1117), including when paired with min-width:0 on the cell -- a
+     single flex item cannot wrap against itself, so nothing downstream of it can help.
+
+     min-width:0 on .upstream-rule-main is deliberately *not* here, and it is not an oversight at the
+     collapsed breakpoints either. Desktop track is minmax(180px, 1.3fr), so the floor is the
+     explicit 180px, never the item's auto minimum; at <=1100px the row becomes 1fr, whose min is
+     `auto` and where the property could plausibly matter. Measured at 1100/1024/900/767/640/480/390
+     with and without it: identical cell width and identical token right edge at every one, because
+     this rule already binds first. */
+  overflow-wrap: anywhere;
+}
+
+/* Grid column 2 of .upstream-rule-row, holding the title and the scope chips.
+   It owns the space between its two children rather than leaving .upstream-rule-meta to push itself
+   down with margin-top, which is what it used to do. Two reasons for moving it:
+   the spacing is a property of the pair, not of the lower one; and this class was being emitted with
+   no rule at all behind it, which check-class-drift.mjs flags as intent that never happens.
+   Verified pixel-identical to the margin version -- title, meta and the neighbouring condition cell
+   all land on the same subpixel top/left/width/height, and the row keeps the same height, at
+   1280/1024/767/390 across a short name, a name long enough to wrap, and an unbreakable pattern.
+   No min-width:0 here: measured at all four widths with and without, it changes nothing, because
+   overflow-wrap on the children already binds first. */
+.upstream-rule-main {
+  display: grid;
+  gap: 6px;
 }
 
 .upstream-rule-meta {
-  margin-top: 6px;
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
@@ -2572,6 +2619,8 @@ so the mark owns the size
   border-inline-start: 1px solid var(--pool-border-strong);
   border-radius: 0;
   background: transparent;
+  /* Same defect as the title above, reached through model_patterns rather than the name. */
+  overflow-wrap: anywhere;
 }
 
 .upstream-rule-condition {
@@ -2585,8 +2634,12 @@ so the mark owns the size
   font-size: 12px;
 }
 
+/* Indented to the title column: 64px priority track plus the row's 14px gap. Left at the
+   card's own edge it began 78px to the left of every other thing in the card, reading as a
+   stray link between two rules rather than as this rule's disclosure. */
 .upstream-rule-summary {
   margin-top: 12px;
+  margin-inline-start: 78px;
   border: 0;
   background: transparent;
   color: var(--pool-accent);
@@ -2596,7 +2649,7 @@ so the mark owns the size
 }
 
 .upstream-rule-natural {
-  margin: 8px 0 0;
+  margin: 8px 0 0 78px;
   padding: 4px 0 4px 12px;
   border-inline-start: 2px solid var(--pool-border-strong);
   border-radius: 0;
@@ -2788,6 +2841,22 @@ so the mark owns the size
   }
   .upstream-rule-test-body {
     grid-column: auto;
+  }
+
+  /* One column means the cells no longer line up under anything, so column captions would
+     caption the wrong things. Each card's sr-only labels stay and carry the meaning. */
+  .upstream-rule-head {
+    display: none;
+  }
+
+  /* The single-column row has no 64px priority track to align to, so the desktop indent
+     would push the disclosure 78px in from everything above it. */
+  .upstream-rule-summary {
+    margin-inline-start: 0;
+  }
+
+  .upstream-rule-natural {
+    margin-inline-start: 0;
   }
 }
 
@@ -3286,6 +3355,28 @@ so the mark owns the size
 /* A rail spanning the full page width has room to give each measurement its own
    block: caption, figure, then qualifier. The paired layout above is for the narrow
    rail beside a table, where a stacked figure would waste the column. */
+/* The modifier styled the cards but never laid the container out, so it inherited the base
+   rail's single-column grid: on UpstreamErrorRules five metrics stacked into five full-width
+   rows, each with a 1050px hairline track, and pushed the rules themselves off the first
+   screen. Every rail that does read as a band gets its columns from a page-specific class
+   (.pool-email-metrics), which is why the name promised something no page received unless it
+   brought its own grid. `grid-auto-flow: column` is what the mobile query below already
+   overrides back to `row` -- the desktop half of that pair was simply absent. Auto columns
+   rather than a fixed count so a rail of four and a rail of six both divide their width. */
+.pool-metric-rail--band {
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-material);
+  box-shadow: var(--pool-shadow-panel);
+}
+
+.pool-metric-rail--band > .pool-metric-card:first-child {
+  border-inline-start: 0;
+}
+
 .pool-metric-rail--band .pool-metric-card {
   align-content: start;
   grid-template-columns: minmax(0, 1fr);
@@ -3379,6 +3470,10 @@ so the mark owns the size
 }
 
 .pool-email-metrics {
+  /* Pinned against the --band modifier's `grid-auto-flow: column`: this rail states its own
+     five columns, and row flow is what keeps a sixth metric wrapping under them instead of
+     opening a sixth column the frame was not drawn for. */
+  grid-auto-flow: row;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 0;
   overflow: hidden;
@@ -4382,6 +4477,68 @@ so the mark owns the size
   border-top: 0;
 }
 
+/* The rail used to be the whole right column. It now shares it with the outcome meter, so the
+   column owns the gap and each child keeps its own surface. */
+.pool-registration-aside {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  align-content: start;
+}
+
+.pool-registration-outcome {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-material);
+  box-shadow: var(--pool-shadow-panel);
+}
+
+.pool-registration-outcome h3 {
+  margin: 0 0 10px;
+  color: var(--pool-text-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pool-registration-outcome__empty {
+  margin: 0;
+  color: var(--pool-text-3);
+  font-size: 12px;
+  line-height: var(--pool-leading-body);
+}
+
+/* Clamped to two lines in the table and on the card: upstream errors run to a sentence or more,
+   and letting one row grow to five lines re-flows every row beside it. The full text is in the
+   title attribute and, unclamped, in the drawer. */
+.pool-registration-job-error,
+.pool-registration-job-card__error {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--pool-danger);
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
+/* `.pool-table .pool-resource-summary__meta` sets display:flex with two classes of
+   specificity, which outranks the clamp above and leaves line-clamp inert -- a failure
+   reason then wrapped to four lines inside a 140px status cell and stood that row up at
+   double the height of its neighbours. One line is all a column this narrow can carry
+   honestly: it marks that a reason was recorded, the title attribute has it on hover, and
+   the drawer prints it in full. The mobile card variant keeps two lines; it has the width. */
+.pool-table .pool-registration-job-error {
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  line-clamp: 1;
+}
+
+.pool-registration-job-card__error {
+  font-size: 12px;
+  line-height: var(--pool-leading-body);
+}
+
 .pool-settings-empty {
   min-height: 150px;
   display: grid;
@@ -5356,21 +5513,41 @@ so the mark owns the size
     gap: 12px;
   }
 
+  /* Wraps rather than scrolling. Seven tabs need 632px, so at 360x800 (336px client) four of the
+     seven were parked off-screen behind a swipe — and `scrollbar-width: none` plus the
+     ::-webkit-scrollbar rule below deliberately removed the one cue that the strip scrolled at
+     all. Unlike .pool-ai-settings-nav this never tripped the sliver detector: no tab was sliced
+     mid-glyph, so the defect was pure discoverability, which is exactly the kind of thing the
+     assertions cannot see and only a screenshot catches.
+
+     Wrapping is affordable here specifically because this rule sets `position: static` — the strip
+     scrolls away with the content instead of holding viewport like the sticky AI nav does, so the
+     extra rows cost nothing once the user starts reading the panel. */
   .pool-settings-tabs.pool-tabs--left > .pool-tabs-list {
     position: static;
     top: auto;
     gap: 4px;
     padding: 6px;
-    overflow-x: auto;
     border: 1px solid var(--pool-border-subtle);
     border-radius: 14px;
     background: var(--pool-bg-material);
     box-shadow: var(--pool-shadow-panel);
-    scrollbar-width: none;
   }
 
-  .pool-settings-tabs.pool-tabs--left > .pool-tabs-list::-webkit-scrollbar {
-    display: none;
+  /* An explicit 3-column grid, not `flex: 1 1 auto`. Stretching to fill each row made the seven
+     tabs land 3/3/1, and the lone tab on the last row inflated to full width — roughly three times
+     the tap target of any tab above it. Equal columns keep every tap target identical and leave the
+     last row visibly short, which is the honest reading of "seven items in a three-wide grid"
+     rather than faking a full row. */
+  .pool-settings-tabs.pool-tabs--left > .pool-tabs-list {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .pool-settings-tabs.pool-tabs--left > .pool-tabs-list .pool-tab-trigger {
+    min-width: 0;
+    justify-content: center;
+    text-align: center;
   }
 
   .pool-settings-tabs .pool-tab-trigger {
@@ -5622,10 +5799,17 @@ so the mark owns the size
     grid-template-columns: 1fr;
   }
 
-  .pool-tabs--left .pool-tabs-list,
-.pool-settings-tabs.pool-tabs--left .pool-tabs-list {
+  .pool-tabs--left .pool-tabs-list {
     flex-direction: row;
     overflow-x: auto;
+  }
+
+  /* The settings variant is deliberately excluded from the `overflow-x: auto` above: it wraps
+     instead (see the .pool-settings-tabs rule earlier in this same media block). Both selectors
+     have equal specificity and this one is later in source order, so leaving it grouped above
+     silently reinstated the scroll and undid the wrap. */
+  .pool-settings-tabs.pool-tabs--left .pool-tabs-list {
+    flex-direction: row;
   }
 
   .pool-settings-row {
@@ -5752,15 +5936,18 @@ overlong presentation. */
     grid-template-columns: minmax(0, 1fr);
   }
 
+  /* This was `flex-wrap: nowrap` + `overflow-x: auto`, turning the three step buttons into a
+     horizontal scroller. The three fit on one line at 390px, so the scroller only ever engaged at
+     360px -- where it hid 11px, i.e. the tail of the third label, with no visible affordance
+     saying to scroll. Wrapping costs nothing at 390px (the row already fits) and at 360px puts
+     step 3 on a second line fully legible, which still reads as 1-2-3. */
   .pool-registration-quickstart__copy > div:last-child {
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    padding-bottom: 4px;
-    scrollbar-width: thin;
+    flex-wrap: wrap;
+    padding-bottom: 0;
   }
 
   .pool-registration-quickstart__copy > div:last-child .pool-button {
-    flex: 0 0 auto;
+    flex: 0 1 auto;
   }
 
   .pool-registration-start-form {
@@ -7238,6 +7425,9 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 }
 
 .pool-cf-mail-metrics {
+  /* Pinned against the --band modifier's column flow, same reason as .pool-email-metrics:
+     a fifth metric should wrap inside the frame, not open a fifth column beside four. */
+  grid-auto-flow: row;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   margin-bottom: 22px;
 }

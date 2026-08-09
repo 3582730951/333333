@@ -52,7 +52,11 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 		path = "/" + path
 	}
 	target := base + path
-	if spec.TransportProfile == storage.CustomProviderTransportClaudeCode && strings.Contains(path, "/messages") && !strings.Contains(target, "beta=") {
+	// Real Claude Code addresses every messages endpoint as ?beta=true (see doClaude), so
+	// any relay that genuinely serves Claude Code clients already accepts it — which makes
+	// sending it the faithful shape rather than a risk, and lets a provider stuck on the
+	// generic profile still look like the real client. PassThrough keeps its own query.
+	if !spec.PassThrough && claudeShapedCustomCall(spec) && strings.Contains(path, "/messages") && !strings.Contains(target, "beta=") {
 		if strings.Contains(target, "?") {
 			target += "&beta=true"
 		} else {
@@ -70,27 +74,39 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 	}
 
 	built := http.Header{}
-	switch spec.TransportProfile {
-	case storage.CustomProviderTransportClaudeCode:
+	// Claude-Code-mode relays gate on the client shape (X-App, X-Stainless-*, a session
+	// id, the betas), which the generic builder does not emit — and the profile that used
+	// to be the only way to reach that builder is inferred from the provider's name, so an
+	// operator who correctly selected upstream_protocol=anthropic_messages could still land
+	// on the generic path. claudeShapedCustomCall keys off the protocol/path instead of the
+	// name. PassThrough is excluded: those endpoints (multipart Files uploads, Skills) need
+	// their own Content-Type and beta forwarded verbatim, which is a different header set.
+	claudeShaped := !spec.PassThrough && claudeShapedCustomCall(spec)
+	if claudeShaped {
+		// Narrow the cookie jar to the conversation before either transport reads it.
+		spec.CookieJarKey = customClaudeCookieJarKey(spec, identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint))
+	}
+	switch {
+	case claudeShaped:
 		id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
-		if spec.PassThrough {
-			c.applyClaudePassthroughHeaders(built, spec, id, stream)
-			copyOpenAICompatPassthroughHeaders(built, spec, []string{
-				"Content-Range",
-				"Idempotency-Key",
-				"If-Match",
-				"If-Modified-Since",
-				"If-None-Match",
-				"If-Unmodified-Since",
-				"Last-Event-ID",
-				"OpenAI-Beta",
-				"Prefer",
-				"Range",
-			})
-		} else {
-			c.applyClaudeHeaders(built, spec, id, stream)
-		}
-	case storage.CustomProviderTransportCodexCLI:
+		c.applyClaudeCodeCustomHeaders(built, spec, id, stream)
+	case spec.PassThrough && spec.TransportProfile == storage.CustomProviderTransportClaudeCode:
+		// Opaque Files/Skills/Agents proxy: endpoint semantics, not the messages shape.
+		id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
+		c.applyClaudePassthroughHeaders(built, spec, id, stream)
+		copyOpenAICompatPassthroughHeaders(built, spec, []string{
+			"Content-Range",
+			"Idempotency-Key",
+			"If-Match",
+			"If-Modified-Since",
+			"If-None-Match",
+			"If-Unmodified-Since",
+			"Last-Event-ID",
+			"OpenAI-Beta",
+			"Prefer",
+			"Range",
+		})
+	case spec.TransportProfile == storage.CustomProviderTransportCodexCLI:
 		if spec.PassThrough {
 			applyOpenAICompatPassthroughHeaders(built, spec, stream)
 		} else {
@@ -120,7 +136,22 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 		// header set. Keep existing custom message transport behavior unchanged.
 		defaultHeaders := !(spec.PassThrough &&
 			spec.TransportProfile == storage.CustomProviderTransportClaudeCode)
-		return c.postViaSidecar(ctx, sidecarSpec, target, built, timeout, "", defaultHeaders)
+		// A Claude-Code-shaped custom call carries the SAME claude-cli identity as native
+		// Claude traffic (applyClaudeCodeCustomHeaders / applyClaudePassthroughHeaders both
+		// stamp the full x-app + x-stainless-* + claude-cli UA set), so it needs the same
+		// undici wire order. Without an explicit order the sidecar receives the header map
+		// as JSON, and encoding/json sorts map keys — curl_cffi then preserves that order
+		// all the way to the socket, putting alphabetical headers under a claude-cli UA.
+		// An operator may legitimately point a custom provider at api.anthropic.com itself,
+		// so this path can reach the same edge as doClaude.
+		// claudeHeaderOrder is reused rather than duplicated: it projects the known undici
+		// order onto whatever is present and sorts anything else into a stable tail, so the
+		// extra passthrough headers (Range, If-Match, ...) get a deterministic slot.
+		headerOrder := []string(nil)
+		if claudeShaped || spec.TransportProfile == storage.CustomProviderTransportClaudeCode {
+			headerOrder = claudeHeaderOrder(built)
+		}
+		return c.postViaSidecarOrdered(ctx, sidecarSpec, target, built, timeout, "", defaultHeaders, headerOrder)
 	}
 
 	ctx, guard := newRequestGuard(ctx, c.cfg.RequestTimeout())
@@ -138,7 +169,11 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 	if directSpec.Egress.Type == "curl_cffi_sidecar" {
 		directSpec.Egress.Type = "direct"
 	}
-	client, err := c.httpClientForEgress(directSpec)
+	// Same ALPN reasoning as doClaude's stdlib fallback: when this request claims to be
+	// claude-cli (or targets an Anthropic host), it must not ride HTTP/2, because the real
+	// client's bundled undici cannot speak it. Non-Claude custom providers are untouched —
+	// the predicate keys off the target host and the claude-cli User-Agent only.
+	client, err := c.httpClientForEgressMode(directSpec, forceHTTP1ForClaudeImpersonation(target, built))
 	if err != nil {
 		guard.Fail()
 		return nil, err

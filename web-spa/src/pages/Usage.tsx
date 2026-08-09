@@ -6,7 +6,7 @@ import ResourceTable from '../components/ResourceTable.jsx';
 import PageHeader, { Panel } from '../components/PageHeader.jsx';
 import StatCard from '../components/StatCard.jsx';
 import { UsageAreaChart, GroupedBar, CacheRateBars, UsageModelAreaChart } from '../components/LazyCharts.jsx';
-import { COLORS, modelColor } from '../lib/chartTheme.js';
+import { COLORS, seriesColorMap } from '../lib/chartTheme.js';
 import { fmtTokens, fmtInt } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
@@ -207,10 +207,12 @@ export default function Usage() {
   const cachedPct = promptForCache > 0 ? Math.max(0, Math.min(100, Math.round((cacheRead / promptForCache) * 100))) : 0;
   const cacheWritePct = promptForCache > 0 ? Math.max(0, Math.min(100, Math.round((cacheCreation / promptForCache) * 100))) : 0;
   const missedPct = promptForCache > 0 ? Math.max(0, 100 - cachedPct - cacheWritePct) : 0;
-  const cacheCompositionSegments = (officialProviderModelCache.length ? officialProviderModelCache : cache.by_model || []).slice(0, 8).map((m) => ({
+  const cacheCompositionRows = (officialProviderModelCache.length ? officialProviderModelCache : cache.by_model || []).slice(0, 8);
+  const cacheCompositionColor = seriesColorMap(cacheCompositionRows.map((m) => modelKey(m)));
+  const cacheCompositionSegments = cacheCompositionRows.map((m) => ({
     key: modelKey(m),
     label: modelLabel(m),
-    color: modelColor(modelKey(m)),
+    color: cacheCompositionColor(modelKey(m)),
     read: m.cache_read_tokens || 0,
     requests: m.requests,
     request_hit_rate: m.request_hit_rate,
@@ -221,6 +223,11 @@ export default function Usage() {
   }));
   const cacheSegmentTotal = cacheCompositionSegments.reduce((s, m) => s + m.read, 0);
   const cacheSeries = series.filter((descriptor) => descriptor.provider_type !== 'kiro' && descriptor.provider_id !== 'kiro');
+  // Must use the same key expression ModelAreaChart uses internally, and be built from the
+  // same unfiltered cacheSeries: the toggle swatches below are the legend for the lines that
+  // chart draws, so any divergence in key or order would colour the legend differently from
+  // the thing it labels.
+  const cacheSeriesColor = seriesColorMap(cacheSeries.map((s: any) => s.series_key || s.model_key || s.series_label));
   const cacheSeriesKeys = new Set(cacheSeries.map((descriptor) => descriptor.series_key));
   const cacheModelSeries = modelSeries.filter((row) => cacheSeriesKeys.has(String(row.series_key || '')));
   const selectedKeySet = new Set(selectedCacheModels.length ? selectedCacheModels : cacheSeries.map((descriptor) => descriptor.series_key));
@@ -504,8 +511,8 @@ export default function Usage() {
         </div>
         <div style={{ height: 280 }}>
           {trendMode === 'provider_model' && hasModelTrend
-            ? <ModelAreaChart modelSeries={modelSeries} series={series} height={280} />
-            : <AreaChart buckets={ts} height={280} />}
+            ? <ModelAreaChart modelSeries={modelSeries} series={series} height={280} ariaLabel={t('usage.trend')} />
+            : <AreaChart buckets={ts} height={280} ariaLabel={t('usage.trend')} />}
         </div>
       </div>
 
@@ -518,7 +525,7 @@ export default function Usage() {
           <div className="pool-model-toggle-row">
             {cacheSeries.map((s) => {
               const active = selectedKeySet.has(s.series_key);
-              const color = modelColor(s.series_key);
+              const color = cacheSeriesColor(s.series_key || s.model_key || s.series_label);
               return (
                 <button key={s.series_key} type="button" className={`pool-model-toggle ${active ? 'is-active' : ''}`} onClick={() => toggleCacheModel(s.series_key)}>
                   <i style={{ background: color }} />
@@ -528,7 +535,7 @@ export default function Usage() {
             })}
           </div>
           <div style={{ height: 260 }}>
-            <ModelAreaChart modelSeries={cacheModelSeries} series={cacheSeries} height={260} metric={cacheMetric} selectedKeys={selectedKeySet} />
+            <ModelAreaChart modelSeries={cacheModelSeries} series={cacheSeries} height={260} metric={cacheMetric} selectedKeys={selectedKeySet} ariaLabel={t('usage.model_cache_trend')} />
           </div>
         </div>
       ) : null}
@@ -537,7 +544,7 @@ export default function Usage() {
         <div className="pool-grid cols-2" style={{ marginBottom: 18 }}>
           {hasTopAccts ? (
             <div className="pool-chart-card"><div className="head"><div className="t">{t('usage.top_accounts')}</div></div>
-              <BarChart data={topAccts} series={[{ key: 'input', name: t('usage.input'), color: C.blue }, { key: 'output', name: t('usage.output'), color: C.green }]} stacked />
+              <BarChart ariaLabel={t('usage.top_accounts')} data={topAccts} series={[{ key: 'input', name: t('usage.input'), color: C.blue }, { key: 'output', name: t('usage.output'), color: C.green }]} stacked />
             </div>
           ) : null}
           {hasModelCacheBars ? (

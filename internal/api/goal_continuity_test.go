@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 )
@@ -1380,5 +1382,234 @@ func TestGoalResumeUnidentifiedAlwaysProducesStreamTerminal(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-MiCliProxy-Goal-Error") != "goal_resume_context_unidentified" || !strings.Contains(string(body), "response.failed") || !strings.Contains(string(body), "goal_resume_context_unidentified") {
 		t.Fatalf("unidentified stream must terminate status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
+// TestGoalResumeRefusesResponsesHistoryForMessagesFamilyProviders pins the fix for
+// "switch a chatgpt account to kiro/antigravity and goal breaks". The same Claude Code
+// session identifiers can own a Responses-family goal, because handleMessagesViaCodex
+// rewrites /v1/messages into /v1/responses while keeping the client's headers. A later
+// kiro/antigravity turn must never receive that Responses history under the "messages"
+// key, and must never silently proceed as if no durable context existed.
+func TestGoalResumeRefusesResponsesHistoryForMessagesFamilyProviders(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	h.app.cfg.GoalContinuityEnabled = true
+	const (
+		keyHash   = "cross-family-key-hash"
+		sessionID = "cross-family-claude-session"
+	)
+
+	// Turn 1: the session reached a chatgpt/codex account through the bridge, so the
+	// durable goal is Responses-family even though the client is Claude Code.
+	codexBody := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"responses-only-history"}]}]}`)
+	codexResponse := []byte(`{"id":"resp_cross_family_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"responses-only-answer"}]}]}`)
+	codexReq, err := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(codexBody)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexReq.Header.Set("X-Claude-Code-Session-Id", sessionID)
+	codexCtx := withDownstreamKey(withGoalOriginalBody(context.Background(), codexBody), downstreamPolicy{KeyHash: keyHash})
+	codexGoal, err := h.app.persistGoalContinuity(codexCtx, codexReq, "codex", codexBody, codexResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(codexGoal.ID) == "" {
+		t.Fatal("codex turn did not create a durable goal")
+	}
+
+	// Turn 2: the same session is now served by kiro / antigravity / a custom Messages
+	// provider. It carries its own complete history, so the turn can proceed — but as a
+	// NEW same-family goal, with the restart made visible rather than replaying.
+	for _, protocol := range []string{"kiro", "antigravity", "custom_messages"} {
+		current := []byte(`{"model":"claude-sonnet-4-6","session_id":"` + sessionID + `","messages":[{"role":"user","content":"switched provider"}]}`)
+		req, err := http.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(current)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+		ctx := withDownstreamKey(context.Background(), downstreamPolicy{KeyHash: keyHash})
+		replay := h.app.goalReplayBody(ctx, req, protocol, current)
+		if replay.Kind != goalResumeFamilyRestart {
+			t.Fatalf("%s resume kind = %q, want %q (reason=%q)", protocol, replay.Kind, goalResumeFamilyRestart, replay.Reason)
+		}
+		// The decisive property: no Responses-family history may be handed to a
+		// Messages-family upstream in any form.
+		if strings.Contains(string(replay.Body), "responses-only-history") ||
+			strings.Contains(string(replay.Body), "responses-only-answer") ||
+			strings.Contains(string(replay.Body), `"input"`) {
+			t.Fatalf("%s received Responses-family history: %s", protocol, replay.Body)
+		}
+	}
+
+	// A request that depends on pool-side history (it carries an upstream state handle
+	// instead of its own messages) cannot be restarted, so it must be refused with a
+	// diagnosable code instead of being sent upstream in the wrong shape.
+	stateful := []byte(`{"model":"claude-sonnet-4-6","session_id":"` + sessionID + `","messages":[{"role":"user","content":"switched provider"}]}`)
+	statefulReq, err := http.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(stateful)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	statefulReq.Header.Set("X-Claude-Code-Session-Id", sessionID)
+	statefulReq.Header.Set("X-Codex-Turn-State", "carried-over-upstream-state")
+	statefulCtx := withDownstreamKey(context.Background(), downstreamPolicy{KeyHash: keyHash})
+	refused := h.app.goalReplayBody(statefulCtx, statefulReq, "kiro", stateful)
+	if refused.Kind != goalResumeProtocolMismatch || len(refused.Body) != 0 {
+		t.Fatalf("stateful cross-family resume kind=%q body=%s", refused.Kind, refused.Body)
+	}
+	nonStream := httptest.NewRecorder()
+	writeGoalResumeError(nonStream, false, "kiro", refused.Kind, refused.Reason)
+	if nonStream.Code != http.StatusConflict || !strings.Contains(nonStream.Body.String(), "goal_resume_protocol_family_mismatch") {
+		t.Fatalf("non-stream refusal is not diagnosable: status=%d body=%s", nonStream.Code, nonStream.Body.String())
+	}
+	streamed := httptest.NewRecorder()
+	writeGoalResumeError(streamed, true, "kiro", refused.Kind, refused.Reason)
+	if streamed.Header().Get("X-MiCliProxy-Goal-Error") != "goal_resume_protocol_family_mismatch" {
+		t.Fatalf("stream refusal header = %q", streamed.Header().Get("X-MiCliProxy-Goal-Error"))
+	}
+	// A Messages-family client must get a Messages-family terminal, or the CLI hangs
+	// on a stream it cannot parse instead of showing the refusal.
+	if !strings.Contains(streamed.Body.String(), "event: error") ||
+		!strings.Contains(streamed.Body.String(), "message_stop") ||
+		strings.Contains(streamed.Body.String(), "response.failed") {
+		t.Fatalf("stream refusal used the wrong protocol terminal: %s", streamed.Body.String())
+	}
+
+	// The Responses-family goal must survive untouched: the refusal is a scoping
+	// decision, not a data loss event, so returning to codex still resumes.
+	back := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"back to codex"}]}]}`)
+	backReq, err := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(back)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backReq.Header.Set("X-Claude-Code-Session-Id", sessionID)
+	backCtx := withDownstreamKey(context.Background(), downstreamPolicy{KeyHash: keyHash})
+	backReplay := h.app.goalReplayBody(backCtx, backReq, "codex", back)
+	if backReplay.Kind != goalResumeFound || backReplay.Session.ID != codexGoal.ID ||
+		!strings.Contains(string(backReplay.Body), "responses-only-history") {
+		t.Fatalf("codex resume regressed: kind=%q session=%q body=%s", backReplay.Kind, backReplay.Session.ID, backReplay.Body)
+	}
+}
+
+// TestAntigravityGoalContinuityAdvancesAcrossTwoTurns covers the path that previously
+// had no goal handling at all: an Antigravity turn must leave a durable checkpoint, and
+// the next turn of the same session must resume it. The replay call uses the literal
+// "claude" protocol that handleMessages passes before provider selection, so this also
+// pins that a Messages-family goal stored as "antigravity" stays resolvable there.
+func TestAntigravityGoalContinuityAdvancesAcrossTwoTurns(t *testing.T) {
+	var upstreamBodies []string
+	var mu sync.Mutex
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		upstreamBodies = append(upstreamBodies, string(body))
+		turn := len(upstreamBodies)
+		mu.Unlock()
+		answer := "antigravity-answer-one"
+		if turn > 1 {
+			answer = "antigravity-answer-two"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"`+answer+`"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":4}}}`)
+	})
+	h.app.cfg.GoalContinuityEnabled = true
+
+	ctx := context.Background()
+	const (
+		accountID = "antigravity-goal-two-turns"
+		keyHash   = "antigravity-goal-key-hash"
+		sessionID = "antigravity-goal-session"
+		model     = "claude-sonnet-4-6"
+	)
+	account := storage.Account{ID: accountID, Label: accountID, GroupName: "cyber", Provider: "antigravity", Status: "active"}
+	if err := h.store.UpsertAccount(ctx, account, storage.AccountToken{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertAntigravityCredentials(ctx, storage.AntigravityCredentials{
+		AccountID: accountID, ProjectID: "goal-project", AccessToken: "antigravity-access",
+		ExpiresAt: time.Now().Add(2 * time.Hour).Unix(), BaseURL: h.upstream.URL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	newRequest := func(body []byte) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+		return req.WithContext(withDownstreamKey(withGoalOriginalBody(context.Background(), body), downstreamPolicy{KeyHash: keyHash}))
+	}
+	send := func(body []byte) *httptest.ResponseRecorder {
+		t.Helper()
+		req := newRequest(body)
+		w := httptest.NewRecorder()
+		if got := h.app.antigravityMessagesWithLease(w, req, body, model, scheduler.Lease{Account: account}, map[string]bool{}); got != outcomeDone {
+			t.Fatalf("antigravity outcome = %v body=%s", got, w.Body.String())
+		}
+		if w.Code != http.StatusOK {
+			t.Fatalf("antigravity status = %d body=%s", w.Code, w.Body.String())
+		}
+		return w
+	}
+
+	// --- Turn 1: nothing durable exists yet, and the terminal must create the goal.
+	firstBody := []byte(`{"model":"` + model + `","max_tokens":128,"session_id":"` + sessionID + `","messages":[{"role":"user","content":"antigravity-question-one"}]}`)
+	first := send(firstBody)
+	if !strings.Contains(first.Body.String(), "antigravity-answer-one") {
+		t.Fatalf("turn 1 response = %s", first.Body.String())
+	}
+	h.app.WaitForAsyncWrites()
+
+	goals, err := h.store.ListGoalSessions(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(goals) != 1 || goals[0].Protocol != "antigravity" {
+		t.Fatalf("antigravity turn 1 did not persist exactly one antigravity goal: %+v", goals)
+	}
+	firstGoalID := goals[0].ID
+
+	// --- Turn 2: the same replay call handleMessages makes must find that goal and
+	// rebuild the native Messages history before the account is selected again.
+	secondBody := []byte(`{"model":"` + model + `","max_tokens":128,"session_id":"` + sessionID + `","messages":[{"role":"user","content":"antigravity-question-two"}]}`)
+	replay := h.app.goalReplayBody(newRequest(secondBody).Context(), newRequest(secondBody), "claude", secondBody)
+	if replay.Kind != goalResumeFound || replay.Session.ID != firstGoalID {
+		t.Fatalf("antigravity turn 2 replay kind=%q session=%q reason=%q", replay.Kind, replay.Session.ID, replay.Reason)
+	}
+	rebuilt := string(replay.Body)
+	if !strings.Contains(rebuilt, "antigravity-question-one") ||
+		!strings.Contains(rebuilt, "antigravity-answer-one") ||
+		!strings.Contains(rebuilt, "antigravity-question-two") {
+		t.Fatalf("antigravity replay lost a turn: %s", rebuilt)
+	}
+	// Messages-family history must stay under "messages"; an "input" key here is the
+	// exact malformed body that broke provider switches.
+	if strings.Contains(rebuilt, `"input"`) {
+		t.Fatalf("antigravity replay used the Responses history key: %s", rebuilt)
+	}
+
+	second := send(replay.Body)
+	if !strings.Contains(second.Body.String(), "antigravity-answer-two") {
+		t.Fatalf("turn 2 response = %s", second.Body.String())
+	}
+	h.app.WaitForAsyncWrites()
+
+	// Turn 2 must advance the SAME goal, and the upstream must have received turn 1's
+	// question and answer alongside turn 2's question.
+	goals, err = h.store.ListGoalSessions(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(goals) != 1 || goals[0].ID != firstGoalID {
+		t.Fatalf("antigravity turn 2 forked the goal: %+v", goals)
+	}
+	mu.Lock()
+	sent := append([]string(nil), upstreamBodies...)
+	mu.Unlock()
+	if len(sent) != 2 {
+		t.Fatalf("upstream calls = %d", len(sent))
+	}
+	if !strings.Contains(sent[1], "antigravity-question-one") ||
+		!strings.Contains(sent[1], "antigravity-answer-one") ||
+		!strings.Contains(sent[1], "antigravity-question-two") {
+		t.Fatalf("antigravity turn 2 upstream body lost history: %s", sent[1])
 	}
 }

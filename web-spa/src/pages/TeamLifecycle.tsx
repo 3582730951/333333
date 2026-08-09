@@ -487,14 +487,20 @@ export default function TeamLifecycle() {
         </ol>
       </section>
 
+      {/* active / waiting / review / completed are mutually exclusive states of the same
+          workflow set, so each is a genuine part of `total` -- and the active card was already
+          printing that denominator as its own detail, handing the reader both numbers and
+          leaving them to divide. The track draws that division. `workspaces` counts rooms, not
+          cycles, so it has no denominator here and stays a bare number. total===0 yields no
+          share at all rather than a zero-width track, which would imply a measured zero. */}
       <SummaryRail
         className="pool-lifecycle-metrics"
         items={[
           { key: 'workspaces', label: t('team_lifecycle.workspaces'), value: snapshot.workspaces.length, detail: t('team_lifecycle.rooms'), tone: 'accent' },
-          { key: 'active', label: t('team_lifecycle.active'), value: active, detail: `${total} ${t('team_lifecycle.total_cycles')}`, tone: 'success' },
-          { key: 'waiting', label: t('team_lifecycle.waiting'), value: waiting, detail: t('team_lifecycle.durable_queue'), tone: waiting ? 'warning' : 'neutral' },
-          { key: 'review', label: t('team_lifecycle.review'), value: review, detail: t('team_lifecycle.operator_review'), tone: review ? 'danger' : 'neutral' },
-          { key: 'completed', label: t('team_lifecycle.completed'), value: completed, detail: t('team_lifecycle.replacement_queued'), tone: 'accent' },
+          { key: 'active', label: t('team_lifecycle.active'), value: active, detail: `${total} ${t('team_lifecycle.total_cycles')}`, tone: 'success', share: total ? active / total : undefined },
+          { key: 'waiting', label: t('team_lifecycle.waiting'), value: waiting, detail: t('team_lifecycle.durable_queue'), tone: waiting ? 'warning' : 'neutral', share: total ? waiting / total : undefined },
+          { key: 'review', label: t('team_lifecycle.review'), value: review, detail: t('team_lifecycle.operator_review'), tone: review ? 'danger' : 'neutral', share: total ? review / total : undefined },
+          { key: 'completed', label: t('team_lifecycle.completed'), value: completed, detail: t('team_lifecycle.replacement_queued'), tone: 'accent', share: total ? completed / total : undefined },
         ]}
       />
 

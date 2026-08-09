@@ -162,7 +162,14 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			raw = replay.Body
 			w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt")
 			w.Header().Set("X-MiCliProxy-Goal-Status", replay.Session.State)
-		case goalResumeAmbiguous, goalResumeRequiresToolResult, goalResumeStorageExhausted:
+		case goalResumeFamilyRestart:
+			// Identifiers owned by a Responses-family goal (a prior turn of this same
+			// session that was bridged to a chatgpt/codex account). The body carries
+			// its own complete history, so the turn proceeds as a new Messages-family
+			// goal instead of replaying incompatible history.
+			w.Header().Set("X-MiCliProxy-Context-Status", "family-restart")
+			w.Header().Set("X-MiCliProxy-Goal-Notice", "goal_resume_protocol_family_restart")
+		case goalResumeAmbiguous, goalResumeRequiresToolResult, goalResumeStorageExhausted, goalResumeProtocolMismatch:
 			writeGoalResumeError(w, isStreamRequest(raw), "claude", replay.Kind, replay.Reason)
 			return
 		}

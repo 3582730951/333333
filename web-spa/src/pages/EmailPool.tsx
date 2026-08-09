@@ -121,16 +121,29 @@ export default function EmailPool() {
     setPage(1);
   };
 
+  // This one card spans two row states; the other three are 1:1 with theirs. That is why its label
+  // is `email_pool.available` -> "未使用" and NOT "可用": `ready`'s own row tag is already 可用, so
+  // naming the sum after one of its halves printed "可用 2" above a table containing exactly one 可用
+  // row. Reading it as 未使用 / 使用中 / 已使用 also makes the four cards a lifecycle in order, which
+  // is how the pool actually drains. Renaming this back to 可用 reintroduces the mismatch.
   const available = countOf(counts, 'idle') + countOf(counts, 'ready');
   const inUse = countOf(counts, 'in_use');
   const used = countOf(counts, 'used');
   const failed = countOf(counts, 'error');
+  // Four of these five are parts of the first one, and the rail already knew how to draw that:
+  // an entry carrying `share` gets a proportional track. Without it the proportions existed only
+  // as the "占总量 33%" strings below the numbers, so telling at a glance whether the pool is
+  // mostly available or mostly spent meant reading four percentages and comparing them mentally.
+  // The strings stay -- the track answers which is biggest, the text says by how much.
+  // An empty pool yields no share rather than 0: MetricRail draws a track for any finite share, and
+  // a zero-width one reads as a measured zero instead of nothing measured yet.
+  const shareOf = (part: number) => (total ? part / total : undefined);
   const metrics = [
     { key: 'total', label: t('email_pool.total'), value: total, detail: t('email_pool.all_entries') },
-    { key: 'available', label: t('email_pool.available'), value: available, detail: shareDetail(available, total), tone: 'success' },
-    { key: 'in-use', label: t('email_pool.in_use'), value: inUse, detail: shareDetail(inUse, total), tone: 'info' },
-    { key: 'used', label: t('email_pool.used'), value: used, detail: shareDetail(used, total) },
-    { key: 'error', label: t('email_pool.error'), value: failed, detail: shareDetail(failed, total), tone: 'danger' },
+    { key: 'available', label: t('email_pool.available'), value: available, share: shareOf(available), detail: shareDetail(available, total), tone: 'success' },
+    { key: 'in-use', label: t('email_pool.in_use'), value: inUse, share: shareOf(inUse), detail: shareDetail(inUse, total), tone: 'info' },
+    { key: 'used', label: t('email_pool.used'), value: used, share: shareOf(used), detail: shareDetail(used, total) },
+    { key: 'error', label: t('email_pool.error'), value: failed, share: shareOf(failed), detail: shareDetail(failed, total), tone: 'danger' },
   ];
 
   const selected = [...selectedIds];
@@ -166,11 +179,17 @@ export default function EmailPool() {
     </ActionGroup>
   ), [doTest, testing]);
 
+  // These six declared 1156px against roughly 1044px of pane once the selection checkbox and the
+  // expander folding introduces are paid for, so 最近使用 was dropped behind a per-row expander at
+  // 1440x900 -- and the column that survived in its place was 最近错误, 240px wide and printing "—"
+  // in five rows of six. Trimmed to 1008px so all six fit, and 最近错误 carries the higher priority
+  // number so it is the one that folds first when the pane really is too narrow: a mostly-empty
+  // column is a cheaper loss than when each mailbox was last touched.
   const columns = useMemo(() => [
     {
       title: t('email_pool.email'),
       dataIndex: 'email',
-      width: 310,
+      width: 280,
       render: (value: string) => (
         <TextClamp
           strong
@@ -191,19 +210,21 @@ export default function EmailPool() {
     {
       title: t('email_pool.group'),
       dataIndex: 'group_name',
-      width: 168,
+      width: 140,
       render: (value?: string) => <TextClamp title={value || undefined}>{value || t('email_pool.default_group')}</TextClamp>,
     },
     {
       title: t('email_pool.last_error'),
       dataIndex: 'error_message',
-      width: 240,
+      width: 170,
+      priority: 80,
       render: (value?: string) => <TextClamp title={value || undefined} muted={!value}>{value || '—'}</TextClamp>,
     },
     {
       title: t('email_pool.last_used'),
       dataIndex: 'last_used_at',
-      width: 170,
+      width: 150,
+      priority: 20,
       render: (value?: number) => value ? fmtDateTime(value) : t('email_pool.never_used'),
     },
     {
@@ -333,7 +354,14 @@ export default function EmailPool() {
             'aria-label': `${t('email_pool.email')}: ${account.email}`,
           }),
         }}
-        minScrollX={1156}
+        minScrollX={
+          // Must equal the six declared widths above (280+112+140+170+150+156). It is a floor,
+          // not a hint: defaultTableScrollX returns max(declared, minScrollX), so a stale value
+          // wins over the columns and the table reserves width the pane does not have. Left at
+          // the old 1156 after the retune, it clipped by 10px at 1280x720 -- the columns fit in
+          // the 1100px available there, only the floor did not.
+          1008
+        }
         safeActionWidth={156}
         density="regular"
         rowHeight={68}

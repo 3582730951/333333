@@ -26,6 +26,12 @@ const (
 	goalStorageReserveMin             = int64(8 << 20)
 	goalStorageReserveMax             = int64(128 << 20)
 	goalStorageMaintenanceStepsPerRun = 16
+	// Headroom maintenance leaves below the new-goal admission ceiling, so a fresh
+	// session is admitted without a foreground reclaim. Bounded on both sides: large
+	// enough for several ordinary turns, small enough to stay a rounding-scale slice
+	// of the reserve rather than a second budget.
+	goalStorageAdmissionHeadroomMin = int64(1 << 20)
+	goalStorageAdmissionHeadroomMax = int64(16 << 20)
 )
 
 type DiskFilesystemSnapshot struct {
@@ -203,16 +209,19 @@ func (s *Server) runSafeDiskCleanup(ctx context.Context, snap *DiskGuardSnapshot
 	} else {
 		snap.GoalsDeleted += goals
 	}
+	// Converge below the target, not to it. See goalStorageMaintenanceFloor: the
+	// target doubles as CommitGoalTurn's admission ceiling for a new goal.
+	maintenanceFloor := goalStorageMaintenanceFloor(s.goalStorageMaxBytes(ctx))
 	for step := 0; step < goalStorageMaintenanceStepsPerRun; step++ {
 		used, err := s.store.GoalStorageBytes(cleanupCtx)
 		if err != nil {
 			snap.LastError = appendDiskGuardCode(snap.LastError, "goal_budget_measure_failed")
 			break
 		}
-		if used <= snap.GoalStorageTargetBytes {
+		if used <= maintenanceFloor {
 			break
 		}
-		reclaimed, err := s.store.EnforceGoalStorageBudgetStep(cleanupCtx, snap.GoalStorageTargetBytes)
+		reclaimed, err := s.store.EnforceGoalStorageBudgetStep(cleanupCtx, maintenanceFloor)
 		if err != nil {
 			snap.LastError = appendDiskGuardCode(snap.LastError, "goal_budget_cleanup_failed")
 			break
@@ -234,6 +243,33 @@ func (s *Server) runSafeDiskCleanup(ctx context.Context, snap *DiskGuardSnapshot
 		snap.RouteBindingsDeleted += bindings.Total()
 	}
 	s.cleanupExpiredDiagnosticJobs(cleanupCtx)
+}
+
+// goalStorageMaintenanceFloor is the value background maintenance actually converges
+// to. It must be strictly below the target, because the target is simultaneously the
+// admission ceiling CommitGoalTurn applies to a brand-new goal: converging to exactly
+// the target leaves a new session only the rounding remainder of headroom (217 KiB of
+// a 896 MiB target in the reported deployment), so almost every new goal is rejected
+// with a storage-budget error and has to pay a bounded foreground reclaim first — or
+// fails outright and leaves nothing for the next turn to resume.
+func goalStorageMaintenanceFloor(maxBytes int64) int64 {
+	target, reserve := goalStorageMaintenanceTarget(maxBytes)
+	if target <= 0 {
+		return target
+	}
+	headroom := reserve / 8
+	if headroom < goalStorageAdmissionHeadroomMin {
+		headroom = goalStorageAdmissionHeadroomMin
+	}
+	if headroom > goalStorageAdmissionHeadroomMax {
+		headroom = goalStorageAdmissionHeadroomMax
+	}
+	if headroom >= target {
+		// A tiny budget cannot give up a fixed slice; halve the target instead so
+		// maintenance still lands strictly below the admission ceiling.
+		headroom = target / 2
+	}
+	return target - headroom
 }
 
 func goalStorageMaintenanceTarget(maxBytes int64) (target, reserve int64) {

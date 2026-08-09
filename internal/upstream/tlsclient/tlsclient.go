@@ -102,6 +102,22 @@ type Request struct {
 	ProxyURL     string        // optional chain proxy (http(s)/socks5(h))
 	CookieJarKey string        // scopes a persistent cookie jar across a multi-call flow
 	Timeout      time.Duration // 0 => factory default
+	// ForceHTTP1 restricts the TLS ClientHello's ALPN extension to exactly
+	// ["http/1.1"], so the connection can only negotiate HTTP/1.1.
+	//
+	// This exists to impersonate Node's global fetch. Node's BUNDLED undici (what
+	// global fetch is built on, and therefore what the Anthropic TS SDK uses) cannot
+	// speak HTTP/2 at all — undici forces allowH2:false for those legacy v1
+	// dispatcher consumers. Real Claude Code therefore offers ALPN ["http/1.1"] and
+	// every one of its requests is HTTP/1.1. Our default Chrome_120 profile offers
+	// ["h2","http/1.1"], so an Anthropic edge that prefers h2 would see an HTTP/2
+	// connection carrying a claude-cli User-Agent — a combination genuine Claude
+	// Code cannot produce, and a cheap binary discriminator. Two observable signals
+	// change with this flag: the JA4 ALPN field (h2 -> h1) and the presence of an
+	// HTTP/2 SETTINGS/Akamai fingerprint at all (real Claude Code exposes none).
+	//
+	// Left false for every non-Anthropic provider so their fingerprints are untouched.
+	ForceHTTP1 bool
 }
 
 // Response mirrors the subset of a response the pool needs, with a streaming Body.
@@ -189,8 +205,18 @@ func ResolveProfile(profileName, ja3Override string) profiles.ClientProfile {
 }
 
 // cacheKey intentionally excludes CookieJarKey so account/session state cannot fragment connections.
+//
+// ForceHTTP1 MUST be part of the key: it is baked into the client's ALPN at construction
+// time, so an h1-pinned and a non-pinned request that share a profile+proxy would
+// otherwise share one cached client and the first caller to create it would silently
+// decide the other's protocol — either leaking h2 onto Claude traffic or dragging another
+// provider down to HTTP/1.1.
 func cacheKey(r Request) string {
-	return r.Profile + "\x00" + r.JA3Override + "\x00" + r.ProxyURL
+	h1 := "0"
+	if r.ForceHTTP1 {
+		h1 = "1"
+	}
+	return r.Profile + "\x00" + r.JA3Override + "\x00" + r.ProxyURL + "\x00" + h1
 }
 
 func (f *Factory) clientFor(r Request) (tls_client.HttpClient, error) {
@@ -214,6 +240,11 @@ func (f *Factory) clientFor(r Request) (tls_client.HttpClient, error) {
 		// The pool owns failover/retry semantics; the transport must not silently follow
 		// redirects (an upstream 3xx is a signal we surface, not chase).
 		tls_client.WithNotFollowRedirects(),
+	}
+	if r.ForceHTTP1 {
+		// utls rewrites the profile's ALPNExtension to exactly ["http/1.1"]
+		// (u_parrots.go, WithForceHttp1 branch), so h2 can never be negotiated.
+		opts = append(opts, tls_client.WithForceHttp1())
 	}
 	if r.ProxyURL != "" {
 		opts = append(opts, tls_client.WithProxyUrl(r.ProxyURL))

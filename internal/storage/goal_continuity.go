@@ -155,6 +155,13 @@ type GoalAlias struct {
 	Type      string
 	Value     string
 	Namespace string
+	// Family scopes the alias to a wire-history family (see GoalProtocolFamily).
+	// A Claude Code session that also ran through the Anthropic→Responses bridge
+	// emits the exact same client identifiers for both families; without this
+	// dimension the two goals would fight over one globally unique alias_hash and
+	// each turn would rebind the alias away from the other family's history.
+	// Empty preserves the deployed v2 hash so existing rows stay resolvable.
+	Family string
 }
 
 type GoalSession struct {
@@ -496,6 +503,15 @@ func hashGoalAlias(alias GoalAlias) string {
 		// installation namespace and for one-time exact state-alias migration.
 		return hashGoalValue(alias.Type, alias.Value)
 	}
+	if family := strings.TrimSpace(strings.ToLower(alias.Family)); family != "" && family != GoalFamilyResponses {
+		// Only the non-Responses families move to v3. Keeping Responses on the
+		// deployed v2 digest means every already-persisted Codex goal — the
+		// overwhelming majority of stored aliases — resumes without migration,
+		// while a Messages-family turn can no longer steal the same alias row.
+		s := sha256.Sum256([]byte("goal-alias-v3\x00" + family + "\x00" + namespace + "\x00" +
+			strings.TrimSpace(alias.Type) + "\x00" + strings.TrimSpace(alias.Value)))
+		return hex.EncodeToString(s[:])
+	}
 	s := sha256.Sum256([]byte("goal-alias-v2\x00" + namespace + "\x00" +
 		strings.TrimSpace(alias.Type) + "\x00" + strings.TrimSpace(alias.Value)))
 	return hex.EncodeToString(s[:])
@@ -523,6 +539,7 @@ func normalizedGoalAliases(in []GoalAlias) []GoalAlias {
 		alias.Type = strings.TrimSpace(strings.ToLower(alias.Type))
 		alias.Value = strings.TrimSpace(alias.Value)
 		alias.Namespace = strings.TrimSpace(alias.Namespace)
+		alias.Family = strings.TrimSpace(strings.ToLower(alias.Family))
 		if alias.Type == "" || alias.Value == "" {
 			continue
 		}
@@ -536,7 +553,7 @@ func normalizedGoalAliases(in []GoalAlias) []GoalAlias {
 	return out
 }
 
-func (s *Store) resolveGoalAliases(ctx context.Context, q sqlQueryer, aliases []GoalAlias) (GoalResolution, error) {
+func (s *Store) resolveGoalAliases(ctx context.Context, q sqlQueryer, aliases []GoalAlias, family string) (GoalResolution, error) {
 	aliases = normalizedGoalAliases(aliases)
 	if len(aliases) == 0 {
 		return GoalResolution{}, ErrGoalNotFound
@@ -576,6 +593,18 @@ func (s *Store) resolveGoalAliases(ctx context.Context, q sqlQueryer, aliases []
 	if err := rows.Err(); err != nil {
 		return GoalResolution{}, err
 	}
+	// A foreign-family match can only produce a malformed replay body or a rejected
+	// commit, so it is not a candidate at all. Filtering here rather than in SQL keeps
+	// the protocol→family mapping in one place and stays engine independent.
+	if family = strings.TrimSpace(strings.ToLower(family)); family != "" {
+		kept := out[:0]
+		for _, item := range out {
+			if GoalProtocolFamily(item.Protocol) == family {
+				kept = append(kept, item)
+			}
+		}
+		out = kept
+	}
 	if len(out) == 0 {
 		return GoalResolution{}, ErrGoalNotFound
 	}
@@ -597,7 +626,14 @@ type sqlQueryer interface {
 }
 
 func (s *Store) ResolveGoalAliases(ctx context.Context, aliases []GoalAlias) (GoalResolution, error) {
-	return s.resolveGoalAliases(ctx, s.rdb, aliases)
+	return s.resolveGoalAliases(ctx, s.rdb, aliases, "")
+}
+
+// ResolveGoalAliasesForFamily restricts resolution to goals whose stored protocol
+// belongs to family. Callers that are about to replay or append history must use it:
+// a match from another family is never resumable.
+func (s *Store) ResolveGoalAliasesForFamily(ctx context.Context, aliases []GoalAlias, family string) (GoalResolution, error) {
+	return s.resolveGoalAliases(ctx, s.rdb, aliases, family)
 }
 
 // ResolveGoalAliasSets applies the caller's documented identity precedence.  A
@@ -606,16 +642,22 @@ func (s *Store) ResolveGoalAliases(ctx context.Context, aliases []GoalAlias) (Go
 // may fall through to a persisted response/turn alias.  It is used by the relay
 // before recovery and by CommitGoalTurn inside its write transaction.
 func (s *Store) ResolveGoalAliasSets(ctx context.Context, aliasSets [][]GoalAlias) (GoalResolution, error) {
-	return s.resolveGoalAliasSets(ctx, s.rdb, aliasSets)
+	return s.resolveGoalAliasSets(ctx, s.rdb, aliasSets, "")
 }
 
-func (s *Store) resolveGoalAliasSets(ctx context.Context, q sqlQueryer, aliasSets [][]GoalAlias) (GoalResolution, error) {
+// ResolveGoalAliasSetsForFamily applies the same precedence as ResolveGoalAliasSets
+// but only accepts a goal of the given wire-history family.
+func (s *Store) ResolveGoalAliasSetsForFamily(ctx context.Context, aliasSets [][]GoalAlias, family string) (GoalResolution, error) {
+	return s.resolveGoalAliasSets(ctx, s.rdb, aliasSets, family)
+}
+
+func (s *Store) resolveGoalAliasSets(ctx context.Context, q sqlQueryer, aliasSets [][]GoalAlias, family string) (GoalResolution, error) {
 	for _, aliases := range aliasSets {
 		aliases = normalizedGoalAliases(aliases)
 		if len(aliases) == 0 {
 			continue
 		}
-		resolution, err := s.resolveGoalAliases(ctx, q, aliases)
+		resolution, err := s.resolveGoalAliases(ctx, q, aliases, family)
 		if errors.Is(err, ErrGoalNotFound) {
 			continue
 		}
@@ -628,6 +670,14 @@ func (s *Store) resolveGoalAliasSets(ctx context.Context, q sqlQueryer, aliasSet
 // fingerprint triple is allowed and callers must reject more than one result.  It is
 // never a model-name, cache-prefix, or account-affinity guess.
 func (s *Store) ResolveFallbackGoal(ctx context.Context, downstreamKeyHash, workspaceHash, initialGoalHash string) (GoalResolution, error) {
+	return s.ResolveFallbackGoalForFamily(ctx, downstreamKeyHash, workspaceHash, initialGoalHash, "")
+}
+
+// ResolveFallbackGoalForFamily adds the wire-history family to the fallback triple.
+// The workspace and initial-prompt fingerprints are protocol agnostic, so without it
+// the same repository opened once through Codex and once through Messages resolves to
+// whichever goal was written last.
+func (s *Store) ResolveFallbackGoalForFamily(ctx context.Context, downstreamKeyHash, workspaceHash, initialGoalHash, family string) (GoalResolution, error) {
 	if strings.TrimSpace(downstreamKeyHash) == "" || strings.TrimSpace(workspaceHash) == "" || strings.TrimSpace(initialGoalHash) == "" {
 		return GoalResolution{}, ErrGoalNotFound
 	}
@@ -657,6 +707,15 @@ func (s *Store) ResolveFallbackGoal(ctx context.Context, downstreamKeyHash, work
 	}
 	if err := rows.Err(); err != nil {
 		return GoalResolution{}, err
+	}
+	if family = strings.TrimSpace(strings.ToLower(family)); family != "" {
+		kept := matches[:0]
+		for _, item := range matches {
+			if GoalProtocolFamily(item.Protocol) == family {
+				kept = append(kept, item)
+			}
+		}
+		matches = kept
 	}
 	if len(matches) == 0 {
 		return GoalResolution{}, ErrGoalNotFound
@@ -689,17 +748,21 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 	if turn.ExpiresAt <= Now() {
 		return GoalSession{}, errors.New("goal turn expiry must be in the future")
 	}
+	family := GoalProtocolFamily(turn.Protocol)
 	turnAliases := append([]GoalAlias(nil), turn.Aliases...)
-	if namespace := strings.TrimSpace(turn.AliasNamespace); namespace != "" {
-		for index := range turnAliases {
-			if strings.TrimSpace(turnAliases[index].Namespace) == "" {
-				turnAliases[index].Namespace = namespace
-			}
+	for index := range turnAliases {
+		if namespace := strings.TrimSpace(turn.AliasNamespace); namespace != "" &&
+			strings.TrimSpace(turnAliases[index].Namespace) == "" {
+			turnAliases[index].Namespace = namespace
 		}
+		// The turn's protocol is the authority on which family owns these aliases,
+		// so a caller can never persist a row under a family that disagrees with the
+		// history shape it just wrote.
+		turnAliases[index].Family = family
 	}
 	aliases := normalizedGoalAliases(turnAliases)
 	if strings.TrimSpace(turn.ResponseID) != "" {
-		aliases = append(aliases, GoalAlias{Type: "response_id", Value: turn.ResponseID, Namespace: turn.AliasNamespace})
+		aliases = append(aliases, GoalAlias{Type: "response_id", Value: turn.ResponseID, Namespace: turn.AliasNamespace, Family: family})
 		aliases = normalizedGoalAliases(aliases)
 	}
 	now := Now()
@@ -729,7 +792,7 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 			}
 		}
 	}
-	resolution, resolveErr := s.resolveGoalAliasSets(ctx, tx, resolutionSets)
+	resolution, resolveErr := s.resolveGoalAliasSets(ctx, tx, resolutionSets, family)
 	if resolveErr != nil && !errors.Is(resolveErr, ErrGoalNotFound) {
 		return GoalSession{}, resolveErr
 	}
@@ -838,7 +901,13 @@ FROM goal_session WHERE id=? AND state<>'reclaiming'`, resolution.Session.ID).Sc
 		nextSegment = 1
 	} else {
 		session = resolution.Session
-		if strings.TrimSpace(session.Protocol) != turn.Protocol {
+		// Two providers that serialize history identically may advance one goal: the
+		// stored segments and the incoming turn use the same history key, so the
+		// append is well defined. A different family may not, because its history
+		// would land under the wrong key and be replayed as a malformed body.
+		// Exact-protocol equality was too strict — it rejected every claude→kiro and
+		// claude→antigravity handoff even though those are byte-compatible.
+		if GoalProtocolFamily(session.Protocol) != family {
 			return GoalSession{}, ErrGoalAmbiguous
 		}
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM goal_segment WHERE goal_id=?`, session.ID).Scan(&nextSegment); err != nil {
@@ -1382,8 +1451,31 @@ func appendGoalItems(dst []interface{}, raw interface{}) []interface{} {
 	}
 }
 
+// Goal protocol families. A family is the shape of the durable history, not the
+// upstream vendor: every provider whose downstream contract is Anthropic Messages
+// stores history under "messages", and every Responses-shaped protocol stores it
+// under "input". Replay, the commit-time mismatch gate, and alias scoping are all
+// keyed on the family so two providers that speak the identical wire shape can
+// advance one goal, while two providers that do not can never exchange history.
+const (
+	GoalFamilyMessages  = "messages"
+	GoalFamilyResponses = "responses"
+)
+
+// GoalProtocolFamily maps a persisted protocol to its wire-history family.
+// Unknown protocols intentionally fall back to Responses: that is the historical
+// default of goalHistoryKey, so an older row keeps resolving exactly as before.
+func GoalProtocolFamily(protocol string) string {
+	switch strings.TrimSpace(strings.ToLower(protocol)) {
+	case "claude", "kiro", "antigravity", "custom_messages":
+		return GoalFamilyMessages
+	default:
+		return GoalFamilyResponses
+	}
+}
+
 func goalHistoryKey(protocol string) string {
-	if strings.EqualFold(strings.TrimSpace(protocol), "claude") || strings.EqualFold(strings.TrimSpace(protocol), "kiro") {
+	if GoalProtocolFamily(protocol) == GoalFamilyMessages {
 		return "messages"
 	}
 	return "input"

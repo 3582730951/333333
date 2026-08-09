@@ -54,12 +54,18 @@ describe('model quality mobile presentation', () => {
     );
 
     expect(await screen.findByText('quality-model-01')).toBeInTheDocument();
-    expect(screen.getAllByRole('listitem')).toHaveLength(20);
-    expect(screen.queryByText('quality-model-21')).not.toBeInTheDocument();
-    expect(screen.queryByText('verified-model-01')).not.toBeInTheDocument();
+    // Every query below is scoped to the mobile list. The page also renders a latency
+    // ranking and a state legend, both of which are lists and both of which name models, so
+    // page-wide queries would match the charts instead of the rows they mean to check --
+    // including model 21, which is the slowest sample and so always appears in the ranking
+    // regardless of which table page is showing.
+    const rows = () => screen.getByRole('list', { name: '分组模型状态' });
+    expect(within(rows()).getAllByRole('listitem')).toHaveLength(20);
+    expect(within(rows()).queryByText('quality-model-21')).not.toBeInTheDocument();
+    expect(within(rows()).queryByText('verified-model-01')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '下一页' }));
-    expect(await screen.findByText('quality-model-21')).toBeInTheDocument();
+    expect(await within(rows()).findByText('quality-model-21')).toBeInTheDocument();
     expect(screen.getByText('2 / 2')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '查看 quality-model-21 详情' }));

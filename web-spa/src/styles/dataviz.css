@@ -248,6 +248,7 @@
 
 .pool-delta {
   display: inline-flex;
+  min-height: var(--pool-delta-height);
   align-items: center;
   gap: 3px;
   padding: 2px 7px;
@@ -358,10 +359,26 @@
 
 .pool-kpi__head {
   display: flex;
+  min-height: var(--pool-delta-height);   /* keeps the value baseline level across the strip */
   min-width: 0;
   align-items: center;
   justify-content: space-between;
   gap: var(--pool-space-2);
+}
+
+.pool-kpi__ident {
+  display: flex;
+  min-width: 0;   /* lets the label ellipsis rather than push the badge out */
+  align-items: center;
+  gap: 6px;
+}
+
+.pool-kpi__dot {
+  width: var(--pool-kpi-dot);
+  height: var(--pool-kpi-dot);
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--pool-kpi-accent, var(--pool-text-3));
 }
 
 .pool-kpi__label {
@@ -703,6 +720,47 @@
     margin-top: 0;
   }
 
+  /* The delta pill is a fixed 68.38px and never shrinks (nowrap), so on a 128px head at
+     360px the label was left 39px for a 59px string: "24h Token" rendered "24h To…".
+     Measured across the band the label needs 59px and gets 54px at 390px, 58px at 600px,
+     39px at 360px — short everywhere the pill is present. Two lines clears all three
+     (the longest label wraps to 30px x 2), and the clamp keeps it at exactly two so a
+     longer translation ellipsises instead of pushing the value baseline down.
+
+     Not fixed by dropping the dot: at 360px the deficit is 7.4px with no dot at all.
+     Not fixed by hiding the arrow glyph: that buys 13px, still short at 360px, and it
+     would leave KPI pills arrowless while every other pill in the app keeps its arrow. */
+  .pool-kpi__label {
+    display: -webkit-box;
+    /* Two lines' worth of box on every tile, wrapped or not. Without the floor the dot
+       tracked its own label's centre, so a one-line neighbour sat 7.2px higher than a
+       wrapped one and the row of dots stepped. */
+    min-height: calc(var(--pool-type-caption) * var(--pool-leading-tight) * 2);
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  /* A bullet belongs beside line 1, not centred on the block: on a wrapped label the
+     centred dot landed in the gap between the two lines and read as detached. */
+  .pool-kpi__ident {
+    align-items: flex-start;
+  }
+
+  .pool-kpi__dot {
+    margin-top: calc((var(--pool-type-caption) * var(--pool-leading-tight) - var(--pool-kpi-dot)) / 2);
+  }
+
+  /* Two label lines, so the head reserves two rather than one pill height. Tiles whose
+     label fits on one line stay centred in the same box, which is what keeps the value
+     baseline level across the strip — the same invariant --pool-delta-height holds on
+     desktop, measured at 0.00px spread. */
+  .pool-kpi__head {
+    min-height: calc(var(--pool-type-caption) * var(--pool-leading-tight) * 2);
+  }
+
   .pool-kpi__spark {
     width: 100%;
     height: 26px;
@@ -949,5 +1007,252 @@
 @media (prefers-reduced-motion: reduce) {
   .pool-table-expander {
     transition: none;
+  }
+}
+
+/* ---------- Model quality: health, latency and cadence ---------- */
+
+.pool-mq-overview {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.9fr) minmax(0, 1.1fr);
+  gap: var(--pool-space-4);
+  align-items: stretch;
+  margin-bottom: var(--pool-space-4);
+}
+
+.pool-mq-overview__health,
+.pool-mq-overview__latency {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.pool-mq-overview__health-body {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--pool-space-4);
+  justify-content: center;
+}
+
+.pool-mq-overview__states {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-2);
+}
+
+.pool-mq-overview__note {
+  margin: 0;
+  color: var(--pool-text-3);
+  font-size: var(--pool-type-caption);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.pool-mq-timeline {
+  margin-bottom: var(--pool-space-4);
+}
+
+.pool-mq-timeline__rows {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--pool-space-3);
+}
+
+/* The label column is fixed so both strips start at the same x and the two series stay
+   comparable hour for hour; without it "检测量" and "异常量" render at different widths and
+   the bands shear against each other. */
+.pool-mq-timeline__row {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  align-items: center;
+  gap: var(--pool-space-3);
+}
+
+.pool-mq-timeline__label {
+  color: var(--pool-text-3);
+  font-size: var(--pool-type-caption);
+  line-height: var(--pool-leading-tight);
+  white-space: nowrap;
+}
+
+/* Aligned to the strip, not the card, so the timestamps sit under the band they describe. */
+.pool-mq-timeline__axis {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--pool-space-3);
+  margin-top: var(--pool-space-2);
+  margin-left: calc(52px + var(--pool-space-3));
+  color: var(--pool-text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: var(--pool-leading-tight);
+}
+
+@media (max-width: 900px) {
+  .pool-mq-overview {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---------- System: resources, guard, modules and event cadence ---------- */
+
+.pool-sys-overview {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(280px, 0.85fr);
+  gap: var(--pool-space-4);
+  margin-bottom: var(--pool-space-4);
+}
+
+/* Both cards stretch to the taller of the two in the grid row, so their trailing block is pushed
+   to the bottom edge instead of floating wherever its content happened to end. That keeps the
+   network figures and the guard note on one baseline across the row. */
+.pool-sys-load,
+.pool-sys-guard {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+/* Three gauges on one row at every width the card is given. `auto-fit` would drop them to two
+   plus an orphan at the first awkward breakpoint, and CPU / memory / disk only mean something
+   read side by side. */
+.pool-sys-load__gauges {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--pool-space-3);
+  align-items: start;
+}
+
+.pool-sys-load__foot {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--pool-space-3);
+  /* `auto` rather than a fixed step: this is the block the flex column pushes down. */
+  margin-top: auto;
+  padding-top: var(--pool-space-3);
+  border-top: 1px solid var(--pool-border-subtle);
+}
+
+.pool-sys-load__net {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.pool-sys-load__net-label {
+  color: var(--pool-text-3);
+  font-size: 11.5px;
+  line-height: var(--pool-leading-tight);
+}
+
+.pool-sys-load__net strong {
+  font-size: 17px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  line-height: var(--pool-leading-tight);
+}
+
+/* The throughput and goroutine sublines are the longest strings in the card and they sit two to
+   a row, so they wrap rather than push the border out. */
+.pool-sys-load__net .pool-muted {
+  font-size: 11.5px;
+  line-height: var(--pool-leading-body);
+  overflow-wrap: anywhere;
+}
+
+.pool-sys-guard__flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--pool-space-2);
+  margin-top: auto;
+  padding-top: var(--pool-space-3);
+}
+
+.pool-sys-guard__note {
+  margin-top: var(--pool-space-2);
+  color: var(--pool-text-3);
+  font-size: 11.5px;
+  line-height: var(--pool-leading-body);
+}
+
+.pool-sys-guard__error {
+  margin-top: var(--pool-space-2);
+  color: var(--pool-danger);
+  font-size: 11.5px;
+  line-height: var(--pool-leading-body);
+  overflow-wrap: anywhere;
+}
+
+.pool-sys-modules {
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+  gap: var(--pool-space-4);
+  margin-bottom: var(--pool-space-4);
+}
+
+.pool-sys-timeline,
+.pool-sys-procs {
+  margin-bottom: var(--pool-space-4);
+}
+
+.pool-sys-timeline__rows {
+  display: grid;
+  gap: var(--pool-space-2);
+}
+
+/* Same fixed label column as the model-quality timeline: both strips must start at the same x
+   or the two series shear against each other and stop being comparable hour for hour. */
+.pool-sys-timeline__row {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  align-items: center;
+  gap: var(--pool-space-3);
+}
+
+.pool-sys-timeline__label {
+  color: var(--pool-text-3);
+  font-size: 11.5px;
+  line-height: var(--pool-leading-tight);
+}
+
+.pool-sys-timeline__axis {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--pool-space-3);
+  margin-top: var(--pool-space-2);
+  margin-left: calc(52px + var(--pool-space-3));
+  color: var(--pool-text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: var(--pool-leading-tight);
+}
+
+@media (max-width: 1100px) {
+  .pool-sys-overview,
+  .pool-sys-modules {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Below this the three gauges no longer fit abreast at 104px plus their labels. Two abreast
+   leaves the third as an orphan, so it spans the row and centres instead of hanging off the
+   left edge; three stacked rows would push the network figures below the fold. */
+@media (max-width: 460px) {
+  .pool-sys-load__gauges {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    justify-items: center;
+  }
+
+  .pool-sys-load__gauges > :nth-child(3) {
+    grid-column: 1 / -1;
+  }
+
+  .pool-sys-load__foot {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

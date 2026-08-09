@@ -165,6 +165,13 @@
   align-items: start;
 }
 
+/* 180px fits a stack of single-number cards but not a chart with a legend: three legend rows of
+   "label + value" collapse to one word per line at that width. Pages whose aside carries a chart
+   opt into a wider track rather than every page paying for it. */
+.pool-resource-split--wide-aside {
+  grid-template-columns: minmax(0, 1fr) 240px;
+}
+
 @media (max-width: 767px) {
   .pool-app-mobile .pool-main-layout {
     width: 100vw;

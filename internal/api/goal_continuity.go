@@ -38,6 +38,12 @@ const (
 	goalResumeRequiresToolResult goalResumeKind = "requires_tool_result"
 	goalResumeStorageExhausted   goalResumeKind = "storage_exhausted"
 	goalResumeInProgress         goalResumeKind = "in_progress"
+	// goalResumeProtocolMismatch is returned when the identifiers resolve to durable
+	// history of the other wire family and the request cannot stand on its own body.
+	goalResumeProtocolMismatch goalResumeKind = "protocol_family_mismatch"
+	// goalResumeFamilyRestart is the same collision when the request does carry its
+	// own complete history: the turn proceeds as a new goal in the requested family.
+	goalResumeFamilyRestart goalResumeKind = "family_restart"
 )
 
 type goalResumeResult struct {
@@ -434,7 +440,10 @@ func goalAliasesWithMeta(r *http.Request, body []byte, protocol string, meta *bo
 	// Some Codex transports put the same state token in a JSON field.  Hashing it
 	// under the same kind preserves compatibility without writing the opaque token.
 	add("codex_turn_state", field("turn_state"))
-	if protocol == "claude" {
+	// Every Messages-family provider carries the same Claude Code session field, so
+	// kiro/antigravity/custom turns must contribute the same alias as native claude
+	// or a mid-conversation provider switch would lose the strongest identifier.
+	if storage.GoalProtocolFamily(protocol) == storage.GoalFamilyMessages {
 		add("claude_session", field("session_id"))
 	}
 	// These are real client conversation identifiers, not cache-derived correlators.
@@ -1201,9 +1210,11 @@ func (s *Server) markGoalStreamRetryable(ctx context.Context, r *http.Request, p
 	rawAliases = append(rawAliases, goalIdentityAliases(ctx)...)
 	keyHash, _ := downstreamFromCtx(ctx)
 	namespace := goalDownstreamClientScope(ctx, keyHash, r)
-	resolved, err := s.store.ResolveGoalAliasSets(ctx, goalResolutionSetsForClient(rawAliases, namespace, goalHasResumeAlias(rawAliases)))
+	family := storage.GoalProtocolFamily(protocol)
+	resolved, err := s.store.ResolveGoalAliasSetsForFamily(ctx,
+		goalResolutionSetsForClientFamily(rawAliases, namespace, family, goalHasResumeAlias(rawAliases)), family)
 	if errors.Is(err, storage.ErrGoalNotFound) {
-		resolved, err = s.store.ResolveFallbackGoal(ctx, scopedGoalDownstreamKeyHash(keyHash, namespace), goalWorkspaceFingerprint(r, requestBody), goalInitialFingerprint(requestBody))
+		resolved, err = s.store.ResolveFallbackGoalForFamily(ctx, scopedGoalDownstreamKeyHash(keyHash, namespace), goalWorkspaceFingerprint(r, requestBody), goalInitialFingerprint(requestBody), family)
 	}
 	if err != nil {
 		return
@@ -1221,8 +1232,9 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 	rawRequestAliases = append(rawRequestAliases, goalIdentityAliases(ctx)...)
 	keyHash, _ := downstreamFromCtx(ctx)
 	namespace := goalDownstreamClientScope(ctx, keyHash, r)
-	requestAliases := namespacedGoalAliases(rawRequestAliases, namespace)
-	resolutionSets := goalResolutionSetsForClient(rawRequestAliases, namespace, goalHasResumeAlias(rawRequestAliases))
+	family := storage.GoalProtocolFamily(protocol)
+	requestAliases := familyGoalAliases(namespacedGoalAliases(rawRequestAliases, namespace), family)
+	resolutionSets := goalResolutionSetsForClientFamily(rawRequestAliases, namespace, family, goalHasResumeAlias(rawRequestAliases))
 	scopedKeyHash := scopedGoalDownstreamKeyHash(keyHash, namespace)
 	workspaceHash := goalWorkspaceFingerprint(r, requestBody)
 	initialGoalHash := goalInitialFingerprint(requestBody)
@@ -1241,7 +1253,7 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 	logicalRequestBody := segmentRequestBody
 	var durableReplay []byte
 	replaceInput := false
-	if resolved, resolveErr := s.store.ResolveGoalAliasSets(ctx, resolutionSets); resolveErr == nil {
+	if resolved, resolveErr := s.store.ResolveGoalAliasSetsForFamily(ctx, resolutionSets, family); resolveErr == nil {
 		if replay, _, replayErr := s.store.BuildGoalReplay(ctx, resolved.Session.ID); replayErr == nil {
 			durableReplay = replay
 			segmentRequestBody, replaceInput = incrementalGoalRequestWithMode(segmentRequestBody, replay)
@@ -1254,7 +1266,9 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 		if len(semantics.ReplacementHistory) > 0 {
 			semantics.ReplacementPrefix = codexCompactionReplacementPrefix(durableReplay, logicalRequestBody)
 		}
-	} else if strings.EqualFold(strings.TrimSpace(protocol), "claude") || strings.EqualFold(strings.TrimSpace(protocol), "kiro") {
+	} else if family == storage.GoalFamilyMessages {
+		// Every Messages-family provider serializes the same Claude Code native
+		// compaction turn, so the replacement rule follows the family, not the vendor.
 		semantics.ReplacementHistory, _ = claudeCodeCompactionReplacement(logicalRequestBody, responseBody)
 	}
 	checkpoint, segment, responseID, awaitingTool, err := goalCheckpointAndSegment(requestBody, segmentRequestBody, responseBody, semantics)
@@ -1263,7 +1277,7 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 	}
 	aliases := goalPersistentAliases(requestAliases)
 	if responseID != "" {
-		aliases = append(aliases, storage.GoalAlias{Type: "response_id", Value: responseID, Namespace: namespace})
+		aliases = append(aliases, storage.GoalAlias{Type: "response_id", Value: responseID, Namespace: namespace, Family: family})
 	}
 	parentThread := ""
 	branchThread := ""
@@ -1277,6 +1291,10 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 	}
 	storageMaxBytes := s.goalStorageMaxBytes(ctx)
 	storageTargetBytes, _ := goalStorageMaintenanceTarget(storageMaxBytes)
+	// A foreground reclaim aims at the same floor background maintenance uses, so one
+	// bounded recovery admits several subsequent turns instead of landing exactly on
+	// the admission ceiling and re-triggering on the very next commit.
+	storageFloorBytes := goalStorageMaintenanceFloor(storageMaxBytes)
 	turn := storage.GoalTurn{
 		Protocol: protocol, ParentGoalID: "", BranchHash: branchHash, DownstreamKeyHash: scopedKeyHash,
 		WorkspaceHash: workspaceHash, InitialGoalHash: initialGoalHash,
@@ -1292,11 +1310,11 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 	// already been resolved.  Keeping the thread itself out of this column avoids a
 	// second plaintext identifier at rest.
 	if parentThread != "" && branchThread != "" {
-		if resolved, err := s.store.ResolveGoalAliases(ctx, []storage.GoalAlias{{Type: "codex_root_thread", Value: parentThread, Namespace: namespace}}); err == nil {
+		if resolved, err := s.store.ResolveGoalAliasesForFamily(ctx, []storage.GoalAlias{{Type: "codex_root_thread", Value: parentThread, Namespace: namespace, Family: family}}, family); err == nil {
 			turn.ParentGoalID = resolved.Session.ID
 		}
 	}
-	session, err := s.commitGoalTurnWithStorageRecovery(ctx, turn, storageTargetBytes)
+	session, err := s.commitGoalTurnWithStorageRecovery(ctx, turn, storageFloorBytes)
 	if err != nil {
 		return storage.GoalSession{}, err
 	}
@@ -1430,6 +1448,29 @@ func (s *Server) auditGoalPersistenceDegraded(ctx context.Context, terminal stri
 	})
 }
 
+// crossFamilyGoal reports whether the same client identity owns a durable goal in a
+// different wire family. It runs only after same-family resolution already missed, so
+// it adds no query to a normal resume. It returns the goal id and the stored family.
+func (s *Server) crossFamilyGoal(ctx context.Context, r *http.Request, current []byte, rawAliases []storage.GoalAlias, namespace, keyHash, family string) (string, string) {
+	for _, candidate := range []string{storage.GoalFamilyMessages, storage.GoalFamilyResponses} {
+		if candidate == family {
+			continue
+		}
+		resolved, err := s.store.ResolveGoalAliasSetsForFamily(ctx,
+			goalResolutionSetsForClientFamily(rawAliases, namespace, candidate, goalHasResumeAlias(rawAliases)), candidate)
+		if err == nil && strings.TrimSpace(resolved.Session.ID) != "" {
+			return resolved.Session.ID, candidate
+		}
+		resolved, err = s.store.ResolveFallbackGoalForFamily(ctx,
+			scopedGoalDownstreamKeyHash(keyHash, namespace),
+			goalWorkspaceFingerprint(r, current), goalInitialFingerprint(current), candidate)
+		if err == nil && strings.TrimSpace(resolved.Session.ID) != "" {
+			return resolved.Session.ID, candidate
+		}
+	}
+	return "", ""
+}
+
 func (s *Server) goalReplayBody(ctx context.Context, r *http.Request, protocol string, current []byte) goalResumeResult {
 	if !s.goalContinuityEnabled(ctx) {
 		return goalResumeResult{Kind: goalResumeUnidentified}
@@ -1437,19 +1478,53 @@ func (s *Server) goalReplayBody(ctx context.Context, r *http.Request, protocol s
 	rawAliases := goalAliases(r, current, protocol)
 	keyHash, _ := downstreamFromCtx(ctx)
 	namespace := goalDownstreamClientScope(ctx, keyHash, r)
-	resolution, err := s.store.ResolveGoalAliasSets(ctx, goalResolutionSetsForClient(rawAliases, namespace, goalHasResumeAlias(rawAliases)))
+	family := storage.GoalProtocolFamily(protocol)
+	resolution, err := s.store.ResolveGoalAliasSetsForFamily(ctx,
+		goalResolutionSetsForClientFamily(rawAliases, namespace, family, goalHasResumeAlias(rawAliases)), family)
 	if errors.Is(err, storage.ErrGoalNotFound) {
-		resolution, err = s.store.ResolveFallbackGoal(ctx, scopedGoalDownstreamKeyHash(keyHash, namespace), goalWorkspaceFingerprint(r, current), goalInitialFingerprint(current))
+		resolution, err = s.store.ResolveFallbackGoalForFamily(ctx, scopedGoalDownstreamKeyHash(keyHash, namespace), goalWorkspaceFingerprint(r, current), goalInitialFingerprint(current), family)
 	}
 	if errors.Is(err, storage.ErrGoalAmbiguous) {
 		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{Action: "goal_resume_ambiguous", State: "failed", Reason: protocol, Detail: "multiple hashed goal aliases matched"})
 		return goalResumeResult{Kind: goalResumeAmbiguous, Reason: "more than one durable goal matches the supplied identifiers"}
 	}
 	if errors.Is(err, storage.ErrGoalNotFound) {
+		// The same client identifiers may own a goal in the other wire family — a
+		// Claude Code session that previously reached a chatgpt/codex account through
+		// the Anthropic→Responses bridge is exactly that case. Responses history
+		// cannot be re-serialized as Messages without inventing content for encrypted
+		// reasoning items and opaque item ids, so it is never converted here.
+		if other, otherFamily := s.crossFamilyGoal(ctx, r, current, rawAliases, namespace, keyHash, family); other != "" {
+			_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+				Action: "goal_resume_protocol_family_mismatch", State: "failed", Reason: protocol,
+				Detail: "stored_family=" + otherFamily + " requested_family=" + family,
+			})
+			if goalHasResumeAlias(rawAliases) {
+				// The request carries an upstream state handle instead of its own
+				// history, so it cannot stand alone. Refusing is the only safe answer.
+				return goalResumeResult{Kind: goalResumeProtocolMismatch,
+					Reason: "the durable goal for these identifiers stores " + otherFamily + "-family history"}
+			}
+			// The request carries its own complete history, so the turn can still
+			// succeed. Start a fresh same-family goal and make the restart visible.
+			return goalResumeResult{Kind: goalResumeFamilyRestart,
+				Reason: "durable history for these identifiers belongs to the " + otherFamily + " family"}
+		}
 		return goalResumeResult{Kind: goalResumeUnidentified, Reason: "no durable goal matches the supplied identifiers"}
 	}
 	if err != nil {
 		return goalResumeResult{Kind: goalResumeUnidentified, Reason: err.Error()}
+	}
+	// Resolution is already family filtered. This assertion keeps a future resolver
+	// change from silently reaching the replay assembly below, which would serialize
+	// the stored history under the wrong key and send a malformed body upstream.
+	if storage.GoalProtocolFamily(resolution.Session.Protocol) != family {
+		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+			Action: "goal_resume_protocol_family_mismatch", State: "failed", Reason: protocol,
+			Detail: "stored_family=" + storage.GoalProtocolFamily(resolution.Session.Protocol) + " requested_family=" + family,
+		})
+		return goalResumeResult{Kind: goalResumeProtocolMismatch, Session: resolution.Session,
+			Reason: "the durable goal for these identifiers stores " + storage.GoalProtocolFamily(resolution.Session.Protocol) + "-family history"}
 	}
 	if resolution.Session.State == "awaiting_tool_result" && !bodyHasClientToolResult(current) {
 		return goalResumeResult{Kind: goalResumeRequiresToolResult, Session: resolution.Session, Reason: "the previous turn is waiting for a client tool result"}
@@ -1470,7 +1545,7 @@ func (s *Server) goalReplayBody(ctx context.Context, r *http.Request, protocol s
 		return goalResumeResult{Kind: goalResumeUnidentified, Reason: err.Error()}
 	}
 	historyKey := "input"
-	if protocol == "claude" || protocol == "kiro" {
+	if family == storage.GoalFamilyMessages {
 		historyKey = "messages"
 		for _, key := range []string{"model", "system", "tools", "max_tokens", "temperature", "top_p", "thinking", "stream", "metadata"} {
 			if value, ok := cur[key]; ok {
@@ -1546,6 +1621,8 @@ func writeGoalResumeError(w http.ResponseWriter, stream bool, protocol string, k
 		code, message = "goal_storage_budget_exhausted", "Goal storage is full; active context was retained."
 	case goalResumeInProgress:
 		code, message = "goal_in_progress", "This goal is already being resumed; retry after its last heartbeat lease expires."
+	case goalResumeProtocolMismatch:
+		code, message = "goal_resume_protocol_family_mismatch", "The durable context for this session was recorded in a different upstream wire protocol and cannot be replayed here. Start a new session, or send this turn to the original provider family."
 	}
 	if !stream {
 		writePoolCodeError(w, http.StatusConflict, code, message)
@@ -1559,7 +1636,7 @@ func writeGoalResumeError(w http.ResponseWriter, stream bool, protocol string, k
 	// a concurrent goal/lease conflict looks like a silent unanswered prompt.
 	w.Header().Set("X-MiCliProxy-Goal-Error", code)
 	w.WriteHeader(http.StatusOK)
-	if protocol == "claude" {
+	if storage.GoalProtocolFamily(protocol) == storage.GoalFamilyMessages {
 		_, _ = fmt.Fprintf(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"code\":%q,\"message\":%q}}\n\n", code, message)
 		_, _ = fmt.Fprint(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 	} else {

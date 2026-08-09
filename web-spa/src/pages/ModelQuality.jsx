@@ -6,10 +6,14 @@ import { errMsg, get, post } from '../api.js';
 import PageHeader, { Panel } from '../components/PageHeader.jsx';
 import MobileResourceCell from '../components/MobileResourceCell.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
-import StatCard from '../components/StatCard.jsx';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
+import * as MicroCharts from '../components/MicroCharts.jsx';
 import useAsyncResource from '../hooks/useAsyncResource.js';
+import { COLORS } from '../lib/chartTheme.js';
 import { fmtDateTime, fmtInt, fmtRelative, fmtTokens } from '../lib/format.js';
+import { heatCells, hourlyBuckets } from '../lib/timeSeries.js';
+
+const { HeatStrip, RadialGauge, RankedBars, StackedMeter } = MicroCharts;
 
 const STATE_META = {
   healthy: { label: '正常', color: 'green' },
@@ -19,11 +23,48 @@ const STATE_META = {
   unknown: { label: '未检测', color: 'grey' },
 };
 
+// The backend emits seven distinct outcome values across two enums, and this map used to
+// cover three of them. `statuses[].last_outcome` is one of pass / false_alarm / error /
+// inconclusive / confirmed_anomaly; `runs[].outcome` is one of pass / error /
+// model_mismatch / incorrect. The four unmapped values fell through to the raw identifier
+// rendered in neutral grey -- so a confirmed_anomaly row, the one state that means the model
+// really is degraded, showed the English enum name in the same colour as a healthy one.
+// `anomaly` was in this map but is never emitted by the API at all.
 const OUTCOME_META = {
   pass: { label: '通过', color: 'green' },
-  anomaly: { label: '异常', color: 'red' },
+  false_alarm: { label: '复核通过', color: 'green' },
+  confirmed_anomaly: { label: '复核异常', color: 'red' },
+  incorrect: { label: '答案错误', color: 'red' },
+  model_mismatch: { label: '模型不符', color: 'amber' },
+  inconclusive: { label: '复核失败', color: 'grey' },
   error: { label: '请求错误', color: 'grey' },
 };
+
+// Chart grouping for the same seven values. Kept separate from the tag metadata because the
+// charts need three buckets, not seven colours: a false_alarm is a pass for rate purposes,
+// and an inconclusive is an error because nothing was actually measured.
+const OUTCOME_BUCKET = {
+  pass: 'pass',
+  false_alarm: 'pass',
+  confirmed_anomaly: 'anomaly',
+  incorrect: 'anomaly',
+  model_mismatch: 'anomaly',
+  inconclusive: 'error',
+  error: 'error',
+};
+
+const STATE_COLOR = {
+  healthy: COLORS.green,
+  suspect: COLORS.amber,
+  degraded: COLORS.red,
+  unavailable: COLORS.grey,
+};
+
+// Composition order for the health meter, best state first. `unknown` is deliberately absent:
+// it is the absence of a measurement rather than a health state, so it would need a fifth
+// colour that means "no data" next to four that mean something. It is reported as a count
+// under the meter instead.
+const STATE_ORDER = ['healthy', 'suspect', 'degraded', 'unavailable'];
 
 function stateTag(state) {
   const meta = STATE_META[state] || { label: state || '未知', color: 'grey' };
@@ -93,6 +134,53 @@ export default function ModelQuality() {
     acc[state] = (acc[state] || 0) + 1;
     return acc;
   }, {}), [statuses]);
+
+  // Everything below is derived client-side from the two arrays the endpoint already
+  // returns. No backend change was needed to visualise any of it.
+  const overview = useMemo(() => {
+    const buckets = { pass: 0, anomaly: 0, error: 0 };
+    for (const run of runs) {
+      const bucket = OUTCOME_BUCKET[run.outcome];
+      if (bucket) buckets[bucket] += 1;
+    }
+    const measured = buckets.pass + buckets.anomaly;
+    // Errors are excluded from the denominator on purpose: a request that never reached the
+    // model is not evidence either way about that model's quality, and the page already
+    // states that network errors only mark a model unavailable.
+    const passRate = measured > 0 ? buckets.pass / measured : null;
+
+    const latency = statuses
+      .filter((row) => Number(row.last_latency_ms) > 0)
+      .sort((a, b) => Number(b.last_latency_ms) - Number(a.last_latency_ms))
+      .slice(0, 7)
+      .map((row) => ({
+        key: qualityKey(row),
+        name: row.model || '—',
+        value: Number(row.last_latency_ms),
+        color: STATE_COLOR[row.state] || COLORS.grey,
+        meta: `${row.group_name || '默认分组'} · ${(STATE_META[row.state] || {}).label || '未检测'}`,
+      }));
+
+    // Anomalies and total volume share one time axis so a burst of anomalies confined to one
+    // hour (an upstream incident) reads differently from anomalies spread evenly across the day
+    // (a model actually degrading).
+    const buckets24 = hourlyBuckets(runs, {
+      timeOf: (run) => run.created_at,
+      series: {
+        volume: () => true,
+        anomalies: (run) => OUTCOME_BUCKET[run.outcome] === 'anomaly',
+      },
+    });
+    const timeline = buckets24 && {
+      volume: heatCells(buckets24.counts.volume, buckets24.slots, '次检测'),
+      anomalies: heatCells(buckets24.counts.anomalies, buckets24.slots, '次异常'),
+      from: fmtDateTime(buckets24.from),
+      to: fmtDateTime(buckets24.to),
+      anomalyTotal: buckets24.totals.anomalies,
+    };
+
+    return { buckets, measured, passRate, latency, timeline };
+  }, [runs, statuses]);
 
   if (error && !lastRefresh && !loading) {
     return (
@@ -193,12 +281,89 @@ export default function ModelQuality() {
         </>}
       />
 
-      <div className="pool-stat-grid" style={{ marginBottom: 18 }}>
-        <StatCard label="监控状态" value={data?.enabled ? '已启用' : '未启用'} color={data?.enabled ? 'var(--pool-success)' : 'var(--pool-warning)'} sub={`${data?.interval_minutes || 60} 分钟一次 · ${data?.reasoning_effort || 'medium'} reasoning`} />
-        <StatCard label="检测范围" value={`${fmtInt(checked)} / ${fmtInt(statuses.length)}`} color="var(--pool-accent)" sub="已检测 / 分组模型组合" />
-        <StatCard label="疑似异常" value={fmtInt(summary.suspect || 0)} color="var(--pool-warning)" sub="需下一轮再次确认" />
-        <StatCard label="确认降智" value={fmtInt(summary.degraded || 0)} color="var(--pool-danger)" sub={`连续 ${data?.degraded_threshold || 2} 轮复核异常`} />
-      </div>
+      {statuses.length ? (
+        <section className="pool-mq-overview">
+          <div className="pool-chart-card pool-mq-overview__health">
+            <div className="head">
+              <div>
+                <div className="t">检测健康度</div>
+                <div className="s">{`${data?.enabled ? '已启用' : '未启用'} · ${data?.interval_minutes || 60} 分钟一次 · 连续 ${degradedThreshold} 轮异常判定降智`}</div>
+              </div>
+            </div>
+            <div className="pool-mq-overview__health-body">
+              <RadialGauge
+                value={overview.passRate ?? 0}
+                size={128}
+                color={overview.passRate == null ? COLORS.grey : overview.passRate >= 0.9 ? COLORS.green : overview.passRate >= 0.7 ? COLORS.amber : COLORS.red}
+                valueText={overview.passRate == null ? '—' : undefined}
+                caption="近期通过率"
+                label={`${fmtInt(overview.measured)} 次有效检测`}
+              />
+              <div className="pool-mq-overview__states">
+                <StackedMeter
+                  segments={STATE_ORDER.map((state) => ({
+                    key: state,
+                    name: STATE_META[state].label,
+                    value: summary[state] || 0,
+                    color: STATE_COLOR[state],
+                  }))}
+                  valueFormatter={fmtInt}
+                  ariaLabel="分组模型健康状态构成"
+                />
+                <p className="pool-mq-overview__note">
+                  {summary.unknown
+                    ? `${fmtInt(checked)} / ${fmtInt(statuses.length)} 个分组模型已检测，${fmtInt(summary.unknown)} 个待首轮抽样`
+                    : `全部 ${fmtInt(statuses.length)} 个分组模型均已检测`}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="pool-chart-card pool-mq-overview__latency">
+            <div className="head">
+              <div>
+                <div className="t">响应延迟对比</div>
+                <div className="s">最近一次检测耗时，按状态着色</div>
+              </div>
+            </div>
+            <RankedBars
+              rows={overview.latency}
+              valueFormatter={(value) => `${fmtInt(value)} ms`}
+              emptyText="尚无延迟样本"
+              ariaLabel="分组模型响应延迟对比"
+            />
+          </div>
+        </section>
+      ) : null}
+
+      {overview.timeline ? (
+        <section className="pool-chart-card pool-mq-timeline">
+          <div className="head">
+            <div>
+              <div className="t">近 24 小时检测节奏</div>
+              <div className="s">
+                {overview.timeline.anomalyTotal
+                  ? `共 ${fmtInt(overview.timeline.anomalyTotal)} 次异常，集中程度可判断是上游波动还是模型降智`
+                  : '窗口内没有异常记录'}
+              </div>
+            </div>
+          </div>
+          <div className="pool-mq-timeline__rows">
+            <div className="pool-mq-timeline__row">
+              <span className="pool-mq-timeline__label">检测量</span>
+              <HeatStrip cells={overview.timeline.volume} color={COLORS.blue} ariaLabel="近 24 小时每小时检测次数" />
+            </div>
+            <div className="pool-mq-timeline__row">
+              <span className="pool-mq-timeline__label">异常量</span>
+              <HeatStrip cells={overview.timeline.anomalies} color={COLORS.red} ariaLabel="近 24 小时每小时异常次数" />
+            </div>
+          </div>
+          <div className="pool-mq-timeline__axis">
+            <span>{overview.timeline.from}</span>
+            <span>{overview.timeline.to}</span>
+          </div>
+        </section>
+      ) : null}
 
       <Panel title="分组 × 模型状态" extra={<Typography.Text type="tertiary" size="small">网络错误只标记不可用，不计为降智</Typography.Text>}>
         <ResourceTable

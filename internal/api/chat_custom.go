@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -459,6 +460,9 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 	var requestErr error
 	var prefetchedErrorBody []byte
 	prefetchedError := false
+	// Hoisted: the body is identical across egress rotations, and digesting a long prompt
+	// once per retry would put avoidable CPU on the request path.
+	attemptBodyHash := diagnosticBodyHash(body)
 	for {
 		resp, requestErr = s.upstream.Do(r.Context(), upstream.Request{
 			Method:           http.MethodPost,
@@ -474,6 +478,13 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 			CookieJarKey:     customProviderCookieJarKey(r, lease, provider),
 			OSHint:           s.osHint(body, lease.Egress),
 		})
+		// Recorded per wire attempt, inside the loop, so an egress rotation leaves one row
+		// per exit rather than only the outcome that happened to be last. Without this the
+		// provider_attempts table could only ever describe antigravity: an export whose
+		// single largest failure cluster was 1512 relay 5xx contained zero rows for it.
+		s.recordProviderAttempt(requestIDFromContext(r.Context()), lease.Account.ID, provider.ID, "inference",
+			diagnosticResponseStatus(resp), diagnosticWireErrorClass(diagnosticResponseStatus(resp), requestErr),
+			attemptBodyHash, diagnosticRetryAfter(resp))
 		if requestErr == nil && (resp == nil || !customProviderRetryableEgressStatus(resp.StatusCode) || len(remainingEgressIDs) == 0) {
 			break
 		}
@@ -923,8 +934,13 @@ func (s *Server) handleMessagesViaResponsesCustom(w http.ResponseWriter, r *http
 		w.WriteHeader(cc.resp.StatusCode)
 		uscan := usage.NewStreamScanner("codex")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "claude_messages", model, cc.resp.StatusCode), provider.ID)
-		responsesStreamToAnthropicSSE(rw, io.TeeReader(cc.resp.Body, uscan), model, converted.ToolNames, converted.InheritModelTools, cc.scrubber)
+		// The goal history is the downstream Anthropic body, not the Responses body
+		// this provider happens to speak upstream, so the capture sits after the
+		// conversion and belongs to the Messages family.
+		goalOut, finishGoal := s.captureCustomMessagesGoalStream(r.Context(), r, raw, rw)
+		responsesStreamToAnthropicSSE(goalOut, io.TeeReader(cc.resp.Body, uscan), model, converted.ToolNames, converted.InheritModelTools, cc.scrubber)
 		s.settleStreamUsage(r, cc, uscan)
+		finishGoal(false)
 		return
 	}
 	responseBody, err := s.readUpstreamResponseBody(cc.resp.Body)
@@ -948,6 +964,9 @@ func (s *Server) handleMessagesViaResponsesCustom(w http.ResponseWriter, r *http
 	}
 	s.recordCustomUsage(r, cc, responseBody)
 	_ = s.settleBillingHold(r.Context(), cc.holdID, "settled")
+	// `out` is already the complete downstream Anthropic Messages body in both
+	// branches below, so the goal turn is persisted from it directly.
+	s.persistCustomMessagesGoalContinuity(r.Context(), r, raw, out)
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -997,11 +1016,13 @@ func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request,
 		w.WriteHeader(http.StatusOK)
 		uscan := usage.NewStreamScanner("openai_chat")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "claude_messages", model, cc.resp.StatusCode), provider.ID)
-		chatStreamToAnthropicSSEWithOptions(r.Context(), rw, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber, bodysource.CaptureOptions{
+		goalOut, finishGoal := s.captureCustomMessagesGoalStream(r.Context(), r, raw, rw)
+		chatStreamToAnthropicSSEWithOptions(r.Context(), goalOut, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber, bodysource.CaptureOptions{
 			MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
 			Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver,
 		})
 		s.settleStreamUsage(r, cc, uscan)
+		finishGoal(false)
 		return
 	}
 	body, err := s.readUpstreamResponseBody(cc.resp.Body)
@@ -1020,6 +1041,7 @@ func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request,
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
+	s.persistCustomMessagesGoalContinuity(r.Context(), r, raw, out)
 }
 
 // handleNativeAnthropicMessagesViaCustom relays /v1/messages to a custom provider that
@@ -1045,8 +1067,10 @@ func (s *Server) handleNativeAnthropicMessagesViaCustom(w http.ResponseWriter, r
 		w.WriteHeader(cc.resp.StatusCode)
 		uscan := usage.NewStreamScanner("claude")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "claude_messages", model, cc.resp.StatusCode), provider.ID)
-		terminal, _ := streamCopyRewriteValidated(rw, io.TeeReader(cc.resp.Body, uscan), cc.scrubber, customSSEAnthropicMessages, s.leakScrubEnabled(r.Context()))
+		goalOut, finishGoal := s.captureCustomMessagesGoalStream(r.Context(), r, raw, rw)
+		terminal, copyErr := streamCopyRewriteValidated(goalOut, io.TeeReader(cc.resp.Body, uscan), cc.scrubber, customSSEAnthropicMessages, s.leakScrubEnabled(r.Context()))
 		s.settleValidatedStreamUsage(r, cc, uscan, terminal)
+		finishGoal(copyErr != nil || !terminal)
 		return
 	}
 	body, err := s.readUpstreamResponseBody(cc.resp.Body)
@@ -1065,6 +1089,77 @@ func (s *Server) handleNativeAnthropicMessagesViaCustom(w http.ResponseWriter, r
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(cc.resp.StatusCode)
 	_, _ = w.Write(clean)
+	s.persistCustomMessagesGoalContinuity(r.Context(), r, raw, clean)
+}
+
+// persistCustomMessagesGoalContinuity records the durable turn for a custom provider
+// serving /v1/messages. All three upstream bridges (native Anthropic Messages,
+// Responses, Chat Completions) return an Anthropic Messages body downstream, so the
+// persisted history belongs to the Messages family regardless of upstream protocol.
+func (s *Server) persistCustomMessagesGoalContinuity(ctx context.Context, r *http.Request, requestBody, responseBody []byte) {
+	if len(responseBody) == 0 {
+		return
+	}
+	if _, err := s.persistGoalContinuity(ctx, r, "custom_messages", requestBody, responseBody); err != nil {
+		log.Printf("[GOAL-CONTINUITY] custom messages persistence degraded request_id=%s: %v", requestIDFromContext(ctx), err)
+		s.auditGoalPersistenceDegraded(ctx, "custom_messages_terminal", err)
+	}
+}
+
+// goalCapturingWriter mirrors everything written downstream into a bounded spool so a
+// goal checkpoint can be rebuilt from the exact bytes the client received. Flush is
+// forwarded so SSE latency is unchanged; a spool write failure only loses the
+// checkpoint and never breaks the relay.
+type goalCapturingWriter struct {
+	http.ResponseWriter
+	capture *bodysource.SpoolBuffer
+}
+
+func (g *goalCapturingWriter) Write(p []byte) (int, error) {
+	n, err := g.ResponseWriter.Write(p)
+	if n > 0 && g.capture != nil {
+		if _, captureErr := g.capture.Write(p[:n]); captureErr != nil {
+			g.capture = nil
+		}
+	}
+	return n, err
+}
+
+func (g *goalCapturingWriter) Flush() {
+	if flusher, ok := g.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// captureCustomMessagesGoalStream tees a downstream Anthropic SSE relay so the goal
+// checkpoint can be rebuilt from the exact events the client received. It returns the
+// writer to relay through plus a finish func that persists or marks retryable.
+func (s *Server) captureCustomMessagesGoalStream(ctx context.Context, r *http.Request, requestBody []byte, w http.ResponseWriter) (http.ResponseWriter, func(streamFailed bool)) {
+	if !s.goalContinuityEnabled(ctx) {
+		return w, func(bool) {}
+	}
+	capture, err := bodysource.NewSpoolBuffer(ctx, s.responseBodyCaptureOptions(ctx))
+	if err != nil {
+		log.Printf("[GOAL-CONTINUITY] custom messages stream capture unavailable request_id=%s: %v", requestIDFromContext(ctx), err)
+		return w, func(bool) {}
+	}
+	wrapped := &goalCapturingWriter{ResponseWriter: w, capture: capture}
+	return wrapped, func(streamFailed bool) {
+		defer capture.Close()
+		if streamFailed {
+			s.markGoalStreamRetryable(ctx, r, "custom_messages", requestBody, "upstream_stream_error")
+			return
+		}
+		if wrapped.capture == nil {
+			return
+		}
+		frames, readErr := responseSpoolBytes(capture)
+		if readErr != nil {
+			log.Printf("[GOAL-CONTINUITY] custom messages stream capture unreadable request_id=%s: %v", requestIDFromContext(ctx), readErr)
+			return
+		}
+		s.persistCustomMessagesGoalContinuity(ctx, r, requestBody, goalResponseFromSSE(frames))
+	}
 }
 
 func withExplicitAnthropicAutoToolChoice(raw []byte) []byte {

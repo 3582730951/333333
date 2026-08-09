@@ -651,7 +651,13 @@ func (s *Server) adminOAuthComplete(w http.ResponseWriter, r *http.Request) {
 	case "codex":
 		parsed, err = s.exchangeCodexCode(r.Context(), desc, redirected.Code, pend.verifier)
 	case "claude":
-		parsed, err = s.exchangeClaudeCode(r.Context(), desc, redirected.Code, firstNonEmpty(redirected.State, pend.state), pend.verifier)
+		// Run the code→token exchange from the SAME exit the imported account will be
+		// bound to. This exchange is the account's first contact with api.anthropic.com
+		// and it is what mints the refresh token; performing it from the relay host while
+		// every later request arrives from a proxy makes the credential's origin IP
+		// permanently inconsistent with its usage IP.
+		parsed, err = s.exchangeClaudeCode(r.Context(), desc, redirected.Code, firstNonEmpty(redirected.State, pend.state), pend.verifier,
+			s.claudeImportOAuthEgress(r.Context(), groupName, importEgressID), "oauth:claude:"+req.SessionID)
 	case "antigravity":
 		parsed, err = s.exchangeAntigravityCode(r.Context(), redirected.Code, desc.redirectURI, antigravityEgress, "oauth:antigravity:"+req.SessionID)
 	default:
@@ -671,10 +677,15 @@ func (s *Server) adminOAuthComplete(w http.ResponseWriter, r *http.Request) {
 
 var apiExternalHTTPClient = &http.Client{Timeout: 60 * time.Second}
 
-// oauthHTTPClient is the client used for token exchange. The token endpoints are
-// reached directly (the same way the shipped refreshClaude call reaches the
-// Anthropic OAuth endpoint); they are not the relayed inference hosts and need no
-// proxy/sidecar. A finite timeout guards against a hung exchange.
+// oauthHTTPClient is the host-direct client for token endpoints that are NOT the relayed
+// inference hosts: auth.openai.com, chatgpt.com's session endpoint, and the operator's own
+// reauth worker. A finite timeout guards against a hung exchange.
+//
+// It must NOT be used for Anthropic. api.anthropic.com/v1/oauth/token is the same host as
+// the inference endpoint, so a token call from here would put the account's credential
+// lifecycle on the relay host's IP and Go TLS fingerprint while its inference traffic uses
+// the account's bound egress and an impersonated fingerprint. Anthropic OAuth goes through
+// doClaudeOAuthRequest → upstream.DoAnthropicOAuth instead.
 func oauthHTTPClient() *http.Client {
 	return apiExternalHTTPClient
 }
@@ -716,9 +727,34 @@ func (s *Server) exchangeCodexCode(ctx context.Context, d oauthProviderDesc, cod
 	return authparse.ParseOAuthCodex(tr.AccessToken, tr.RefreshToken, tr.IDToken)
 }
 
+// claudeImportOAuthEgress resolves the egress a Claude login/import should use for its
+// token exchange: the egress the account is about to be bound to. It never fails the
+// login — an unresolvable egress degrades to direct, which is the historical behavior.
+//
+// The degradation is audited rather than silent. This exchange hits api.anthropic.com, the
+// same host the account will later inference against, so running it off the relay host's
+// address means the account's very first appearance to the upstream comes from a different
+// network than every request after it. That is worth an operator seeing; it is accepted
+// here (instead of failing closed like the probe paths) only because a login that cannot
+// complete leaves no account at all.
+func (s *Server) claudeImportOAuthEgress(ctx context.Context, groupName, requestedEgressID string) storage.EgressProfile {
+	egressID, err := s.resolveImportPrimaryEgressForGroup(ctx, requestedEgressID, groupName)
+	if err != nil || strings.TrimSpace(egressID) == "" {
+		s.auditClaudeOAuthEgressDegraded(ctx, "import_egress_unresolved", err)
+		return storage.EgressProfile{Type: "direct"}
+	}
+	egress, err := s.store.GetEgressProfile(ctx, egressID)
+	if err != nil {
+		s.auditClaudeOAuthEgressDegraded(ctx, "import_egress_lookup_failed", err)
+		return storage.EgressProfile{Type: "direct"}
+	}
+	return egress
+}
+
 // exchangeClaudeCode runs the Anthropic authorization-code → tokens exchange
-// (JSON). The access token is an opaque sk-ant-oat string.
-func (s *Server) exchangeClaudeCode(ctx context.Context, d oauthProviderDesc, code, state, verifier string) (authparse.ParsedAuth, error) {
+// (JSON). The access token is an opaque sk-ant-oat string. The exchange travels on the
+// account's future egress and fingerprint (see upstream.DoAnthropicOAuth).
+func (s *Server) exchangeClaudeCode(ctx context.Context, d oauthProviderDesc, code, state, verifier string, egress storage.EgressProfile, cookieJarKey string) (authparse.ParsedAuth, error) {
 	if parsedCode, parsedState := splitCodeAndState(code); parsedCode != "" {
 		code = parsedCode
 		if parsedState != "" {
@@ -736,14 +772,7 @@ func (s *Server) exchangeClaudeCode(ctx context.Context, d oauthProviderDesc, co
 		payload["state"] = state
 	}
 	raw, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.tokenURL, bytes.NewReader(raw))
-	if err != nil {
-		return authparse.ParsedAuth{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", oauthUserAgent)
-	resp, err := oauthHTTPClient().Do(req)
+	resp, err := s.doClaudeOAuthRequest(ctx, egress, storage.Account{}, cookieJarKey, d.tokenURL, raw)
 	if err != nil {
 		return authparse.ParsedAuth{}, err
 	}

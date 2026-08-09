@@ -63,6 +63,54 @@ func TestBillingHeaderInjectedForNonClaudeCodeClient(t *testing.T) {
 	}
 }
 
+// TestBillingHeaderPreservesSubagentMarker: genuine Claude Code adds cc_is_subagent=true to
+// the attribution block when the request comes from a subagent (a Task-tool invocation), as
+// in the observed real block
+//
+//	x-anthropic-billing-header: cc_version=2.1.226.be8; cc_entrypoint=cli; cc_is_subagent=true;
+//
+// We rewrite that block to realign cc_version with our User-Agent, and used to drop the
+// marker in the process. A subagent request is independently recognizable from its body, so
+// dropping it left the body saying "subagent" while the block said "main agent", and pinned
+// every account at a 0% subagent rate fleet-wide.
+func TestBillingHeaderPreservesSubagentMarker(t *testing.T) {
+	for _, value := range []string{"true", "false"} {
+		t.Run("preserves "+value, func(t *testing.T) {
+			body := []byte(`{"model":"claude","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.226.be8; cc_entrypoint=cli; cc_is_subagent=` + value + `;"}],"messages":[]}`)
+			got := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, "2.1.159"))
+			if !strings.Contains(got, "cc_is_subagent="+value+";") {
+				t.Fatalf("cc_is_subagent=%s was dropped from the rewritten block: %q", value, got)
+			}
+			// cc_version is still realigned to ours, and field order is preserved.
+			if !strings.Contains(got, "cc_version=2.1.159.") {
+				t.Fatalf("cc_version was not realigned to our version: %q", got)
+			}
+			if got := strings.Index(got, "cc_entrypoint="); got < 0 {
+				t.Fatal("cc_entrypoint missing")
+			}
+			if strings.Index(got, "cc_entrypoint=") > strings.Index(got, "cc_is_subagent=") {
+				t.Fatalf("field order diverges from the real client (cc_entrypoint must precede cc_is_subagent): %q", got)
+			}
+		})
+	}
+
+	t.Run("never synthesized when downstream omits it", func(t *testing.T) {
+		body := []byte(`{"model":"claude","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.100.123; cc_entrypoint=cli;"}],"messages":[]}`)
+		got := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, "2.1.159"))
+		if strings.Contains(got, "cc_is_subagent") {
+			t.Fatalf("cc_is_subagent must never be invented for a client that did not send it: %q", got)
+		}
+	})
+
+	t.Run("garbage values are dropped, not forwarded", func(t *testing.T) {
+		body := []byte(`{"model":"claude","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.100.123; cc_entrypoint=cli; cc_is_subagent=yes-injected;"}],"messages":[]}`)
+		got := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, "2.1.159"))
+		if strings.Contains(got, "yes-injected") {
+			t.Fatalf("an unrecognized cc_is_subagent value must not be forwarded into the block: %q", got)
+		}
+	})
+}
+
 func TestCurrentBillingHeaderMatchesCapturedBuildAndSDKEntrypoint(t *testing.T) {
 	body := []byte(`{"model":"claude","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.100.123; cc_entrypoint=sdk-cli;"}],"messages":[]}`)
 	got := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, identity.ClaudeCLIVersion))

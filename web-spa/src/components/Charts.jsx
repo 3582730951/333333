@@ -5,7 +5,7 @@ import {
 } from 'recharts';
 import { documentElementAttribute, observeDocumentElementAttributes } from '../lib/browserDocument.js';
 import { fmtTokens, fmtTime } from '../lib/format.js';
-import { PALETTE, modelColor } from '../lib/chartTheme.js';
+import { PALETTE, seriesColorMap } from '../lib/chartTheme.js';
 
 // Track the console theme so chart axes/grid stay legible on theme toggle.
 export function useIsDark() {
@@ -307,10 +307,13 @@ export function UsageModelAreaChart({
   useIsDark();
   const gradientPrefix = useId().replace(/[^a-zA-Z0-9_-]/g, '');
   const c = axisColors();
+  // Colours come from the *unfiltered* series list, deliberately: assigning after the
+  // selectedKeys filter would recolour every remaining line whenever one is toggled off.
+  const colorOf = seriesColorMap((series || []).map((s) => s.series_key || s.model_key || s.series_label));
   const descriptors = (series || []).map((s, i) => ({
     ...s,
     field: `m${i}`,
-    color: modelColor(s.series_key || s.model_key || s.series_label),
+    color: colorOf(s.series_key || s.model_key || s.series_label),
   })).filter((s) => !selectedKeys || selectedKeys.has(s.series_key));
   if (!descriptors.length || !modelSeries.length) return <Empty />;
   const fieldByKey = new Map(descriptors.map((s) => [s.series_key, s.field]));
@@ -375,10 +378,11 @@ export function CacheRateBars({ data = [] }) {
       prompt: d.cache_input_tokens || d.prompt_tokens || 0,
     }));
   if (!rows.length) return <Empty />;
+  const colorOf = seriesColorMap(rows.map((r) => r.modelKey));
   return (
     <div>
       {rows.map((r, i) => {
-        const c = modelColor(r.modelKey);
+        const c = colorOf(r.modelKey);
         return (
           <div key={i} style={{ marginBottom: 14 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12.5, marginBottom: 6 }}>

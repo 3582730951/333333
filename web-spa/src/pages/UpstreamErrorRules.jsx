@@ -143,7 +143,8 @@ export default function UpstreamErrorRules() {
   // Every count here is a slice of the rule list, so each gets its proportion of the
   // total rather than leaving four bare numbers to be compared by eye.
   const metrics = useMemo(() => {
-    const share = (part) => (rules.length ? part / rules.length : 0);
+    // undefined, not 0, on an empty list -- see the MetricRail contract in DisplayPrimitives.jsx.
+    const share = (part) => (rules.length ? part / rules.length : undefined);
     const enabled = rules.filter((r) => r.enabled).length;
     const byAction = (action) => rules.filter((r) => r.downstream_action === action).length;
     const failover = byAction('failover');
@@ -239,19 +240,41 @@ export default function UpstreamErrorRules() {
 
       <section className="upstream-rule-list">
         {rules.length === 0 ? <div className="upstream-rule-empty">暂无规则。点击“新建规则”开始配置。</div> : null}
+        {/* These cards were already a table -- five columns in a fixed grid, the same field in the
+            same place on every row -- but with no header, so each card had to caption itself and
+            "匹配条件" got printed once per rule. One header row names the columns instead, and the
+            label survives for screen readers as sr-only text inside each cell, which is the only
+            reader that still needs the repetition. Hidden below 1100px, where the row collapses to
+            a single column and a header would caption nothing. */}
+        {rules.length > 0 ? (
+          <div className="upstream-rule-row upstream-rule-head" aria-hidden="true">
+            <span>优先级</span>
+            <span>规则与适用范围</span>
+            <span>匹配条件</span>
+            <span>命中后</span>
+            <span />
+          </div>
+        ) : null}
         {rules.map((rule) => (
           <article key={rule.id} className="upstream-rule-card">
             <div className="upstream-rule-row">
-              <div className="upstream-rule-priority">#{rule.priority}</div>
+              <div className="upstream-rule-priority"><span className="pool-sr-only">优先级 </span>#{rule.priority}</div>
               <div className="upstream-rule-main">
                 <div className="upstream-rule-title"><strong>{rule.name || rule.id}</strong><Tag color={rule.enabled ? 'green' : 'grey'}>{rule.enabled ? '启用' : '停用'}</Tag></div>
                 <div className="upstream-rule-meta"><span>{rule.providers?.join(', ') || '全部平台'}</span><span>{rule.entrypoints?.join(', ') || '全部入口'}</span><span>{rule.model_patterns?.join(', ') || '全部模型'}</span></div>
               </div>
-              <div className="upstream-rule-condition"><b>匹配条件</b><span>{rule.status_codes?.join(', ') || '任意状态'} · {rule.body_keywords?.join(', ') || '任意 body'}</span></div>
-              <div className="upstream-rule-actions"><Tag>{labelOf(ACCOUNT_ACTIONS, rule.account_action)}</Tag><Tag color="blue">{labelOf(DOWNSTREAM_ACTIONS, rule.downstream_action)}</Tag></div>
-              <div className="upstream-rule-ops"><Switch checked={!!rule.enabled} onChange={() => toggleRule(rule)} /><Button size="small" icon={<IconEdit />} onClick={() => openEditor(rule)}>编辑</Button><Button size="small" icon={<IconDelete />} onClick={() => removeRule(rule)}>删除</Button></div>
+              <div className="upstream-rule-condition"><b className="pool-sr-only">匹配条件</b><span>{rule.status_codes?.join(', ') || '任意状态'} · {rule.body_keywords?.join(', ') || '任意 body'}</span></div>
+              <div className="upstream-rule-actions"><span className="pool-sr-only">命中后 </span><Tag>{labelOf(ACCOUNT_ACTIONS, rule.account_action)}</Tag><Tag color="blue">{labelOf(DOWNSTREAM_ACTIONS, rule.downstream_action)}</Tag></div>
+              <div className="upstream-rule-ops"><Switch checked={!!rule.enabled} onChange={() => toggleRule(rule)} aria-label={`启用规则 ${rule.name || rule.id}`} /><Button size="small" icon={<IconEdit />} onClick={() => openEditor(rule)}>编辑</Button><Button size="small" icon={<IconDelete />} onClick={() => removeRule(rule)}>删除</Button></div>
             </div>
-            <button type="button" className="upstream-rule-summary" onClick={() => setExpanded((x) => ({ ...x, [rule.id]: !x[rule.id] }))}>命中后会发生什么</button>
+            <button
+              type="button"
+              className="upstream-rule-summary"
+              aria-expanded={!!expanded[rule.id]}
+              onClick={() => setExpanded((x) => ({ ...x, [rule.id]: !x[rule.id] }))}
+            >
+              判定说明
+            </button>
             {expanded[rule.id] ? <p className="upstream-rule-natural">{humanSummary(rule)}</p> : null}
           </article>
         ))}

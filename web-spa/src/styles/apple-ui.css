@@ -760,6 +760,68 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* Admin-only band: the four aggregates that the per-model rows cannot show at a glance. The
+   availability cell spans two tracks because a stacked meter with a legend needs the width -- at
+   one track its legend items wrap under each other and stop reading as a single distribution. */
+.pool-model-summary {
+  margin-bottom: 14px;
+  padding: 16px 18px;
+}
+
+.pool-model-summary__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  gap: 16px 22px;
+  margin: 0;
+}
+
+.pool-model-summary__cell {
+  display: grid;
+  gap: 3px;
+  align-content: start;
+  min-width: 0;
+}
+
+.pool-model-summary__cell--wide {
+  grid-column: span 2;
+}
+
+.pool-model-summary__cell dt {
+  color: var(--pool-text-3);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.pool-model-summary__cell dd {
+  margin: 0;
+  color: var(--pool-text);
+  font-size: 22px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+}
+
+.pool-model-summary__cell small {
+  color: var(--pool-text-2);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+/* The meter replaces the numeral in this cell, so it takes the numeral's optical weight rather
+   than sitting at 22px line-height with a 9px bar floating inside it. */
+.pool-model-summary__meter {
+  align-self: center;
+  padding-top: 4px;
+  font-size: 12px;
+  font-weight: 400;
+}
+
+@media (max-width: 767px) {
+  .pool-model-summary__cell--wide {
+    grid-column: 1 / -1;
+  }
+}
+
 /* Names are short and of similar length, so columns fit far more of them on screen than
    one row each — and the reader scans a screenful instead of scrolling past it. */
 .pool-model-directory__list {
@@ -781,6 +843,68 @@ body {
    drawn on every item and the panel's own overflow clip hides the trailing one. */
 .pool-model-directory__item {
   border-inline-end: 1px solid var(--pool-border-subtle);
+}
+
+/* The plain row is one name in a 248px cell. A capability row carries six data points, which
+   cannot share a single line at that width without colliding, so the rich variant widens the
+   track and stacks three lines inside each cell instead of adding flex children. */
+.pool-model-directory__list--rich {
+  grid-template-columns: repeat(auto-fill, minmax(324px, 1fr));
+}
+
+.pool-model-directory__item--rich {
+  display: grid;
+  gap: 7px;
+  align-content: start;
+  align-items: stretch;
+  min-height: 0;
+  padding: 13px 18px;
+}
+
+/* The name may wrap to two lines; the window figure must not be pushed off the row, so it is a
+   fixed-width second column rather than a flex sibling competing for the same space. */
+.pool-model-directory__name {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.pool-model-directory__name code {
+  min-width: 0;
+  color: var(--pool-text);
+  font-family: var(--pool-font-mono);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.pool-model-directory__name b {
+  color: var(--pool-text-2);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.pool-model-directory__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: center;
+  min-width: 0;
+  color: var(--pool-text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pool-model-directory__meta time {
+  margin-inline-start: auto;
+  white-space: nowrap;
+}
+
+/* Inside a row the meter is a 4px rule, not a chart: the numbers live on the metadata line. */
+.pool-model-directory__item--rich .pool-stacked-meter__track {
+  height: 4px;
 }
 
 .pool-model-directory__item--skeleton {

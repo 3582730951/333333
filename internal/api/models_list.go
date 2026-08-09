@@ -11,9 +11,29 @@ import (
 	"codex-account-pool/internal/storage"
 )
 
+// Capabilities is populated on the admin endpoint only. It is omitempty so the user
+// endpoint's response stays byte-identical, and /admin/models consumers that read just
+// Models (Groups.jsx) are unaffected.
 type modelListResponse struct {
-	Models      []string `json:"models"`
-	GeneratedAt int64    `json:"generated_at"`
+	Models       []string                 `json:"models"`
+	Capabilities []modelCapabilitySummary `json:"capabilities,omitempty"`
+	GeneratedAt  int64                    `json:"generated_at"`
+}
+
+// One row per distinct model, aggregated across the accounts that report it. The three
+// availability counts and the three context-1M counts each partition Accounts exactly,
+// so a reader can render either as a share of a known total.
+type modelCapabilitySummary struct {
+	Model                string `json:"model"`
+	Accounts             int    `json:"accounts"`
+	Verified             int    `json:"verified"`
+	Unverified           int    `json:"unverified"`
+	Unsupported          int    `json:"unsupported"`
+	Context1MSupported   int    `json:"context_1m_supported"`
+	Context1MUnsupported int    `json:"context_1m_unsupported"`
+	Context1MUnknown     int    `json:"context_1m_unknown"`
+	MaxContextWindow     int64  `json:"max_context_window"`
+	LastProbeAt          int64  `json:"last_probe_at"`
 }
 
 func (s *Server) handleAdminModels(w http.ResponseWriter, r *http.Request) {
@@ -34,7 +54,12 @@ func (s *Server) handleAdminModels(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, modelListResponse{Models: sortedCapabilityModels(filterDisplayCapabilities(caps, accounts), nil), GeneratedAt: storage.Now()})
+	display := filterDisplayCapabilities(caps, accounts)
+	writeJSON(w, http.StatusOK, modelListResponse{
+		Models:       sortedCapabilityModels(display, nil),
+		Capabilities: summarizeCapabilityModels(display),
+		GeneratedAt:  storage.Now(),
+	})
 }
 
 func (s *Server) handleUserModels(w http.ResponseWriter, r *http.Request) {
@@ -114,6 +139,60 @@ func sortedCapabilityModels(caps []storage.ModelCapability, allowedAccounts map[
 	}
 	sort.Slice(models, func(i, j int) bool { return naturalModelLess(models[i], models[j]) })
 	return models
+}
+
+// summarizeCapabilityModels aggregates rows per distinct model. It keys on the lowercased
+// slug and keeps the first spelling encountered, which is the rule sortedCapabilityModels
+// uses; the two therefore always describe the same set under the same names, in the same
+// natural order.
+func summarizeCapabilityModels(caps []storage.ModelCapability) []modelCapabilitySummary {
+	order := make([]string, 0, len(caps))
+	byKey := map[string]*modelCapabilitySummary{}
+	for _, capRow := range caps {
+		model := strings.TrimSpace(capRow.ModelSlug)
+		if model == "" {
+			continue
+		}
+		key := strings.ToLower(model)
+		row := byKey[key]
+		if row == nil {
+			row = &modelCapabilitySummary{Model: model}
+			byKey[key] = row
+			order = append(order, key)
+		}
+		row.Accounts++
+		switch capRow.AvailabilityState {
+		case capability.AvailabilityVerified:
+			row.Verified++
+		case capability.AvailabilityUnsupported:
+			row.Unsupported++
+		default:
+			row.Unverified++
+		}
+		switch capRow.Context1MState {
+		case capability.Context1MSupported:
+			row.Context1MSupported++
+		case capability.Context1MUnsupported:
+			row.Context1MUnsupported++
+		default:
+			row.Context1MUnknown++
+		}
+		if window := capRow.NativeMaxContextWindow; window > row.MaxContextWindow {
+			row.MaxContextWindow = window
+		}
+		if capRow.NativeContextWindow > row.MaxContextWindow {
+			row.MaxContextWindow = capRow.NativeContextWindow
+		}
+		if capRow.LastProbeAt > row.LastProbeAt {
+			row.LastProbeAt = capRow.LastProbeAt
+		}
+	}
+	out := make([]modelCapabilitySummary, 0, len(order))
+	for _, key := range order {
+		out = append(out, *byKey[key])
+	}
+	sort.Slice(out, func(i, j int) bool { return naturalModelLess(out[i].Model, out[j].Model) })
+	return out
 }
 
 func naturalModelLess(a, b string) bool {

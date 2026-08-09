@@ -8,7 +8,7 @@ import SystemHealthSummaryBase from '../components/SystemHealthSummary.jsx';
 import * as MicroCharts from '../components/MicroCharts.jsx';
 import useVisibleInterval, { usePageVisible } from '../hooks/useVisibleInterval.js';
 import { UsageAreaChart, UsageModelAreaChart, DonutChart, GroupedBar, CacheRateBars } from '../components/LazyCharts.jsx';
-import { COLORS, modelColor } from '../lib/chartTheme.js';
+import { COLORS, seriesColorMap } from '../lib/chartTheme.js';
 import { fmtTokens, fmtInt, fmtTime } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
 import {
@@ -82,9 +82,15 @@ function KpiTile({
   invertDelta?: boolean;
 }) {
   return (
-    <article className="pool-kpi">
+    // `color` used to reach only the Sparkline, so it rendered nothing on the three
+    // tiles that carry no series. The dot gives every tile the same treatment and
+    // doubles as the sparkline's legend where one is present.
+    <article className="pool-kpi" style={{ '--pool-kpi-accent': color } as React.CSSProperties}>
       <div className="pool-kpi__head">
-        <span className="pool-kpi__label">{label}</span>
+        <span className="pool-kpi__ident">
+          <span className="pool-kpi__dot" aria-hidden="true" />
+          <span className="pool-kpi__label">{label}</span>
+        </span>
         {delta !== undefined ? <DeltaBadge value={delta} invert={invertDelta} /> : null}
       </div>
       <div className="pool-kpi__value">{value}</div>
@@ -220,11 +226,15 @@ export default function Dashboard() {
   const registrationDays = (secondary?.registration?.by_day || []).map((row) => ({
     x: (row.date || '').slice(5), success: row.succeeded || 0, failed: row.failed || 0,
   }));
-  const modelTokenRows = byModel.slice(0, 6).map((row) => ({
+  const topModels = byModel.slice(0, 6);
+  // Built over the sliced rows -- the six that actually render -- so the six colours are
+  // guaranteed distinct rather than hash-collided down to four or five.
+  const modelTokenColor = seriesColorMap(topModels.map((row) => row.dimension_key || row.model_key || row.model));
+  const modelTokenRows = topModels.map((row) => ({
     key: String(row.dimension_key || row.model_key || row.model || ''),
     name: row.display_label || row.series_label || `${row.provider_name || row.provider_id || ''}${row.provider_name || row.provider_id ? ' · ' : ''}${row.model_label || row.model || `(${t('common.unknown')})`}`,
     value: row.total_tokens || 0,
-    color: modelColor(row.dimension_key || row.model_key || row.model),
+    color: modelTokenColor(row.dimension_key || row.model_key || row.model),
     meta: row.requests ? `${fmtInt(row.requests)} ${t('dashboard.requests_unit')}` : undefined,
   }));
   // Local formatter: the compact B/M/k scale belongs to this view only and must not
@@ -236,14 +246,19 @@ export default function Dashboard() {
     if (number >= 1e3) return `${(number / 1e3).toFixed(1)}k`;
     return `${number}`;
   };
-  const topAccountRows = (secondary?.cache?.by_account || []).slice(0, 6).map((row) => {
+  const topAccounts = (secondary?.cache?.by_account || []).slice(0, 6);
+  // A separate map from the model chart above: this is its own chart with its own legend, so
+  // the two are independent and an account may share a colour with a model. Within one chart
+  // no two rows can.
+  const accountColor = seriesColorMap(topAccounts.map((row) => row.account_id));
+  const topAccountRows = topAccounts.map((row) => {
     const input = Number(row.actual_prompt_tokens || row.prompt_tokens || 0);
     const output = Number(row.actual_completion_tokens || row.completion_tokens || 0);
     return {
       key: String(row.account_id || ''),
       name: compactIdentity(row.account_id),
       value: input + output,
-      color: modelColor(row.account_id),
+      color: accountColor(row.account_id),
       meta: `${t('usage.input')} ${fmtTokens(input)} · ${t('usage.output')} ${fmtTokens(output)}`,
     };
   });

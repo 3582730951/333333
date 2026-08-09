@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
@@ -209,7 +210,23 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no")
-		inputTok, outputTok, cachedTok, stopReason, streamErr := upstream.AntigravityStreamToAnthropic(ctx, io.MultiReader(bytes.NewReader(prefix), reader), w, displayModel, msgID)
+		// The converter writes Anthropic SSE straight to the client, so a goal
+		// checkpoint has to be reconstructed from a tee of that same output. The
+		// spool is bounded by the shared response-capture budget and is only opened
+		// when goal continuity is on, so an ordinary stream keeps its current cost.
+		streamOut := io.Writer(w)
+		var goalCapture *bodysource.SpoolBuffer
+		if s.goalContinuityEnabled(ctx) {
+			capture, captureErr := bodysource.NewSpoolBuffer(ctx, s.responseBodyCaptureOptions(ctx))
+			if captureErr != nil {
+				log.Printf("[GOAL-CONTINUITY] antigravity stream capture unavailable request_id=%s: %v", requestIDFromContext(ctx), captureErr)
+			} else {
+				goalCapture = capture
+				defer goalCapture.Close()
+				streamOut = io.MultiWriter(w, goalCapture)
+			}
+		}
+		inputTok, outputTok, cachedTok, stopReason, streamErr := upstream.AntigravityStreamToAnthropic(ctx, io.MultiReader(bytes.NewReader(prefix), reader), streamOut, displayModel, msgID)
 		if streamErr != nil && !errors.Is(streamErr, context.Canceled) {
 			// The converter always emits a valid Anthropic terminal sequence after
 			// downstream commit. Never replay here because tool calls or billable
@@ -220,6 +237,17 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 			flusher.Flush()
 		}
 		s.recordAntigravityUsage(r, lease.Account.ID, displayModel, affinity, inputTok, outputTok, cachedTok, stopReason)
+		if streamErr != nil {
+			// An interrupted relay leaves the already durable checkpoint intact and
+			// only marks the goal retryable, exactly like the kiro and claude paths.
+			s.markGoalStreamRetryable(ctx, r, "antigravity", raw, "upstream_stream_error")
+		} else if goalCapture != nil {
+			if frames, captureErr := responseSpoolBytes(goalCapture); captureErr != nil {
+				log.Printf("[GOAL-CONTINUITY] antigravity stream capture unreadable request_id=%s: %v", requestIDFromContext(ctx), captureErr)
+			} else if response := goalResponseFromSSE(frames); len(response) > 0 {
+				s.persistAntigravityGoalContinuity(ctx, r, raw, response)
+			}
+		}
 	} else {
 		chunk, parseErr := upstream.ParseAntigravityNonStream(resp.Body)
 		if parseErr != nil {
@@ -230,6 +258,7 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(respJSON)
 		s.recordAntigravityUsage(r, lease.Account.ID, displayModel, affinity, chunk.InputTokens, chunk.OutputTokens, chunk.CachedTokens, chunk.StopReason)
+		s.persistAntigravityGoalContinuity(ctx, r, raw, respJSON)
 	}
 	// Persist session-sticky affinity binding for this account.
 	if affinity.Hash != "" {
@@ -246,6 +275,17 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 		bindingCancel()
 	}
 	return outcomeDone
+}
+
+// persistAntigravityGoalContinuity records the durable turn for an Antigravity
+// response. Antigravity is downstream-identical to Anthropic Messages, so it joins
+// the Messages history family: a conversation may move between claude, kiro and
+// antigravity accounts and keep advancing the same goal.
+func (s *Server) persistAntigravityGoalContinuity(ctx context.Context, r *http.Request, requestBody, responseBody []byte) {
+	if _, err := s.persistGoalContinuity(ctx, r, "antigravity", requestBody, responseBody); err != nil {
+		log.Printf("[GOAL-CONTINUITY] antigravity persistence degraded request_id=%s: %v", requestIDFromContext(ctx), err)
+		s.auditGoalPersistenceDegraded(ctx, "antigravity_terminal", err)
+	}
 }
 
 // doAntigravityWithEgressRetry exhausts the selected account's ordered outlets

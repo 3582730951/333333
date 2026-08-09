@@ -98,7 +98,8 @@ export default function Egress() {
   }).length;
   const proxyCount = rows.filter((row) => row.type && row.type !== 'direct').length;
   const concurrencyTotal = rows.reduce((sum, row) => sum + (Number(row.max_concurrency) || 0), 0);
-  const share = (part) => (rows.length ? part / rows.length : 0);
+  // undefined, not 0, on an empty list -- see the MetricRail contract in DisplayPrimitives.jsx.
+  const share = (part) => (rows.length ? part / rows.length : undefined);
   const egressMetrics = [
     { label: '出口', value: rows.length },
     {

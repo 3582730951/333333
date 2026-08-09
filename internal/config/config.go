@@ -35,14 +35,19 @@ const (
 	// to re-bench one whose probe still fails before the next attempt.
 	DefaultAccountRecheckIntervalSeconds = 20
 	DefaultAccountRecheckBackoffSeconds  = 120
-	DefaultRequestTimeoutSec             = 600
-	DefaultShutdownDrainSec              = 30
-	DefaultMaxBodyBytes                  = 1 << 30
-	DefaultBodyMemoryThresholdBytes      = 8 << 20
-	DefaultBodyMemoryBudgetMaxBytes      = 256 << 20
-	DefaultBodySpoolMaxBytes             = 32 << 30
-	DefaultBodyDiskReserveBytes          = 0
-	DefaultUsageJournalSegmentBytes      = 8 << 20
+	// Consecutive-5xx breaker. Five failures is well past any single retry ladder, so
+	// a healthy account with one bad minute is never benched by it, while a dead
+	// upstream stops absorbing traffic within seconds instead of hours.
+	DefaultAccountFailureStreakThreshold       = 5
+	DefaultAccountFailureStreakCooldownSeconds = 300
+	DefaultRequestTimeoutSec                   = 600
+	DefaultShutdownDrainSec                    = 30
+	DefaultMaxBodyBytes                        = 1 << 30
+	DefaultBodyMemoryThresholdBytes            = 8 << 20
+	DefaultBodyMemoryBudgetMaxBytes            = 256 << 20
+	DefaultBodySpoolMaxBytes                   = 32 << 30
+	DefaultBodyDiskReserveBytes                = 0
+	DefaultUsageJournalSegmentBytes            = 8 << 20
 	// Goal continuity keeps a seven-day sliding window. The original 256 MiB
 	// bootstrap default was exhausted by sustained Codex tool traffic while the
 	// server still had ample disk. One GiB provides fourfold admission headroom;
@@ -582,6 +587,19 @@ type Config struct {
 	// AccountRecheckBackoffSeconds is how long to re-bench an account whose recheck
 	// probe still fails, before the next probe attempt. Default 120s.
 	AccountRecheckBackoffSeconds int `json:"account_recheck_backoff_seconds"`
+	// AccountFailureStreakThreshold is how many consecutive upstream 5xx responses
+	// from one account bench it for recheck. Only rate/quota signals used to bench an
+	// account, so an upstream that failed *every* request — a dead relay behind a
+	// custom provider — stayed in rotation indefinitely: production diagnostics show
+	// one provider account serving 1512 consecutive 503s across 14 unbroken hours,
+	// each also consuming a fallback attempt against a second group. A success, or a
+	// non-5xx response, resets the streak. 0 disables the breaker.
+	// Runtime key: account_failure_streak_threshold. Default 5.
+	AccountFailureStreakThreshold int `json:"account_failure_streak_threshold"`
+	// AccountFailureStreakCooldownSeconds is how long a streak-benched account is
+	// cooled. It is benched for recheck, so the liveness probe (not the clock alone)
+	// readmits it. Runtime key: account_failure_streak_cooldown_seconds. Default 300s.
+	AccountFailureStreakCooldownSeconds int `json:"account_failure_streak_cooldown_seconds"`
 	// CodexPromptCacheRetention is retained only for config-file compatibility.
 	// Current codex-rs 0.144.x sends no prompt_cache_retention field on HTTP or WS,
 	// so the relay does not inject it and strips legacy downstream values. Cache
@@ -935,6 +953,8 @@ func Default() Config {
 		AccountRecheckEnabled:                  true,
 		AccountRecheckIntervalSeconds:          DefaultAccountRecheckIntervalSeconds,
 		AccountRecheckBackoffSeconds:           DefaultAccountRecheckBackoffSeconds,
+		AccountFailureStreakThreshold:          DefaultAccountFailureStreakThreshold,
+		AccountFailureStreakCooldownSeconds:    DefaultAccountFailureStreakCooldownSeconds,
 		CodexPromptCacheRetention:              "",
 		CodexInstallModel:                      "gpt-5.6-sol",
 		CodexInstallEffort:                     "",
@@ -1680,6 +1700,13 @@ func (c *Config) normalize() {
 	}
 	if c.AccountRecheckBackoffSeconds <= 0 {
 		c.AccountRecheckBackoffSeconds = DefaultAccountRecheckBackoffSeconds
+	}
+	// A negative threshold is a typo, not "disabled"; 0 is the explicit off switch.
+	if c.AccountFailureStreakThreshold < 0 {
+		c.AccountFailureStreakThreshold = DefaultAccountFailureStreakThreshold
+	}
+	if c.AccountFailureStreakCooldownSeconds <= 0 {
+		c.AccountFailureStreakCooldownSeconds = DefaultAccountFailureStreakCooldownSeconds
 	}
 	if c.WebSearchEnabled && c.WebSearchToolType == "" {
 		c.WebSearchToolType = "web_search"

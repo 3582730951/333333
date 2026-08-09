@@ -97,6 +97,25 @@ func namespacedGoalAliases(aliases []storage.GoalAlias, namespace string) []stor
 	return out
 }
 
+// familyGoalAliases stamps the wire-history family onto a copy of the alias list.
+// The namespace alone does not separate a Claude Code session that reached Codex
+// through the Anthropic→Responses bridge from the same session speaking native
+// Messages: both emit identical client identifiers, so without the family the two
+// goals would rebind one globally unique alias row away from each other on
+// every turn.
+func familyGoalAliases(aliases []storage.GoalAlias, family string) []storage.GoalAlias {
+	family = strings.TrimSpace(strings.ToLower(family))
+	out := make([]storage.GoalAlias, len(aliases))
+	copy(out, aliases)
+	if family == "" {
+		return out
+	}
+	for index := range out {
+		out[index].Family = family
+	}
+	return out
+}
+
 func scopedGoalDownstreamKeyHash(keyHash, namespace string) string {
 	keyHash = strings.TrimSpace(keyHash)
 	namespace = strings.TrimSpace(namespace)
@@ -112,9 +131,29 @@ func scopedGoalDownstreamKeyHash(keyHash, namespace string) string {
 // legacy unscoped namespace and is then rebound under the client scope by the
 // successful commit. Weak root/session aliases never cross that migration bridge.
 func goalResolutionSetsForClient(raw []storage.GoalAlias, namespace string, allowResumeFallback bool) [][]storage.GoalAlias {
-	scoped := namespacedGoalAliases(raw, namespace)
+	return goalResolutionSetsForClientFamily(raw, namespace, "", allowResumeFallback)
+}
+
+// goalResolutionSetsForClientFamily adds the wire-history family to every scoped set
+// and, for the families that moved to the v3 alias digest, appends the same sets once
+// more without a family. That second pass reads the still-valid v2 rows of a goal
+// persisted before this upgrade; family-filtered resolution in storage keeps the
+// bridge safe, because a v2 row owned by another family is discarded rather than
+// resumed. The first commit after the upgrade writes the v3 rows, so the bridge
+// naturally stops mattering for that goal.
+func goalResolutionSetsForClientFamily(raw []storage.GoalAlias, namespace, family string, allowResumeFallback bool) [][]storage.GoalAlias {
+	scoped := familyGoalAliases(namespacedGoalAliases(raw, namespace), family)
 	sets := goalResolutionAliasSets(scoped, allowResumeFallback)
-	if strings.TrimSpace(namespace) == "" || !allowResumeFallback {
+	if strings.TrimSpace(namespace) == "" {
+		return sets
+	}
+	if family = strings.TrimSpace(strings.ToLower(family)); family != "" && family != storage.GoalFamilyResponses {
+		// Same namespace, same alias values, previous digest — not a widening of the
+		// identity, only the older hash of the very same client-scoped identifiers.
+		legacyDigest := goalResolutionAliasSets(namespacedGoalAliases(raw, namespace), allowResumeFallback)
+		sets = append(sets, legacyDigest...)
+	}
+	if !allowResumeFallback {
 		return sets
 	}
 	for _, legacy := range goalAliasPrioritySets(raw) {

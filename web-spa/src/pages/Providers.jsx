@@ -575,7 +575,10 @@ export default function Providers() {
             ]}
           />
         ) : null}
-        <div className="pool-field__help">请求会经过该提供商的 Base URL、协议画像、API Key、出口及模型映射；结果同时显示下游模型与目标模型。</div>
+        {/* 第二句原本写"结果同时显示下游模型与目标模型"，而下面 583 行就是
+            `{requested_model} → {target_model}`——等于用文字描述紧邻的界面本身。留下的第一句
+            才是看不出来的信息：这不是连通性测试，而是走完整条链路。 */}
+        <div className="pool-field__help">请求会经过该提供商的 Base URL、协议画像、API Key、出口及模型映射。</div>
         {testResult ? (
           <div className="pool-resource-summary" style={{ marginTop: 12 }}>
             <strong>{testResult.ok ? '到达成功' : '测试失败'}</strong>

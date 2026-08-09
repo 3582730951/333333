@@ -16,9 +16,31 @@ const list = (pattern, dir) => execSync(`grep -rl "" --include=${pattern} ${dir}
 const styleFiles = list('*.css', 'src/styles');
 const codeFiles = [...list('*.jsx', 'src'), ...list('*.tsx', 'src')];
 
-const css = styleFiles.map((f) => readFileSync(path.join(root, f), 'utf8')).join('\n');
+// The prefixes this app owns. `pool-` was the only one checked for a long time, which left whole
+// families unwatched: `upstream-rule-main` and `public-chat-admin-page` were both emitted with no
+// rule behind them and neither ever failed a gate, because neither starts with `pool-`. Measured
+// scope when this widened: 3 undefined names outside `pool-`, so the miss was narrow -- but narrow
+// is not the same as covered, and the whole point of this check is that a name with no rule is
+// invisible to typecheck, unit tests, and any screenshot that happens not to exercise it.
+//
+// Prefix-scoped rather than "every class we emit": the Semi Design components bring their own
+// `semi-*` classes whose rules live in node_modules, and matching those would report the entire
+// vendor surface as drift.
+const OWNED_PREFIXES = ['pool-', 'upstream-rule', 'upstream-rules', 'public-chat'];
+const owned = (name) => OWNED_PREFIXES.some((p) => name.startsWith(p));
+const CLASS_RE = new RegExp(`\\.((?:${OWNED_PREFIXES.join('|')})[a-z0-9_-]*)`, 'g');
+
+// Comments are stripped before anything is read as a selector. A comment that discusses a class by
+// name -- `.upstream-rule-main is deliberately not styled here` -- otherwise registers as a
+// definition and silently cancels the drift report for that name. That happened on the first run of
+// the widened check above: the one class it was written to catch came back clean because the comment
+// explaining why it has no rule was itself counted as the rule. A gate whose own documentation
+// disables it is worse than no gate, since it reports success.
+const stripComments = (text) => text.replace(/\/\*[\s\S]*?\*\//g, ' ');
+
+const css = stripComments(styleFiles.map((f) => readFileSync(path.join(root, f), 'utf8')).join('\n'));
 // Class names as they appear in selectors, and custom properties as they are declared.
-const definedClasses = new Set([...css.matchAll(/\.(pool-[a-z0-9_-]+)/g)].map((m) => m[1]));
+const definedClasses = new Set([...css.matchAll(CLASS_RE)].map((m) => m[1]));
 const definedVars = new Set([...css.matchAll(/(--pool-[a-z0-9-]+)\s*:/g)].map((m) => m[1]));
 const readVars = new Set([...css.matchAll(/var\(\s*(--pool-[a-z0-9-]+)/g)].map((m) => m[1]));
 
@@ -38,11 +60,25 @@ for (const file of codeFiles) {
     // A fragment left dangling on its separator (`pool-delta--${tone}` -> `pool-delta--`)
     // is the hole, not a name, so it is dropped rather than reported as missing.
     for (const cls of raw.replace(/\$\{[^}]*\}/g, ' ').split(/\s+/)) {
-      if (cls.startsWith('pool-') && !/[-_]$/.test(cls)) note(usedClasses, cls, file);
+      if (owned(cls) && !/[-_]$/.test(cls)) note(usedClasses, cls, file);
+    }
+    // The erase above drops the hole's contents too, and a hole is where a state class most
+    // often lives: `${collapsed ? 'pool-sider-collapsed' : 'pool-sider-expanded'}` emits two
+    // real names that no rule need exist for. The ternary sweep below only recovers `--`
+    // modifier names, so plain state classes were invisible to this gate -- four unstyled ones
+    // sat in App.tsx behind exactly this blind spot. Mine the string literals out of each hole.
+    for (const hole of raw.matchAll(/\$\{([^}]*)\}/g)) {
+      for (const lit of hole[1].matchAll(/'([^']*)'|"([^"]*)"/g)) {
+        for (const cls of (lit[1] ?? lit[2] ?? '').split(/\s+/)) {
+          if (owned(cls) && !/[-_]$/.test(cls)) note(usedClasses, cls, file);
+        }
+      }
     }
   }
   // Classes assembled in arrays or ternaries, e.g. `cond ? 'pool-x--on' : ''`.
-  for (const m of src.matchAll(/'(pool-[a-z0-9_-]*--[a-z0-9_-]+)'/g)) note(usedClasses, m[1], file);
+  for (const m of src.matchAll(/'([a-z][a-z0-9_-]*--[a-z0-9_-]+)'/g)) {
+    if (owned(m[1])) note(usedClasses, m[1], file);
+  }
   for (const m of src.matchAll(/'(--pool-[a-z0-9-]+)'\s*:/g)) note(setVars, m[1], file);
 }
 

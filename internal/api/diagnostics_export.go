@@ -390,8 +390,8 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 	}
 	addCSV("sidecar_status.csv", []string{"sidecar_egress_id", "real_egress_id", "health", "profile_max_concurrency", "adaptive_limit", "inflight", "queue_depth", "recent_failures", "circuit_state", "circuit_until", "bypass_until", "cooldown_until", "bound_account_count", "created_at", "updated_at"}, sidecarStatusRows(egressProfiles, bindings, sidecarAdaptive))
 	addCSV("settings.csv", []string{"key", "value", "updated_at"}, settingRows(settings))
-	addCSV("custom_providers.csv", []string{"id", "name", "base_url", "upstream_protocol", "enabled", "auto_discover_models", "models", "model_mappings", "created_at", "updated_at"}, customProviderRows(customProviders))
-	addCSV("upstream_error_rules.csv", []string{"id", "name", "enabled", "priority", "providers", "entrypoints", "model_patterns", "status_codes", "body_keywords", "match_mode", "account_action", "downstream_action", "response_status", "custom_message", "cooldown_seconds", "prefer_retry_after", "idle_seconds", "idle_ping_seconds", "skip_log", "description", "created_at", "updated_at"}, upstreamErrorRuleRows(upstreamRules))
+	addCSV("custom_providers.csv", []string{"id", "name", "base_url", "upstream_protocol", "transport_profile", "routes", "egress_ids", "enabled", "auto_discover_models", "models", "model_mappings", "created_at", "updated_at"}, customProviderRows(customProviders))
+	addCSV("upstream_error_rules.csv", upstreamErrorRuleColumns, upstreamErrorRuleRows(upstreamRules))
 	addCSV("codex_reset_credit_consumptions.csv", []string{"account_code", "seven_day_reset_at", "redeem_request_id", "status", "created_at", "updated_at"}, codexResetCreditRows(resetConsumptions, codebook))
 	addCSV("account_lifecycle_status.csv", []string{"account_code", "validity_status", "subscription_tier", "subscription_expires_at", "last_health_check_at", "last_token_refresh_at", "health_check_fail_count", "summary_json", "created_at", "updated_at"}, lifecycleStatusRows(lifecycleStatuses, codebook))
 	addCSV("codex_reauth_config.csv", []string{"account_code", "login_email_present", "password_configured", "otp_url_configured", "target_workspace_id", "auto_enabled", "last_status", "last_error", "created_at", "updated_at"}, codexReauthConfigRows(reauthConfigs, codebook))
@@ -1307,8 +1307,8 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	addCSV("codex_group_policy_revisions.csv", []string{"group_name", "instructions_enabled", "instruction_file_count", "policy_revision_hmac_prefix", "updated_at"}, nil)
 	addCSV("sidecar_status.csv", []string{"sidecar_egress_id", "real_egress_id", "health", "profile_max_concurrency", "adaptive_limit", "inflight", "queue_depth", "recent_failures", "circuit_state", "circuit_until", "bypass_until", "cooldown_until", "bound_account_count", "created_at", "updated_at"}, nil)
 	addCSV("settings.csv", []string{"key", "value", "updated_at"}, settingRows(settings))
-	addCSV("custom_providers.csv", []string{"id", "name", "base_url", "upstream_protocol", "enabled", "auto_discover_models", "models", "model_mappings", "created_at", "updated_at"}, customProviderRows(customProviders))
-	addCSV("upstream_error_rules.csv", []string{"id", "name", "enabled", "priority", "providers", "entrypoints", "model_patterns", "status_codes", "body_keywords", "match_mode", "account_action", "downstream_action", "response_status", "custom_message", "cooldown_seconds", "prefer_retry_after", "idle_seconds", "idle_ping_seconds", "skip_log", "description", "created_at", "updated_at"}, upstreamErrorRuleRows(upstreamRules))
+	addCSV("custom_providers.csv", []string{"id", "name", "base_url", "upstream_protocol", "transport_profile", "routes", "egress_ids", "enabled", "auto_discover_models", "models", "model_mappings", "created_at", "updated_at"}, customProviderRows(customProviders))
+	addCSV("upstream_error_rules.csv", upstreamErrorRuleColumns, upstreamErrorRuleRows(upstreamRules))
 	addCSV("codex_reset_credit_consumptions.csv", []string{"account_code", "seven_day_reset_at", "redeem_request_id", "status", "created_at", "updated_at"}, codexResetCreditRows(resetConsumptions, codebook))
 	addCSV("account_lifecycle_status.csv", []string{"account_code", "validity_status", "subscription_tier", "subscription_expires_at", "last_health_check_at", "last_token_refresh_at", "health_check_fail_count", "summary_json", "created_at", "updated_at"}, lifecycleStatusRows(lifecycleStatuses, codebook))
 	addCSV("codex_reauth_config.csv", []string{"account_code", "login_email_present", "password_configured", "otp_url_configured", "target_workspace_id", "auto_enabled", "last_status", "last_error", "created_at", "updated_at"}, codexReauthConfigRows(reauthConfigs, codebook))
@@ -1966,6 +1966,9 @@ func (b diagnosticCodebook) sanitize(text string) string {
 		if !strings.HasPrefix(value, "/") {
 			prefix, path = value[:1], value[1:]
 		}
+		if diagnosticPublicEndpointPaths[path] {
+			return value
+		}
 		return prefix + diagnosticAlias(b.aliasKey, "PATH", "path", path)
 	})
 	text = diagnosticHighEntropyRE.ReplaceAllStringFunc(text, func(value string) string {
@@ -2039,25 +2042,17 @@ func diagnosticHighEntropyCandidate(value string) bool {
 	if len(value) < 40 || diagnosticStableAliasRE.MatchString(strings.ToUpper(value)) {
 		return false
 	}
-	lowerSnakeCase := true
-	underscoreCount := 0
+	// Long schema fields, setting keys, and enum values are identifiers, not secrets.
+	// The old regexp classified any 40-byte snake_case value as high entropy and
+	// destroyed otherwise useful diagnostic state.
+	if diagnosticSnakeCaseIdentifier(value) {
+		return false
+	}
 	counts := map[rune]int{}
 	runeCount := 0
 	for _, character := range value {
 		runeCount++
 		counts[character]++
-		if character == '_' {
-			underscoreCount++
-		}
-		if (character < 'a' || character > 'z') && character != '_' {
-			lowerSnakeCase = false
-		}
-	}
-	// Long schema fields and enum values are identifiers, not secrets. The old
-	// regexp classified any 40-byte snake_case value as high entropy and
-	// destroyed otherwise useful diagnostic state.
-	if lowerSnakeCase && underscoreCount >= 2 {
-		return false
 	}
 	if runeCount == 0 {
 		return false
@@ -2068,6 +2063,88 @@ func diagnosticHighEntropyCandidate(value string) bool {
 		entropy -= probability * (math.Log(probability) / math.Ln2)
 	}
 	return entropy >= 3.5
+}
+
+// Bounds for the lower_snake_case identifier exemption. Words in a setting key or
+// enum value are short and overwhelmingly alphabetic; digits appear in a couple of
+// version fragments (`v3`, `1gib`, `v4`), never spread across most words.
+const (
+	diagnosticIdentifierMinSegments  = 3
+	diagnosticIdentifierMaxSegment   = 24
+	diagnosticIdentifierMaxDigitRate = 0.30
+	// A secret shaped to look like an identifier — lowercase alphanumerics split by
+	// underscores — is caught here rather than by the digit share: in a real key most
+	// words are pure letters, while every segment of a random alnum string contains a
+	// digit with overwhelming probability.
+	diagnosticIdentifierDigitSegmentDivisor = 3
+)
+
+// diagnosticSnakeCaseIdentifier reports whether value has the shape of a
+// lower_snake_case identifier: at least three `_`-separated short words drawn from
+// lowercase letters and digits, with digits a small minority of the whole.
+//
+// The previous test rejected any value containing a digit at all, which silently
+// destroyed exactly the identifiers operators need most — every versioned key. Two
+// real setting keys in an exported production package were replaced by `TOKEN-…`
+// aliases solely because they contained `v3`/`1gib` and `v4`, leaving the operator
+// with a diagnostics bundle that could not name its own configuration.
+//
+// What this exemption does and does not guarantee, measured rather than assumed:
+//
+//	No real credential encoding can reach it. base64, base64url, and hex were each run
+//	through 20k trials with zero exemptions — every one needs a character outside
+//	[a-z0-9_] (uppercase, `+/=-`) or, for hex, carries ~62% digits against the 30%
+//	ceiling here. All 29 long lower_snake_case literals in this repo survive.
+//
+//	A blob deliberately encoded to imitate an identifier can still pass, rarely. Random
+//	[a-z0-9] words joined by underscores escape at ~4e-5 (2-6 per 100k), down from ~14%
+//	before the digit-bearing segment cap: in a real key digits sit in a version fragment
+//	or two, while nearly every word of a random alnum string carries one. Tightening the
+//	digit share to 8% only moves that to ~3e-5 and costs the headroom a future versioned
+//	key needs, so the residual is accepted knowingly. Nothing here is a substitute for
+//	the explicit token, JWT, and secret-prefix patterns that run before this catch-all.
+func diagnosticSnakeCaseIdentifier(value string) bool {
+	segments := strings.Split(value, "_")
+	if len(segments) < diagnosticIdentifierMinSegments {
+		return false
+	}
+	digits := 0
+	total := 0
+	digitSegments := 0
+	for _, segment := range segments {
+		if segment == "" || len(segment) > diagnosticIdentifierMaxSegment {
+			return false
+		}
+		segmentDigits := 0
+		for i := 0; i < len(segment); i++ {
+			c := segment[i]
+			switch {
+			case c >= 'a' && c <= 'z':
+			case c >= '0' && c <= '9':
+				segmentDigits++
+			default:
+				return false
+			}
+			total++
+		}
+		if segmentDigits > 0 {
+			digits += segmentDigits
+			digitSegments++
+		}
+	}
+	if total == 0 {
+		return false
+	}
+	// At most a third of the words may carry digits, always allowing one so that a
+	// short key like `codex_prompt_cache_v2` is not punished for its version suffix.
+	maxDigitSegments := len(segments) / diagnosticIdentifierDigitSegmentDivisor
+	if maxDigitSegments < 1 {
+		maxDigitSegments = 1
+	}
+	if digitSegments > maxDigitSegments {
+		return false
+	}
+	return float64(digits)/float64(total) <= diagnosticIdentifierMaxDigitRate
 }
 
 func diagnosticContainsHighEntropy(value string) bool {
@@ -2094,6 +2171,36 @@ var (
 	diagnosticHighEntropyRE     = regexp.MustCompile(`[A-Za-z0-9_+/=-]{40,}`)
 	diagnosticStableAliasRE     = regexp.MustCompile(`^(?:ACC|EGR|GRP|USR|KEY|REQ|SES|TSK|HST|JOB|ENT|EVT|EMAIL|URL|IP|PATH|TOKEN|TEXT|FIELD)-[A-Z2-7]{26}$`)
 )
+
+// diagnosticPublicEndpointPaths are wire-protocol endpoints, not local filesystem paths.
+// The path aliaser cannot tell the two apart from shape alone, and aliasing these costs
+// the operator the one thing the row is for: which entrypoint a route override applies
+// to, or which endpoint an attempt hit. They carry no host, user, or deployment detail —
+// every one is published in the upstream API documentation. Anything not on this closed
+// list keeps being aliased, so a genuine `/home/<user>/...` or `/var/lib/...` is unaffected.
+var diagnosticPublicEndpointPaths = map[string]bool{
+	storage.CustomProviderDownstreamChat:      true,
+	storage.CustomProviderDownstreamResponses: true,
+	storage.CustomProviderDownstreamMessages:  true,
+	"/v1/models":                              true,
+	"/v1/responses/compact":                   true,
+	"/v1/messages/count_tokens":               true,
+	"/v1/organizations/usage":                 true,
+}
+
+// diagnosticContainsUnixPath reports whether text holds a filesystem path that must be
+// aliased, skipping the published endpoint constants. The sanitizer and the DLP gate that
+// re-scans the finished artifact must agree exactly: if the gate applied the bare regex
+// while the sanitizer exempted a value, every export carrying that value would fail
+// validation instead of publishing.
+func diagnosticContainsUnixPath(text string) bool {
+	for _, match := range diagnosticUnixPathRE.FindAllStringSubmatch(text, -1) {
+		if len(match) > 1 && !diagnosticPublicEndpointPaths[match[1]] {
+			return true
+		}
+	}
+	return false
+}
 
 func diagnosticSafeCSVCell(value string) string {
 	value = strings.NewReplacer("\r", " ", "\n", " ").Replace(value)
@@ -2301,9 +2408,19 @@ func sidecarStatusRows(profiles []storage.EgressProfile, bindings []storage.Acco
 	for _, profile := range profiles {
 		profilesByID[profile.ID] = profile
 	}
+	// A sidecar with live runtime state must not also emit a config-only row. The two rows
+	// carry the same ID and health with no key to tell them apart, so an export of one
+	// sidecar read as two — one of them permanently `half_open` with every runtime column
+	// blank. The runtime row already carries the profile fields the config row would show.
+	// Runtime state is keyed by (sidecar, real egress), so a sidecar fronting several
+	// egresses keeps one row each; only the redundant config row is suppressed.
+	hasRuntime := make(map[string]bool, len(adaptive))
+	for _, status := range adaptive {
+		hasRuntime[status.SidecarEgressID] = true
+	}
 	ids := make([]string, 0, len(profiles))
 	for _, profile := range profiles {
-		if storage.IsSidecarEgress(profile) {
+		if storage.IsSidecarEgress(profile) && !hasRuntime[profile.ID] {
 			ids = append(ids, profile.ID)
 		}
 	}
@@ -2371,6 +2488,14 @@ func sensitiveDiagnosticKey(key string) bool {
 	return false
 }
 
+// customProviderRows exports one row per configured relay.
+//
+// transport_profile, routes, and egress_ids are here because without them the package
+// cannot answer the first question asked of any relay problem: which wire format did we
+// speak, and out of which egress. A provider row that shows only upstream_protocol is
+// ambiguous — the same `anthropic_messages` protocol behaves differently under the
+// `claude_code` profile than under `generic` — and per-route overrides mean the
+// provider-level protocol is not even authoritative for a given downstream path.
 func customProviderRows(rows []storage.CustomProvider) [][]string {
 	out := make([][]string, 0, len(rows))
 	for _, row := range rows {
@@ -2380,6 +2505,9 @@ func customProviderRows(rows []storage.CustomProvider) [][]string {
 			row.Name,
 			redactURLUserinfo(row.BaseURL),
 			row.UpstreamProtocol,
+			row.TransportProfile,
+			customProviderRouteSummary(row.Routes),
+			strings.Join(row.EgressIDs, " "),
 			strconv.FormatBool(row.Enabled),
 			strconv.FormatBool(row.AutoDiscoverModels),
 			strings.Join(row.Models, " "),
@@ -2391,6 +2519,24 @@ func customProviderRows(rows []storage.CustomProvider) [][]string {
 	return out
 }
 
+// customProviderRouteSummary renders per-entrypoint overrides as JSON, with each route's
+// base URL passed through the same userinfo redaction as the provider's own.
+func customProviderRouteSummary(routes []storage.CustomProviderRoute) string {
+	if len(routes) == 0 {
+		return ""
+	}
+	safe := make([]storage.CustomProviderRoute, 0, len(routes))
+	for _, route := range routes {
+		route.BaseURL = redactURLUserinfo(route.BaseURL)
+		safe = append(safe, route)
+	}
+	encoded, err := json.Marshal(safe)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
 func redactURLUserinfo(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil || u.User == nil {
@@ -2398,6 +2544,21 @@ func redactURLUserinfo(raw string) string {
 	}
 	u.User = url.User("<redacted>")
 	return u.String()
+}
+
+// upstreamErrorRuleColumns is shared by both export paths and lives next to the row
+// builder so a field added below is seen alongside the names it has to line up with.
+// The two lists had drifted: the header stopped at 22 names while the builder emitted 24
+// values, so every column from description onward was read under the wrong name -- an
+// export carried `description=false` and `created_at=true`, and the real timestamps fell
+// off the end of the row. The header was also duplicated verbatim at two call sites, so
+// fixing one would have left the other wrong.
+var upstreamErrorRuleColumns = []string{
+	"id", "name", "enabled", "priority", "providers", "entrypoints", "model_patterns",
+	"status_codes", "body_keywords", "match_mode", "account_action", "downstream_action",
+	"response_status", "custom_message", "cooldown_seconds", "prefer_retry_after",
+	"idle_seconds", "idle_ping_seconds", "skip_log", "filter_account_action",
+	"keyword_case_sensitive", "description", "created_at", "updated_at",
 }
 
 func upstreamErrorRuleRows(rows []storage.UpstreamErrorRule) [][]string {

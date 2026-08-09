@@ -96,6 +96,10 @@ const activeUserPages = userPages.filter(([name]) => selected(name, 'UI_REVIEW_P
 
 const now = 1783125600;
 const dayStart = now - (now % 86400);
+// A frozen `now` keeps every rendered timestamp reproducible, which is what a screenshot diff
+// needs. It cannot serve a duration that the page measures against the real clock, though: those
+// grow by a day for every day since the constant was written. Rows in that position use this.
+const liveNow = Math.floor(Date.now() / 1000);
 const fixtures = {
   seed,
   timezoneScenarios: [
@@ -228,6 +232,89 @@ const fixtures = {
       public_url: 'https://pool.example.test/chat/trial-desk-with-a-long-slug-for-truncation',
     },
   ],
+  // Same gap PublicChat had: no fixture, so /admin/upstream-error-rules fell through to the
+  // catch-all `{}` and every capture of this page photographed its empty state. The rule cards
+  // -- the substance of the screen -- have never been on screen, and the five-metric rail read
+  // 0/0/0/0/0 in every shot. Field names come from storage.UpstreamErrorRule, not from guesswork.
+  //
+  // The set is chosen to exercise the branches that render differently: an enabled and a disabled
+  // rule for both Tag colours, each of the four downstream actions the rail counts separately
+  // (failover / pass / idle_stream / custom_error) so no metric sits at zero, one rule scoped to
+  // everything (empty arrays print the 全部平台 / 全部入口 / 全部模型 fallbacks) against ones with
+  // explicit scopes, and a name long enough to test the title row against the tag beside it.
+  upstreamErrorRules: [
+    {
+      id: 'uer_fixture_quota', name: '配额耗尽自动切换', enabled: true, priority: 10,
+      providers: ['codex'], entrypoints: ['responses'], model_patterns: ['gpt-5*'],
+      status_codes: [429], body_keywords: ['quota', 'insufficient_quota'], match_mode: 'any',
+      account_action: 'cooldown', downstream_action: 'failover',
+      response_status: 0, custom_message: '', cooldown_seconds: 1800, prefer_retry_after: true,
+      idle_seconds: 0, idle_ping_seconds: 0, skip_log: false, filter_account_action: false,
+      keyword_case_sensitive: false, description: '上游报配额耗尽时冷却该账号并换一个继续。',
+      created_at: now - 2592000, updated_at: now - 86400,
+    },
+    {
+      id: 'uer_fixture_safety', name: '安全检查等待提示拦截（长名称用于验证标题与标签同行）', enabled: true, priority: 20,
+      providers: ['claude'], entrypoints: ['claude_messages', 'claude_passthrough'],
+      // The third pattern is deliberately long *and* unbreakable, with no space, comma or hyphen in
+      // it. The long name on the line above cannot stand in for this: it is CJK, so it wraps at
+      // every character and the cell always fits. That is exactly why check:layout-collisions
+      // photographed this row for months while .upstream-rule-meta span printed straight across the
+      // next column -- measured at 1280px, a 120-char token reached x=1117 with the condition
+      // column's text starting at x=548. Underscores, because a glob of this shape is what a
+      // deployment-specific model alias actually looks like and hyphens would give it wrap points.
+      model_patterns: [
+        'claude-sonnet-4-5*',
+        'claude-opus-4*',
+        'claude_opus_4_internal_eval_alias_do_not_route_externally_v3*',
+      ],
+      status_codes: [], body_keywords: ['safety check', 'checking your request'], match_mode: 'all',
+      account_action: 'none', downstream_action: 'idle_stream',
+      response_status: 0, custom_message: '', cooldown_seconds: 0, prefer_retry_after: false,
+      idle_seconds: 60, idle_ping_seconds: 15, skip_log: true, filter_account_action: true,
+      keyword_case_sensitive: false, description: '把上游的安全检查等待文案换成心跳空转，下游不会看到中断。',
+      created_at: now - 1209600, updated_at: now - 7200,
+    },
+    {
+      id: 'uer_fixture_passthrough', name: '客户端错误直接透传', enabled: true, priority: 50,
+      providers: [], entrypoints: [], model_patterns: [],
+      status_codes: [400, 401, 403, 404, 422], body_keywords: [], match_mode: 'any',
+      account_action: 'builtin', downstream_action: 'pass',
+      response_status: 0, custom_message: '', cooldown_seconds: 0, prefer_retry_after: false,
+      idle_seconds: 0, idle_ping_seconds: 0, skip_log: false, filter_account_action: false,
+      keyword_case_sensitive: true, description: '请求本身的问题不惩罚账号，原样返回给调用方。',
+      created_at: now - 5184000, updated_at: now - 259200,
+    },
+    {
+      id: 'uer_fixture_maintenance', name: '上游维护窗口返回自定义错误', enabled: false, priority: 80,
+      providers: ['codex'], entrypoints: ['chat_completions'], model_patterns: [],
+      status_codes: [502, 503, 504], body_keywords: ['maintenance'], match_mode: 'any',
+      account_action: 'quarantine', downstream_action: 'custom_error',
+      response_status: 503, custom_message: '上游正在维护，请稍后重试。', cooldown_seconds: 3600,
+      prefer_retry_after: true, idle_seconds: 0, idle_ping_seconds: 0, skip_log: false,
+      filter_account_action: false, keyword_case_sensitive: false,
+      description: '维护期临时启用，隔离账号并给下游一个明确的说法。',
+      created_at: now - 864000, updated_at: now - 43200,
+    },
+  ],
+  upstreamErrorRuleModelOptions: {
+    providers: [
+      {
+        id: 'codex', label: 'Codex / ChatGPT',
+        families: [
+          { id: 'gpt-5', label: 'GPT-5', models: [{ id: 'gpt-5.5', label: 'gpt-5.5' }, { id: 'gpt-5-mini', label: 'gpt-5-mini' }] },
+          { id: 'o-series', label: 'o 系列', models: [{ id: 'o4-mini', label: 'o4-mini' }] },
+        ],
+      },
+      {
+        id: 'claude', label: 'Claude',
+        families: [
+          { id: 'sonnet', label: 'Sonnet', models: [{ id: 'claude-sonnet-4-5-20250929', label: 'claude-sonnet-4-5' }] },
+          { id: 'opus', label: 'Opus', models: [{ id: 'claude-opus-4-6', label: 'claude-opus-4-6' }] },
+        ],
+      },
+    ],
+  },
 };
 
 const operationLog = [];
@@ -448,6 +535,43 @@ function timeseries(req) {
   };
 }
 
+// Per-model capability rows for /admin/models, derived from fixtures.modelNames rather than
+// written out beside it: a name added to that list would otherwise silently get no row, and the
+// page would review with a partly-populated table that looks intentional.
+//
+// Field names come from modelCapabilitySummary's json tags in internal/api/models_list.go. A
+// wrong name here does not error, it renders as a zero, which reviews as real data.
+//
+// Availability and 1M-context each have to partition `accounts` exactly, because the page draws
+// them as shares of a known total. Both remainders are therefore computed, never hand-written.
+function modelCapabilityFixture() {
+  return fixtures.modelNames.map((model, index) => {
+    // 1..4 accounts, so one model sits at a single account where there is no distribution to draw.
+    const accounts = (index % 4) + 1;
+    const verified = index % 5 === 3 ? 0 : Math.min(accounts, 1 + (index % 3));
+    const unsupported = accounts - verified > 0 && index % 4 === 1 ? 1 : 0;
+    const supported1M = index % 3 === 2 ? 0 : Math.min(accounts, 1 + (index % 2));
+    const unsupported1M = accounts - supported1M > 0 && index % 6 === 4 ? 1 : 0;
+    return {
+      model,
+      accounts,
+      verified,
+      unsupported,
+      // Remainder: guarantees verified + unverified + unsupported === accounts.
+      unverified: accounts - verified - unsupported,
+      context_1m_supported: supported1M,
+      context_1m_unsupported: unsupported1M,
+      context_1m_unknown: accounts - supported1M - unsupported1M,
+      // A 1M-context model, a 400k one and a 200k one, so the column has a real range to scale.
+      // The non-1M split keys on index % 2, not index % 3: supported1M is zero only when
+      // index % 3 === 2, so any second test on index % 3 here can never be true.
+      max_context_window: supported1M > 0 ? 1000000 : index % 2 === 0 ? 400000 : 200000,
+      // index 7 has never been probed: the page must render that as unknown, not as 1970.
+      last_probe_at: index === 7 ? 0 : liveNow - 300 - index * 1800,
+    };
+  });
+}
+
 async function handleAPI(req) {
   const url = new URL(req.url());
   const p = url.pathname;
@@ -517,7 +641,13 @@ async function handleAPI(req) {
   if (p === '/admin/providers') return req.respond(json({ providers: [{ id: 'openai', name: 'OpenAI', base_url: 'https://api.openai.com/v1', enabled: true, auto_discover_models: true, models: ['gpt-5.5', 'gpt-5.4'] }] }));
   // Without these the model pages review as their own empty state, which says nothing
   // about how they render a real capability snapshot.
-  if (p === '/admin/models' || p === '/user/models') return req.respond(json({ models: fixtures.modelNames, generated_at: Math.floor(Date.now() / 1000) - 240 }));
+  //
+  // The two endpoints deliberately return different shapes. `capabilities` is omitempty on
+  // modelListResponse and is populated only on the admin path, so a fixture that served it to
+  // both would never exercise that contract -- and the portal model page would review as if it
+  // had data the real server never sends it.
+  if (p === '/admin/models') return req.respond(json({ models: fixtures.modelNames, capabilities: modelCapabilityFixture(), generated_at: liveNow - 240 }));
+  if (p === '/user/models') return req.respond(json({ models: fixtures.modelNames, generated_at: liveNow - 240 }));
   if (p === '/admin/register/providers') return req.respond(json({ providers: [
     { type: 'sms', key: 'smsactivate', display_name: 'SMS-Activate', enabled: true, priority: 20, config: { api_key: '', api_key_configured: true, service: 'dr', max_price: '0.50' } },
     { type: 'mailbox', key: 'imap', display_name: 'IMAP', enabled: true, priority: 10, config: { host: 'imap.example.test', port: '993', email: '', email_configured: true, password: '', password_configured: true, use_tls: true } },
@@ -583,30 +713,85 @@ async function handleAPI(req) {
     { account_id: fixtures.accounts[1].id, provider: 'claude', model: 'claude-sonnet-4', used_percent: 94, remaining_tokens: 8200, limit_tokens: 500000, status: 'error/token_expired', quota_summary: { sync_reason: 'error/token_expired', primary: { used_percent: 94, remaining_tokens: 8200, reset_at: now + 900 }, secondary: { used_percent: 88 } } },
     { account_id: fixtures.accounts[2].id, provider: 'codex', model: '', used_percent: 76, remaining_tokens: 64000, limit_tokens: 300000, status: 'ok', quota_summary: { sync_reason: 'ok', primary: { used_percent: 76, remaining_tokens: 64000, reset_at: now + 14400 }, secondary: { used_percent: 55 }, credits: { has_credits: false, unlimited: false, balance: '$0.00', spend_control_reached: true, source: 'workspace', limit: '$50.00', used: '$50.00', remaining: '$0.00', used_percent: 100, remaining_percent: 0, reset_at: now + 86400, status: 'spend_limit_reached', updated_at: now - 120 }, reset_credits: { status: 'ok', available_count: 0, source: 'rate-limit-reset-credits', updated_at: now - 120 } } },
   ]));
+  // This fixture previously omitted `network` and `disk_guard` entirely, so the network card
+  // read a flat 0 B/s and the disk-guard card rendered only its em-dash fallback in every
+  // screenshot. Both are value types on the Go side (sysmetrics.Snapshot.Network and
+  // api.DiskGuardSnapshot), so production JSON always carries them -- the placeholder states
+  // the review kept seeing were unreachable in the real app.
   if (p === '/admin/system') return req.respond(json({
     supported: true,
     hostname: 'fixture-vps',
     uptime_seconds: 456789,
     cpu: { usage_pct: 18, cores: 4, load1: 0.42, load5: 0.55, load15: 0.61 },
-    mem: { total_kb: 8388608, used_kb: 4128768, used_pct: 49 },
+    mem: { scope: 'cgroup', total_kb: 8388608, available_kb: 4259840, used_kb: 4128768, used_pct: 49 },
     disk: { path: '/', total_bytes: 68719476736, used_bytes: 21474836480, free_bytes: 47244640256, used_pct: 31 },
+    network: {
+      interfaces: 3,
+      interface_names: ['eth0', 'wg0', 'docker0'],
+      rx_bytes: 91234567890,
+      tx_bytes: 20345678901,
+      rx_bytes_per_sec: 1258291,
+      tx_bytes_per_sec: 389120,
+      total_bytes_per_sec: 1647411,
+    },
+    // `level` must stay consistent with `filesystems`: the backend derives the top-level level
+    // from the worst per-filesystem level, so a 'pressure' snapshot cannot contain a 'critical'
+    // filesystem. Roles come from the fixed set data | spool | journal | diagnostics | database.
+    disk_guard: {
+      level: 'pressure',
+      free_percent: 12.4,
+      free_bytes: 8522825728,
+      filesystems: [
+        { roles: ['data', 'database', 'spool'], level: 'pressure', free_percent: 12.4, free_bytes: 8522825728 },
+        { roles: ['diagnostics'], level: 'normal', free_percent: 27.6, free_bytes: 18964578304 },
+        { roles: ['journal'], level: 'normal', free_percent: 41.2, free_bytes: 28306407424 },
+      ],
+      forced_context_ttl_seconds: 1800,
+      contexts_deleted: 1284,
+      goals_deleted: 42,
+      goal_bytes_reclaimed: 2254857830,
+      codex_mappings_deleted: 7,
+      route_bindings_deleted: 3,
+      logs_deleted: 9,
+      last_run_at: now - 240,
+      last_log_cleanup_at: now - 3600,
+      database_writable: true,
+      journal_writable: true,
+      spool_writable: true,
+      background_paused: true,
+      large_requests_paused: false,
+      admission_blocked: false,
+    },
     registration: {
       total_rss_kb: 196608,
       node: 1,
       chrome: 2,
       xvfb: 1,
+      other: 0,
       procs: [
         { pid: 4101, comm: 'node', kind: 'node', rss_kb: 65536 },
         { pid: 4108, comm: 'chrome', kind: 'chrome', rss_kb: 98304 },
+        { pid: 4119, comm: 'chrome-renderer', kind: 'chrome', rss_kb: 24576 },
+        { pid: 4126, comm: 'Xvfb', kind: 'xvfb', rss_kb: 8192 },
       ],
     },
-    go: { goroutines: 42, sys_bytes: 134217728 },
+    go: { goroutines: 42, sys_bytes: 134217728, alloc_bytes: 41943040, num_gc: 318 },
+    // Statuses span the full enum (running | restarting | panic | failed | stopped) so the
+    // composition meter and the restart ranking both have something to show.
     supervisor_modules: [
       { name: 'registrar-worker', status: 'running', restart_count: 0, panic_count: 0, unexpected_exit_count: 0, uptime_millis: 456000, last_message: 'healthy' },
       { name: 'cache-diagnostics', status: 'running', restart_count: 1, panic_count: 0, unexpected_exit_count: 0, uptime_millis: 256000, last_message: 'healthy' },
+      { name: 'egress-prober', status: 'restarting', restart_count: 6, panic_count: 0, unexpected_exit_count: 5, last_uptime_millis: 42000, restart_backoff_millis: 8000, next_restart_unix: now + 6, last_message: 'probe socket closed' },
+      { name: 'quota-poller', status: 'panic', restart_count: 11, panic_count: 4, unexpected_exit_count: 1, last_uptime_millis: 18000, restart_backoff_millis: 30000, next_restart_unix: now + 24, last_message: 'panic', last_panic: 'runtime error: index out of range [3]' },
+      { name: 'mail-reaper', status: 'stopped', restart_count: 0, panic_count: 0, unexpected_exit_count: 0, last_uptime_millis: 96000, last_message: 'disabled by config' },
     ],
     supervisor_events: [
       { time_unix: now - 300, module: 'cache-diagnostics', type: 'event', message: 'fixture heartbeat', uptime_millis: 256000, backoff_millis: 0 },
+      { time_unix: now - 900, module: 'quota-poller', type: 'panic_restart', message: 'panic', panic: 'runtime error: index out of range [3]', uptime_millis: 18000, backoff_millis: 30000 },
+      { time_unix: now - 1500, module: 'egress-prober', type: 'unexpected_exit', message: 'probe socket closed', uptime_millis: 42000, backoff_millis: 8000 },
+      { time_unix: now - 2400, module: 'quota-poller', type: 'panic', message: 'panic', panic: 'runtime error: index out of range [3]', uptime_millis: 21000, backoff_millis: 15000 },
+      { time_unix: now - 21600, module: 'egress-prober', type: 'unexpected_exit', message: 'probe socket closed', uptime_millis: 51000, backoff_millis: 4000 },
+      { time_unix: now - 25200, module: 'registrar-worker', type: 'event', message: 'fixture rotation', uptime_millis: 456000, backoff_millis: 0 },
     ],
   }));
   if (p === '/admin/model-quality') return req.respond(json({
@@ -615,15 +800,26 @@ async function handleAPI(req) {
     interval_minutes: 60,
     reasoning_effort: 'medium',
     degraded_threshold: 2,
+    // Outcome values here must stay inside the enums the API actually emits:
+    //   statuses[].last_outcome  pass | false_alarm | error | inconclusive | confirmed_anomaly
+    //   runs[].outcome           pass | error | model_mismatch | incorrect
+    // This fixture previously used match/mismatch, which the backend never returns, so the
+    // page rendered its unmapped-value fallback in every screenshot and the review never saw
+    // the real labels.
     statuses: [
-      { group_name: 'cyber', model: 'gpt-5.5', provider: 'codex', state: 'healthy', last_outcome: 'match', consecutive_anomalies: 0, last_actual: '42', last_expected: '42', last_returned_model: 'gpt-5.5', total_tokens: 184000, last_latency_ms: 812, last_probe_at: now - 900 },
-      { group_name: 'staging', model: 'claude-sonnet-4', provider: 'claude', state: 'suspect', last_outcome: 'mismatch', consecutive_anomalies: 1, last_actual: '41', last_expected: '42', last_returned_model: 'claude-sonnet-4-20250514', total_tokens: 96000, last_latency_ms: 1540, last_probe_at: now - 1800 },
-      { group_name: '', model: 'gpt-5-mini-with-a-very-long-model-identifier', provider: 'custom', state: 'degraded', last_outcome: 'mismatch', consecutive_anomalies: 3, last_actual: '', last_expected: '42', last_returned_model: '', total_tokens: 12000, last_latency_ms: 4200, last_probe_at: now - 5400 },
+      { group_name: 'cyber', model: 'gpt-5.5', provider: 'codex', state: 'healthy', last_outcome: 'pass', consecutive_anomalies: 0, last_actual: '42', last_expected: '42', last_returned_model: 'gpt-5.5', total_tokens: 184000, last_latency_ms: 812, last_probe_at: now - 900 },
+      { group_name: 'staging', model: 'claude-sonnet-4', provider: 'claude', state: 'suspect', last_outcome: 'confirmed_anomaly', consecutive_anomalies: 1, last_actual: '41', last_expected: '42', last_returned_model: 'claude-sonnet-4-20250514', total_tokens: 96000, last_latency_ms: 1540, last_probe_at: now - 1800 },
+      { group_name: '', model: 'gpt-5-mini-with-a-very-long-model-identifier', provider: 'custom', state: 'degraded', last_outcome: 'confirmed_anomaly', consecutive_anomalies: 3, last_actual: '', last_expected: '42', last_returned_model: '', total_tokens: 12000, last_latency_ms: 4200, last_probe_at: now - 5400 },
+      { group_name: 'edge', model: 'gpt-5-nano', provider: 'codex', state: 'unavailable', last_outcome: 'inconclusive', consecutive_anomalies: 0, consecutive_errors: 3, last_actual: '', last_expected: '17', last_returned_model: '', total_tokens: 3200, last_latency_ms: 2600, last_probe_at: now - 9000 },
+      { group_name: 'edge', model: 'gpt-5-thinking', provider: 'codex', state: 'unknown', last_outcome: '', consecutive_anomalies: 0, last_actual: '', last_expected: '', last_returned_model: '', total_tokens: 0, last_latency_ms: 0, last_probe_at: 0 },
     ],
     runs: [
-      { created_at: now - 900, group_name: 'cyber', model: 'gpt-5.5', phase: 'primary', outcome: 'match', actual: '42', expected: '42', returned_model: 'gpt-5.5', total_tokens: 1800, latency_ms: 812 },
-      { created_at: now - 1800, group_name: 'staging', model: 'claude-sonnet-4', phase: 'confirmation', outcome: 'mismatch', actual: '41', expected: '42', returned_model: 'claude-sonnet-4-20250514', total_tokens: 2100, latency_ms: 1540, error_kind: '' },
+      { created_at: now - 900, group_name: 'cyber', model: 'gpt-5.5', phase: 'primary', outcome: 'pass', actual: '42', expected: '42', returned_model: 'gpt-5.5', total_tokens: 1800, latency_ms: 812 },
+      { created_at: now - 1800, group_name: 'staging', model: 'claude-sonnet-4', phase: 'confirmation', outcome: 'incorrect', actual: '41', expected: '42', returned_model: 'claude-sonnet-4-20250514', total_tokens: 2100, latency_ms: 1540, error_kind: '' },
+      { created_at: now - 3600, group_name: 'cyber', model: 'gpt-5.5', phase: 'primary', outcome: 'model_mismatch', actual: '42', expected: '42', returned_model: 'gpt-5.4-fallback', total_tokens: 1650, latency_ms: 980 },
       { created_at: now - 5400, group_name: '', model: 'gpt-5-mini-with-a-very-long-model-identifier', phase: 'primary', outcome: 'error', actual: '', expected: '42', returned_model: '', total_tokens: 0, latency_ms: 4200, error_kind: 'upstream_timeout', error_message: 'fixture upstream timeout after 4200ms' },
+      { created_at: now - 43200, group_name: 'cyber', model: 'gpt-5.5', phase: 'primary', outcome: 'pass', actual: '17', expected: '17', returned_model: 'gpt-5.5', total_tokens: 1720, latency_ms: 760 },
+      { created_at: now - 46800, group_name: 'staging', model: 'claude-sonnet-4', phase: 'primary', outcome: 'pass', actual: '17', expected: '17', returned_model: 'claude-sonnet-4-20250514', total_tokens: 1900, latency_ms: 1320 },
     ],
   }));
   if (p === '/admin/cf-events') return req.respond(json([{ id: 1, created_at: now - 60, account_id: fixtures.accounts[0].id, status: 403, cf_ray: 'fixture-ray', category: 'challenge', message: 'fixture challenge' }]));
@@ -651,6 +847,52 @@ async function handleAPI(req) {
     { isoCode: 'US', name: 'United States', nameZh: '美国' },
     { isoCode: 'JP', name: 'Japan', nameZh: '日本' },
   ]));
+  // Neither the job list nor the SMS market had a fixture, so both fell through to the
+  // catch-all `{}` and the Registration page has only ever been photographed as three
+  // stacked empty states: no jobs, an all-zero metric rail, and a market grid showing
+  // only its "save credentials first" placeholder. Every status HandleJobList can return
+  // gets a row here -- api.registration writes queued/pending/running on the way in and
+  // completed/completed_with_review/failed/cancelled on the way out, and the fields are
+  // exactly the ones its inline `job` struct marshals (no group_name/egress_id/identity_mode,
+  // which is why the route column can only ever print its two fallbacks).
+  if (p === '/admin/register/batch' || p === '/admin/register/email/jobs') return req.respond(json({
+    jobs: [
+      // A job that has not finished is measured against the wall clock, not against `now`, so an
+      // in-flight row anchored to the frozen constant photographed as "35天 17小时" and grew by a
+      // day for every day since this fixture was written. Only the unfinished rows need the real
+      // clock; every settled row keeps `now` so its stamps stay reproducible.
+      { id: 'reg-job-fixture-running-001', platform: 'chatgpt', method: 'protocol_v2', total: 12, succeeded: 7, failed: 1, status: 'running', started_at: liveNow - 420, completed_at: 0, error: '', created_at: liveNow - 450 },
+      { id: 'reg-job-fixture-queued-002', platform: 'chatgpt', method: 'browser_v3', total: 5, succeeded: 0, failed: 0, status: 'queued', started_at: 0, completed_at: 0, error: '', created_at: now - 90 },
+      { id: 'reg-job-fixture-review-003', platform: 'chatgpt', method: 'protocol_v2', total: 8, succeeded: 6, failed: 2, status: 'completed_with_review', started_at: now - 7800, completed_at: now - 6900, error: '', created_at: now - 7830 },
+      { id: 'reg-job-fixture-done-004', platform: 'chatgpt', method: 'protocol', total: 4, succeeded: 4, failed: 0, status: 'completed', started_at: now - 21600, completed_at: now - 21100, error: '', created_at: now - 21650 },
+      { id: 'reg-job-fixture-failed-005', platform: 'chatgpt', method: 'node', total: 3, succeeded: 0, failed: 3, status: 'failed', started_at: now - 43200, completed_at: now - 42900, error: 'sms provider returned no numbers for BR after 3 attempts; upstream balance may be exhausted', created_at: now - 43260 },
+      { id: 'reg-job-fixture-cancelled-006', platform: 'chatgpt', method: 'browser', total: 6, succeeded: 2, failed: 0, status: 'cancelled', started_at: now - 86400, completed_at: now - 86000, error: '', created_at: now - 86450 },
+    ],
+  }));
+  // Two providers across six countries so the ranking has ties to break and both
+  // selection_basis branches are exercised; `eligible: false` rows cover the price-window
+  // rejection path. Shape is provider.SMSMarketCandidate (SMSPriceSnapshot embedded).
+  if (p === '/admin/register/sms-market') return req.respond(json({
+    items: [
+      { provider: 'herosms', service: 'dr', country_id: '73', country_iso: 'BR', country_name: 'Brazil', price: 0.042, inventory: 8420, provider_rank: 1, balance: 18.44, fetched_at: now - 1200, attempts: 41, succeeded: 37, success_rate: 0.902, score: 0.86, eligible: true, selection_basis: 'historical_success_rate' },
+      { provider: 'smsbower', service: 'dr', country_id: '48', country_iso: 'CO', country_name: 'Colombia', price: 0.051, inventory: 3110, provider_rank: 2, balance: 9.02, fetched_at: now - 1200, attempts: 28, succeeded: 24, success_rate: 0.857, score: 0.79, eligible: true, selection_basis: 'historical_success_rate' },
+      { provider: 'herosms', service: 'dr', country_id: '15', country_iso: 'PL', country_name: 'Poland', price: 0.089, inventory: 1240, provider_rank: 3, balance: 18.44, fetched_at: now - 1200, attempts: 12, succeeded: 9, success_rate: 0.75, score: 0.68, eligible: true, selection_basis: 'historical_success_rate' },
+      { provider: 'smsbower', service: 'dr', country_id: '6', country_iso: 'ID', country_name: 'Indonesia', price: 0.037, inventory: 15680, provider_rank: 4, balance: 9.02, fetched_at: now - 1200, attempts: 2, succeeded: 1, success_rate: 0.5, score: 0.41, eligible: true, selection_basis: 'community_cold_start' },
+      { provider: 'herosms', service: 'dr', country_id: '187', country_iso: 'US', country_name: 'United States', price: 0.612, inventory: 210, provider_rank: 5, balance: 18.44, fetched_at: now - 1200, attempts: 6, succeeded: 2, success_rate: 0.333, score: 0.12, eligible: false, selection_basis: 'community_cold_start' },
+      { provider: 'smsbower', service: 'dr', country_id: '117', country_iso: 'PH', country_name: 'Philippines', price: 0.058, inventory: 0, provider_rank: 6, balance: 9.02, fetched_at: now - 1200, attempts: 0, succeeded: 0, success_rate: 0.5, score: 0, eligible: false, selection_basis: 'community_cold_start' },
+    ],
+    min_price: 0.02,
+    max_price: 0.25,
+    preferred_countries: ['BR', 'CO', 'PL'],
+    cold_start_policy: 'community_recommended_order',
+    history_window_days: 14,
+    minimum_history_samples: 3,
+    refresh_interval_seconds: 3600,
+    last_refreshed_at: now - 1200,
+    stale: false,
+    refreshed_rows: 0,
+    warning: '',
+  }));
   // Every status the page counts separately gets a non-zero row: idle/ready roll up into
   // 可用, and in_use / used / error are their own metrics. With only idle and error present
   // three of the five rail tracks reviewed as a flat 0, which says nothing about how the
@@ -686,9 +928,98 @@ async function handleAPI(req) {
   if (p === '/admin/team-lifecycle/workspaces') return req.respond(json({
     items: [{ id: 'workspace-fixture-001', name: 'Production Team', provider: 'openai', parent_account_id: fixtures.accounts[0].id, mailbox_domain: 'example.com', desired_seats: 8, active: true }],
   }));
-  if (p === '/admin/team-lifecycle/workflows') return req.respond(json({ items: [] }));
+  // `items: []` meant every capture of /team-lifecycle photographed an empty table, so the quota
+  // column -- the only proportional graphic on the page -- had never been drawn at all. Its three
+  // branches are chosen deliberately, from quotaCell() in TeamLifecycle.tsx:135:
+  //   * quota_remaining_bps < 0            -> renders 未知 text and no meter at all;
+  //   * bps <= rotate_threshold_bps        -> TinyMeter tone 'danger', plus the --low title colour;
+  //   * otherwise                          -> tone 'accent'.
+  // Both percentFromBPS branches are covered too: it prints two decimals under 10% and one at or
+  // above, so 812 -> 8.12% and 9450 -> 94.5% exercise each. 10000 and 45 give the bar its extremes,
+  // a full rail and a 0%-rounded sliver, which is where a rounded fill overflows its track if the
+  // radius is wrong. States span all eight stateTag colours so no Tag branch is unphotographed.
+  // Field names are from the TeamWorkflow interface, not guessed.
+  if (p === '/admin/team-lifecycle/workflows') return req.respond(json({
+    items: [
+      {
+        id: 'wf-fixture-active', workspace_id: 'workspace-fixture-001',
+        parent_account_id: fixtures.accounts[0].id, child_account_id: 'child-fixture-001',
+        state: 'active', credential_path: '/var/lib/codex/team/child-001.json',
+        imported_account_id: 'acct-child-001', replacement_method: 'protocol_v2',
+        mailbox_provider_key: 'cloudflare-primary', required_email_domain: 'example.com',
+        quota_remaining_bps: 9450, rotate_threshold_bps: 100, attempt: 1, max_attempts: 5,
+        next_attempt_at: 0, shadow_mode: false, version: 3,
+        created_at: now - 604800, updated_at: now - 3600, completed_at: 0,
+      },
+      {
+        id: 'wf-fixture-retry', workspace_id: 'workspace-fixture-001',
+        parent_account_id: fixtures.accounts[0].id, child_account_id: 'child-fixture-002',
+        state: 'retry_wait', replacement_method: 'browser_v3', replacement_job_ref: 'reg-job-fixture-failed-005',
+        mailbox_provider_key: 'cloudflare-primary', required_email_domain: 'example.com',
+        quota_remaining_bps: 45, rotate_threshold_bps: 100, attempt: 3, max_attempts: 5,
+        next_attempt_at: now + 900, error_class: 'sms_provider_exhausted', shadow_mode: false,
+        version: 7, created_at: now - 259200, updated_at: now - 600, completed_at: 0,
+      },
+      {
+        id: 'wf-fixture-review', workspace_id: 'workspace-fixture-001',
+        parent_account_id: fixtures.accounts[0].id, child_account_id: 'child-fixture-003',
+        state: 'review_required', replacement_method: 'protocol_v2',
+        quota_remaining_bps: 812, rotate_threshold_bps: 1000, attempt: 5, max_attempts: 5,
+        next_attempt_at: 0, error_class: 'phone_verification_required', shadow_mode: false,
+        version: 11, created_at: now - 432000, updated_at: now - 7200, completed_at: 0,
+      },
+      {
+        id: 'wf-fixture-phone', workspace_id: 'workspace-fixture-001',
+        parent_account_id: fixtures.accounts[0].id, child_account_id: 'child-fixture-004',
+        state: 'phone_verification', replacement_method: 'browser_v3',
+        quota_remaining_bps: 10000, rotate_threshold_bps: 500, attempt: 2, max_attempts: 5,
+        next_attempt_at: now + 120, shadow_mode: true, version: 4,
+        created_at: now - 86400, updated_at: now - 300, completed_at: 0,
+      },
+      {
+        id: 'wf-fixture-queued', workspace_id: 'workspace-fixture-001',
+        parent_account_id: fixtures.accounts[0].id, child_account_id: '',
+        state: 'queued', replacement_method: '',
+        quota_remaining_bps: -1, rotate_threshold_bps: 100, attempt: 0, max_attempts: 5,
+        next_attempt_at: 0, shadow_mode: false, version: 1,
+        created_at: now - 1800, updated_at: now - 1800, completed_at: 0,
+      },
+      {
+        id: 'wf-fixture-completed', workspace_id: 'workspace-fixture-001',
+        parent_account_id: fixtures.accounts[0].id, child_account_id: 'child-fixture-006',
+        state: 'completed', credential_path: '/var/lib/codex/team/child-006.json',
+        imported_account_id: 'acct-child-006', replacement_method: 'protocol_v2',
+        quota_remaining_bps: 7320, rotate_threshold_bps: 100, attempt: 1, max_attempts: 5,
+        next_attempt_at: 0, shadow_mode: false, version: 9,
+        created_at: now - 1209600, updated_at: now - 172800, completed_at: now - 172800,
+      },
+      {
+        id: 'wf-fixture-removing', workspace_id: 'workspace-fixture-001',
+        parent_account_id: fixtures.accounts[0].id, child_account_id: 'child-fixture-007',
+        state: 'removing', replacement_method: 'protocol_v2',
+        quota_remaining_bps: 220, rotate_threshold_bps: 500, attempt: 1, max_attempts: 5,
+        next_attempt_at: 0, shadow_mode: false, version: 5,
+        created_at: now - 345600, updated_at: now - 900, completed_at: 0,
+      },
+      {
+        id: 'wf-fixture-cancelled', workspace_id: 'workspace-fixture-001',
+        parent_account_id: fixtures.accounts[0].id, child_account_id: 'child-fixture-008',
+        state: 'cancelled', replacement_method: 'browser_v3',
+        quota_remaining_bps: 5000, rotate_threshold_bps: 100, attempt: 2, max_attempts: 5,
+        next_attempt_at: 0, error_class: 'operator_cancelled', shadow_mode: false, version: 6,
+        created_at: now - 518400, updated_at: now - 259200, completed_at: 0,
+      },
+    ],
+  }));
+  // The five-metric rail read 0/0/0/0/0 in every previous shot. These counts are the ones the
+  // workflow list above actually contains, because the page derives `total` from the list length
+  // while the other four come from here -- a mismatch would photograph as a rail that contradicts
+  // the table beneath it.
   if (p === '/admin/team-lifecycle/stats') return req.respond(json({
-    states: { active: 0, queued: 0, retry_wait: 0, review_required: 0, completed: 0 },
+    states: {
+      active: 1, queued: 1, retry_wait: 1, review_required: 1, completed: 1,
+      phone_verification: 1, removing: 1, cancelled: 1,
+    },
     readiness: {
       ready: true, workspace_create_ready: true, cycle_create_ready: true, parent_accounts: 1, mailbox_profiles: 1,
       mailbox_default_configured: true, mailbox_healthy: true, registration_ready: true, registration_method: 'protocol_v2', workspaces: 1, blockers: [],
@@ -705,6 +1036,17 @@ async function handleAPI(req) {
   if (p === '/user/api-keys') return req.respond(json([{ label: 'my-portal-key-with-long-label', key_hash: 'portal1234567890abcdef', enabled: true, created_at: now - 1200, secret: 'cap_user_fixture' }]));
   if (p === '/user/profile') return req.respond(json({ email: 'user@example.test', name: 'User Fixture With Long Display Name', role: 'user' }));
   if (p === '/admin/public-chat/links') return req.respond(json({ links: fixtures.publicChatLinks }));
+  // Ordered before the bare collection route: handleAPI matches on pathname with plain equality,
+  // so the more specific paths have to be tested first or /model-options would never be reached.
+  if (p === '/admin/upstream-error-rules/model-options') return req.respond(json(fixtures.upstreamErrorRuleModelOptions));
+  if (p === '/admin/upstream-error-rules/test') {
+    return req.respond(json({
+      matched: true, rule_id: 'uer_fixture_quota', rule_name: '配额耗尽自动切换',
+      account_action: 'cooldown', downstream_action: 'failover',
+      cooldown_seconds: 1800, response_status: 0, message: '',
+    }));
+  }
+  if (p === '/admin/upstream-error-rules') return req.respond(json(fixtures.upstreamErrorRules));
   if (p.startsWith('/admin/') || p.startsWith('/user/')) return req.respond(json({}));
   return req.continue();
 }
@@ -800,13 +1142,52 @@ async function gotoApp(page, baseURL, route) {
   await new Promise((resolve) => setTimeout(resolve, 200));
 }
 
+// Segment capture has to scroll whatever actually scrolls. On an ordinary page that is the
+// window; when a modal or drawer is open it is not, because the overlay locks the body -- so
+// window.scrollTo becomes a no-op and every extra frame is a byte-identical copy of the first
+// while the overlay's own below-fold content stays unreachable. Found on the user-group editor,
+// a 960px modal whose 流量接收策略 banner sits below its fold at 1440x900.
+//
+// Which node scrolls is not knowable in advance: .pool-modal-content carries `overflow: auto`
+// in one CSS variant and `display: grid` + max-height in another, which moves the scroller down
+// to .pool-modal-body. Rather than encode that, measure both wrappers and take whichever hides
+// the most -- correct under either variant, and under the mobile bottom-sheet as well.
+async function resolveScroller(page) {
+  return page.evaluate(() => {
+    const candidates = [...document.querySelectorAll(
+      '.pool-modal-content, .pool-modal-body, .pool-drawer-content, .pool-drawer-body',
+    )];
+    let best = null;
+    let bestHidden = 0;
+    for (const el of candidates) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 2 || rect.height <= 2) continue;
+      const hidden = el.scrollHeight - el.clientHeight;
+      if (hidden > bestHidden + 1) {
+        best = el;
+        bestHidden = hidden;
+      }
+    }
+    document.querySelectorAll('[data-capture-scroll]').forEach((el) => el.removeAttribute('data-capture-scroll'));
+    if (!best) {
+      return { mode: 'window', height: Math.ceil(document.documentElement.scrollHeight), viewportHeight: innerHeight };
+    }
+    best.setAttribute('data-capture-scroll', '1');
+    return { mode: 'element', height: best.scrollHeight, viewportHeight: best.clientHeight };
+  });
+}
+
 async function screenshotDocument(page, file, { segments = true } = {}) {
-  const dimensions = await page.evaluate(() => ({
-    height: Math.ceil(document.documentElement.scrollHeight),
-    viewportHeight: innerHeight,
-  }));
+  const dimensions = await resolveScroller(page);
   const captureAt = async (target, y) => {
-    await page.evaluate((top) => window.scrollTo(0, top), y);
+    await page.evaluate((top, mode) => {
+      if (mode === 'element') {
+        const el = document.querySelector('[data-capture-scroll="1"]');
+        if (el) el.scrollTop = top;
+        return;
+      }
+      window.scrollTo(0, top);
+    }, y, dimensions.mode);
     await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     await page.screenshot({ path: target });
   };
@@ -822,8 +1203,21 @@ async function screenshotDocument(page, file, { segments = true } = {}) {
       await captureAt(target, position);
       files.push(target);
     }
-    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.evaluate((mode) => {
+      if (mode === 'element') {
+        const el = document.querySelector('[data-capture-scroll="1"]');
+        if (el) el.scrollTop = 0;
+        return;
+      }
+      window.scrollTo(0, 0);
+    }, dimensions.mode);
   }
+  // The marker is cleared unconditionally, not only in the segments branch: assertNoTextOverlap
+  // runs on this page right after, and a stray attribute surviving into the next state's
+  // resolveScroller would make it scroll the wrong node.
+  await page.evaluate(() => {
+    document.querySelectorAll('[data-capture-scroll]').forEach((el) => el.removeAttribute('data-capture-scroll'));
+  });
   return files;
 }
 
@@ -971,6 +1365,50 @@ async function pageMetrics(page) {
         client: `${element.clientWidth}x${element.clientHeight}`,
         scroll: `${element.scrollWidth}x${element.scrollHeight}`,
       }));
+
+    // Native selects, measured here and not by clippedControls above, for two independent
+    // reasons. First, adding 'select' to that selector list would not work: it tests
+    // scrollWidth > clientWidth, and a select renders its label in shadow DOM where
+    // scrollWidth is reliable on some engines and not others. An explicit ruler span in the
+    // select's own font is engine-independent. Second, coverage: the same rule in
+    // check-layout-collisions.mjs only ever sees a page's default state, which reaches 12 of
+    // the 34 native selects in src/pages -- the other 22 are inside modals and non-default
+    // tabs. This function runs on every state capture, which is what opens those.
+    //
+    // A closed select clips with `text-overflow: clip` and no ellipsis, so the last glyph is
+    // sliced vertically rather than marked as truncated. Registration's 邮箱提供商 shipped
+    // that way: 224px of label in 187px of field.
+    const clippedSelects = [];
+    for (const element of document.querySelectorAll('select')) {
+      const style = getComputedStyle(element);
+      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
+      if (element.closest('[aria-hidden="true"]')) continue;
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 2 || rect.height <= 2) continue;
+      const option = element.options[element.selectedIndex] || element.options[0];
+      const label = option ? (option.textContent || '').trim() : '';
+      if (!label) continue;
+      const ruler = document.createElement('span');
+      ruler.style.cssText = 'position:absolute;top:-9999px;left:-9999px;visibility:hidden;'
+        + `white-space:nowrap;font:${style.font};letter-spacing:${style.letterSpacing}`;
+      ruler.textContent = label;
+      document.body.appendChild(ruler);
+      const textWidth = ruler.getBoundingClientRect().width;
+      ruler.remove();
+      // A select reserves room for its own dropdown arrow beyond padding, so a label that
+      // merely touches the arrow is not a defect. Same 4px allowance as the overlap probe;
+      // keeping the two thresholds equal is what makes their findings comparable.
+      const available = rect.width - parseFloat(style.paddingLeft || 0) - parseFloat(style.paddingRight || 0);
+      if (textWidth - available > 4) {
+        clippedSelects.push({
+          element: element.className || 'select',
+          text: label.slice(0, 60),
+          textWidth: Math.round(textWidth),
+          available: Math.round(available),
+          overflowPx: Math.round(textWidth - available),
+        });
+      }
+    }
     // A card left as an unreadable sliver at the edge of a horizontal scroll pane.
     //
     // This is the blind spot that let a real defect ship. The dashboard chart row was a
@@ -1057,6 +1495,12 @@ async function pageMetrics(page) {
       siblingOverlaps: siblingOverlaps.slice(0, 12),
       chartTextOverlaps: chartTextOverlaps.slice(0, 12),
       clippedControls: clippedControls.slice(0, 12),
+      clippedSelects: clippedSelects.slice(0, 12),
+      // Coverage, not a finding: a zero in clippedSelects means "none of the selects measured
+      // here clip" only if some were measured. Without this the field reads identically on a
+      // page whose selects are all clean and on a page where the state capture never opened
+      // the modal holding them.
+      selectsMeasured: document.querySelectorAll('select').length,
       scrollClippedText: scrollClippedText.slice(0, 12),
       // Informational: every horizontal scroll pane and how far its content runs past the
       // edge. Not an assertion — a horizontal scroller is legitimate (wide tables page this
@@ -1129,6 +1573,9 @@ function assertNoTextOverlap(metrics, label) {
   if (metrics.clippedControls?.length) {
     throw new Error(`${label} has clipped control text: ${JSON.stringify(metrics.clippedControls.slice(0, 4))}`);
   }
+  if (metrics.clippedSelects?.length) {
+    throw new Error(`${label} has clipped select label: ${JSON.stringify(metrics.clippedSelects.slice(0, 4))}`);
+  }
   if (metrics.scrollClippedText?.length) {
     throw new Error(`${label} has text sliced by a scroll container edge: ${JSON.stringify(metrics.scrollClippedText.slice(0, 4))}`);
   }
@@ -1152,13 +1599,16 @@ async function assertPageContent(page, name, label) {
     UpstreamErrors: ['上游错误规则'],
     Usage: ['用量分析', 'Top 账号', 'Provider + Model 用量与缓存诊断'],
     Settings: ['设置中心', '通用配置', '下游 Key 必填'],
-    Registration: ['自动注册', '启动注册任务', '暂无注册任务'],
+    // '暂无注册任务' was in this list, which is how the empty table went unnoticed for so long:
+    // the assertion was pinned to the placeholder. Now that the fixture returns jobs, the
+    // expectation names the sections that render the data instead.
+    Registration: ['自动注册', '启动注册任务', '接码国家排名', '产出构成'],
     TeamLifecycle: ['团队生命周期', '四项配置'],
     EmailPool: ['邮箱池'],
     CloudflareMailbox: ['Cloudflare 自建邮箱'],
     Quota: ['配额 / 限额'],
     ModelQuality: ['模型智商 / 降智检测'],
-    System: ['系统监控', 'CPU 使用率', '资源与模块状态'],
+    System: ['系统监控', '资源与运行时', '磁盘空间守卫', '模块状态分布', '近 24 小时事件节奏'],
     CFEvents: ['Cloudflare 事件'],
     Audit: ['审计日志'],
     Keys: ['API Keys'],
@@ -1401,6 +1851,25 @@ async function captureStates(browser, baseURL) {
   await captureState(accounts, dir, 'accounts-bulk-selected.png', ['selected', 'bulk-selected'], covered);
   await accounts.close();
 
+  // The page sweep only ever photographs a tab component's default pane, so Groups' 用户分组 tab
+  // had never been screenshotted or measured for overlap. Two captures, because the tab's densest
+  // content is not on the pane at all: the 流量接收策略 banner, the traffic-fallback selector and
+  // the Super-Instruct card all live in UserGroupEditor, which renders inside a 960px-wide Modal.
+  // The 新建用户分组 button only exists while the user tab is active, hence the tab click first.
+  // captureState runs assertNoTextOverlap, so both surfaces get measured as well as photographed.
+  const userGroups = await preparePage(browser, baseURL, 'admin', { name: '1440x900', width: 1440, height: 900 }, 'light');
+  await gotoApp(userGroups, baseURL, '/groups');
+  await clickButtonByText(userGroups, '用户分组');
+  // Proof the pane actually switched, and not a swallowed wait: this button's label is
+  // `activeTab === 'user' ? '新建用户分组' : '新建账号池分组'`, so the text existing means the
+  // tab is live. An emptiness marker like 暂无用户分组 would instead depend on the fixture.
+  await waitForText(userGroups, '新建用户分组');
+  await captureState(userGroups, dir, 'groups-user-tab.png', ['tab-switch'], covered, { fullDocument: true });
+  await clickButtonByText(userGroups, '新建用户分组');
+  await waitForText(userGroups, '流量接收策略');
+  await captureState(userGroups, dir, 'groups-user-group-editor.png', ['modal/drawer', 'tab-switch'], covered, { fullDocument: true });
+  await userGroups.close();
+
   for (const [name, viewport, theme] of [
     ['settings-registrar-desktop.png', { name: '1440x900', width: 1440, height: 900 }, 'light'],
     ['settings-registrar-mobile.png', { name: '390x844', width: 390, height: 844, mobile: true }, 'dark'],
@@ -1428,6 +1897,32 @@ async function captureStates(browser, baseURL) {
       );
       await clickButtonByText(settings, section.title);
       await settings.waitForFunction((text) => !document.body.innerText.includes(text), { timeout: 15000 }, section.content);
+    }
+
+    // SETTINGS_TAB_KEYS has seven entries and this sweep reached five of them: the two rightmost,
+    // 思考配置 and 内容合规, had never been photographed or measured at any viewport. Both are
+    // ConfigForm panes, so they are the widest label/control pairs on the screen and exactly where a
+    // 390px viewport pushes text into its neighbour.
+    //
+    // Waited on the *subtitle*, not the pane title. 内容合规 is both the tab's label and its
+    // heading, so waiting for that string would be satisfied by the tab button that was already on
+    // screen before the click -- a pass that proves nothing. The subtitles are unique to the panes.
+    // The wait is load-bearing rather than cosmetic: tabContent() renders null until the key is in
+    // mountedTabs, so without it the capture can photograph an empty pane.
+    for (const tab of [
+      { label: '思考配置', settled: '思考模式、推理预算与兼容策略', slug: 'thinking' },
+      { label: '内容合规', settled: '敏感词与历史合规策略', slug: 'moderation' },
+    ]) {
+      await clickButtonByText(settings, tab.label);
+      await waitForText(settings, tab.settled);
+      await captureState(
+        settings,
+        dir,
+        name.replace('settings-registrar', `settings-${tab.slug}`),
+        [`settings-${tab.slug}`],
+        covered,
+        { fullDocument: true, theme, viewport: viewport.name },
+      );
     }
     await settings.close();
   }

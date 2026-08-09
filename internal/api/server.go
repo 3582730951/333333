@@ -195,6 +195,10 @@ type Server struct {
 	storageAdmissionBlocked     atomic.Bool
 	storageLargeRequestsPaused  atomic.Bool
 	usageDirectWrites           atomic.Bool
+	// failureStreaks counts consecutive upstream 5xx responses per account so a dead
+	// upstream is benched instead of absorbing traffic forever. In-memory and TTL'd;
+	// see failure_streak.go.
+	failureStreaks failureStreakTable
 }
 
 func NewServer(dep Dependencies) *Server {

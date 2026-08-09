@@ -255,6 +255,12 @@ func (s *Server) onUpstreamError(ctx context.Context, account storage.Account, s
 		return v
 	}
 	s.benchOnLimitForAccount(ctx, account, status, header, body)
+	// Plain server errors reach here with no remediation of their own:
+	// usageLimitCooldown returns 0 for anything that is not a 429 or a quota signal,
+	// so an upstream returning 503 to every request stayed a first-choice candidate
+	// indefinitely. Count the consecutive failures and bench the account once the
+	// streak proves the upstream is not serving traffic at all.
+	s.benchOnFailureStreak(ctx, account, status)
 	return v
 }
 
@@ -416,7 +422,13 @@ func (s *Server) guardRateLimit(ctx context.Context, accountID string, header ht
 
 // guardRateLimitForAccount avoids a hot-path account lookup while preserving the
 // legacy ID-only helper for callers that do not already hold the selected account.
+//
+// Every relay reaches this only after the upstream accepted the request, so it is
+// also the point where an account's consecutive-failure streak is cleared: one good
+// response means the upstream is serving traffic, and the breaker must not carry a
+// stale count toward a later bench.
 func (s *Server) guardRateLimitForAccount(ctx context.Context, account storage.Account, header http.Header) {
+	s.noteUpstreamSuccess(account.ID)
 	if account.IgnoreRateLimitControls {
 		return
 	}

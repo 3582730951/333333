@@ -8,8 +8,11 @@ import CopyCodeBlock from '../components/CopyCodeBlock.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import { MetricRail, TextClamp } from '../components/DisplayPrimitives.jsx';
 import { ReadinessPanel, TaskDetailDrawer, TaskProgress } from '../components/WorkflowPrimitives.jsx';
+import * as MicroCharts from '../components/MicroCharts.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import { normalizeApiError } from '../api/errors';
+import { COLORS } from '../lib/chartTheme.js';
+import { fmtDateTime, fmtDuration, fmtInt } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
 import {
   useRegistrationCountriesData, useRegistrationDashboardData, useRegistrationOptionsData,
@@ -22,10 +25,12 @@ import {
 } from '../features/automation/model/registration';
 import type {
   RegistrationBlocker, RegistrationCountryStrategy, RegistrationIdentityMode,
-  RegistrationJob, RegistrationProviderOption, RegistrationStartInput,
+  RegistrationJob, RegistrationProviderOption, RegistrationStartInput, SMSMarketCandidate,
 } from '../features/automation/model/registration';
 
 const { Button, Toast, Typography, Form, Card, Tag, Select } = PoolUI as any;
+const { RankedBars, StackedMeter } = MicroCharts as any;
+const C = COLORS;
 const ErrorBanner = LoadErrorBanner as any;
 const DataTable = ResourceTable as any;
 const SummaryRail = MetricRail as any;
@@ -62,10 +67,48 @@ interface RegistrationFormValues {
   mailbox_provider?: string;
 }
 
+// Every status api/registration.go can persist. `queued` is what HandleRegisterBatch writes on
+// insert and `completed_with_review` is what a partially-successful batch settles to -- both were
+// missing here, so a job read as an untranslated grey `queued` for its first seconds and a batch
+// that half-succeeded reported the same neutral grey as one that had not started.
+const JOB_STATUS_COLOR: Record<string, string> = {
+  queued: 'grey',
+  pending: 'grey',
+  running: 'blue',
+  completed: 'green',
+  completed_with_review: 'amber',
+  cancelled: 'grey',
+  failed: 'red',
+};
+// Statuses that mean the job still has work ahead of it. `queued` belongs here: it is the state
+// every job passes through on insert, so counting only pending/running showed 0 in flight for the
+// first seconds after pressing start -- exactly when the operator is watching.
+const ACTIVE_JOB_STATUSES = new Set(['queued', 'pending', 'running']);
+
+function jobStatusLabel(status: unknown): string {
+  const value = String(status || 'unknown');
+  return t(`registration.job_status.${value}`, value);
+}
+
 function jobTag(status: unknown) {
   const value = String(status || 'unknown');
-  const colors: Record<string, string> = { completed: 'green', running: 'blue', pending: 'grey', cancelled: 'amber', failed: 'red' };
-  return <Tag color={colors[value] || 'grey'}>{value}</Tag>;
+  return <Tag color={JOB_STATUS_COLOR[value] || 'grey'}>{jobStatusLabel(value)}</Tag>;
+}
+
+// How long the batch ran, or has been running. `started_at` and `completed_at` are 0 until the
+// job reaches each state, so an unstarted job has no duration to report rather than one measured
+// from the epoch.
+//
+// fmtDuration floors to whole minutes, which is right for module uptime but wrong here: a batch
+// that has been running 40 seconds would read `0分`, and a just-pressed start is exactly when this
+// column is being watched. Under a minute is reported in seconds instead.
+function jobDurationText(job: RegistrationJob): string {
+  const started = Number(job.started_at) || 0;
+  if (!started) return '—';
+  const completed = Number(job.completed_at) || 0;
+  const until = completed || Math.floor(Date.now() / 1000);
+  const seconds = Math.max(0, until - started);
+  return seconds < 60 ? `${seconds}${t('registration.seconds_unit')}` : fmtDuration(seconds);
 }
 
 function blockerText(blocker: RegistrationBlocker): string {
@@ -82,8 +125,11 @@ function providerOptionLabel(option: RegistrationProviderOption): string {
 }
 
 export function RegistrationJobCard({ job, onOpen }: { job: RegistrationJob; onOpen: () => void }) {
-  const group = job.group_name || t('registration.default_group');
-  const egress = job.egress_id || t('registration.default_egress');
+  // Same substitution as the desktop table's 路由 column: group and egress are never present on a
+  // job from HandleJobList, so this foot was two constants on every card. Duration and start time
+  // are what the payload actually carries.
+  const duration = jobDurationText(job);
+  const startedText = fmtDateTime(Number(job.started_at) || Number(job.created_at) || 0);
   return (
     <button
       type="button"
@@ -104,10 +150,11 @@ export function RegistrationJobCard({ job, onOpen }: { job: RegistrationJob; onO
         {jobTag(job.status)}
       </span>
       <Progress task={job} totalKey="total" successKey="succeeded" failedKey="failed" />
+      {job.error ? <span className="pool-registration-job-card__error" title={String(job.error)}>{String(job.error)}</span> : null}
       <span className="pool-compact-record__foot">
-        <span title={group}>{group}</span>
+        <span title={duration}>{duration}</span>
         <span aria-hidden="true">·</span>
-        <span title={egress}>{egress}</span>
+        <span title={startedText}>{startedText}</span>
         <span className="pool-compact-record__disclosure" aria-hidden="true">›</span>
       </span>
     </button>
@@ -166,7 +213,7 @@ export default function Registration() {
   const persistStrategy = async (nextStrategy: RegistrationCountryStrategy, manualIso: string, minPrice = Number(minPriceInput) || 0, maxPrice = Number(maxPriceInput) || 0) => {
     const nextManualCountry = nextStrategy === 'manual' ? manualIso : '';
     if (minPrice < 0 || maxPrice < 0 || minPrice > 1000 || maxPrice > 1000 || (minPrice > 0 && maxPrice > 0 && minPrice > maxPrice)) {
-      throw new Error('接码价格范围无效：需要 0–1000 USD，且最低价不能高于最高价。');
+      throw new Error(t('registration.market_price_invalid'));
     }
     if (nextStrategy === savedStrategy && nextManualCountry === savedManualCountry && minPrice === savedMinPrice && maxPrice === savedMaxPrice) return;
     await saveStrategyMutation.mutateAsync({ strategy: nextStrategy, manualCountry: nextManualCountry, minPrice, maxPrice });
@@ -188,7 +235,7 @@ export default function Registration() {
   const refreshSMSMarket = async () => {
     try {
       await refreshSMSMarketMutation.mutateAsync(undefined);
-      Toast.success('国家价格与库存已重新扫描');
+      Toast.success(t('registration.market_refreshed'));
     } catch (error) {
       showErrorToast(error);
     }
@@ -247,7 +294,7 @@ export default function Registration() {
     {
       title: t('registration.job'),
       key: 'job',
-      width: 280,
+      width: 240,
       render: (_: unknown, row: RegistrationJob) => (
         <div className="pool-job-cell">
           <Clamp strong>{row.id || 'register-job'}</Clamp>
@@ -261,28 +308,56 @@ export default function Registration() {
     {
       title: t('registration.progress'),
       key: 'progress',
-      width: 320,
+      width: 260,
       render: (_: unknown, row: RegistrationJob) => <Progress task={row} totalKey="total" successKey="succeeded" failedKey="failed" />,
     },
+    // This column used to be 路由 (group + egress). HandleJobList's `job` struct marshals neither
+    // field, so both sides printed their fallback on every row -- 220px repeating 默认分组 / 默认出口
+    // down the whole table. What the endpoint does return, and nothing rendered, is the timing:
+    // when the batch started and how long it took (or has been running).
     {
-      title: t('registration.route'),
-      key: 'route',
-      width: 220,
+      title: t('registration.duration'),
+      key: 'timing',
+      width: 160,
       render: (_: unknown, row: RegistrationJob) => (
         <div className="pool-resource-summary">
-          <Clamp>{row.group_name || t('registration.default_group')}</Clamp>
-          <div className="pool-resource-summary__meta">{row.egress_id || t('registration.default_egress')}</div>
+          <Clamp>{jobDurationText(row)}</Clamp>
+          <div className="pool-resource-summary__meta">{fmtDateTime(Number(row.started_at) || Number(row.created_at) || 0)}</div>
         </div>
       ),
     },
-    { title: t('registration.status'), dataIndex: 'status', width: 120, render: jobTag },
+    {
+      title: t('registration.status'),
+      dataIndex: 'status',
+      width: 140,
+      // The four columns declared 950px against a ~875px pane, so folding dropped the right-most
+      // one -- status -- and the whole status vocabulary went behind a per-row expander at
+      // 1440x900. Trimming the other three to 800px total makes them all fit, and the priority
+      // makes 耗时 fold first at 1280 rather than the column carrying whether the job worked.
+      priority: 10,
+      render: (value: string | undefined, row: RegistrationJob) => (
+        <div className="pool-resource-summary">
+          {jobTag(value)}
+          {/* A failed job's reason is in the payload and appeared nowhere in the UI, so the table
+              said only "red" and the drawer repeated it. One line here, in full in the drawer. */}
+          {row.error ? <div className="pool-resource-summary__meta pool-registration-job-error" title={String(row.error)}>{String(row.error)}</div> : null}
+        </div>
+      ),
+    },
   ];
 
+  const activeJobs = jobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status || '')).length;
+  const succeededTotal = jobs.reduce((sum, job) => sum + (Number(job.succeeded) || 0), 0);
+  const failedTotal = jobs.reduce((sum, job) => sum + (Number(job.failed) || 0), 0);
+  const settledTotal = succeededTotal + failedTotal;
+  // MetricRail draws a track for any entry carrying a `share`, so these three become small charts
+  // instead of bare integers. The job count is the denominator for one and the numerator of
+  // nothing, so it stays a plain number -- a total has nothing to be a fraction of.
   const jobMetrics = [
     { label: t('registration.jobs'), value: jobs.length },
-    { label: t('registration.running'), value: jobs.filter((job) => ['pending', 'running'].includes(job.status || '')).length, tone: 'warning' },
-    { label: t('registration.success'), value: jobs.reduce((sum, job) => sum + (Number(job.succeeded) || 0), 0), tone: 'success' },
-    { label: t('registration.failed'), value: jobs.reduce((sum, job) => sum + (Number(job.failed) || 0), 0), tone: jobs.some((job) => Number(job.failed) > 0) ? 'danger' : undefined },
+    { label: t('registration.running'), value: activeJobs, tone: 'warning', share: jobs.length ? activeJobs / jobs.length : undefined },
+    { label: t('registration.success'), value: succeededTotal, tone: 'success', share: settledTotal ? succeededTotal / settledTotal : undefined },
+    { label: t('registration.failed'), value: failedTotal, tone: failedTotal > 0 ? 'danger' : undefined, share: settledTotal ? failedTotal / settledTotal : undefined },
   ];
   const countryOptions = countries.map((country) => ({
     label: `${country.isoCode} - ${country.nameZh} (${country.name})`,
@@ -312,6 +387,94 @@ export default function Registration() {
   ];
   const smsMarket = smsMarketQuery.data;
   const visibleMarket = (smsMarket?.items || []).slice(0, 8);
+
+  // A country's identity is its ISO code; the platform it was priced on is metadata, because the
+  // same country appears once per provider and the codes alone would collide in the legend.
+  const marketRowName = (item: SMSMarketCandidate) => `${item.country_iso || item.country_id} · ${item.provider}`;
+  const marketRowKey = (item: SMSMarketCandidate) => `${item.provider}-${item.country_id}`;
+  // Below the minimum sample count the backend has no history to rank on and falls back to the
+  // community order, so the rate it reports is a default rather than a measurement. Saying so is
+  // the difference between "50% success" and "not measured yet".
+  const marketSamples = smsMarket?.minimum_history_samples || 3;
+  const marketSuccessRows = visibleMarket.map((item) => {
+    const measured = Number(item.attempts) >= marketSamples;
+    const percent = Math.round((Number(item.success_rate) || 0) * 100);
+    const notes = [
+      measured ? `${item.succeeded}/${item.attempts}` : t('registration.market_cold'),
+      `$${Number(item.price).toFixed(3)}`,
+      `${t('registration.market_inventory')} ${fmtInt(item.inventory)}`,
+    ];
+    if (!item.eligible) notes.push(t('registration.market_ineligible'));
+    return {
+      key: marketRowKey(item),
+      name: marketRowName(item),
+      value: percent,
+      // Ineligible rows are greyed rather than hidden: a country excluded by the price window is
+      // still evidence about why the scheduler picked something else.
+      color: !item.eligible ? C.grey : measured ? (percent >= 80 ? C.green : percent >= 60 ? C.amber : C.red) : C.blue,
+      meta: notes.join(' · '),
+    };
+  });
+  // Cheapest first, so the row the operator most likely wants leads and the bar grows away from
+  // it. Zero-priced rows are kept because a free tier is a real answer, not missing data.
+  const marketPriceRows = visibleMarket
+    .map((item) => ({
+      key: marketRowKey(item),
+      name: marketRowName(item),
+      value: Number(item.price) || 0,
+      color: item.eligible ? C.blue : C.grey,
+      meta: `${t('registration.market_inventory')} ${fmtInt(item.inventory)}${item.eligible ? '' : ` · ${t('registration.market_ineligible')}`}`,
+    }))
+    .sort((a, b) => a.value - b.value);
+  // Two separate reasons this axis has to be set explicitly.
+  //
+  // RankedBars floors its own axis at 1 to stay safe against an all-zero set, which for a chart
+  // measured in cents means a $1.00 ceiling: the priciest row would fill 40% of the track and the
+  // gap between $0.02 and $0.12 would be a tenth of it.
+  //
+  // And the maximum cannot be the priciest row either. One country outside the price window at
+  // $0.61 against a board of $0.03-$0.09 compressed every row the scheduler can actually choose
+  // into the first 15% of the track -- the ranking was there and unreadable. The axis is the
+  // priciest *eligible* row, so the resolution goes to the countries in contention; excluded rows
+  // peg at full width, which is already what they are, and carry the grey and the 超出价格区间 note
+  // that say so. With nothing eligible the whole board is the axis rather than no chart at all.
+  const marketEligibleMax = visibleMarket.reduce(
+    (max, item) => (item.eligible ? Math.max(max, Number(item.price) || 0) : max),
+    0,
+  );
+  const marketPriceMax = marketEligibleMax || marketPriceRows.reduce((max, row) => Math.max(max, row.value), 0);
+  const marketScanNote = t('registration.market_scan_note')
+    .replace('{samples}', String(marketSamples))
+    .replace('{days}', String(smsMarket?.history_window_days || 14))
+    .replace('{order}', (smsMarket?.preferred_countries || DEFAULT_PREFERRED).join(' › '));
+  const marketFreshness = smsMarket?.last_refreshed_at
+    ? `${smsMarket.stale ? t('registration.market_stale') : t('registration.market_synced')} · ${fmtDateTime(smsMarket.last_refreshed_at)}`
+    : t('registration.market_never');
+
+  // Attempt-level composition across every job on the page. The rail above counts jobs and
+  // accounts separately but never relates them, so a run that produced 12 accounts from 40
+  // attempts looked identical to one that produced 12 from 12.
+  const attemptTotals = jobs.reduce<{ succeeded: number; failed: number; remaining: number }>(
+    (acc, job) => {
+      const total = Number(job.total) || 0;
+      const succeeded = Number(job.succeeded) || 0;
+      const failed = Number(job.failed) || 0;
+      return {
+        succeeded: acc.succeeded + succeeded,
+        failed: acc.failed + failed,
+        // Only jobs still in flight have work outstanding; a settled job's shortfall is already
+        // counted as failed or was cancelled, and charting it as "remaining" would imply the
+        // batch is still running.
+        remaining: acc.remaining + (ACTIVE_JOB_STATUSES.has(job.status || '') ? Math.max(0, total - succeeded - failed) : 0),
+      };
+    },
+    { succeeded: 0, failed: 0, remaining: 0 },
+  );
+  const attemptSegments: Array<{ key: string; name: string; value: number; color: string }> = [
+    { key: 'succeeded', name: t('registration.outcome_success'), value: attemptTotals.succeeded, color: C.green },
+    { key: 'failed', name: t('registration.outcome_failed'), value: attemptTotals.failed, color: C.red },
+    { key: 'remaining', name: t('registration.outcome_remaining'), value: attemptTotals.remaining, color: C.grey },
+  ];
 
   return (
     <div>
@@ -460,53 +623,60 @@ export default function Registration() {
         </div>
       </Card>
 
-      <ErrorBanner error={smsMarketQuery.error} onRetry={smsMarketQuery.reload} title="接码国家市场读取失败" />
-      <Card className="pool-card pool-sms-market-card" style={{ marginBottom: 18 }} title="接码国家智能选择">
+      <ErrorBanner error={smsMarketQuery.error} onRetry={smsMarketQuery.reload} title={t('registration.market_failed')} />
+      <Card className="pool-card pool-sms-market-card" style={{ marginBottom: 18 }} title={t('registration.market_title')}>
         <div className="pool-sms-market-head">
           <div>
-            <Typography.Text strong>成功率优先，价格与库存共同决策</Typography.Text>
-            <p className="pool-sms-market-description">
-              系统每小时遍历各平台国家价格；累计至少 {smsMarket?.minimum_history_samples || 3} 次后按近 {smsMarket?.history_window_days || 14} 天成功率选择。冷启动按社区推荐 {((smsMarket?.preferred_countries || DEFAULT_PREFERRED).join(' › '))}。
-            </p>
+            <Typography.Text strong>{t('registration.market_sub')}</Typography.Text>
+            <p className="pool-sms-market-description">{marketScanNote}</p>
           </div>
           <div className="pool-sms-market-actions">
-            <Button icon={<IconRefresh />} loading={refreshSMSMarketMutation.isPending} onClick={refreshSMSMarket}>立即比价</Button>
+            <Button icon={<IconRefresh />} loading={refreshSMSMarketMutation.isPending} onClick={refreshSMSMarket}>{t('registration.market_compare')}</Button>
           </div>
         </div>
         <div className="pool-sms-price-policy">
           <label>
-            <span>最低单价 · USD</span>
-            <input className="pool-input" type="number" min="0" max="1000" step="0.001" placeholder="不限" value={minPriceInput} onChange={(event) => setMinPriceInput(event.target.value)} />
+            <span>{t('registration.market_min')} · USD</span>
+            <input className="pool-input" type="number" min="0" max="1000" step="0.001" placeholder={t('registration.market_unlimited')} value={minPriceInput} onChange={(event) => setMinPriceInput(event.target.value)} />
           </label>
           <label>
-            <span>最高单价 · USD</span>
-            <input className="pool-input" type="number" min="0" max="1000" step="0.001" placeholder="不限" value={maxPriceInput} onChange={(event) => setMaxPriceInput(event.target.value)} />
+            <span>{t('registration.market_max')} · USD</span>
+            <input className="pool-input" type="number" min="0" max="1000" step="0.001" placeholder={t('registration.market_unlimited')} value={maxPriceInput} onChange={(event) => setMaxPriceInput(event.target.value)} />
           </label>
-          <Button theme="solid" loading={savingStrategy} onClick={saveSMSPolicy}>保存价格范围</Button>
-          <span className="pool-sms-market-freshness">
-            {smsMarket?.last_refreshed_at
-              ? `${smsMarket.stale ? '数据待刷新' : '价格已同步'} · ${new Date(smsMarket.last_refreshed_at * 1000).toLocaleString()}`
-              : '等待首次价格扫描'}
-          </span>
+          <Button theme="solid" loading={savingStrategy} onClick={saveSMSPolicy}>{t('registration.market_save')}</Button>
+          <span className="pool-sms-market-freshness">{marketFreshness}</span>
         </div>
-        <div className="pool-sms-market-grid">
-          {visibleMarket.map((item, index) => (
-            <article className={`pool-sms-market-item${item.eligible ? '' : ' is-ineligible'}`} key={`${item.provider}-${item.country_id}`}>
-              <span className="pool-sms-market-rank">{index + 1}</span>
-              <div className="pool-sms-market-country">
-                <strong>{item.country_iso || item.country_id}</strong>
-                <span title={item.country_name || item.provider}>{item.country_name || item.provider}</span>
-              </div>
-              <div className="pool-sms-market-stat"><span>成功率</span><strong>{Math.round(item.success_rate * 100)}%</strong><small>{item.attempts ? `${item.succeeded}/${item.attempts}` : '冷启动'}</small></div>
-              <div className="pool-sms-market-stat"><span>单价</span><strong>${item.price.toFixed(3)}</strong><small>库存 {item.inventory}</small></div>
-              <Tag size="small" color={item.selection_basis === 'historical_success_rate' ? 'green' : 'blue'}>
-                {item.selection_basis === 'historical_success_rate' ? '历史概率' : '社区推荐'}
-              </Tag>
-            </article>
-          ))}
-          {!smsMarketQuery.loading && visibleMarket.length === 0 ? (
-            <div className="pool-sms-market-empty">保存接码平台凭据后点击“立即比价”，国家价格、库存与历史成功率会显示在这里。</div>
-          ) : null}
+        {/* Two ranked charts replaced a grid of eight cards carrying five numbers each. The
+            backend ranks countries by success rate and breaks ties on price and stock, so those
+            are the two axes worth drawing -- as a grid of forty figures the ordering the
+            scheduler actually applies was invisible.
+            Success rate sits on a fixed 0-100 axis so bar length is comparable between
+            refreshes; price is normalised to the priciest row because there is no meaningful
+            ceiling, and both read longer-as-worse: a long success bar is good, a long price bar
+            is expensive. */}
+        <div className="pool-sms-market-charts">
+          <section className="pool-sms-market-chart">
+            <h3>{t('registration.market_rank_label')}</h3>
+            <RankedBars
+              rows={marketSuccessRows}
+              max={100}
+              keepZero
+              valueFormatter={(value: number) => `${value}%`}
+              ariaLabel={t('registration.market_rank_label')}
+              emptyText={t('registration.market_empty')}
+            />
+          </section>
+          <section className="pool-sms-market-chart">
+            <h3>{t('registration.market_price_label')}</h3>
+            <RankedBars
+              rows={marketPriceRows}
+              max={marketPriceMax}
+              keepZero
+              valueFormatter={(value: number) => `$${value.toFixed(3)}`}
+              ariaLabel={t('registration.market_price_label')}
+              emptyText={t('registration.market_empty')}
+            />
+          </section>
         </div>
       </Card>
 
@@ -514,7 +684,7 @@ export default function Registration() {
         <Button icon={<IconRefresh />} onClick={dashboardQuery.reload}>{t('common.refresh')}</Button>
         <Typography.Text type="tertiary">{t('registration.output_note')}</Typography.Text>
       </div>
-      <div className="pool-resource-split">
+      <div className="pool-resource-split pool-resource-split--wide-aside">
         <DataTable
           error={dashboardQuery.error}
           onRetry={dashboardQuery.reload}
@@ -539,7 +709,25 @@ export default function Registration() {
           )}
           mobileListLabel={t('registration.jobs')}
         />
-        {!dashboardQuery.error || dashboardQuery.lastRefresh ? <SummaryRail items={jobMetrics} className="pool-registration-metrics" /> : null}
+        {!dashboardQuery.error || dashboardQuery.lastRefresh ? (
+          <div className="pool-registration-aside">
+            <SummaryRail items={jobMetrics} className="pool-registration-metrics" />
+            {/* Attempt-level composition, which the rail cannot express: its 成功 and 失败 cards are
+                two independent numbers, and the shortfall between them and the batch target has no
+                card at all. */}
+            <section className="pool-registration-outcome">
+              <h3>{t('registration.outcome')}</h3>
+              <StackedMeter
+                segments={attemptSegments}
+                ariaLabel={t('registration.outcome')}
+                valueFormatter={(value: number) => `${fmtInt(value)} ${t('registration.attempts_unit')}`}
+              />
+              {attemptSegments.every((segment) => segment.value <= 0) ? (
+                <p className="pool-registration-outcome__empty">{t('registration.outcome_empty')}</p>
+              ) : null}
+            </section>
+          </div>
+        ) : null}
       </div>
       <DetailDrawer
         task={detailJob}

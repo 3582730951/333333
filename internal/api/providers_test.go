@@ -210,6 +210,62 @@ func TestAdminProvidersPartialPatchPreservesProtocolAndRoutingFields(t *testing.
 	}
 }
 
+// TestAdminProvidersInfersClaudeCodeFromProtocol covers the real-world Claude-Code-relay
+// case: the operator selects upstream_protocol=anthropic_messages but the provider's
+// id/name carries no "claude-code" hint, so name inference alone left it on the generic
+// transport and it never presented the Claude Code client shape upstream.
+func TestAdminProvidersInfersClaudeCodeFromProtocol(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/providers", `{
+		"id":"duckcoding",
+		"name":"DuckCoding",
+		"base_url":"https://relay.example/v1",
+		"upstream_protocol":"anthropic_messages"
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("create provider = %d: %s", code, raw)
+	}
+	var got storage.CustomProvider
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.TransportProfile != storage.CustomProviderTransportClaudeCode {
+		t.Fatalf("anthropic_messages provider did not get the claude_code transport: %+v", got)
+	}
+
+	// An explicit transport_profile always wins over the inference.
+	code, raw = grpReq(t, h, http.MethodPost, "/admin/providers", `{
+		"id":"explicit-generic",
+		"base_url":"https://relay.example/v1",
+		"upstream_protocol":"anthropic_messages",
+		"transport_profile":"generic"
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("create provider = %d: %s", code, raw)
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.TransportProfile != storage.CustomProviderTransportGeneric {
+		t.Fatalf("explicit transport_profile was overridden: %+v", got)
+	}
+
+	// Non-Anthropic protocols keep their existing inference.
+	code, raw = grpReq(t, h, http.MethodPost, "/admin/providers", `{
+		"id":"deepseek",
+		"base_url":"https://api.deepseek.example/v1"
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("create provider = %d: %s", code, raw)
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.TransportProfile != storage.CustomProviderTransportGeneric {
+		t.Fatalf("chat_completions provider changed transport: %+v", got)
+	}
+}
+
 func TestAdminProvidersRejectsInvalidProtocol(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 

@@ -655,22 +655,20 @@ func decodeClaudeJSONObject(body []byte, root *map[string]interface{}) error {
 // single parse/marshal pass without a second JSON round-trip. See
 // EnsureClaudeCodeBillingHeader for the fingerprint rationale.
 func setClaudeBillingBlock(root map[string]interface{}, version string) bool {
-	entrypoint := "cli"
+	attrs := claudeBillingAttrs{entrypoint: "cli"}
 	switch sys := root["system"].(type) {
 	case []interface{}:
 		idx := -1
 		for i, blk := range sys {
 			if bm, ok := blk.(map[string]interface{}); ok {
 				if t, _ := bm["text"].(string); strings.HasPrefix(strings.TrimSpace(t), claudeBillingHeaderPrefix) {
-					if strings.Contains(t, "cc_entrypoint=sdk-cli") {
-						entrypoint = "sdk-cli"
-					}
+					attrs = parseClaudeBillingAttrs(t)
 					idx = i
 					break
 				}
 			}
 		}
-		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForEntrypoint(version, entrypoint)}
+		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForAttrs(version, attrs)}
 		if idx >= 0 {
 			sys[idx] = billing
 			root["system"] = sys
@@ -678,15 +676,78 @@ func setClaudeBillingBlock(root map[string]interface{}, version string) bool {
 			root["system"] = append([]interface{}{billing}, sys...)
 		}
 	case string:
-		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForEntrypoint(version, entrypoint)}
+		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForAttrs(version, attrs)}
 		root["system"] = []interface{}{billing, map[string]interface{}{"type": "text", "text": sys}}
 	case nil:
-		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForEntrypoint(version, entrypoint)}
+		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForAttrs(version, attrs)}
 		root["system"] = []interface{}{billing}
 	default:
 		return false
 	}
 	return true
+}
+
+// claudeBillingAttrs holds the fields of a downstream x-anthropic-billing-header block that
+// we PROJECT onto the block we emit instead of overwriting. cc_version is deliberately NOT
+// in here: it is realigned to our account-bound claude-cli version so it agrees with our
+// User-Agent.
+type claudeBillingAttrs struct {
+	entrypoint string
+	// subagent is the verbatim cc_is_subagent value ("true"/"false"), or "" when the
+	// downstream block carried no such field.
+	subagent string
+}
+
+// parseClaudeBillingAttrs pulls the projectable fields out of a downstream billing block.
+//
+// cc_is_subagent is emitted by genuine Claude Code whenever the request comes from a
+// subagent (a Task-tool invocation) rather than the main conversation; an observed real
+// block reads:
+//
+//	x-anthropic-billing-header: cc_version=2.1.226.be8; cc_entrypoint=cli; cc_is_subagent=true;
+//
+// Dropping it was a coherence leak in the same class the cc_entrypoint projection already
+// guards against. A subagent request is independently recognizable from its body (subagent
+// system prompt, no human-authored user turn), so stripping the marker left the body saying
+// "subagent" while the attribution block said "main agent" — a contradiction the real
+// client never produces. Fleet-wide it also pinned every account at a 0% subagent rate,
+// which for an account doing heavy agentic work is itself anomalous.
+//
+// We only ever PASS THROUGH what the downstream sent and never synthesize the field, so
+// this cannot invent a marker the client did not claim. Unrecognized values are dropped
+// rather than forwarded, so a downstream cannot inject arbitrary text into the block.
+func parseClaudeBillingAttrs(text string) claudeBillingAttrs {
+	attrs := claudeBillingAttrs{entrypoint: "cli"}
+	fields := strings.TrimSpace(text)
+	fields = strings.TrimPrefix(fields, claudeBillingHeaderPrefix)
+	for _, field := range strings.Split(fields, ";") {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "cc_entrypoint":
+			if strings.EqualFold(strings.TrimSpace(value), "sdk-cli") {
+				attrs.entrypoint = "sdk-cli"
+			}
+		case "cc_is_subagent":
+			switch v := strings.ToLower(strings.TrimSpace(value)); v {
+			case "true", "false":
+				attrs.subagent = v
+			}
+		}
+	}
+	return attrs
+}
+
+// claudeBillingHeaderTextForAttrs renders the block, keeping the real client's field order
+// (cc_version, cc_entrypoint, then cc_is_subagent when present).
+func claudeBillingHeaderTextForAttrs(version string, attrs claudeBillingAttrs) string {
+	out := claudeBillingHeaderTextForEntrypoint(version, attrs.entrypoint)
+	if attrs.subagent != "" {
+		out += fmt.Sprintf(" cc_is_subagent=%s;", attrs.subagent)
+	}
+	return out
 }
 
 // claudeBillingHeaderText builds the billing-header block for a claude-cli version.

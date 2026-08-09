@@ -1089,8 +1089,11 @@ function LoggingTab() {
       settingsErrorTitle="日志配置读取异常"
       settingsErrorSection={logging}
     >
-      <Banner type="info" closeIcon={null} style={{ marginBottom: 12 }}
-        description="控制结构化日志的详细程度、失败阈值和统一保留策略。系统每天清理超过保留天数的审计、用量、代理、注册、生命周期和已结束计费记录，并每 7 天压缩一次数据库。" />
+      {/* The banner that stood here spent 76 characters to deliver one new fact. It opened by
+          announcing "详细程度、失败阈值和保留策略" -- the labels of the three fields immediately
+          below it -- then listed the retention cleanup, which line ~1105 already states more
+          completely (it also names Cloudflare and the in-progress-hold exception). Only the 7-day
+          compaction was unique, so it moved down beside 日志保留天数, the field it belongs to. */}
       <Form key={settingsFormKey('logging', loggingValues)} onSubmit={save} initValues={loggingValues} labelPosition="left" labelWidth={140} style={{ maxWidth: 600 }}>
         <Form.Switch field="verbose_logging" label="详尽日志" />
         <Typography.Text type="tertiary" size="small" style={{ display: 'block', marginBottom: 12, marginLeft: 140 }}>
@@ -1102,7 +1105,7 @@ function LoggingTab() {
         </Typography.Text>
         <Form.InputNumber field="log_retention_days" label="日志保留天数" min={1} max={90} style={{ width: 120 }} />
         <Typography.Text type="tertiary" size="small" style={{ display: 'block', marginBottom: 12, marginLeft: 140 }}>
-          默认 7 天。超过此天数的审计、Cloudflare、用量、代理、注册、生命周期日志及已结束计费记录会被自动清理；进行中的计费 hold 不受影响。
+          默认 7 天。超过此天数的审计、Cloudflare、用量、代理、注册、生命周期日志及已结束计费记录会被自动清理，数据库每 7 天压缩一次；进行中的计费 hold 不受影响。
         </Typography.Text>
         <div style={{ marginTop: 8 }}>
           {Boolean(logging.degraded) && <Tag color="red" style={{ marginBottom: 8 }}>系统已自动降级 — 注册失败率超标</Tag>}

@@ -508,8 +508,14 @@ export default function App() {
       ) : null}
     </div>
   );
+  // Only the non-default states get a class name. `pool-app-desktop`, `pool-sider-expanded`,
+  // `pool-sider-collapsed` and `pool-admin-header` each had no rule anywhere in src/styles: the
+  // styling for those states lives on the base class (.pool-app-layout, .pool-shell-sider,
+  // .pool-shell-header) or on the ancestor (.pool-sidebar-is-collapsed), so the extra names were
+  // decoration that read as intent. Their styled counterparts (pool-app-mobile, pool-portal-header)
+  // are kept.
   return (
-    <Layout className={`pool-app-layout ${responsive.isMobile ? 'pool-app-mobile' : 'pool-app-desktop'} ${isAdmin ? 'pool-admin-shell' : 'pool-portal-shell'} ${navCollapsed ? 'pool-sidebar-is-collapsed' : ''}`} style={layoutStyle}>
+    <Layout className={`pool-app-layout ${responsive.isMobile ? 'pool-app-mobile' : ''} ${isAdmin ? 'pool-admin-shell' : 'pool-portal-shell'} ${navCollapsed ? 'pool-sidebar-is-collapsed' : ''}`} style={layoutStyle}>
       <a
         href="#main-content"
         className="pool-skip-link"
@@ -528,7 +534,7 @@ export default function App() {
         aria-label={responsive.isMobile ? t('app.navigation') : t('app.admin')}
         aria-modal={responsive.isMobile && mobileOpen ? true : undefined}
         role={responsive.isMobile ? 'dialog' : undefined}
-        className={`pool-shell-sider ${navCollapsed ? 'pool-sider-collapsed' : 'pool-sider-expanded'}`}
+        className="pool-shell-sider"
         style={{ width: sidebarWidth, transform: responsive.isMobile ? (mobileOpen ? 'translateX(0)' : 'translateX(-100%)') : undefined }}
       >
         <div className="pool-brand">
@@ -557,7 +563,7 @@ export default function App() {
         style={{ marginLeft: isAdmin && !responsive.isMobile ? sidebarWidth : 0 }}
       >
         <RouteStatus announcement={routeAnnouncement} />
-        <Header className={`pool-shell-header ${isAdmin ? 'pool-admin-header' : 'pool-portal-header'}`}>
+        <Header className={`pool-shell-header ${isAdmin ? '' : 'pool-portal-header'}`}>
           {isAdmin ? <div className="pool-topbar-left">
             {responsive.isMobile ? <Button ref={mobileMenuButtonRef} theme="borderless" icon={<IconList />} onClick={() => { setAccountMenuOpen(false); setMobileOpen((value) => !value); }} className="pool-mobile-menu-btn" aria-label={t('app.toggle_menu')} aria-expanded={mobileOpen} aria-controls="pool-mobile-navigation" /> : null}
             <div className="pool-topbar-title"><span className="pool-topbar-title-main">{t('app.admin')}</span>{activeRoute ? <><span className="pool-topbar-divider">/</span><span className="pool-topbar-current">{t(activeRoute.titleKey)}</span></> : null}</div>

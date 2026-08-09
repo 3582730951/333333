@@ -95,6 +95,13 @@ export function ActionGroup({ children, className = '', minWidth, compact = fals
 // sense of scale. `share` (0..1) turns an entry into a proportional track, so a rail
 // whose entries are parts of a whole reads as a small chart. Entries without a share
 // stay plain numbers — a total has nothing to be a fraction of.
+//
+// Pass `undefined` for share, never 0, when there is no denominator. Any finite share
+// draws a track, so `part / 0 -> 0` renders a full-width empty rail that reads as a
+// measured "0% of the whole" when the truth is that the whole does not exist yet. The
+// distinction is load-bearing on every page here: an empty pool must look unmeasured,
+// while a real 0-of-N (0 multi-egress groups out of 2) must still draw its 0% track.
+// Note `Number(null)` is 0 and therefore finite — undefined is the only safe sentinel.
 export function MetricRail({ items = [], className = '', label = '指标摘要' }) {
   const list = Array.isArray(items) ? items.filter(Boolean) : [];
   if (!list.length) return null;

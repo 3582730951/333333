@@ -74,6 +74,11 @@ type Scheduler struct {
 	candidateIndexes      atomic.Value // map[string]*routeCandidateIndex, immutable after publication
 	candidateRefreshMu    sync.Mutex
 
+	// kiroBlockLogged dedupes the Kiro model-resolution diagnostic (see
+	// logKiroModelBlockOnce). Diagnostic-only state: it never affects selection.
+	kiroBlockLogMu  sync.Mutex
+	kiroBlockLogged map[string]struct{}
+
 	// egressCache is a process-level cache for egress profiles used by selectEgress.
 	// It is separate from the request-scoped egressCache in selectFresh so that concurrent
 	// requests share the same cached egress profiles, avoiding repeated DB lookups for
@@ -186,6 +191,9 @@ const (
 	leaseBlockProviderMismatch  leaseBlockReason = "provider_mismatch"
 	leaseBlockModelUnsupported  leaseBlockReason = "model_unsupported"
 	leaseBlockCoordinator       leaseBlockReason = "coordinator_unavailable"
+
+	// kiroBlockLogMaxEntries bounds the diagnostic dedupe table.
+	kiroBlockLogMaxEntries = 4096
 )
 
 // InvalidateAccountCache clears the account list cache so the next Select() call
@@ -357,6 +365,13 @@ type NoAccountError struct {
 	AllowedProviders []string
 	Model            string
 	Counters         NoAccountCounters
+	// EmptyPool marks the group as holding no accounts at all, as opposed to holding
+	// accounts that were each skipped for a reason the counters name. The counters cannot
+	// express this: an empty group produces no skips, so every counter stays zero and the
+	// message collapses to the same bare text a fully saturated pool produces. The two
+	// need opposite operator responses — add an account versus wait — so they must not
+	// read alike.
+	EmptyPool bool
 }
 
 func (e *NoAccountError) Error() string {
@@ -381,12 +396,16 @@ func (e *NoAccountError) Error() string {
 	add("concurrency", e.Counters.Concurrency)
 	add("token_budget", e.Counters.TokenBudget)
 	add("coordinator_unavailable", e.Counters.Coordinator)
-	if len(parts) == 0 {
-		return ErrNoAccount.Error()
-	}
 	providers := strings.Join(e.AllowedProviders, ",")
 	if providers == "" {
 		providers = e.Provider
+	}
+	if e.EmptyPool {
+		return fmt.Sprintf("%s: group=%q holds no accounts (providers=%q model=%q)",
+			ErrNoAccount, e.Group, providers, e.Model)
+	}
+	if len(parts) == 0 {
+		return ErrNoAccount.Error()
 	}
 	return fmt.Sprintf("%s: group=%q providers=%q model=%q skipped(%s)", ErrNoAccount, e.Group, providers, e.Model, strings.Join(parts, " "))
 }
@@ -402,6 +421,10 @@ func (e *NoAccountError) Unwrap() error {
 // scheduler and wait; the error is exposed only to non-request diagnostics.
 func (e *NoAccountError) Retryable() bool {
 	if e == nil {
+		return false
+	}
+	// An empty group is configuration, not load: waiting cannot make an account appear.
+	if e.EmptyPool {
 		return false
 	}
 	c := e.Counters
@@ -1427,9 +1450,20 @@ func canonicalClaudeRouteModel(model string) string {
 // current plan permits it. Claude-family bootstrap additionally requires static
 // adaptive-thinking support; Kiro's exact GPT models do not use that envelope.
 func (s *Scheduler) resolveKiroRouteModel(ctx context.Context, account storage.Account, route Route) (string, bool, bool) {
+	model, bootstrap, ok, _ := s.resolveKiroRouteModelDetailed(ctx, account, route)
+	return model, bootstrap, ok
+}
+
+// resolveKiroRouteModelDetailed is resolveKiroRouteModel plus the reason it declined.
+// Every rejection here used to be an indistinguishable `return "", false, false`, so an
+// operator seeing "this Kiro account has quota but is never selected" had roughly fifteen
+// candidate explanations — a missing catalog, a 1m-context demand the catalog cannot
+// prove, an unverified alias, a plan that forbids bootstrap — and no way to tell which.
+// The reason is a diagnostic string only: it never changes which accounts are eligible.
+func (s *Scheduler) resolveKiroRouteModelDetailed(ctx context.Context, account storage.Account, route Route) (string, bool, bool, string) {
 	credentials, err := s.store.GetKiroCredentials(ctx, account.ID)
 	if err != nil {
-		return "", false, false
+		return "", false, false, "kiro_credentials_unavailable"
 	}
 	region := firstRouteValue(credentials.APIRegion, route.KiroDefaultRegion, s.Config().KiroDefaultAPIRegion, "us-east-1")
 	allowlist := route.KiroEndpointAllowlist
@@ -1438,28 +1472,30 @@ func (s *Scheduler) resolveKiroRouteModel(ctx context.Context, account storage.A
 	}
 	endpointHash, err := kirowire.EndpointHash(credentials.Endpoint, region, allowlist)
 	if err != nil {
-		return "", false, false
+		// The account's endpoint/region is outside the configured allowlist, so no
+		// capability row can ever key to it. This is a configuration mismatch, not quota.
+		return "", false, false, "kiro_endpoint_not_allowlisted"
 	}
 	capabilityKey, _ := kirowire.KiroCapabilityKey(endpointHash, region, credentials.ProfileARN)
 	catalog, catalogErr := s.store.ListKiroModelCatalog(ctx, account.ID, capabilityKey)
 	if catalogErr != nil {
-		return "", false, false
+		return "", false, false, "kiro_catalog_read_failed"
 	}
 	if len(catalog) > 0 {
 		descriptor, found := capability.ResolveKiroCatalogModel(route.Model, catalog)
 		if !found {
-			return "", false, false
+			return "", false, false, "kiro_model_absent_from_live_catalog"
 		}
 		if strings.EqualFold(strings.TrimSpace(route.ContextMode), "1m") && descriptor.MaxInputTokens < 1_000_000 {
-			return "", false, false
+			return "", false, false, "kiro_catalog_model_lacks_1m_context"
 		}
-		return strings.TrimSpace(descriptor.UpstreamID), false, true
+		return strings.TrimSpace(descriptor.UpstreamID), false, true, ""
 	}
 	// One-million-token entitlement is established only by an account-scoped,
 	// complete live catalog. Runtime inference and plan labels are deliberately
 	// insufficient because they do not prove the current region/governance scope.
 	if strings.EqualFold(strings.TrimSpace(route.ContextMode), "1m") {
-		return "", false, false
+		return "", false, false, "kiro_1m_context_requires_live_catalog"
 	}
 	// Claude-family Kiro inference is a mandatory-thinking path, so its runtime
 	// evidence must include a successful thinking request. Kiro's GPT-5.6 models
@@ -1469,16 +1505,21 @@ func (s *Scheduler) resolveKiroRouteModel(ctx context.Context, account storage.A
 	isGPTRequest := capability.KiroSupportsGPTModel(route.Model)
 	verified, err := s.store.VerifiedKiroModels(ctx, account.ID, endpointHash, !isGPTRequest)
 	if err != nil {
-		return "", false, false
+		return "", false, false, "kiro_verified_models_read_failed"
 	}
 	resolved, ok := capability.ResolveKiroModel(route.Model, verified)
 	if !ok {
-		return "", false, false
+		if len(verified) == 0 {
+			// Nothing has ever succeeded on this account+endpoint, and the requested
+			// model is not bootstrappable — the common "imported but never usable" state.
+			return "", false, false, "kiro_no_verified_models_yet"
+		}
+		return "", false, false, "kiro_model_not_verified"
 	}
 	if capability.KiroModelAlias(route.Model) {
 		normalizedAlias := strings.ToLower(strings.TrimSpace(route.Model))
 		if normalizedAlias == "default" {
-			return "", false, false
+			return "", false, false, "kiro_default_alias_unresolvable"
 		}
 		if normalizedAlias == "auto" {
 			foundAuto := false
@@ -1489,37 +1530,41 @@ func (s *Scheduler) resolveKiroRouteModel(ctx context.Context, account storage.A
 				}
 			}
 			if !foundAuto {
-				return "", false, false
+				return "", false, false, "kiro_auto_alias_not_verified"
 			}
 		}
-		return resolved, false, true
+		return resolved, false, true, ""
 	}
 	for _, model := range verified {
 		canonical, modelOK := capability.KiroCanonicalModel(model)
 		if modelOK && canonical == resolved {
-			return resolved, false, true
+			return resolved, false, true, ""
 		}
 	}
 	// GPT models are deliberately exact and have already passed
 	// KiroSupportsGPTModel above. They do not support the Claude adaptive-thinking
 	// envelope, but may still bootstrap from their persisted static capability.
 	if !capability.KiroSupportsGPTModel(resolved) && !capability.KiroSupportsAdaptiveThinking(resolved) {
-		return "", false, false
+		return "", false, false, "kiro_model_lacks_adaptive_thinking"
 	}
 	if !capability.KiroPlanAllowsBootstrap(account.PlanType, resolved) {
-		return "", false, false
+		// The account's plan label forbids bootstrapping this model. This one is worth
+		// distinguishing because the fix is a plan/label correction, not a retry.
+		return "", false, false, "kiro_plan_forbids_bootstrap"
 	}
 	capabilities, err := s.store.ListCapabilities(ctx, account.ID)
 	if err != nil {
-		return "", false, false
+		return "", false, false, "kiro_static_capabilities_read_failed"
 	}
 	for _, staticCapability := range capabilities {
 		canonical, modelOK := capability.KiroCanonicalModel(staticCapability.ModelSlug)
 		if modelOK && canonical == resolved {
-			return resolved, true, true
+			return resolved, true, true, ""
 		}
 	}
-	return "", false, false
+	// Static capabilities are seeded at import (kiro_import.go), so an empty/mismatched
+	// table here means the import never completed or the model is outside the seed set.
+	return "", false, false, "kiro_model_absent_from_static_capabilities"
 }
 
 func (s *Scheduler) tryLeaseAccount(ctx context.Context, accountID string, route Route, egressCache map[string]storage.EgressProfile) (Lease, bool) {
@@ -1567,9 +1612,11 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	resolvedModel := candidateRoute.Model
 	if accountProvider == "kiro" && capabilityRouteModel(candidateRoute.Model) {
 		var ok bool
-		resolvedModel, _, ok = s.resolveKiroRouteModel(ctx, account, candidateRoute)
+		var detail string
+		resolvedModel, _, ok, detail = s.resolveKiroRouteModelDetailed(ctx, account, candidateRoute)
 		if !ok {
-			return Lease{}, leaseBlockModelUnsupported, false
+			s.logKiroModelBlockOnce(account.ID, candidateRoute.Model, detail)
+			return Lease{}, qualifiedBlockReason(leaseBlockModelUnsupported, detail), false
 		}
 	} else if (accountProvider == "claude" || accountProvider == "codex" || accountProvider == "antigravity") && capabilityRouteModel(candidateRoute.Model) {
 		caps, err := s.store.ListCapabilities(ctx, account.ID)
@@ -1808,6 +1855,9 @@ func (s *Scheduler) notifyLoadChangedLocked() {
 }
 
 func statefulStickyWaitReason(reason leaseBlockReason) bool {
+	// Compare on the base so a diagnostically-qualified reason ("base:detail", see
+	// qualifiedBlockReason) is classified identically to its base.
+	reason = baseBlockReason(reason)
 	return reason == leaseBlockTokenBudget || reason == leaseBlockConcurrency ||
 		reason == leaseBlockRateLimitCooldown || reason == leaseBlockRecheckPending ||
 		reason == leaseBlockEgressCooldown || reason == leaseBlockCoordinator
@@ -1818,6 +1868,58 @@ func (reason leaseBlockReason) humanString() string {
 		return "unknown"
 	}
 	return strings.ReplaceAll(string(reason), "_", " ")
+}
+
+// qualifiedBlockReason appends a diagnostic detail to a base block reason as
+// "base:detail". Every consumer of leaseBlockReason compares against the exact base
+// constants (statefulStickyWaitReason, waitReasonForBlock) and treats anything else via
+// its existing fallthrough, so qualifying a reason adds diagnosis without changing any
+// scheduling decision. The base is returned unchanged when there is no detail.
+func qualifiedBlockReason(base leaseBlockReason, detail string) leaseBlockReason {
+	detail = strings.TrimSpace(detail)
+	if detail == "" {
+		return base
+	}
+	return base + leaseBlockReason(":"+detail)
+}
+
+// baseBlockReason strips any diagnostic qualifier, for callers that must compare against
+// the base constants.
+func baseBlockReason(reason leaseBlockReason) leaseBlockReason {
+	if base, _, found := strings.Cut(string(reason), ":"); found {
+		return leaseBlockReason(base)
+	}
+	return reason
+}
+
+// logKiroModelBlockOnce reports a Kiro model-resolution rejection at most once per
+// (account, model, reason). Without this the rejection is entirely silent on the pool
+// selection path — the account is simply skipped, so "has quota, never selected" has no
+// evidence anywhere. The reason is deterministic per account+model, so one line is
+// enough; deduping keeps a per-request hot path from flooding the log.
+func (s *Scheduler) logKiroModelBlockOnce(accountID, model, detail string) {
+	if detail == "" {
+		return
+	}
+	key := accountID + "\x00" + model + "\x00" + detail
+	s.kiroBlockLogMu.Lock()
+	if s.kiroBlockLogged == nil {
+		s.kiroBlockLogged = make(map[string]struct{}, 64)
+	}
+	_, seen := s.kiroBlockLogged[key]
+	if !seen {
+		// Bounded: a full table is cleared rather than grown, so a churning account set
+		// cannot leak memory. Re-logging after a reset is acceptable for a diagnostic.
+		if len(s.kiroBlockLogged) >= kiroBlockLogMaxEntries {
+			s.kiroBlockLogged = make(map[string]struct{}, 64)
+		}
+		s.kiroBlockLogged[key] = struct{}{}
+	}
+	s.kiroBlockLogMu.Unlock()
+	if seen {
+		return
+	}
+	log.Printf("[SCHEDULER] kiro account=%s model=%s not selectable: %s", accountID, model, detail)
 }
 
 func (s *Scheduler) waitForStatefulStickyLease(ctx context.Context, accountID string, route Route, initialReason leaseBlockReason) (Lease, error) {
@@ -1868,7 +1970,7 @@ func (s *Scheduler) waitForStatefulStickyLease(ctx context.Context, accountID st
 }
 
 func waitReasonForBlock(reason leaseBlockReason) string {
-	switch reason {
+	switch baseBlockReason(reason) {
 	case leaseBlockConcurrency:
 		return "concurrency"
 	case leaseBlockTokenBudget:
@@ -1942,9 +2044,32 @@ func tokenBudgetLimited(budget int64, compaction bool, inflight int, tokens, est
 	return budget > 0 && !compaction && estimated > 0 && inflight > 0 && tokens+estimated > budget
 }
 
+// normalizedLoad expresses an outlet's saturation as a fraction so the egress and
+// sidecar terms stay inside the sub-1 tiebreaker band that sits under the caller's
+// raw per-account inflight count. Keeping them under 1 is what makes account
+// fairness the primary axis and outlet load the tiebreaker.
+//
+// The non-positive case returned the raw inflight count, which inverted the
+// convention every admission path shares: concurrencyLimited, the in-process lease
+// coordinator, and the Redis acquire script all gate on `limit > 0`, so 0 means
+// unlimited. Scoring it as the raw count made "no cap" the single heaviest term in
+// the sum, so an uncapped outlet with 8 inflight contributed 8.0 while an outlet
+// capped at 16 and equally loaded contributed 0.5 -- the near-saturated outlet won.
+// Worse, 8.0 outranks any realistic per-account inflight difference, so one busy
+// uncapped egress could override account fairness entirely. An export carrying two
+// proxies at max_concurrency=9999999999 next to the only account-bound egress at 0
+// is exactly that shape: both spellings mean unlimited, but only the huge cap
+// scored like it.
+//
+// A saturating fraction keeps the uncapped case in the same band while still
+// preferring the less-loaded of two uncapped outlets, which returning a flat 0
+// would discard.
 func normalizedLoad(inflight, limit int) float64 {
+	if inflight <= 0 {
+		return 0
+	}
 	if limit <= 0 {
-		return float64(inflight)
+		return float64(inflight) / float64(inflight+1)
 	}
 	return float64(inflight) / float64(limit)
 }
@@ -1965,6 +2090,30 @@ func rendezvous(key, id string) uint64 {
 }
 
 func (s *Scheduler) noAccountError(route Route, counters NoAccountCounters) error {
+	return s.noAccountErrorForPool(route, counters, -1)
+}
+
+// noAccountErrorForPool builds the selection failure, with poolSize reporting how many
+// accounts the group held before filtering; pass a negative value when that is unknown.
+// A zero pool is surfaced explicitly instead of being left to the counters, which cannot
+// represent it.
+func (s *Scheduler) noAccountErrorForPool(route Route, counters NoAccountCounters, poolSize int) error {
+	if poolSize == 0 {
+		model := route.Model
+		if routeAllowsProvider(route, "kiro") {
+			if canonical, ok := capability.KiroCanonicalModel(model); ok {
+				model = canonical
+			}
+		}
+		return &NoAccountError{
+			Group:            route.Group,
+			Provider:         route.Provider,
+			AllowedProviders: append([]string(nil), route.AllowedProviders...),
+			Model:            model,
+			Counters:         counters,
+			EmptyPool:        true,
+		}
+	}
 	if route.Provider == "" && len(route.AllowedProviders) == 0 && route.Model == "" && route.Affinity.Hash == "" {
 		return ErrNoAccount
 	}

@@ -14,6 +14,14 @@ function clamp01(value) {
   return Math.max(0, Math.min(1, number));
 }
 
+// A percentage for an inline style. Binary floats put things like
+// `width: 89.99999999999999%` into the DOM -- harmless to render, but it is what a reader of the
+// inspector sees and what a snapshot diff compares. Two decimals is finer than any track these
+// bars sit in, and dropping the trailing zeros keeps whole numbers whole.
+function percentOf(ratio) {
+  return `${Number((ratio * 100).toFixed(2))}%`;
+}
+
 // How tall a rendered line of text is as a multiple of its font-size.
 //
 // This is not a guess and it is not an em box. getBoundingClientRect on an SVG <text>
@@ -159,7 +167,7 @@ export function Sparkline({
       {showEndDot ? (
         <span
           className="pool-sparkline__dot"
-          style={{ top: `${(lastY / height) * 100}%`, background: color }}
+          style={{ top: percentOf(lastY / height), background: color }}
           aria-hidden="true"
         />
       ) : null}
@@ -287,7 +295,7 @@ export function RankedBars({
             </div>
             <div className="pool-ranked__track">
               {value > 0 ? (
-                <span style={{ width: `${Math.max(ratio * 100, 1.5)}%`, background: row.color || 'var(--pool-accent)' }} />
+                <span style={{ width: percentOf(Math.max(ratio, 0.015)), background: row.color || 'var(--pool-accent)' }} />
               ) : null}
             </div>
             {row.meta ? <div className="pool-ranked__meta">{row.meta}</div> : null}
@@ -347,7 +355,7 @@ export function StackedMeter({ segments = [], ariaLabel, legend = true, valueFor
         {items.map((segment, index) => (
           <span
             key={segment.key || segment.name || index}
-            style={{ width: `${(Number(segment.value) / total) * 100}%`, background: segment.color || 'var(--pool-accent)' }}
+            style={{ width: percentOf(Number(segment.value) / total), background: segment.color || 'var(--pool-accent)' }}
             title={`${segment.name}: ${valueFormatter ? valueFormatter(segment.value) : segment.value}`}
           />
         ))}

@@ -56,7 +56,24 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		// Provider ids are slugified on create, but a restored backup keeps whatever id it
+		// carried — normalizeAccountBackupCustomProvider only trims. Slugifying an edit
+		// unconditionally would insert a second row under the slug and leave the original,
+		// still named by every model_provider target, untouched: the operator's change would
+		// silently miss live traffic. Delete and test already address the raw path id, so an
+		// id naming an existing provider verbatim wins over its slug. New providers still
+		// get a slug.
 		id := slugify(req.ID)
+		if raw := strings.TrimSpace(req.ID); raw != "" && raw != id {
+			found, ok, err := s.store.GetCustomProvider(r.Context(), raw)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			if ok {
+				id = found.ID
+			}
+		}
 		if id == "" {
 			id = slugify(req.Name)
 		}
@@ -64,7 +81,8 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, errors.New("provider id or name required"))
 			return
 		}
-		if id == "codex" || id == "claude" || id == "kiro" || id == "antigravity" {
+		switch strings.ToLower(id) {
+		case "codex", "claude", "kiro", "antigravity":
 			writeError(w, http.StatusBadRequest, errors.New("'codex', 'claude', 'kiro', and 'antigravity' are reserved provider ids"))
 			return
 		}
@@ -125,6 +143,17 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 			p.UpstreamProtocol = proto
 		} else if !exists {
 			p.UpstreamProtocol = defaultProtocolForTransportProfile(p.TransportProfile)
+		}
+		// The protocol is the stronger signal than the name. Anthropic Messages is spoken
+		// only by Claude Code and the Anthropic SDKs, so a provider on that protocol wants
+		// the Claude Code transport — but inferredProviderTransportProfile can only guess
+		// from the id/name, and most relays ("duckcoding", "88code", a bare hostname) carry
+		// no hint, leaving them on generic. Infer the profile from the protocol whenever the
+		// operator did not state one explicitly; an explicit request always wins.
+		if req.TransportProfile == nil &&
+			p.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages &&
+			p.TransportProfile == storage.CustomProviderTransportGeneric {
+			p.TransportProfile = storage.CustomProviderTransportClaudeCode
 		}
 		if req.EgressIDs != nil {
 			if err := s.validateOrderedEgressIDs(r, *req.EgressIDs); err != nil {

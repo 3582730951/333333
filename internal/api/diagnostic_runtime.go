@@ -1,7 +1,10 @@
 package api
 
 import (
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,6 +14,7 @@ import (
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
+	"codex-account-pool/internal/upstream"
 )
 
 const diagnosticRuntimeRecordLimit = 8192
@@ -169,6 +173,58 @@ func (s *Server) recordRouteAttempt(requestID string, tier int, target, selectio
 	s.diagnostics.mu.Lock()
 	s.diagnostics.routeAttempts = appendBounded(s.diagnostics.routeAttempts, &s.diagnostics.routeAttemptHead, row)
 	s.diagnostics.mu.Unlock()
+}
+
+// diagnosticWireErrorClass maps a wire outcome onto the same closed vocabulary the
+// antigravity path already reports, so provider_attempts.error_class stays queryable
+// across providers instead of meaning different things per column value. A transport
+// error carries no status, so callers pass 0 with err set.
+//
+// client_error is the one class antigravity never needed: its failures are all auth,
+// quota or capacity, while a relay commonly answers 400 for an unmapped model. Folding
+// that into transient would advertise a permanent misconfiguration as retryable.
+func diagnosticWireErrorClass(status int, err error) string {
+	if err != nil {
+		return string(upstream.AntigravityFailureTransient)
+	}
+	switch {
+	case status < 400:
+		return string(upstream.AntigravityFailureNone)
+	case status == http.StatusUnauthorized, status == http.StatusForbidden:
+		return string(upstream.AntigravityFailureAuth)
+	case status == http.StatusTooManyRequests:
+		return string(upstream.AntigravityFailureRateLimit)
+	case status == http.StatusServiceUnavailable, status == 529:
+		return string(upstream.AntigravityFailureCapacity)
+	case status == http.StatusRequestTimeout, status >= 500:
+		return string(upstream.AntigravityFailureTransient)
+	default:
+		return "client_error"
+	}
+}
+
+// diagnosticBodyHash digests a request body at the wire boundary. Only the digest ever
+// reaches the export, so a prompt cannot be recovered from provider_attempts.
+func diagnosticBodyHash(body []byte) string {
+	digest := sha256.Sum256(body)
+	return fmt.Sprintf("%x", digest[:])
+}
+
+// diagnosticResponseStatus reports 0 for a transport failure, where no response exists.
+// Recording 0 rather than skipping the row keeps a connection that never answered visible
+// in the table; a skipped row is indistinguishable from a request never sent.
+func diagnosticResponseStatus(resp *upstream.Response) int {
+	if resp == nil {
+		return 0
+	}
+	return resp.StatusCode
+}
+
+func diagnosticRetryAfter(resp *upstream.Response) string {
+	if resp == nil || resp.Header == nil {
+		return ""
+	}
+	return resp.Header.Get("Retry-After")
 }
 
 // recordProviderAttempt records metadata from one provider wire attempt. BodyHash

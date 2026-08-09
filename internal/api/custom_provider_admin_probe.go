@@ -117,7 +117,11 @@ func (s *Server) adminCustomProviderModelTest(w http.ResponseWriter, r *http.Req
 	probe := upstream.Request{
 		Method: http.MethodPost, Provider: provider.ID, BaseURL: provider.BaseURL,
 		TransportProfile: provider.TransportProfile, DownstreamPath: result.UpstreamPath,
-		Headers: headers, Account: account, Token: token, Egress: lease.Egress,
+		// The protocol decides whether the upstream sees the Claude Code client shape
+		// (claudeShapedCustomCall). Pass it explicitly so the probe reports on the exact
+		// header set real traffic will use, rather than one inferred from the path.
+		UpstreamProtocol: provider.UpstreamProtocol,
+		Headers:          headers, Account: account, Token: token, Egress: lease.Egress,
 		CookieJarKey: customProviderCookieJarKey(r, lease, provider), MinimalProbe: true,
 	}
 	probe.SetBodyBytes(body)
