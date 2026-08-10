@@ -40,7 +40,20 @@ func (c *Client) DoRawHTTP1Source(ctx context.Context, egress storage.EgressProf
 	return c.doRawSource(ctx, http1TransparentEgress(egress), method, rawURL, headers, body, cookieJarKey, true)
 }
 
-func (c *Client) doRawSource(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body bodysource.BodySource, cookieJarKey string, forceHTTP1 bool) (*Response, error) {
+func (c *Client) doRawSource(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body bodysource.BodySource, cookieJarKey string, forceHTTP1 bool) (result *Response, resultErr error) {
+	started := time.Now()
+	defer func() {
+		if resultErr != nil {
+			c.observeEgress(egress.ID, time.Since(started), false)
+			return
+		}
+		if result != nil && result.Body != nil && strings.TrimSpace(egress.ID) != "" {
+			result.Body = &firstByteObservedBody{
+				ReadCloser: result.Body, started: started, status: result.StatusCode,
+				observe: func(latency time.Duration, success bool) { c.observeEgress(egress.ID, latency, success) },
+			}
+		}
+	}()
 	if strings.EqualFold(strings.TrimSpace(egress.Type), "curl_cffi_sidecar") {
 		// In-process fingerprint engine: route native-adapter egress (Kiro's aws-sdk-js
 		// calls, Codex/WHAM reset-credit/quota/registration calls) through tls-client with

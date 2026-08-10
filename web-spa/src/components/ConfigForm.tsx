@@ -1,5 +1,5 @@
 import React, { useMemo, useRef, useState } from 'react';
-import * as PoolUI from './pool/index.jsx';
+import { Form, Button, Toast, Banner, LoadingState } from './pool/index.jsx';
 import { IconRefresh, IconSave } from './pool/icons.jsx';
 import LoadErrorBannerBase from './LoadErrorBanner.jsx';
 import PageHeaderBase from './PageHeader.jsx';
@@ -8,7 +8,6 @@ import { useAdvancedSettingsData, useSaveAdvancedSettingsMutation } from '../fea
 import type { AdvancedSettingsKind, SettingsValues } from '../features/settings/model/settings';
 import { t } from '../lib/i18n.js';
 
-const { Form, Button, Toast, Banner, LoadingState } = PoolUI as any;
 const LoadErrorBanner = LoadErrorBannerBase as any;
 const PageHeader = PageHeaderBase as any;
 

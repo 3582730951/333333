@@ -1965,7 +1965,7 @@ func TestServerSideStateStrictStickyRateLimitWaitsForPinnedAccount(t *testing.T)
 	}
 	if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
 		AccountID: "acc-1", Provider: "codex", Model: "gpt-5", LimiterType: "tokens", Source: "tokens",
-		RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1, ResetAt: storage.Now() + 1, Status: "rejected",
+		RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1, ResetAt: storage.Now() + 5, Status: "rejected",
 	}); err != nil {
 		t.Fatal(err)
 	}

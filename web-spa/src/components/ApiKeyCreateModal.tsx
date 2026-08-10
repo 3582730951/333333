@@ -1,12 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react';
-import * as PoolUI from './pool/index.jsx';
+import { Button, Form, Modal } from './pool/index.jsx';
 import { IconPlus } from './pool/icons.jsx';
 import { showErrorToast } from './ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import { t } from '../lib/i18n.js';
 import type { ApiKeyCreateInput } from '../features/access/model/keys';
 
-const { Button, Form, Modal } = PoolUI as any;
 type KeyMode = 'admin' | 'portal';
 interface RawKeyForm {
   label?: unknown;

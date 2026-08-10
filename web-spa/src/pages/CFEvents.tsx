@@ -1,5 +1,5 @@
 import React from 'react';
-import * as PoolUI from '../components/pool/index.jsx';
+import { Button, Tag } from '../components/pool/index.jsx';
 import { IconRefresh } from '../components/pool/icons.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
@@ -10,7 +10,6 @@ import { fmtDateTime } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
 import type { CFEventRow } from '../features/observability/model/types';
 
-const { Button, Tag } = PoolUI as any;
 const DataTable = ResourceTable as any;
 const Clamp = TextClamp as any;
 const MobileRow = MobileResourceCell as any;

@@ -1,0 +1,34 @@
+Branch / field: cache-hit-optimization / performance_pipeline_v2
+
+Comparison:
+  from efd4940f3d3c53890cf7e2682c39694de4566a4e
+  to   358a78822338b475546789054874858c5e165677
+
+Summary:
+  234 files changed
+  4,589 insertions
+  2,690 deletions
+
+Primary source deltas:
+  internal/api/search_passthrough.go             captured BodySource reuse
+  internal/api/httputil.go                       adaptive supervised SSE batching
+  internal/api/usage_dashboard_cache.go          stale-while-revalidate dashboard cache
+  internal/storage/usage_rollup.go                incremental exact-hour SQLite rollup
+  internal/scheduler/candidate_index.go           direct concurrent index publication
+  internal/scheduler/scheduler.go                 sharded load + bounded egress EWMA
+  internal/upstream/client.go                     bounded transport cache + TTFT observer
+  internal/upstream/tlsclient/tlsclient.go         bounded TLS-client / cookie-jar caches
+  internal/console/console.go                     Brotli preference with gzip fallback
+  web-spa/src/lib/i18n.js                         lazy locale runtime
+  web-spa/src/lib/locales/{zh,en}.js               split locale dictionaries
+  web-spa/src/App.tsx                             bounded eager prefetch
+  web-spa/src/app/routeDefinitions.ts             heavy-route prefetch disabled
+  web-spa/vite.config.js                          deterministic Brotli precompression
+  web-spa/scripts/check-build-budget.mjs          actual configured-prefetch budget
+
+Generated build delta:
+  internal/console/dist/**                        rebuilt hashed SPA assets and .br files
+  scripts/managed-source-manifest.txt             regenerated release manifest
+
+Reproduce the complete name/status diff:
+  git diff-tree --no-commit-id --name-status efd4940f3d3c53890cf7e2682c39694de4566a4e 358a78822338b475546789054874858c5e165677

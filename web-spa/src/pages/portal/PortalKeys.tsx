@@ -1,5 +1,5 @@
 import React, { useState, useCallback } from 'react';
-import * as PoolUI from '../../components/pool/index.jsx';
+import { Button, Toast } from '../../components/pool/index.jsx';
 import { IconRefresh, IconPlus } from '../../components/pool/icons.jsx';
 import ApiKeyCreateModal from '../../components/ApiKeyCreateModal.tsx';
 import ApiKeysTable from '../../components/ApiKeysTable.tsx';
@@ -14,7 +14,6 @@ import {
   useCreatePortalKeyMutation, useDeletePortalKeyMutation, usePortalKeysData, useUpdatePortalKeyMutation,
 } from '../../features/access/queries/keys.ts';
 
-const { Button, Toast } = PoolUI as any;
 const CreateModal = ApiKeyCreateModal as any;
 const KeysTable = ApiKeysTable as any;
 const ErrorBanner = LoadErrorBanner as any;

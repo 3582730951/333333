@@ -1,5 +1,5 @@
 import React, { useState, type ReactNode } from 'react';
-import * as PoolUI from '../components/pool/index.jsx';
+import { Button, ConfirmDialog, Select, Toast } from '../components/pool/index.jsx';
 import { IconDownload, IconRefresh } from '../components/pool/icons.jsx';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
@@ -19,7 +19,6 @@ import {
   type UsageMetricRow, type UsageRange,
 } from '../features/observability/model/usage';
 
-const { Button, ConfirmDialog, Select, Toast } = PoolUI as any;
 const DataTable = ResourceTable as any;
 const Section = Panel as any;
 const MetricCard = StatCard as any;

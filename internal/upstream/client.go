@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -45,16 +46,50 @@ type Client struct {
 	// takes effect on the next request without a process restart or a client rebuild.
 	// nil overlay = use the boot cfg. Only ever stored whole (never mutated in place),
 	// so concurrent request reads are race-free.
-	liveCfg        atomic.Pointer[config.Config]
-	identitySecret []byte
-	jars           *jarLRU
-	tmu            sync.Mutex
-	transports     map[string]*http.Transport
-	sidecars       *sidecarAdaptiveController
+	liveCfg            atomic.Pointer[config.Config]
+	identitySecret     []byte
+	jars               *jarLRU
+	tmu                sync.Mutex
+	transports         map[string]*http.Transport
+	transportLRU       *list.List
+	transportItems     map[string]*list.Element
+	transportMax       int
+	transportTTL       time.Duration
+	transportHits      uint64
+	transportMisses    uint64
+	transportEvictions uint64
+	sidecars           *sidecarAdaptiveController
 	// tlsFactory is the in-process TLS/HTTP2 fingerprinting engine (bogdanfinn/tls-client).
 	// It is the switchable replacement for the external curl_cffi sidecar; a sidecar egress
 	// routes through it instead of the Python process when EgressFingerprintEngine=="inprocess".
-	tlsFactory *tlsclient.Factory
+	tlsFactory     *tlsclient.Factory
+	observerMu     sync.RWMutex
+	egressObserver func(egressID string, latency time.Duration, success bool)
+}
+
+type transportCacheEntry struct {
+	key      string
+	lastUsed time.Time
+}
+
+// UpstreamCacheStats is safe to expose in admin diagnostics: it contains only
+// cache cardinalities/counters, never account, endpoint, cookie, or request data.
+type UpstreamCacheStats struct {
+	Transports CacheStats           `json:"transports"`
+	CookieJars CacheStats           `json:"cookie_jars"`
+	TLS        tlsclient.CacheStats `json:"tls"`
+}
+
+func cacheLimitsForMemory(bytes int64) (jarMax, transportMax, tlsClientMax int) {
+	const mib = int64(1024 * 1024)
+	switch {
+	case bytes > 0 && bytes <= 64*mib:
+		return 4096, 64, 64
+	case bytes > 256*mib:
+		return 32768, 1024, 1024
+	default:
+		return 16384, 256, 256
+	}
 }
 
 // inProcessFingerprint reports whether sidecar-bound egress should route through the
@@ -439,6 +474,52 @@ type idleCancelBody struct {
 	guard *requestGuard
 }
 
+type firstByteObservedBody struct {
+	io.ReadCloser
+	once    sync.Once
+	started time.Time
+	status  int
+	observe func(time.Duration, bool)
+}
+
+func (b *firstByteObservedBody) finish(success bool) {
+	if b == nil {
+		return
+	}
+	b.once.Do(func() {
+		if b.observe != nil {
+			b.observe(time.Since(b.started), success)
+		}
+	})
+}
+
+func (b *firstByteObservedBody) Read(p []byte) (int, error) {
+	if b == nil || b.ReadCloser == nil {
+		return 0, io.ErrClosedPipe
+	}
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.finish(egressStatusSuccess(b.status))
+	} else if err != nil {
+		b.finish(false)
+	}
+	return n, err
+}
+
+func (b *firstByteObservedBody) Close() error {
+	if b == nil || b.ReadCloser == nil {
+		return nil
+	}
+	// A caller can legitimately close a header-only response without reading it.
+	// Record the header latency rather than dropping the sample entirely.
+	b.finish(egressStatusSuccess(b.status))
+	return b.ReadCloser.Close()
+}
+
+func egressStatusSuccess(status int) bool {
+	return status > 0 && status < http.StatusInternalServerError && status != http.StatusRequestTimeout && status != http.StatusTooManyRequests
+}
+
 func (b *idleCancelBody) Read(p []byte) (int, error) {
 	if b == nil || b.guard == nil {
 		return 0, fmt.Errorf("%w: response body guard is nil", errInvalidResponseContract)
@@ -475,14 +556,56 @@ func NewClient(cfg config.Config) *Client {
 	if len(secret) != 32 {
 		secret = identity.ResolveSecret([]byte(cfg.IdentitySecret))
 	}
+	jarMax, transportMax, tlsClientMax := cacheLimitsForMemory(cfg.EffectiveBodyMemoryBudgetBytes())
 	return &Client{
 		cfg:            cfg,
 		identitySecret: secret,
-		jars:           newJarLRU(0),
+		jars:           newJarLRU(jarMax),
 		transports:     map[string]*http.Transport{},
+		transportLRU:   list.New(),
+		transportItems: map[string]*list.Element{},
+		transportMax:   transportMax,
+		transportTTL:   30 * time.Minute,
 		sidecars:       newSidecarAdaptiveController(),
-		tlsFactory:     tlsclient.New(),
+		tlsFactory:     tlsclient.NewWithLimits(tlsClientMax, jarMax),
 	}
+}
+
+// SetEgressObserver installs the scheduler's process-local EWMA sink. The
+// callback receives only an egress id, first-byte latency, and success bit.
+func (c *Client) SetEgressObserver(observer func(string, time.Duration, bool)) {
+	if c == nil {
+		return
+	}
+	c.observerMu.Lock()
+	c.egressObserver = observer
+	c.observerMu.Unlock()
+}
+
+func (c *Client) observeEgress(egressID string, latency time.Duration, success bool) {
+	if c == nil || strings.TrimSpace(egressID) == "" {
+		return
+	}
+	c.observerMu.RLock()
+	observer := c.egressObserver
+	c.observerMu.RUnlock()
+	if observer != nil {
+		observer(egressID, latency, success)
+	}
+}
+
+func (c *Client) CacheStats() UpstreamCacheStats {
+	if c == nil {
+		return UpstreamCacheStats{}
+	}
+	c.tmu.Lock()
+	transports := CacheStats{Entries: len(c.transports), Capacity: c.transportMax, Hits: c.transportHits, Misses: c.transportMisses, Evictions: c.transportEvictions}
+	c.tmu.Unlock()
+	stats := UpstreamCacheStats{Transports: transports, CookieJars: c.jars.stats()}
+	if c.tlsFactory != nil {
+		stats.TLS = c.tlsFactory.Stats()
+	}
+	return stats
 }
 
 // SidecarAdaptiveStatuses exposes only safe aggregate transport health for the
@@ -496,8 +619,23 @@ func (c *Client) SidecarAdaptiveStatuses() []SidecarAdaptiveStatus {
 }
 
 func (c *Client) Do(ctx context.Context, req Request) (resp *Response, err error) {
+	started := time.Now()
 	defer func() {
 		resp, err = enforceResponseContract(resp, err)
+		if err != nil {
+			c.observeEgress(req.Egress.ID, time.Since(started), false)
+			return
+		}
+		if resp != nil && resp.Body != nil && strings.TrimSpace(req.Egress.ID) != "" {
+			resp.Body = &firstByteObservedBody{
+				ReadCloser: resp.Body,
+				started:    started,
+				status:     resp.StatusCode,
+				observe: func(latency time.Duration, success bool) {
+					c.observeEgress(req.Egress.ID, latency, success)
+				},
+			}
+		}
 	}()
 	if req.Provider == "claude" {
 		if !req.PassThrough {
@@ -719,9 +857,25 @@ func (c *Client) transportForEgressMode(egress storage.EgressProfile, forceHTTP1
 	key := transportKeyForMode(egress, forceHTTP1)
 	c.tmu.Lock()
 	defer c.tmu.Unlock()
+	c.ensureTransportCacheLocked()
+	now := time.Now()
+	for back := c.transportLRU.Back(); back != nil; back = c.transportLRU.Back() {
+		entry := back.Value.(*transportCacheEntry)
+		if c.transportTTL <= 0 || now.Sub(entry.lastUsed) < c.transportTTL {
+			break
+		}
+		c.evictTransportLocked(back)
+	}
 	if t := c.transports[key]; t != nil {
+		c.transportHits++
+		if element := c.transportItems[key]; element != nil {
+			entry := element.Value.(*transportCacheEntry)
+			entry.lastUsed = now
+			c.transportLRU.MoveToFront(element)
+		}
 		return t, nil
 	}
+	c.transportMisses++
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -790,7 +944,57 @@ func (c *Client) transportForEgressMode(egress storage.EgressProfile, forceHTTP1
 		return nil, fmt.Errorf("unsupported egress type %q", egress.Type)
 	}
 	c.transports[key] = transport
+	c.transportItems[key] = c.transportLRU.PushFront(&transportCacheEntry{key: key, lastUsed: now})
+	for c.transportMax > 0 && c.transportLRU.Len() > c.transportMax {
+		c.evictTransportLocked(c.transportLRU.Back())
+	}
 	return transport, nil
+}
+
+func (c *Client) ensureTransportCacheLocked() {
+	if c.transports == nil {
+		c.transports = map[string]*http.Transport{}
+	}
+	if c.transportLRU == nil {
+		c.transportLRU = list.New()
+	}
+	if c.transportItems == nil {
+		c.transportItems = map[string]*list.Element{}
+	}
+	if c.transportMax <= 0 {
+		c.transportMax = 256
+	}
+	if c.transportTTL <= 0 {
+		c.transportTTL = 30 * time.Minute
+	}
+}
+
+func (c *Client) evictTransportLocked(element *list.Element) {
+	if element == nil {
+		return
+	}
+	entry, _ := element.Value.(*transportCacheEntry)
+	c.transportLRU.Remove(element)
+	if entry == nil {
+		return
+	}
+	delete(c.transportItems, entry.key)
+	if transport := c.transports[entry.key]; transport != nil {
+		transport.CloseIdleConnections()
+		delete(c.transports, entry.key)
+		c.transportEvictions++
+	}
+}
+
+// PrepareEgress constructs the bounded connection-pool entry before the first
+// user request. It performs no network I/O; normal health/probe traffic then
+// populates DNS, TLS-session, and idle-connection caches on this shared transport.
+func (c *Client) PrepareEgress(egress storage.EgressProfile) error {
+	if c == nil || storage.IsSidecarEgress(egress) || strings.EqualFold(strings.TrimSpace(egress.Type), "curl_cffi_sidecar") {
+		return nil
+	}
+	_, err := c.transportForEgress(egress)
+	return err
 }
 
 func (c *Client) doSidecar(ctx context.Context, spec Request) (*Response, error) {

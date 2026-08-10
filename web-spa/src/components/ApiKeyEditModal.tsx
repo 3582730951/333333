@@ -1,11 +1,10 @@
 import React, { useMemo } from 'react';
-import * as PoolUI from './pool/index.jsx';
+import { Banner, Button, Form, Modal } from './pool/index.jsx';
 import { IconSave } from './pool/icons.jsx';
 import { showErrorToast } from './ErrorToast.jsx';
 import { t } from '../lib/i18n.js';
 import type { ApiKeyRow, ApiKeyUpdateInput } from '../features/access/model/keys';
 
-const { Banner, Button, Form, Modal } = PoolUI as any;
 
 interface RawEditForm {
   label?: unknown;

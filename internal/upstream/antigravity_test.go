@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"codex-account-pool/internal/antigravityidentity"
 	"codex-account-pool/internal/config"
 
 	"github.com/google/uuid"
@@ -185,8 +186,10 @@ func TestAntigravityFinalWireIdentitySafetyAndCatalogLimit(t *testing.T) {
 	}
 	if requestID := gjson.GetBytes(one, "requestId").String(); requestID == "" {
 		t.Fatal("missing requestId")
-	} else if _, parseErr := uuid.Parse(requestID); parseErr != nil {
-		t.Fatalf("requestId %q is not a standard UUID: %v", requestID, parseErr)
+	} else if !strings.HasPrefix(requestID, "agent-") {
+		t.Fatalf("requestId %q is missing native agent- prefix", requestID)
+	} else if _, parseErr := uuid.Parse(strings.TrimPrefix(requestID, "agent-")); parseErr != nil {
+		t.Fatalf("requestId %q does not contain a standard UUID: %v", requestID, parseErr)
 	}
 	if gjson.GetBytes(one, "request.safetySettings").Exists() {
 		t.Fatalf("final wire retained safetySettings: %s", one)
@@ -220,6 +223,20 @@ func TestAntigravityFinalWireOmitsContextManagement(t *testing.T) {
 	}
 	if got := gjson.GetBytes(out, "request.contents.0.parts.0.text").String(); got != "continue the full conversation" {
 		t.Fatalf("message content changed while stripping context management: %q; body=%s", got, out)
+	}
+}
+
+func TestAntigravitySensitiveWordsObfuscateSystemInstructionOnly(t *testing.T) {
+	body := []byte(`{"max_tokens":32,"system":"Use proxy API safely","messages":[{"role":"user","content":"proxy API remains unchanged"}]}`)
+	out, err := anthropicToAntigravityForAccount(body, "claude-opus-4-8", "project", "account", 0, []string{"proxy", "API"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gjson.GetBytes(out, "request.systemInstruction.parts.0.text").String(); got != "Use p\u200broxy A\u200bPI safely" {
+		t.Fatalf("system instruction = %q", got)
+	}
+	if got := gjson.GetBytes(out, "request.contents.0.parts.0.text").String(); got != "proxy API remains unchanged" {
+		t.Fatalf("user content changed: %q", got)
 	}
 }
 
@@ -391,7 +408,7 @@ func TestFetchAntigravityModelsUsesAccountCatalog(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer access" {
 			t.Fatalf("authorization = %q", got)
 		}
-		if got := r.Header.Get("User-Agent"); got != antigravityDefaultUA {
+		if got := r.Header.Get("User-Agent"); got != antigravityidentity.UserAgent() {
 			t.Fatalf("user agent = %q", got)
 		}
 		body, _ := io.ReadAll(r.Body)
@@ -420,5 +437,16 @@ func TestFetchAntigravityModelsRejectsCapabilityOnlyResponse(t *testing.T) {
 	models, err := FetchAntigravityModels(context.Background(), "access", "project-1", server.URL, "")
 	if err == nil || len(models) != 0 || !strings.Contains(err.Error(), "capability hints") {
 		t.Fatalf("models=%+v err=%v, want non-authoritative capability-hint error", models, err)
+	}
+}
+
+func BenchmarkAnthropicToAntigravityLargeRequest(b *testing.B) {
+	body := []byte(`{"model":"claude-opus-4-8","max_tokens":4096,"messages":[{"role":"user","content":"` + strings.Repeat("x", 1<<20) + `"}]}`)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	for i := 0; i < b.N; i++ {
+		if _, err := anthropicToAntigravityForAccount(body, "claude-opus-4-8", "project", "account", 8192); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

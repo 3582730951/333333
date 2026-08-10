@@ -238,19 +238,28 @@ func (s *Server) writeSearchCapabilityUnavailable(w http.ResponseWriter, actual,
 }
 
 func requestWithPassthroughBody(r *http.Request, raw []byte) (*http.Request, func(), error) {
-	source := bodysource.Bytes(raw)
+	source := bodySourceFromContext(r.Context())
+	owned := false
+	if view, ok := bodysource.ByteView(source); !ok || source.Size() != int64(len(raw)) || !sameBodyBytes(view, raw) {
+		source = bodysource.Bytes(raw)
+		owned = true
+	}
 	body, err := source.Open()
 	if err != nil {
-		_ = source.Close()
+		if owned {
+			_ = source.Close()
+		}
 		return nil, func() {}, err
 	}
 	selected := r.Clone(contextWithBodySource(r.Context(), source))
 	selected.Body = body
 	selected.GetBody = source.Open
-	selected.ContentLength = int64(len(raw))
+	selected.ContentLength = source.Size()
 	closeRequest := func() {
 		_ = body.Close()
-		_ = source.Close()
+		if owned {
+			_ = source.Close()
+		}
 	}
 	return selected, closeRequest, nil
 }

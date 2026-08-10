@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
-import * as PoolUI from '../components/pool/index.jsx';
+import { Tag, Button, LoadingState } from '../components/pool/index.jsx';
 import { IconRefresh, IconPlus, IconUser, IconKey, IconSetting, IconLineChartStroked } from '../components/pool/icons.jsx';
 import LoadErrorBannerBase from '../components/LoadErrorBanner.jsx';
 import PageHeaderBase from '../components/PageHeader.jsx';
@@ -15,7 +15,6 @@ import {
   DASHBOARD_REFRESH_MS, invalidateDashboardUsageSnapshot, useDashboardCoreData, useDashboardSecondaryData,
 } from '../features/observability/queries/dashboard';
 
-const { Tag, Button, LoadingState } = PoolUI as any;
 const LoadErrorBanner = LoadErrorBannerBase as any;
 const PageHeader = PageHeaderBase as any;
 const SystemHealthSummary = SystemHealthSummaryBase as any;

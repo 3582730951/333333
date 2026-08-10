@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -175,6 +176,7 @@ func streamCopyRewriteValidated(w http.ResponseWriter, body io.Reader, scrubber 
 	privacy := len(privacyOptions) > 0 && privacyOptions[0]
 	var err error
 	if privacy {
+		batch := newAdaptiveSSEBatch(w)
 		err = forEachSSEFrame(source, func(frame []byte) error {
 			out := sanitizeCustomSSEFrame(frame, protocol)
 			if len(out) == 0 {
@@ -183,14 +185,13 @@ func streamCopyRewriteValidated(w http.ResponseWriter, body io.Reader, scrubber 
 			if scrubber != nil && !scrubber.Empty() {
 				out = scrubber.ReplaceAll(out)
 			}
-			if _, writeErr := w.Write(out); writeErr != nil {
-				return writeErr
-			}
-			if flusher, ok := w.(http.Flusher); ok {
-				flusher.Flush()
-			}
-			return nil
+			return batch.append(out)
 		})
+		if err != nil {
+			batch.abort()
+		} else {
+			err = errors.Join(err, batch.close())
+		}
 	} else {
 		err = streamCopyRewrite(w, source, scrubber)
 	}

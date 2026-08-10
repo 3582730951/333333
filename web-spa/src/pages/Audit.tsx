@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import * as PoolUI from '../components/pool/index.jsx';
+import { ActionMenu, Button, Tag, Select, Toast } from '../components/pool/index.jsx';
 import { IconRefresh, IconDownload } from '../components/pool/icons.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
@@ -14,7 +14,6 @@ import { downloadBlob } from '../lib/browserDownload.js';
 import { fmtDateTime, fmtRelative } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
 
-const { ActionMenu, Button, Tag, Select, Toast } = PoolUI as any;
 const DataTable = ResourceTable as any;
 const MobileRow = MobileResourceCell as any;
 

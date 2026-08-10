@@ -34,6 +34,121 @@ const (
 	codexEgressPriorSuccesses  = int64(9)
 )
 
+const (
+	schedulerLoadShardCount      = 64
+	schedulerEWMAEntriesPerShard = 64
+)
+
+type schedulerLoadShard struct {
+	mu       sync.RWMutex
+	inflight map[string]int
+	tokens   map[string]int64
+	egress   map[string]int
+}
+
+// shardedLoadCounters prevents unrelated accounts and outlets from contending
+// on the scheduler state/notification mutex at high concurrency.
+type shardedLoadCounters struct {
+	shards [schedulerLoadShardCount]schedulerLoadShard
+}
+
+func newShardedLoadCounters() *shardedLoadCounters {
+	l := &shardedLoadCounters{}
+	for i := range l.shards {
+		l.shards[i].inflight = map[string]int{}
+		l.shards[i].tokens = map[string]int64{}
+		l.shards[i].egress = map[string]int{}
+	}
+	return l
+}
+
+func schedulerLoadHash(value string) uint32 {
+	var sum uint32 = 2166136261
+	for i := 0; i < len(value); i++ {
+		sum ^= uint32(value[i])
+		sum *= 16777619
+	}
+	return sum
+}
+
+func (l *shardedLoadCounters) shard(key string) *schedulerLoadShard {
+	return &l.shards[schedulerLoadHash(key)&(schedulerLoadShardCount-1)]
+}
+
+func (l *shardedLoadCounters) addAccount(id string, inflight int, tokens int64) {
+	shard := l.shard(id)
+	shard.mu.Lock()
+	nextInflight := shard.inflight[id] + inflight
+	if nextInflight <= 0 {
+		delete(shard.inflight, id)
+	} else {
+		shard.inflight[id] = nextInflight
+	}
+	nextTokens := shard.tokens[id] + tokens
+	if nextTokens <= 0 {
+		delete(shard.tokens, id)
+	} else {
+		shard.tokens[id] = nextTokens
+	}
+	shard.mu.Unlock()
+}
+
+func (l *shardedLoadCounters) account(id string) (int, int64) {
+	shard := l.shard(id)
+	shard.mu.RLock()
+	inflight, tokens := shard.inflight[id], shard.tokens[id]
+	shard.mu.RUnlock()
+	return inflight, tokens
+}
+
+func (l *shardedLoadCounters) addEgress(id string, delta int) {
+	if strings.TrimSpace(id) == "" {
+		return
+	}
+	shard := l.shard(id)
+	shard.mu.Lock()
+	next := shard.egress[id] + delta
+	if next <= 0 {
+		delete(shard.egress, id)
+	} else {
+		shard.egress[id] = next
+	}
+	shard.mu.Unlock()
+}
+
+func (l *shardedLoadCounters) egressLoad(id string) int {
+	shard := l.shard(id)
+	shard.mu.RLock()
+	load := shard.egress[id]
+	shard.mu.RUnlock()
+	return load
+}
+
+func (l *shardedLoadCounters) active() int64 {
+	var active int64
+	for i := range l.shards {
+		shard := &l.shards[i]
+		shard.mu.RLock()
+		for _, count := range shard.inflight {
+			active += int64(count)
+		}
+		shard.mu.RUnlock()
+	}
+	return active
+}
+
+type egressEWMA struct {
+	LatencyMillis float64
+	Success       float64
+	Samples       uint64
+	UpdatedAt     time.Time
+}
+
+type egressEWMAShard struct {
+	mu   sync.RWMutex
+	rows map[string]egressEWMA
+}
+
 type Scheduler struct {
 	store           *storage.Store
 	cfg             atomic.Value // stores config.Config
@@ -42,6 +157,8 @@ type Scheduler struct {
 	inflight        map[string]int
 	inflightTokens  map[string]int64
 	egressInflight  map[string]int
+	loads           *shardedLoadCounters
+	egressEWMA      [schedulerLoadShardCount]egressEWMAShard
 	loadChanged     chan struct{}
 	rr              int // round-robin cursor for spreading load across equal-load candidates
 	queueMu         sync.Mutex
@@ -71,7 +188,8 @@ type Scheduler struct {
 	accountRefreshMu      sync.Mutex
 	rateRefreshMu         sync.Mutex
 	modelRefreshMu        sync.Mutex
-	candidateIndexes      atomic.Value // map[string]*routeCandidateIndex, immutable after publication
+	candidateIndexes      sync.Map // key -> *routeCandidateIndex; avoids whole-map copy on publication
+	candidateIndexCount   atomic.Int64
 	candidateRefreshMu    sync.Mutex
 
 	// kiroBlockLogged dedupes the Kiro model-resolution diagnostic (see
@@ -152,26 +270,29 @@ type waitQueue struct {
 // SchedulerMetrics is a cheap runtime snapshot used by diagnostics and tests. Values
 // are process-local and intentionally monotonic except Queued, which is a gauge.
 type SchedulerMetrics struct {
-	Active               int64 `json:"active"`
-	Queued               int64 `json:"queued"`
-	Waited               int64 `json:"waited"`
-	Cancelled            int64 `json:"cancelled"`
-	AccountSwitches      int64 `json:"account_switches"`
-	WaitConcurrency      int64 `json:"wait_concurrency"`
-	WaitTokenBudget      int64 `json:"wait_token_budget"`
-	WaitCooldown         int64 `json:"wait_cooldown"`
-	WaitRecheck          int64 `json:"wait_recheck"`
-	WaitEgress           int64 `json:"wait_egress"`
-	CooldownWakeups      int64 `json:"cooldown_wakeups"`
-	StateWakeups         int64 `json:"state_wakeups"`
-	WaitNanos            int64 `json:"wait_nanos"`
-	RouteSelects         int64 `json:"route_selects"`
-	RouteNanos           int64 `json:"route_nanos"`
-	RouteAvgNanos        int64 `json:"route_avg_nanos"`
-	RouteMaxNanos        int64 `json:"route_max_nanos"`
-	CandidateEvaluations int64 `json:"candidate_evaluations"`
-	CandidateFallbacks   int64 `json:"candidate_fallbacks"`
-	CandidateIndexBuilds int64 `json:"candidate_index_builds"`
+	Active                int64 `json:"active"`
+	Queued                int64 `json:"queued"`
+	Waited                int64 `json:"waited"`
+	Cancelled             int64 `json:"cancelled"`
+	AccountSwitches       int64 `json:"account_switches"`
+	WaitConcurrency       int64 `json:"wait_concurrency"`
+	WaitTokenBudget       int64 `json:"wait_token_budget"`
+	WaitCooldown          int64 `json:"wait_cooldown"`
+	WaitRecheck           int64 `json:"wait_recheck"`
+	WaitEgress            int64 `json:"wait_egress"`
+	CooldownWakeups       int64 `json:"cooldown_wakeups"`
+	StateWakeups          int64 `json:"state_wakeups"`
+	WaitNanos             int64 `json:"wait_nanos"`
+	RouteSelects          int64 `json:"route_selects"`
+	RouteNanos            int64 `json:"route_nanos"`
+	RouteAvgNanos         int64 `json:"route_avg_nanos"`
+	RouteMaxNanos         int64 `json:"route_max_nanos"`
+	CandidateEvaluations  int64 `json:"candidate_evaluations"`
+	CandidateFallbacks    int64 `json:"candidate_fallbacks"`
+	CandidateIndexBuilds  int64 `json:"candidate_index_builds"`
+	CandidateIndexEntries int64 `json:"candidate_index_entries"`
+	EgressEWMAOutlets     int64 `json:"egress_ewma_outlets"`
+	EgressEWMASamples     int64 `json:"egress_ewma_samples"`
 }
 
 type leaseBlockReason string
@@ -210,7 +331,7 @@ func (s *Scheduler) InvalidateAccountCache() {
 	s.auxCacheAt = nil
 	s.accountCacheMutex.Unlock()
 	s.affinityCache.clear()
-	s.candidateIndexes.Store(map[string]*routeCandidateIndex{})
+	s.clearCandidateIndexes()
 	s.NotifyStateChanged()
 }
 
@@ -322,8 +443,10 @@ type Route struct {
 	// !ServerSideState. New callers should set ServerSideState directly.
 	Movable bool
 	Model   string
-	// ContextMode is part of routing identity and capability selection. "1m"
-	// requires account-scoped evidence and may never fall through to a 200K account.
+	// ContextMode is part of routing identity and capability selection. A single
+	// "1m" selection requires account-scoped evidence and never falls through on
+	// its own; the Messages API may make a second, explicitly standard-window
+	// selection for its Claude-Code-managed virtual-1M compaction mode.
 	ContextMode     string
 	EstimatedTokens int64
 	Compaction      bool
@@ -464,6 +587,7 @@ func NewWithLeaseCoordinator(store *storage.Store, cfg config.Config, coordinato
 		inflight:         map[string]int{},
 		inflightTokens:   map[string]int64{},
 		egressInflight:   map[string]int{},
+		loads:            newShardedLoadCounters(),
 		loadChanged:      make(chan struct{}),
 		waitQueues:       map[string]*waitQueue{},
 		selectionCache:   map[string]*accountSelectionSnapshot{},
@@ -474,8 +598,10 @@ func NewWithLeaseCoordinator(store *storage.Store, cfg config.Config, coordinato
 		coordinator:      coordinator,
 		coordinatorStop:  make(chan struct{}),
 	}
+	for i := range s.egressEWMA {
+		s.egressEWMA[i].rows = map[string]egressEWMA{}
+	}
 	s.cfg.Store(cfg)
-	s.candidateIndexes.Store(map[string]*routeCandidateIndex{})
 	if notifications := coordinator.Notifications(); notifications != nil {
 		s.coordinatorWG.Add(1)
 		go func() {
@@ -509,7 +635,7 @@ func (s *Scheduler) Config() config.Config {
 func (s *Scheduler) UpdateConfig(cfg config.Config) {
 	s.cfg.Store(cfg)
 	s.admission.SetHeadroom(cfg.ResourceHeadroomPercent)
-	s.candidateIndexes.Store(map[string]*routeCandidateIndex{})
+	s.clearCandidateIndexes()
 	s.NotifyStateChanged()
 }
 
@@ -522,20 +648,28 @@ func (s *Scheduler) NotifyStateChanged() {
 }
 
 func (s *Scheduler) Metrics() SchedulerMetrics {
-	s.mu.Lock()
-	active := 0
-	for _, n := range s.inflight {
-		active += n
+	active := int64(0)
+	if s.loads != nil {
+		active = s.loads.active()
 	}
-	s.mu.Unlock()
 	routeSelects := atomic.LoadInt64(&s.metrics.RouteSelects)
 	routeNanos := atomic.LoadInt64(&s.metrics.RouteNanos)
 	routeAverage := int64(0)
 	if routeSelects > 0 {
 		routeAverage = routeNanos / routeSelects
 	}
+	var ewmaOutlets, ewmaSamples int64
+	for i := range s.egressEWMA {
+		shard := &s.egressEWMA[i]
+		shard.mu.RLock()
+		ewmaOutlets += int64(len(shard.rows))
+		for _, row := range shard.rows {
+			ewmaSamples += int64(row.Samples)
+		}
+		shard.mu.RUnlock()
+	}
 	return SchedulerMetrics{
-		Active: int64(active),
+		Active: active,
 		Queued: atomic.LoadInt64(&s.metrics.Queued), Waited: atomic.LoadInt64(&s.metrics.Waited),
 		Cancelled: atomic.LoadInt64(&s.metrics.Cancelled), AccountSwitches: atomic.LoadInt64(&s.metrics.AccountSwitches),
 		WaitConcurrency: atomic.LoadInt64(&s.metrics.WaitConcurrency), WaitTokenBudget: atomic.LoadInt64(&s.metrics.WaitTokenBudget),
@@ -544,7 +678,72 @@ func (s *Scheduler) Metrics() SchedulerMetrics {
 		StateWakeups: atomic.LoadInt64(&s.metrics.StateWakeups), WaitNanos: atomic.LoadInt64(&s.metrics.WaitNanos),
 		RouteSelects: routeSelects, RouteNanos: routeNanos, RouteAvgNanos: routeAverage, RouteMaxNanos: atomic.LoadInt64(&s.metrics.RouteMaxNanos),
 		CandidateEvaluations: atomic.LoadInt64(&s.metrics.CandidateEvaluations), CandidateFallbacks: atomic.LoadInt64(&s.metrics.CandidateFallbacks), CandidateIndexBuilds: atomic.LoadInt64(&s.metrics.CandidateIndexBuilds),
+		CandidateIndexEntries: s.candidateIndexCount.Load(),
+		EgressEWMAOutlets:     ewmaOutlets, EgressEWMASamples: ewmaSamples,
 	}
+}
+
+// ObserveEgress updates a bounded, process-local EWMA from the first response
+// byte (or a pre-header failure). A conservative 90% prior prevents one sample
+// from monopolizing or benching an otherwise healthy outlet.
+func (s *Scheduler) ObserveEgress(egressID string, latency time.Duration, success bool) {
+	egressID = strings.TrimSpace(egressID)
+	if s == nil || egressID == "" {
+		return
+	}
+	if latency < time.Millisecond {
+		latency = time.Millisecond
+	}
+	if latency > 2*time.Minute {
+		latency = 2 * time.Minute
+	}
+	shard := &s.egressEWMA[schedulerLoadHash(egressID)&(schedulerLoadShardCount-1)]
+	shard.mu.Lock()
+	if shard.rows == nil {
+		shard.rows = map[string]egressEWMA{}
+	}
+	if _, exists := shard.rows[egressID]; !exists && len(shard.rows) >= schedulerEWMAEntriesPerShard {
+		var oldestID string
+		var oldestAt time.Time
+		for candidateID, candidate := range shard.rows {
+			if oldestID == "" || candidate.UpdatedAt.Before(oldestAt) {
+				oldestID, oldestAt = candidateID, candidate.UpdatedAt
+			}
+		}
+		delete(shard.rows, oldestID)
+	}
+	row := shard.rows[egressID]
+	const alpha = 0.20
+	value := 0.0
+	if success {
+		value = 1
+	}
+	if row.Samples == 0 {
+		row.Success = 0.9*(1-alpha) + value*alpha
+		row.LatencyMillis = float64(latency.Milliseconds())
+	} else {
+		row.Success = row.Success*(1-alpha) + value*alpha
+		row.LatencyMillis = row.LatencyMillis*(1-alpha) + float64(latency.Milliseconds())*alpha
+	}
+	row.Samples++
+	row.UpdatedAt = time.Now()
+	shard.rows[egressID] = row
+	shard.mu.Unlock()
+}
+
+func (s *Scheduler) egressEWMAQuality(egressID string) (successBucket int, latencyMillis int) {
+	shard := &s.egressEWMA[schedulerLoadHash(egressID)&(schedulerLoadShardCount-1)]
+	shard.mu.RLock()
+	row, ok := shard.rows[egressID]
+	shard.mu.RUnlock()
+	if !ok || row.Samples == 0 || time.Since(row.UpdatedAt) > 30*time.Minute {
+		return 100, 0
+	}
+	successBucket = int(row.Success*100 + 0.5)
+	if successBucket < 20 {
+		successBucket = 20
+	}
+	return successBucket, int(row.LatencyMillis + 0.5)
 }
 
 func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
@@ -1701,11 +1900,7 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	if coordinated == nil {
 		return Lease{}, reason, false
 	}
-	s.mu.Lock()
-	s.inflight[accountID]++
-	incrementEgressInflight(s.egressInflight, egress)
-	s.inflightTokens[accountID] += route.EstimatedTokens
-	s.mu.Unlock()
+	s.addLocalLoad(accountID, egress, 1, route.EstimatedTokens)
 	released := false
 	var releaseMu sync.Mutex
 	release := func() {
@@ -1720,19 +1915,8 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 			log.Printf("[SCHEDULER] lease coordinator release failed account=%s egress=%s: %v", accountID, egress.ID, err)
 		}
 		cancel()
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if s.inflight[accountID] > 0 {
-			s.inflight[accountID]--
-		}
-		decrementEgressInflight(s.egressInflight, egress)
-		if route.EstimatedTokens > 0 {
-			s.inflightTokens[accountID] -= route.EstimatedTokens
-			if s.inflightTokens[accountID] < 0 {
-				s.inflightTokens[accountID] = 0
-			}
-		}
-		s.notifyLoadChangedLocked()
+		s.addLocalLoad(accountID, egress, -1, -route.EstimatedTokens)
+		s.NotifyStateChanged()
 	}
 	return Lease{Account: account, Binding: binding, Egress: egress, ResolvedModel: resolvedModel, FencingToken: coordinated.FencingToken(), release: release}, leaseBlockNone, true
 }
@@ -1806,15 +1990,38 @@ func selectedEgressBinding(binding storage.AccountEgressBinding, accountID, sele
 }
 
 func (s *Scheduler) currentLoad(accountID string) (int, int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.inflight[accountID], s.inflightTokens[accountID]
+	if s.loads == nil {
+		return 0, 0
+	}
+	return s.loads.account(accountID)
 }
 
 func (s *Scheduler) currentEgressLoad(id string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.egressInflight[id]
+	if s.loads == nil {
+		return 0
+	}
+	return s.loads.egressLoad(id)
+}
+
+func (s *Scheduler) addLocalLoad(accountID string, egress storage.EgressProfile, inflightDelta int, tokenDelta int64) {
+	if s.loads == nil {
+		s.loads = newShardedLoadCounters()
+	}
+	s.loads.addAccount(accountID, inflightDelta, tokenDelta)
+	s.loads.addEgress(egress.ID, inflightDelta)
+	if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" && sidecarID != egress.ID {
+		s.loads.addEgress(sidecarID, inflightDelta)
+	}
+}
+
+func (s *Scheduler) egressConcurrencyLimited(egress storage.EgressProfile) bool {
+	if concurrencyLimited(egress.MaxConcurrency, s.currentEgressLoad(egress.ID)) {
+		return true
+	}
+	if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" {
+		return concurrencyLimited(egress.TransportSidecarMaxConcurrency, s.currentEgressLoad(sidecarID))
+	}
+	return false
 }
 
 func egressConcurrencyLimited(egress storage.EgressProfile, inflight map[string]int) bool {
@@ -1936,6 +2143,14 @@ func (s *Scheduler) waitForStatefulStickyLease(ctx context.Context, accountID st
 	lastHeartbeat := time.Now()
 	lastPoll := time.Time{}
 	for {
+		// A clock/load wake can race the caller deadline. Never issue a storage
+		// lookup with an already-cancelled context: that turns the pinned account
+		// into a misleading "not found" diagnosis and discards the real wait
+		// reason (rate limit, concurrency, token budget, and so on).
+		if cause := ctx.Err(); cause != nil {
+			atomic.AddInt64(&s.metrics.Cancelled, 1)
+			return Lease{}, s.statefulStickyWaitTimeoutError(accountID, route, lastReason, time.Since(start), cause)
+		}
 		loadChanged := s.loadChangedChan()
 		now := time.Now()
 		if lastPoll.IsZero() || now.Sub(lastPoll) >= schedulerRecoveryPollInterval {
@@ -2163,9 +2378,7 @@ func (s *Scheduler) strictStickyCanFailover(ctx context.Context, accountID strin
 		return true
 	}
 	inflight, tokens := s.currentLoad(accountID)
-	s.mu.Lock()
-	egressLimited := egressConcurrencyLimited(egress, s.egressInflight)
-	s.mu.Unlock()
+	egressLimited := s.egressConcurrencyLimited(egress)
 	if egressLimited {
 		return true
 	}
@@ -2491,6 +2704,7 @@ func (s *Scheduler) selectFreshEgressWithCache(ctx context.Context, binding stor
 	selectedSidecarLoad := 0
 	selectedSuccessBucket := 0
 	selectedPressure := 0
+	selectedLatency := int64(0)
 	found := false
 	capacityBlocked := false
 	for index, id := range ids {
@@ -2524,18 +2738,28 @@ func (s *Scheduler) selectFreshEgressWithCache(ctx context.Context, binding stor
 		if successBucket < 1 {
 			successBucket = 1
 		}
+		liveSuccess, liveLatency := s.egressEWMAQuality(egress.ID)
+		successBucket = successBucket * liveSuccess / 100
+		if successBucket < 1 {
+			successBucket = 1
+		}
+		effectiveLatency := egress.LatencyMillis
+		if liveLatency > 0 {
+			effectiveLatency = int64(liveLatency)
+		}
 		pressure := egressLoad + sidecarLoad + 1
 		lowerWeightedPressure := found && int64(pressure)*int64(selectedSuccessBucket) < int64(selectedPressure)*int64(successBucket)
 		equalWeightedPressure := found && int64(pressure)*int64(selectedSuccessBucket) == int64(selectedPressure)*int64(successBucket)
 		if !found || lowerWeightedPressure ||
 			(equalWeightedPressure && egressLoad < selectedEgressLoad) ||
 			(equalWeightedPressure && egressLoad == selectedEgressLoad && sidecarLoad < selectedSidecarLoad) ||
-			(equalWeightedPressure && egressLoad == selectedEgressLoad && sidecarLoad == selectedSidecarLoad && egress.LatencyMillis < selected.LatencyMillis) {
+			(equalWeightedPressure && egressLoad == selectedEgressLoad && sidecarLoad == selectedSidecarLoad && effectiveLatency < selectedLatency) {
 			selected = egress
 			selectedEgressLoad = egressLoad
 			selectedSidecarLoad = sidecarLoad
 			selectedSuccessBucket = successBucket
 			selectedPressure = pressure
+			selectedLatency = effectiveLatency
 			found = true
 		}
 	}
@@ -2604,12 +2828,10 @@ func (s *Scheduler) recentCodexEgressOutcomes(ctx context.Context) map[string]st
 }
 
 func (s *Scheduler) currentEgressLoads(egress storage.EgressProfile) (int, int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	egressLoad := s.egressInflight[egress.ID]
+	egressLoad := s.currentEgressLoad(egress.ID)
 	sidecarLoad := 0
 	if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" && sidecarID != egress.ID {
-		sidecarLoad = s.egressInflight[sidecarID]
+		sidecarLoad = s.currentEgressLoad(sidecarID)
 	}
 	return egressLoad, sidecarLoad
 }
@@ -2767,11 +2989,7 @@ func (s *Scheduler) activateCoordinatedCandidate(c candidate, route Route, coord
 	egress := c.egress
 	accountID := account.ID
 	estimatedTokens := route.EstimatedTokens
-	s.mu.Lock()
-	s.inflight[accountID]++
-	incrementEgressInflight(s.egressInflight, egress)
-	s.inflightTokens[accountID] += estimatedTokens
-	s.mu.Unlock()
+	s.addLocalLoad(accountID, egress, 1, estimatedTokens)
 	released := false
 	var releaseMu sync.Mutex
 	release := func() {
@@ -2786,19 +3004,8 @@ func (s *Scheduler) activateCoordinatedCandidate(c candidate, route Route, coord
 			log.Printf("[SCHEDULER] lease coordinator release failed account=%s egress=%s: %v", accountID, egress.ID, err)
 		}
 		cancel()
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if s.inflight[accountID] > 0 {
-			s.inflight[accountID]--
-		}
-		decrementEgressInflight(s.egressInflight, egress)
-		if estimatedTokens > 0 {
-			s.inflightTokens[accountID] -= estimatedTokens
-			if s.inflightTokens[accountID] < 0 {
-				s.inflightTokens[accountID] = 0
-			}
-		}
-		s.notifyLoadChangedLocked()
+		s.addLocalLoad(accountID, egress, -1, -estimatedTokens)
+		s.NotifyStateChanged()
 	}
 	// The binding was already loaded by selectFresh's batch query and carried on the
 	// candidate, so the lease is built without a second DB read while holding s.mu —

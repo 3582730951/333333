@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
-import * as PoolUI from '../components/pool/index.jsx';
+import { Button, Card, Form, Modal, Tag, Toast, Typography } from '../components/pool/index.jsx';
 import { IconPlus, IconPulse, IconRefresh, IconStop, IconUndo, IconUserGroup } from '../components/pool/icons.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
@@ -12,7 +12,6 @@ import { showErrorToast } from '../components/ErrorToast.jsx';
 import { fmtRelative } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
 
-const { Button, Card, Form, Modal, Tag, Toast, Typography } = PoolUI as any;
 const DataTable = ResourceTable as any;
 const MobileRow = MobileResourceCell as any;
 const Clamp = TextClamp as any;

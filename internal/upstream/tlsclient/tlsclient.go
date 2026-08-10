@@ -183,20 +183,50 @@ type Response struct {
 
 // Factory pools transport clients independently from request-scoped cookie state.
 type Factory struct {
-	mu             sync.Mutex
-	clients        map[string]tls_client.HttpClient
-	jars           map[string]*list.Element
-	jarLRU         *list.List
-	cookieJarMax   int
-	cookieJarTTL   time.Duration
-	defaultTimeout time.Duration
-	wsSessionCache utls.ClientSessionCache
+	mu              sync.Mutex
+	clients         map[string]tls_client.HttpClient
+	clientItems     map[string]*list.Element
+	clientLRU       *list.List
+	clientMax       int
+	clientTTL       time.Duration
+	jars            map[string]*list.Element
+	jarLRU          *list.List
+	cookieJarMax    int
+	cookieJarTTL    time.Duration
+	defaultTimeout  time.Duration
+	wsSessionCache  utls.ClientSessionCache
+	clientHits      uint64
+	clientMisses    uint64
+	clientEvictions uint64
+	jarHits         uint64
+	jarMisses       uint64
+	jarEvictions    uint64
 }
 
 const (
-	defaultCookieJarMax = 131072
+	defaultClientMax    = 256
+	defaultClientTTL    = 30 * time.Minute
+	defaultCookieJarMax = 16384
 	defaultCookieJarTTL = 24 * time.Hour
 )
+
+type CacheMetric struct {
+	Entries   int    `json:"entries"`
+	Capacity  int    `json:"capacity"`
+	Hits      uint64 `json:"hits"`
+	Misses    uint64 `json:"misses"`
+	Evictions uint64 `json:"evictions"`
+}
+
+type CacheStats struct {
+	Clients    CacheMetric `json:"clients"`
+	CookieJars CacheMetric `json:"cookie_jars"`
+}
+
+type clientCacheEntry struct {
+	key      string
+	lastUsed time.Time
+}
 
 type cookieJarEntry struct {
 	key      string
@@ -206,11 +236,27 @@ type cookieJarEntry struct {
 
 // New returns a Factory with a sane default request timeout.
 func New() *Factory {
+	return NewWithLimits(defaultClientMax, defaultCookieJarMax)
+}
+
+// NewWithLimits keeps the expensive fingerprint clients and account cookie
+// state bounded to the deployment's memory tier.
+func NewWithLimits(clientMax, cookieJarMax int) *Factory {
+	if clientMax <= 0 {
+		clientMax = defaultClientMax
+	}
+	if cookieJarMax <= 0 {
+		cookieJarMax = defaultCookieJarMax
+	}
 	return &Factory{
 		clients:        map[string]tls_client.HttpClient{},
+		clientItems:    map[string]*list.Element{},
+		clientLRU:      list.New(),
+		clientMax:      clientMax,
+		clientTTL:      defaultClientTTL,
 		jars:           map[string]*list.Element{},
 		jarLRU:         list.New(),
-		cookieJarMax:   defaultCookieJarMax,
+		cookieJarMax:   cookieJarMax,
 		cookieJarTTL:   defaultCookieJarTTL,
 		defaultTimeout: 120 * time.Second,
 		wsSessionCache: utls.NewLRUClientSessionCache(128),
@@ -279,9 +325,24 @@ func (f *Factory) clientFor(r Request) (tls_client.HttpClient, error) {
 	key := cacheKey(r)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	now := time.Now()
+	for back := f.clientLRU.Back(); back != nil; back = f.clientLRU.Back() {
+		entry := back.Value.(*clientCacheEntry)
+		if f.clientTTL <= 0 || now.Sub(entry.lastUsed) < f.clientTTL {
+			break
+		}
+		f.evictClientLocked(back)
+	}
 	if c := f.clients[key]; c != nil {
+		f.clientHits++
+		if element := f.clientItems[key]; element != nil {
+			entry := element.Value.(*clientCacheEntry)
+			entry.lastUsed = now
+			f.clientLRU.MoveToFront(element)
+		}
 		return c, nil
 	}
+	f.clientMisses++
 	timeout := r.Timeout
 	if timeout <= 0 {
 		timeout = f.defaultTimeout
@@ -311,7 +372,42 @@ func (f *Factory) clientFor(r Request) (tls_client.HttpClient, error) {
 		return nil, err
 	}
 	f.clients[key] = c
+	f.clientItems[key] = f.clientLRU.PushFront(&clientCacheEntry{key: key, lastUsed: now})
+	for f.clientMax > 0 && f.clientLRU.Len() > f.clientMax {
+		f.evictClientLocked(f.clientLRU.Back())
+	}
 	return c, nil
+}
+
+func (f *Factory) evictClientLocked(element *list.Element) {
+	if element == nil {
+		return
+	}
+	entry, _ := element.Value.(*clientCacheEntry)
+	f.clientLRU.Remove(element)
+	if entry == nil {
+		return
+	}
+	delete(f.clientItems, entry.key)
+	if client := f.clients[entry.key]; client != nil {
+		if closer, ok := client.(interface{ CloseIdleConnections() }); ok {
+			closer.CloseIdleConnections()
+		}
+		delete(f.clients, entry.key)
+		f.clientEvictions++
+	}
+}
+
+func (f *Factory) Stats() CacheStats {
+	if f == nil {
+		return CacheStats{}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return CacheStats{
+		Clients:    CacheMetric{Entries: len(f.clients), Capacity: f.clientMax, Hits: f.clientHits, Misses: f.clientMisses, Evictions: f.clientEvictions},
+		CookieJars: CacheMetric{Entries: len(f.jars), Capacity: f.cookieJarMax, Hits: f.jarHits, Misses: f.jarMisses, Evictions: f.jarEvictions},
+	}
 }
 
 // Do issues r and returns a streaming Response. The response Body is the live upstream
@@ -383,13 +479,16 @@ func (f *Factory) cookieJar(key string) *cookiejar.Jar {
 		}
 		f.jarLRU.Remove(back)
 		delete(f.jars, entry.key)
+		f.jarEvictions++
 	}
 	if element := f.jars[key]; element != nil {
+		f.jarHits++
 		entry := element.Value.(*cookieJarEntry)
 		entry.lastUsed = now
 		f.jarLRU.MoveToFront(element)
 		return entry.jar
 	}
+	f.jarMisses++
 	jar, _ := cookiejar.New(nil)
 	element := f.jarLRU.PushFront(&cookieJarEntry{key: key, jar: jar, lastUsed: now})
 	f.jars[key] = element
@@ -397,6 +496,7 @@ func (f *Factory) cookieJar(key string) *cookiejar.Jar {
 		back := f.jarLRU.Back()
 		f.jarLRU.Remove(back)
 		delete(f.jars, back.Value.(*cookieJarEntry).key)
+		f.jarEvictions++
 	}
 	return jar
 }

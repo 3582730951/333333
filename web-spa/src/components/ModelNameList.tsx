@@ -1,6 +1,6 @@
 import React, { useCallback, useDeferredValue, useMemo, useState } from 'react';
 import { get } from '../api.js';
-import * as PoolUI from './pool/index.jsx';
+import { Button, EmptyState, Input, Tag } from './pool/index.jsx';
 import { IconRefresh, IconSearch } from './pool/icons.jsx';
 import LoadErrorBanner from './LoadErrorBanner.jsx';
 import PageHeader from './PageHeader.jsx';
@@ -9,7 +9,6 @@ import * as MicroCharts from './MicroCharts.jsx';
 import { fmtInt, fmtRelative, fmtTokens } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
 
-const { Button, EmptyState, Input, Tag } = PoolUI as any;
 // MicroCharts is untyped JSX, so `segments = []` infers never[] at a .tsx call site. Every other
 // .tsx consumer destructures through `as any` for the same reason; matching that.
 const { StackedMeter } = MicroCharts as any;

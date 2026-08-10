@@ -1,7 +1,7 @@
 // @ts-nocheck
 import React, { useCallback, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
-import * as PoolUI from '../components/pool/index.jsx';
+import { Button, Card, ConfirmDialog, Form, Tag, Toast, Typography } from '../components/pool/index.jsx';
 import {
   IconCheckCircleStroked, IconDelete, IconGlobe, IconRefresh, IconSave,
 } from '../components/pool/icons.jsx';
@@ -25,9 +25,6 @@ import type {
   CloudflareMailboxSaveInput,
 } from '../features/accounts/api/emailPool';
 
-const {
-  Button, Card, ConfirmDialog, Form, Tag, Toast, Typography,
-} = PoolUI as any;
 const ErrorBanner = LoadErrorBanner as any;
 const SummaryRail = MetricRail as any;
 const Clamp = TextClamp as any;

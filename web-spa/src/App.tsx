@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type CSSProperties, type LazyExoticComponent, type ReactNode } from 'react';
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router';
 import { useIsFetching } from '@tanstack/react-query';
-import * as PoolUI from './components/pool/index.jsx';
+import { Avatar, Button, Layout, Nav, Toast } from './components/pool/index.jsx';
 import {
   IconChevronDown, IconClose, IconExit, IconGlobe, IconHistogram, IconHome, IconKey, IconLanguage,
   IconList, IconMoon, IconPulse, IconSetting, IconSun, IconUser, IconUserGroup,
@@ -18,7 +18,6 @@ import { prefersReducedNetworkData } from './lib/browserNetwork.js';
 import { resetDocumentOverlayLocks } from './lib/browserDocument.js';
 import type { RouteDefinition } from './model/contracts';
 
-const { Avatar, Button, Layout, Nav, Toast } = PoolUI as any;
 const { Header, Sider, Content } = Layout;
 const SIDEBAR_EXPANDED_WIDTH = 248;
 const SIDEBAR_COLLAPSED_WIDTH = 68;
@@ -347,15 +346,18 @@ export default function App() {
   useEffect(() => {
     if (!auth.authed || prefersReducedNetworkData()) return undefined;
     const routes = (isAdmin ? adminRoutes : portalRoutes) as ReadonlyArray<RouteDefinition>;
-    const preloadRoutes = routes.filter((route) => route.prefetch === 'eager' || route.prefetch === 'idle');
+    // Preload at most the two highest-value routes. The previous eager+idle sweep
+    // downloaded nearly the entire admin application three seconds after login.
+    const preloadRoutes = routes
+      .filter((route) => route.prefetch === 'eager' && route.path !== location.pathname)
+      .slice(0, 2);
     const idle = requestBrowserIdleCallback(() => preloadRoutes.forEach((route) => route.lazyLoader().catch((error) => reportPrefetchError(error, route))), { timeout: 3000 });
     return () => cancelBrowserIdleCallback(idle);
   }, [auth.authed, isAdmin]);
 
   const switchLocale = useCallback(() => {
     const next = locale === 'en' ? 'zh' : 'en';
-    setLocale(next);
-    setLocaleState(next);
+    void setLocale(next).then(() => setLocaleState(next));
   }, [locale]);
 
   const navigation = useMemo(() => isAdmin ? adminNavigation() : portalNavigation(), [isAdmin, locale]);

@@ -35,7 +35,9 @@ import (
 	"strings"
 	"time"
 
+	"codex-account-pool/internal/antigravityidentity"
 	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/jsonview"
 	"codex-account-pool/internal/storage"
 
 	"github.com/google/uuid"
@@ -48,7 +50,6 @@ const (
 	antigravityProdBaseURL  = "https://cloudcode-pa.googleapis.com"
 	antigravityStreamPath   = "/v1internal:streamGenerateContent?alt=sse"
 	antigravityGeneratePath = "/v1internal:generateContent"
-	antigravityDefaultUA    = "antigravity/hub/2.2.1 darwin/arm64"
 	antigravityOAuthUA      = "Go-http-client/2.0"
 	// refreshSkew: token is considered expired 3000s early — mirrors CLIProxyAPI source.
 	antigravityRefreshSkew = 3000
@@ -59,6 +60,10 @@ const (
 var antigravityTransport = &http.Transport{
 	ForceAttemptHTTP2: false,
 	TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{}, // wipe H2 upgrade
+	TLSClientConfig: &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+	},
 }
 
 // AntigravityTokenResponse is the OAuth refresh token response shape.
@@ -125,10 +130,7 @@ func fetchAntigravityModels(ctx context.Context, accessToken, projectID, baseURL
 		payload["project"] = projectID
 	}
 	body, _ := json.Marshal(payload)
-	ua := strings.TrimSpace(userAgent)
-	if ua == "" {
-		ua = antigravityDefaultUA
-	}
+	ua := antigravityidentity.RequestUserAgent(userAgent)
 	var lastErr error
 	for _, base := range bases {
 		headers := make(http.Header)
@@ -150,9 +152,9 @@ func fetchAntigravityModels(ctx context.Context, accessToken, projectID, baseURL
 			lastErr = fmt.Errorf("antigravity model probe returned HTTP %d", resp.StatusCode)
 			continue
 		}
-		modelsNode := gjson.GetBytes(respBody, "models")
+		modelsNode := jsonview.Get(respBody, "models")
 		if !modelsNode.IsObject() {
-			if gjson.GetBytes(respBody, "webSearchModelIds").IsArray() {
+			if jsonview.Get(respBody, "webSearchModelIds").IsArray() {
 				lastErr = errors.New("antigravity model probe returned capability hints without a model catalog")
 			} else {
 				lastErr = errors.New("antigravity model probe response is missing models")
@@ -259,6 +261,9 @@ type AntigravityRequest struct {
 	UserAgent   string // empty → default UA
 	Body        []byte // Anthropic-format request JSON
 	Stream      bool
+	// SensitiveWords are obfuscated only inside the translated systemInstruction.
+	// User/tool content remains unchanged.
+	SensitiveWords []string
 	// MaxOutputTokens is the account catalog's exact-model output ceiling. Zero
 	// means the catalog did not publish a limit.
 	MaxOutputTokens int64
@@ -389,7 +394,7 @@ func buildAntigravityRequest(req AntigravityRequest) (string, http.Header, []byt
 	base := AntigravityEndpointBases(req.BaseURL)[0]
 
 	// Convert Anthropic request body → Antigravity wire format.
-	agBody, err := anthropicToAntigravityForAccount(req.Body, req.Model, req.ProjectID, req.AccountID, req.MaxOutputTokens)
+	agBody, err := anthropicToAntigravityForAccount(req.Body, req.Model, req.ProjectID, req.AccountID, req.MaxOutputTokens, req.SensitiveWords)
 	if err != nil {
 		return "", nil, nil, err
 	}
@@ -401,10 +406,7 @@ func buildAntigravityRequest(req AntigravityRequest) (string, http.Header, []byt
 		target = base + antigravityGeneratePath
 	}
 
-	ua := antigravityDefaultUA
-	if u := strings.TrimSpace(req.UserAgent); u != "" {
-		ua = u
-	}
+	ua := antigravityidentity.RequestUserAgent(req.UserAgent)
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/json")
 	headers.Set("Authorization", "Bearer "+req.AccessToken)
@@ -509,7 +511,7 @@ func anthropicToAntigravity(body []byte, model, projectID string) ([]byte, error
 	return anthropicToAntigravityForAccount(body, model, projectID, "", 0)
 }
 
-func anthropicToAntigravityForAccount(body []byte, model, projectID, accountID string, maxOutputTokens int64) ([]byte, error) {
+func anthropicToAntigravityForAccount(body []byte, model, projectID, accountID string, maxOutputTokens int64, sensitiveWordSets ...[]string) ([]byte, error) {
 	if !json.Valid(body) {
 		return nil, antigravityConversionError("request body is not valid JSON")
 	}
@@ -534,12 +536,11 @@ func anthropicToAntigravityForAccount(body []byte, model, projectID, accountID s
 	if projectID != "" {
 		out, _ = sjson.SetBytes(out, "project", projectID)
 	}
-	out, _ = sjson.SetBytes(out, "requestId", uuid.NewString())
-	out, _ = sjson.SetRawBytes(out, "request.contents", contentsJSON)
+	out, _ = sjson.SetBytes(out, "requestId", "agent-"+uuid.NewString())
 	out, _ = sjson.SetBytes(out, "request.sessionId", antigravityStableSessionID(body, accountID))
 
 	// 3. Forward generationConfig fields.
-	if mt := gjson.GetBytes(body, "max_tokens"); mt.Exists() {
+	if mt := jsonview.Get(body, "max_tokens"); mt.Exists() {
 		requested := mt.Int()
 		if maxOutputTokens > 0 && (requested <= 0 || requested > maxOutputTokens) {
 			requested = maxOutputTokens
@@ -548,16 +549,16 @@ func anthropicToAntigravityForAccount(body []byte, model, projectID, accountID s
 			out, _ = sjson.SetBytes(out, "request.generationConfig.maxOutputTokens", requested)
 		}
 	}
-	if temp := gjson.GetBytes(body, "temperature"); temp.Exists() {
+	if temp := jsonview.Get(body, "temperature"); temp.Exists() {
 		out, _ = sjson.SetBytes(out, "request.generationConfig.temperature", temp.Float())
 	}
-	if topP := gjson.GetBytes(body, "top_p"); topP.Exists() {
+	if topP := jsonview.Get(body, "top_p"); topP.Exists() {
 		out, _ = sjson.SetBytes(out, "request.generationConfig.topP", topP.Float())
 	}
-	if topK := gjson.GetBytes(body, "top_k"); topK.Exists() {
+	if topK := jsonview.Get(body, "top_k"); topK.Exists() {
 		out, _ = sjson.SetBytes(out, "request.generationConfig.topK", topK.Int())
 	}
-	if stops := gjson.GetBytes(body, "stop_sequences"); stops.Exists() {
+	if stops := jsonview.Get(body, "stop_sequences"); stops.Exists() {
 		if !stops.IsArray() {
 			return nil, antigravityConversionError("stop_sequences must be an array")
 		}
@@ -570,7 +571,7 @@ func anthropicToAntigravityForAccount(body []byte, model, projectID, accountID s
 		}
 		out, _ = sjson.SetBytes(out, "request.generationConfig.stopSequences", values)
 	}
-	if thinking := gjson.GetBytes(body, "thinking"); thinking.Exists() {
+	if thinking := jsonview.Get(body, "thinking"); thinking.Exists() {
 		if !thinking.IsObject() {
 			return nil, antigravityConversionError("thinking must be an object")
 		}
@@ -583,7 +584,7 @@ func anthropicToAntigravityForAccount(body []byte, model, projectID, accountID s
 			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", budget.Int())
 			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts", true)
 		case "adaptive", "auto":
-			effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "output_config.effort").String()))
+			effort := strings.ToLower(strings.TrimSpace(jsonview.Get(body, "output_config.effort").String()))
 			if effort == "" {
 				effort = "high"
 			}
@@ -609,11 +610,14 @@ func anthropicToAntigravityForAccount(body []byte, model, projectID, accountID s
 		partsJSON, _ := json.Marshal(parts)
 		out, _ = sjson.SetBytes(out, "request.systemInstruction.role", "user")
 		out, _ = sjson.SetRawBytes(out, "request.systemInstruction.parts", partsJSON)
+		if len(sensitiveWordSets) > 0 {
+			out = obfuscateAntigravitySystemWords(out, sensitiveWordSets[0])
+		}
 	}
 
 	// 5. Tools → functionDeclarations.
 	hasFunctionTools := false
-	if tools := gjson.GetBytes(body, "tools"); tools.IsArray() && len(tools.Array()) > 0 {
+	if tools := jsonview.Get(body, "tools"); tools.IsArray() && len(tools.Array()) > 0 {
 		funcDecls := make([]json.RawMessage, 0, len(tools.Array()))
 		for index, t := range tools.Array() {
 			if typ := strings.TrimSpace(t.Get("type").String()); typ != "" && typ != "custom" {
@@ -648,7 +652,7 @@ func anthropicToAntigravityForAccount(body []byte, model, projectID, accountID s
 		out, _ = sjson.SetRawBytes(out, "request.tools.0.functionDeclarations", fdJSON)
 		hasFunctionTools = len(funcDecls) > 0
 	}
-	if toolChoice := gjson.GetBytes(body, "tool_choice"); toolChoice.Exists() {
+	if toolChoice := jsonview.Get(body, "tool_choice"); toolChoice.Exists() {
 		if !toolChoice.IsObject() {
 			return nil, antigravityConversionError("tool_choice must be an object")
 		}
@@ -683,22 +687,27 @@ func anthropicToAntigravityForAccount(body []byte, model, projectID, accountID s
 	// Note: context_management is already omitted because we rebuild the envelope from scratch.
 
 	// Check for unsupported fields that would reach the wire.
-	if gjson.GetBytes(body, "mcp_servers").Exists() {
+	if jsonview.Get(body, "mcp_servers").Exists() {
 		return nil, antigravityConversionError("mcp_servers are not supported by the Antigravity protocol")
 	}
+
+	// contents is normally the dominant allocation (hundreds of KiB to multiple
+	// MiB). Splice it only after every small envelope/config mutation so sjson does
+	// not repeatedly copy the complete conversation for each later field.
+	out, _ = sjson.SetRawBytes(out, "request.contents", contentsJSON)
 
 	return out, nil
 }
 
 func anthropicSystemToGeminiParts(body []byte) ([]geminiPart, error) {
-	parts, err := anthropicSystemContentToGeminiParts(gjson.GetBytes(body, "system"), "system")
+	parts, err := anthropicSystemContentToGeminiParts(jsonview.Get(body, "system"), "system")
 	if err != nil {
 		return nil, err
 	}
 	// Some gateway/client instruction layers use Chat-style system-role
 	// messages. Antigravity has only systemInstruction, so hoist those blocks
 	// instead of rejecting an otherwise losslessly representable request.
-	for index, message := range gjson.GetBytes(body, "messages").Array() {
+	for index, message := range jsonview.Get(body, "messages").Array() {
 		if strings.TrimSpace(message.Get("role").String()) != "system" {
 			continue
 		}
@@ -754,7 +763,7 @@ type geminiPart struct {
 // anthropicMessagesToGeminiContents converts an Anthropic messages array to
 // the Gemini contents format.
 func anthropicMessagesToGeminiContents(body []byte, model string) ([]geminiContent, error) {
-	msgs := gjson.GetBytes(body, "messages")
+	msgs := jsonview.Get(body, "messages")
 	if !msgs.IsArray() {
 		return nil, antigravityConversionError("anthropic body is missing messages array")
 	}
@@ -1040,7 +1049,7 @@ func normalizeAntigravityClaudeSignature(raw string) (string, bool) {
 // state while preserving stability for retries and later turns on one account.
 func antigravityStableSessionID(body []byte, accountID string) string {
 	seed := strings.TrimSpace(accountID)
-	msgs := gjson.GetBytes(body, "messages")
+	msgs := jsonview.Get(body, "messages")
 	if msgs.IsArray() {
 		for _, m := range msgs.Array() {
 			if m.Get("role").String() == "user" {
@@ -1120,7 +1129,7 @@ func parseAntigravityChunk(payload []byte) (*AntigravityChunk, error) {
 	if !json.Valid(payload) {
 		return nil, fmt.Errorf("antigravity response chunk is not valid JSON")
 	}
-	r := gjson.ParseBytes(payload)
+	r := jsonview.Parse(payload)
 	if embedded := r.Get("error"); embedded.Exists() {
 		return nil, newAntigravityEmbeddedError(embedded)
 	}
@@ -1622,7 +1631,7 @@ func ParseAntigravityNonStream(body io.Reader) (*AntigravityChunk, error) {
 	}
 	// Non-stream responses may be wrapped in {"response":{...},"traceId":"..."}.
 	payload := data
-	if inner := gjson.GetBytes(data, "response"); inner.Exists() {
+	if inner := jsonview.Get(data, "response"); inner.Exists() {
 		payload = []byte(inner.Raw)
 	}
 	return parseAntigravityChunk(payload)

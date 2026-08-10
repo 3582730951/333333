@@ -43,8 +43,11 @@ const prefetchGraph = (entryPattern) => {
   const gzipBytes = [...graph].reduce((total, asset) => total + gzipSync(fs.readFileSync(path.join(dist, asset))).length, 0);
   return { graph, gzipBytes };
 };
-const adminPrefetch = prefetchGraph(/^(?:Dashboard|Accounts|Usage|System|Keys|SettingsV2|Egress|Registration|TeamLifecycle)-.*\.js$/);
-const portalPrefetch = prefetchGraph(/^(?:PortalDashboard|PortalKeys|PortalModels|PortalProfile)-.*\.js$/);
+// Keep this list aligned with routeDefinitions.ts entries marked prefetch=eager.
+// App.tsx excludes the current page and caps each session to two entries, so this
+// is a conservative upper bound (a normal dashboard session loads only Accounts).
+const adminPrefetch = prefetchGraph(/^(?:Dashboard|Accounts)-.*\.js$/);
+const portalPrefetch = prefetchGraph(/^PortalDashboard-.*\.js$/);
 const chartChunk = [...initial].find((asset) => /(?:^|\/)(?:Charts|vendor-charts)-[^/]+\.js$/.test(asset));
 const budget = 256 * 1024;
 
@@ -53,5 +56,5 @@ if (initialGzipBytes > budget) {
   throw new Error(`initial JavaScript gzip budget exceeded: ${initialGzipBytes} > ${budget}`);
 }
 console.log(`Build budget passed: ${initialGzipBytes} HTML initial static-graph JS gzip bytes across ${initial.size} assets`);
-console.log(`Admin 3-second automatic prefetch cost: ${adminPrefetch.gzipBytes} cumulative JS gzip bytes across ${adminPrefetch.graph.size} assets (${adminPrefetch.gzipBytes - initialGzipBytes} bytes after initial)`);
-console.log(`Portal 3-second automatic prefetch cost: ${portalPrefetch.gzipBytes} cumulative JS gzip bytes across ${portalPrefetch.graph.size} assets (${portalPrefetch.gzipBytes - initialGzipBytes} bytes after initial)`);
+console.log(`Admin configured automatic prefetch upper bound: ${adminPrefetch.gzipBytes} cumulative JS gzip bytes across ${adminPrefetch.graph.size} assets (${adminPrefetch.gzipBytes - initialGzipBytes} bytes after initial)`);
+console.log(`Portal configured automatic prefetch upper bound: ${portalPrefetch.gzipBytes} cumulative JS gzip bytes across ${portalPrefetch.graph.size} assets (${portalPrefetch.gzipBytes - initialGzipBytes} bytes after initial)`);

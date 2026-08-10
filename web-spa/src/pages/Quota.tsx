@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react';
-import * as PoolUI from '../components/pool/index.jsx';
+import { Button, Progress, Tag, Toast } from '../components/pool/index.jsx';
 import { IconRefresh, IconDownload } from '../components/pool/icons.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
@@ -13,7 +13,6 @@ import { COLORS } from '../lib/chartTheme.js';
 import { t } from '../lib/i18n.js';
 import type { QuotaRow } from '../features/observability/model/types';
 
-const { Button, Progress, Tag, Toast } = PoolUI as any;
 const DataTable = ResourceTable as any;
 const MobileRow = MobileResourceCell as any;
 const { RankedBars, RadialGauge, StackedMeter } = MicroCharts as any;

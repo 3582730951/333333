@@ -1,5 +1,5 @@
 import React from 'react';
-import * as PoolUI from './pool/index.jsx';
+import { ActionMenu, Switch, Tag, Typography } from './pool/index.jsx';
 import { IconDelete, IconEdit } from './pool/icons.jsx';
 import { KeyCopyActions } from './KeySecretTools.jsx';
 import ResourceTable from './ResourceTable.jsx';
@@ -7,7 +7,6 @@ import { fmtDateTime } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
 import type { ApiKeyRow } from '../features/access/model/keys';
 
-const { ActionMenu, Switch, Tag, Typography } = PoolUI as any;
 const DataTable = ResourceTable as any;
 const CopyActions = KeyCopyActions as any;
 type KeyTableMode = 'admin' | 'portal';

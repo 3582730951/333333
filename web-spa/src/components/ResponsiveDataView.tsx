@@ -1,9 +1,8 @@
 import { useEffect, useMemo, useState, type Key, type ReactNode } from 'react';
-import * as PoolUI from './pool/index.jsx';
+import { Button, Drawer } from './pool/index.jsx';
 import ResourceTable from './ResourceTable.jsx';
 import type { ResponsiveDataView as ResponsiveDataViewModel } from '../model/contracts';
 
-const { Button, Drawer } = PoolUI as any;
 const DataViewTable = ResourceTable as any;
 
 interface ResponsiveDataViewProps<T> {

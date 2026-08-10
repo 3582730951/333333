@@ -457,3 +457,13 @@ func TestParseClaudeCredentialsJSONShape(t *testing.T) {
 		t.Fatalf("scopes = %#v", got)
 	}
 }
+
+func TestParseOAuthAntigravityLeavesUserAgentProcessManaged(t *testing.T) {
+	parsed, err := ParseOAuthAntigravity("access", "refresh", "user@example.com", "project", time.Now().Add(time.Hour).Unix(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Provider != "antigravity" || parsed.AntigravityUserAgent != "" {
+		t.Fatalf("Antigravity OAuth identity = %+v, want empty process-managed UA", parsed)
+	}
+}

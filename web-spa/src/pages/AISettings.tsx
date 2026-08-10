@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
-import * as PoolUI from '../components/pool/index.jsx';
+import { Banner, Button, Card, ConfirmDialog, Input, InputNumber, Select, Switch, Tag, Toast, Typography } from '../components/pool/index.jsx';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import PageHeaderBase from '../components/PageHeader.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
@@ -12,7 +12,6 @@ import { addWindowListener, requestBrowserAnimationFrame } from '../lib/browserL
 import { getDocumentElementById } from '../lib/browserDocument.js';
 import { dispatchBrowserEvent } from '../lib/browserEvents.js';
 
-const { Banner, Button, Card, ConfirmDialog, Input, InputNumber, Select, Switch, Tag, Toast, Typography } = PoolUI as any;
 const PageHeader = PageHeaderBase as any;
 
 const CODEX_CLIENT_POLICY_FIELDS = new Set([

@@ -23,6 +23,7 @@ import (
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/supervisor"
 	"github.com/tidwall/sjson"
 )
 
@@ -163,7 +164,112 @@ func normalizeCodexStreamContentType(h http.Header, requestedStream bool) {
 // Read before it is forwarded, so pooled reuse is byte-for-byte equivalent.
 var sseBufPool = sync.Pool{New: func() interface{} { b := make([]byte, 32*1024); return &b }}
 
-const sseFlushBatchSize = 1024 // flush at most every ~1 KB accumulated to reduce syscalls
+const (
+	sseFlushBatchSize = 4 * 1024
+	sseFlushMaxDelay  = 3 * time.Millisecond
+	sseTailFlushLimit = 8 * 1024
+)
+
+type adaptiveSSEBatch struct {
+	mu       sync.Mutex
+	w        http.ResponseWriter
+	flusher  http.Flusher
+	batch    []byte
+	timer    *time.Timer
+	first    bool
+	closed   bool
+	writeErr error
+}
+
+func newAdaptiveSSEBatch(w http.ResponseWriter) *adaptiveSSEBatch {
+	flusher, _ := w.(http.Flusher)
+	return &adaptiveSSEBatch{w: w, flusher: flusher}
+}
+
+func (b *adaptiveSSEBatch) append(p []byte) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.writeErr != nil {
+		return b.writeErr
+	}
+	b.batch = append(b.batch, p...)
+	complete := completeSSEPrefixLen(b.batch)
+	switch {
+	case complete > 0 && !b.first:
+		b.first = true
+		return b.flushPrefixLocked(complete)
+	case complete >= sseFlushBatchSize:
+		return b.flushPrefixLocked(complete)
+	case complete > 0:
+		b.armLocked()
+	case len(b.batch) >= sseTailFlushLimit:
+		return b.flushPrefixLocked(len(b.batch))
+	}
+	return nil
+}
+
+func (b *adaptiveSSEBatch) armLocked() {
+	if b.timer != nil {
+		return
+	}
+	b.timer = time.AfterFunc(sseFlushMaxDelay, func() {
+		defer supervisor.Recover("adaptive-sse-flush")
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.timer = nil
+		if b.closed || b.writeErr != nil {
+			return
+		}
+		if complete := completeSSEPrefixLen(b.batch); complete > 0 {
+			_ = b.flushPrefixLocked(complete)
+		}
+	})
+}
+
+func (b *adaptiveSSEBatch) flushPrefixLocked(n int) error {
+	if n <= 0 || b.writeErr != nil {
+		return b.writeErr
+	}
+	if b.timer != nil {
+		b.timer.Stop()
+		b.timer = nil
+	}
+	if _, err := b.w.Write(b.batch[:n]); err != nil {
+		b.writeErr = err
+		return err
+	}
+	if b.flusher != nil {
+		b.flusher.Flush()
+	}
+	copy(b.batch, b.batch[n:])
+	b.batch = b.batch[:len(b.batch)-n]
+	return nil
+}
+
+func (b *adaptiveSSEBatch) close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
+	if b.timer != nil {
+		b.timer.Stop()
+		b.timer = nil
+	}
+	if b.writeErr != nil {
+		return b.writeErr
+	}
+	return b.flushPrefixLocked(len(b.batch))
+}
+
+func (b *adaptiveSSEBatch) abort() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
+	if b.timer != nil {
+		b.timer.Stop()
+		b.timer = nil
+	}
+	b.batch = nil
+}
 
 // streamCopy copies an upstream SSE stream to the client. When the client supports
 // flushing it relays every complete SSE prefix immediately and retains only an
@@ -176,49 +282,22 @@ const sseFlushBatchSize = 1024 // flush at most every ~1 KB accumulated to reduc
 // data field cannot grow the accumulator without limit. The pool buffer is used for
 // the upstream Read; the accumulator reuses its backing array across iterations.
 func streamCopy(w http.ResponseWriter, body io.Reader) error {
-	flusher, _ := w.(http.Flusher)
 	bufp := sseBufPool.Get().(*[]byte)
 	defer sseBufPool.Put(bufp)
 	buf := *bufp
-	// Micro-batch accumulator: stack-allocated slice that reuses its backing array
-	// across iterations, resetting to zero-length without re-allocation.
-	var batch []byte
-	flushPrefix := func(n int) error {
-		if n <= 0 {
-			return nil
-		}
-		if _, err := w.Write(batch[:n]); err != nil {
-			return err
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-		copy(batch, batch[n:])
-		batch = batch[:len(batch)-n]
-		return nil
-	}
-	flushBatch := func() error { return flushPrefix(len(batch)) }
+	batch := newAdaptiveSSEBatch(w)
 	for {
 		n, err := body.Read(buf)
 		if n > 0 {
-			batch = append(batch, buf[:n]...)
-			// Relay all complete frames even when an incomplete next frame follows in
-			// the same upstream chunk. Only that trailing fragment remains buffered.
-			if complete := completeSSEPrefixLen(batch); complete > 0 {
-				if ferr := flushPrefix(complete); ferr != nil {
-					return ferr
-				}
-			}
-			if len(batch) >= sseFlushBatchSize {
-				if ferr := flushBatch(); ferr != nil {
-					return ferr
-				}
+			if ferr := batch.append(buf[:n]); ferr != nil {
+				return ferr
 			}
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return flushBatch()
+				return batch.close()
 			}
+			batch.abort()
 			return err
 		}
 	}

@@ -5,6 +5,7 @@ package api
 
 import (
 	"codex-account-pool/internal/accountprovider"
+	"codex-account-pool/internal/antigravityidentity"
 	authparse "codex-account-pool/internal/auth"
 	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/capability"
@@ -729,6 +730,9 @@ func (s *Server) adminProbeModels(w http.ResponseWriter, r *http.Request, accoun
 // ModelProbeIntervalHours is 0 the background refresh is disabled (imports and the
 // manual admin probe still work).
 func (s *Server) StartBackground(ctx context.Context) {
+	// Refresh the public Hub runtime version out of band. Request execution only
+	// reads the cache and therefore never waits for the updater manifest.
+	antigravityidentity.StartVersionUpdater(ctx)
 	if s.regHandler != nil {
 		s.regHandler.StartRuntime(ctx)
 	}

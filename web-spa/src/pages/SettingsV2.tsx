@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo, type ReactNode } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router';
-import * as PoolUI from '../components/pool/index.jsx';
+import { Tabs, TabPane, Card, Toast, Typography, Button, Switch, Select, ConfirmDialog, InputNumber, Input, Tag, Banner, Form } from '../components/pool/index.jsx';
 import { IconChevronDown, IconSave, IconRefresh, IconSearch, IconSetting } from '../components/pool/icons.jsx';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import PageHeaderBase from '../components/PageHeader.jsx';
@@ -19,10 +19,6 @@ import type {
 } from '../features/settings/model/settings';
 import { t } from '../lib/i18n.js';
 
-const {
-  Tabs, TabPane, Card, Toast, Typography, Button, Switch, Select, ConfirmDialog,
-  InputNumber, Input, Tag, Banner, Form,
-} = PoolUI as any;
 const PageHeader = PageHeaderBase as any;
 const SettingsTabShell = SettingsTabShellBase as any;
 const ConfigForm = ConfigFormBase as any;

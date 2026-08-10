@@ -13,6 +13,7 @@ import (
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/sysmetrics"
+	"codex-account-pool/internal/upstream"
 )
 
 var sidecarMetricsClient = &http.Client{Timeout: 500 * time.Millisecond}
@@ -32,28 +33,46 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 	dataDir := filepath.Dir(s.cfg.DatabasePath)
 	payload := struct {
 		sysmetrics.Metrics
-		Admission          interface{}                `json:"admission"`
-		Scheduler          interface{}                `json:"scheduler"`
-		BodyStorage        bodysource.BudgetSnapshot  `json:"body_storage"`
-		UsageJournal       map[string]interface{}     `json:"usage_journal"`
-		HTTP               httpRequestMetricsSnapshot `json:"http"`
-		RoutingAudit       map[string]interface{}     `json:"routing_audit"`
-		ContextRebuilt     uint64                     `json:"context_rebuilt"`
-		ContextDegraded    uint64                     `json:"context_degraded"`
-		CodexSessionMap    map[string]interface{}     `json:"codex_session_mapping"`
-		Sidecar            interface{}                `json:"sidecar,omitempty"`
-		DiskGuard          DiskGuardSnapshot          `json:"disk_guard"`
-		SupervisorEvents   []supervisor.Event         `json:"supervisor_events"`
-		SupervisorModules  []supervisor.ModuleState   `json:"supervisor_modules"`
-		ExceptionCallbacks []supervisor.CallbackState `json:"exception_callbacks"`
-		ExceptionJournal   interface{}                `json:"exception_journal"`
+		Admission          interface{}                 `json:"admission"`
+		Scheduler          interface{}                 `json:"scheduler"`
+		BodyStorage        bodysource.BudgetSnapshot   `json:"body_storage"`
+		UsageJournal       map[string]interface{}      `json:"usage_journal"`
+		UsageRollup        interface{}                 `json:"usage_rollup"`
+		HTTP               httpRequestMetricsSnapshot  `json:"http"`
+		UpstreamCaches     upstream.UpstreamCacheStats `json:"upstream_caches"`
+		RoutingAudit       map[string]interface{}      `json:"routing_audit"`
+		ContextRebuilt     uint64                      `json:"context_rebuilt"`
+		ContextDegraded    uint64                      `json:"context_degraded"`
+		CodexSessionMap    map[string]interface{}      `json:"codex_session_mapping"`
+		Sidecar            interface{}                 `json:"sidecar,omitempty"`
+		DiskGuard          DiskGuardSnapshot           `json:"disk_guard"`
+		SupervisorEvents   []supervisor.Event          `json:"supervisor_events"`
+		SupervisorModules  []supervisor.ModuleState    `json:"supervisor_modules"`
+		ExceptionCallbacks []supervisor.CallbackState  `json:"exception_callbacks"`
+		ExceptionJournal   interface{}                 `json:"exception_journal"`
 	}{
-		Metrics:        sysmetrics.Collect(dataDir),
-		Admission:      s.scheduler.AdmissionSnapshot(),
-		Scheduler:      s.scheduler.Metrics(),
-		BodyStorage:    s.bodyBudgetSnapshot(),
-		UsageJournal:   s.usageJournalMetrics(),
-		HTTP:           s.httpMetrics.snapshot(),
+		Metrics:      sysmetrics.Collect(dataDir),
+		Admission:    s.scheduler.AdmissionSnapshot(),
+		Scheduler:    s.scheduler.Metrics(),
+		BodyStorage:  s.bodyBudgetSnapshot(),
+		UsageJournal: s.usageJournalMetrics(),
+		UsageRollup: func() interface{} {
+			if s.store == nil {
+				return map[string]interface{}{"rows": 0, "ready": false}
+			}
+			stats, err := s.store.UsageHourlyRollupStats(r.Context())
+			if err != nil {
+				return map[string]interface{}{"rows": 0, "ready": false}
+			}
+			return stats
+		}(),
+		HTTP: s.httpMetrics.snapshot(),
+		UpstreamCaches: func() upstream.UpstreamCacheStats {
+			if s.upstream == nil {
+				return upstream.UpstreamCacheStats{}
+			}
+			return s.upstream.CacheStats()
+		}(),
 		RoutingAudit:   s.routingAuditDiagnostics(),
 		ContextRebuilt: atomic.LoadUint64(&s.contextRebuilt), ContextDegraded: atomic.LoadUint64(&s.contextDegraded),
 		CodexSessionMap:    s.codexSessionMappingStats(r.Context()),

@@ -128,6 +128,21 @@ func TestEstimateTokensRuneCountEquivalence(t *testing.T) {
 	}
 }
 
+func TestEstimateClaudeTokensJSONIsConservativeForASCIIAndUnicode(t *testing.T) {
+	for _, raw := range [][]byte{
+		[]byte(strings.Repeat("A", 300)),
+		[]byte(strings.Repeat("汉", 100)),
+		[]byte(`{"messages":[{"content":"emoji 😀🚀 and code {}[]"}]}`),
+	} {
+		if got, cheap := EstimateClaudeTokensJSON(raw), EstimateTokensJSON(raw); got < cheap {
+			t.Fatalf("Claude boundary estimate %d is below scheduler estimate %d for %q", got, cheap, raw)
+		}
+	}
+	if got := EstimateClaudeTokensJSON(nil); got != 0 {
+		t.Fatalf("empty Claude estimate = %d, want 0", got)
+	}
+}
+
 func testPlanner(t *testing.T) *Planner {
 	t.Helper()
 	store, err := storage.Open(filepath.Join(t.TempDir(), "pool.sqlite3"))

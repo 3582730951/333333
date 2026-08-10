@@ -1,0 +1,21 @@
+Branch / field: cache-hit-optimization / performance_pipeline_v2
+
+Baseline tree: efd4940f3d3c53890cf7e2682c39694de4566a4e
+Modified code tree (before verification artifacts): 358a78822338b475546789054874858c5e165677
+Baseline commit: 0c2aa3dcf8e120a8833cb1f57687ce4dc067774f
+
+Implemented behavior:
+- BodySource-backed passthrough reuses the captured source instead of allocating a second request body.
+- SQLite usage writes maintain exact hourly rollups; dashboard responses use 5-second fresh / 60-second stale-while-revalidate snapshots.
+- Standard transports, in-process TLS clients, and cookie jars are bounded by memory tier and expose aggregate hit/miss/eviction metrics.
+- Scheduler hot load counters are split across 64 shards; candidate indexes publish without whole-map copies; bounded egress TTFT/success EWMA affects outlet selection; deadline races preserve the real pinned-account wait reason.
+- The selected locale is a lazy chunk, Pool UI imports are tree-shakeable, heavy automatic prefetch is disabled, and production assets are Brotli-precompressed with gzip fallback.
+- SSE sends the first event immediately, then batches complete events at 4 KiB or 3 ms, retaining an 8 KiB tail bound and a supervised timer callback.
+
+Measured results:
+- 50,000-row hourly dashboard benchmark: 11,515,652 ns/op rollup versus 50,163,787 ns/op raw (4.36x; 77.0% lower query time).
+- Initial static-graph JavaScript: 193,179 gzip bytes versus 216,046 baseline (10.6% lower).
+- Configured admin automatic-prefetch upper bound: 241,292 cumulative gzip bytes / 48,113 after initial, versus 325,324 / 109,278 baseline (25.8% cumulative and 56.0% post-initial reduction).
+- Frontend production release: 129 embedded files, 14 entry assets; Brotli artifacts included.
+
+Diff summary against the baseline tree: 234 files, 4,589 insertions, 2,690 deletions. Most paths are deterministic SPA build replacements and their .br companions.

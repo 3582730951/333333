@@ -24,6 +24,12 @@ var distFS embed.FS
 type compressedAsset struct {
 	body        []byte
 	contentType string
+	encoding    string
+}
+
+type compressedAssetVariants struct {
+	brotli *compressedAsset
+	gzip   *compressedAsset
 }
 
 const consoleBuildErrorHTML = `<!doctype html>
@@ -67,7 +73,7 @@ func Handler() http.Handler {
 	if ixErr == nil {
 		ixErr = validateConsoleIndexAssets(sub, index)
 	}
-	gzippedAssets := buildCompressedAssets(sub)
+	compressedAssets := buildCompressedAssets(sub)
 	fileServer := http.StripPrefix("/console/", http.FileServer(http.FS(sub)))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if ixErr != nil {
@@ -81,9 +87,11 @@ func Handler() http.Handler {
 		}
 		if st, err := fs.Stat(sub, rel); err == nil && !st.IsDir() {
 			setAssetCacheHeaders(w, rel)
-			if asset, ok := gzippedAssets[rel]; ok && canServeGzip(r) {
-				serveCompressedAsset(w, r, asset)
-				return
+			if variants, ok := compressedAssets[rel]; ok {
+				if asset, selected := selectCompressedAsset(r, variants); selected {
+					serveCompressedAsset(w, r, asset)
+					return
+				}
 			}
 			fileServer.ServeHTTP(w, r) // real asset (js/css/img)
 			return
@@ -154,8 +162,8 @@ func setAssetCacheHeaders(w http.ResponseWriter, rel string) {
 	w.Header().Set("Cache-Control", "no-cache")
 }
 
-func buildCompressedAssets(sub fs.FS) map[string]compressedAsset {
-	assets := map[string]compressedAsset{}
+func buildCompressedAssets(sub fs.FS) map[string]compressedAssetVariants {
+	assets := map[string]compressedAssetVariants{}
 	_ = fs.WalkDir(sub, "assets", func(rel string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !isCompressibleAsset(rel) {
 			return nil
@@ -163,6 +171,12 @@ func buildCompressedAssets(sub fs.FS) map[string]compressedAsset {
 		raw, err := fs.ReadFile(sub, rel)
 		if err != nil || len(raw) < 1024 {
 			return nil
+		}
+		contentType := contentTypeForAsset(rel, raw)
+		variants := compressedAssetVariants{}
+		if precompressed, preErr := fs.ReadFile(sub, rel+".br"); preErr == nil && len(precompressed) > 0 {
+			brotliAsset := compressedAsset{body: precompressed, contentType: contentType, encoding: "br"}
+			variants.brotli = &brotliAsset
 		}
 		var buf bytes.Buffer
 		// Assets are compressed exactly ONCE at boot and served from memory forever,
@@ -179,10 +193,13 @@ func buildCompressedAssets(sub fs.FS) map[string]compressedAsset {
 		if err := zw.Close(); err != nil {
 			return nil
 		}
-		assets[rel] = compressedAsset{
+		gzipAsset := compressedAsset{
 			body:        buf.Bytes(),
-			contentType: contentTypeForAsset(rel, raw),
+			contentType: contentType,
+			encoding:    "gzip",
 		}
+		variants.gzip = &gzipAsset
+		assets[rel] = variants
 		return nil
 	})
 	return assets
@@ -197,7 +214,7 @@ func isCompressibleAsset(rel string) bool {
 	}
 }
 
-func canServeGzip(r *http.Request) bool {
+func canServeEncoding(r *http.Request, wanted string) bool {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return false
 	}
@@ -205,16 +222,38 @@ func canServeGzip(r *http.Request) bool {
 		return false
 	}
 	for _, value := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
-		encoding := strings.TrimSpace(strings.Split(value, ";")[0])
-		if strings.EqualFold(encoding, "gzip") {
+		parts := strings.Split(value, ";")
+		encoding := strings.TrimSpace(parts[0])
+		accepted := true
+		for _, parameter := range parts[1:] {
+			parameter = strings.TrimSpace(parameter)
+			name, rawQuality, found := strings.Cut(parameter, "=")
+			if found && strings.EqualFold(strings.TrimSpace(name), "q") {
+				quality, err := strconv.ParseFloat(strings.TrimSpace(rawQuality), 64)
+				if err != nil || quality <= 0 {
+					accepted = false
+				}
+			}
+		}
+		if accepted && (strings.EqualFold(encoding, wanted) || encoding == "*") {
 			return true
 		}
 	}
 	return false
 }
 
+func selectCompressedAsset(r *http.Request, variants compressedAssetVariants) (compressedAsset, bool) {
+	if variants.brotli != nil && canServeEncoding(r, "br") {
+		return *variants.brotli, true
+	}
+	if variants.gzip != nil && canServeEncoding(r, "gzip") {
+		return *variants.gzip, true
+	}
+	return compressedAsset{}, false
+}
+
 func serveCompressedAsset(w http.ResponseWriter, r *http.Request, asset compressedAsset) {
-	w.Header().Set("Content-Encoding", "gzip")
+	w.Header().Set("Content-Encoding", asset.encoding)
 	w.Header().Set("Content-Type", asset.contentType)
 	w.Header().Set("Content-Length", strconv.Itoa(len(asset.body)))
 	w.WriteHeader(http.StatusOK)

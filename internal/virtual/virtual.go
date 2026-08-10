@@ -50,6 +50,27 @@ func EstimateTokensJSON(raw []byte) int64 {
 	return int64(utf8.RuneCount(raw)/4 + 1)
 }
 
+// EstimateClaudeTokensJSON is a deliberately conservative boundary estimate for
+// deciding when a downstream Claude client must compact before a provider's hard
+// window. ASCII JSON/code is budgeted at three bytes per token; non-ASCII UTF-8
+// is budgeted at three tokens per four bytes. This is intentionally stricter than
+// EstimateTokensJSON, which is a cheap scheduler weight and may undercount CJK,
+// emoji, dense code, and escaped JSON near a hard provider limit.
+func EstimateClaudeTokensJSON(raw []byte) int64 {
+	if len(raw) == 0 {
+		return 0
+	}
+	var asciiBytes, nonASCIIBytes int64
+	for _, b := range raw {
+		if b < utf8.RuneSelf {
+			asciiBytes++
+		} else {
+			nonASCIIBytes++
+		}
+	}
+	return (asciiBytes+2)/3 + (nonASCIIBytes*3+3)/4 + 1
+}
+
 func (p *Planner) RecordRequest(ctx context.Context, routeKeyHash, accountID string, body []byte) {
 	if routeKeyHash == "" || accountID == "" || len(body) == 0 {
 		return

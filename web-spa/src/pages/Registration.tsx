@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
-import * as PoolUI from '../components/pool/index.jsx';
+import { Button, Toast, Typography, Form, Card, Tag, Select } from '../components/pool/index.jsx';
 import { IconRefresh, IconPlay, IconSetting } from '../components/pool/icons.jsx';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import PageHeader from '../components/PageHeader.jsx';
@@ -28,7 +28,6 @@ import type {
   RegistrationJob, RegistrationProviderOption, RegistrationStartInput, SMSMarketCandidate,
 } from '../features/automation/model/registration';
 
-const { Button, Toast, Typography, Form, Card, Tag, Select } = PoolUI as any;
 const { RankedBars, StackedMeter } = MicroCharts as any;
 const C = COLORS;
 const ErrorBanner = LoadErrorBanner as any;

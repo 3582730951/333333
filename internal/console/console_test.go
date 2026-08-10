@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+
+	"github.com/andybalholm/brotli"
 )
 
 func TestHandlerCachePolicy(t *testing.T) {
@@ -43,7 +45,7 @@ func TestHandlerCachePolicy(t *testing.T) {
 	}
 }
 
-func TestHandlerServesGzipAssets(t *testing.T) {
+func TestHandlerServesPrecompressedAssets(t *testing.T) {
 	handler := Handler()
 	asset := firstEmbeddedAsset(t)
 
@@ -52,22 +54,32 @@ func TestHandlerServesGzipAssets(t *testing.T) {
 		t.Fatalf("plain Content-Encoding = %q", got)
 	}
 
-	gzipped := requestWithHeader(t, handler, "/console/"+asset, "Accept-Encoding", "br, gzip")
-	if got := gzipped.Header().Get("Content-Encoding"); got != "gzip" {
-		t.Fatalf("gzip Content-Encoding = %q", got)
+	compressed := requestWithHeader(t, handler, "/console/"+asset, "Accept-Encoding", "br, gzip")
+	encoding := compressed.Header().Get("Content-Encoding")
+	if encoding != "br" && encoding != "gzip" {
+		t.Fatalf("compressed Content-Encoding = %q", encoding)
 	}
-	if got := gzipped.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
-		t.Fatalf("gzip Cache-Control = %q", got)
+	if got := compressed.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
+		t.Fatalf("compressed Cache-Control = %q", got)
 	}
-	zr, err := gzip.NewReader(bytes.NewReader(gzipped.Body.Bytes()))
+	var reader io.Reader
+	var closeReader io.Closer
+	if encoding == "br" {
+		reader = brotli.NewReader(bytes.NewReader(compressed.Body.Bytes()))
+	} else {
+		zr, err := gzip.NewReader(bytes.NewReader(compressed.Body.Bytes()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader, closeReader = zr, zr
+	}
+	raw, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := io.ReadAll(zr)
-	if err != nil {
-		t.Fatal(err)
+	if closeReader != nil {
+		_ = closeReader.Close()
 	}
-	_ = zr.Close()
 	if len(raw) == 0 {
 		t.Fatal("decompressed asset is empty")
 	}
@@ -75,6 +87,23 @@ func TestHandlerServesGzipAssets(t *testing.T) {
 	rangeReq := requestWithHeader(t, handler, "/console/"+asset, "Range", "bytes=0-20")
 	if got := rangeReq.Header().Get("Content-Encoding"); got != "" {
 		t.Fatalf("range Content-Encoding = %q", got)
+	}
+
+	gzipOnly := requestWithHeader(t, handler, "/console/"+asset, "Accept-Encoding", "br;q=0, gzip")
+	if got := gzipOnly.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("gzip fallback Content-Encoding = %q", got)
+	}
+}
+
+func TestBuildCompressedAssetsPrefersBuildTimeBrotli(t *testing.T) {
+	assets := fstest.MapFS{
+		"assets/app.js":    {Data: bytes.Repeat([]byte("const value = 1;\n"), 100)},
+		"assets/app.js.br": {Data: []byte("precompressed-brotli")},
+	}
+	compressed := buildCompressedAssets(assets)
+	variants, ok := compressed["assets/app.js"]
+	if !ok || variants.brotli == nil || variants.brotli.encoding != "br" || string(variants.brotli.body) != "precompressed-brotli" || variants.gzip == nil {
+		t.Fatalf("compressed variants=%+v ok=%v", variants, ok)
 	}
 }
 

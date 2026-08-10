@@ -11,9 +11,22 @@ import (
 // memory at once. Each jar is small; a few thousand is a modest footprint that still
 // comfortably covers an active pool, and is conservative for the 1c/1gb target.
 const (
-	defaultJarLRUMax = 131072
+	// The old 131K default could retain far more account/host jars than a
+	// single-node pool can actively use. 16K is the balanced memory tier; the
+	// client selects 4K/16K/32K from the configured body-memory envelope.
+	defaultJarLRUMax = 16384
 	defaultJarTTL    = 24 * time.Hour
 )
+
+// CacheStats is an aggregate-only snapshot. It deliberately contains no cache
+// keys, hosts, account identifiers, cookies, or proxy endpoints.
+type CacheStats struct {
+	Entries   int    `json:"entries"`
+	Capacity  int    `json:"capacity"`
+	Hits      uint64 `json:"hits"`
+	Misses    uint64 `json:"misses"`
+	Evictions uint64 `json:"evictions"`
+}
 
 // jarLRU is a bounded, least-recently-used cache of cookie jars keyed by
 // account:egress:host (plus any sticky passthrough CookieJarKey). The previous
@@ -23,12 +36,15 @@ const (
 // next request (cookies are an optimization / anti-detection aid here, not durable
 // state we must never lose). All methods are safe for concurrent use.
 type jarLRU struct {
-	mu    sync.Mutex
-	max   int
-	ttl   time.Duration
-	now   func() time.Time
-	ll    *list.List               // front = most recently used, back = LRU
-	items map[string]*list.Element // key -> element holding *jarEntry
+	mu        sync.Mutex
+	max       int
+	ttl       time.Duration
+	now       func() time.Time
+	ll        *list.List               // front = most recently used, back = LRU
+	items     map[string]*list.Element // key -> element holding *jarEntry
+	hits      uint64
+	misses    uint64
+	evictions uint64
 }
 
 type jarEntry struct {
@@ -55,12 +71,15 @@ func (l *jarLRU) getOrCreate(key string) *cookiejar.Jar {
 		if now.Sub(entry.used) >= l.ttl {
 			l.ll.Remove(el)
 			delete(l.items, key)
+			l.evictions++
 		} else {
+			l.hits++
 			entry.used = now
 			l.ll.MoveToFront(el)
 			return entry.jar
 		}
 	}
+	l.misses++
 	for back := l.ll.Back(); back != nil; back = l.ll.Back() {
 		entry := back.Value.(*jarEntry)
 		if now.Sub(entry.used) < l.ttl {
@@ -68,6 +87,7 @@ func (l *jarLRU) getOrCreate(key string) *cookiejar.Jar {
 		}
 		l.ll.Remove(back)
 		delete(l.items, entry.key)
+		l.evictions++
 	}
 	jar, _ := cookiejar.New(nil)
 	el := l.ll.PushFront(&jarEntry{key: key, jar: jar, used: now})
@@ -76,6 +96,7 @@ func (l *jarLRU) getOrCreate(key string) *cookiejar.Jar {
 		if back := l.ll.Back(); back != nil {
 			l.ll.Remove(back)
 			delete(l.items, back.Value.(*jarEntry).key)
+			l.evictions++
 		}
 	}
 	return jar
@@ -86,4 +107,13 @@ func (l *jarLRU) len() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.ll.Len()
+}
+
+func (l *jarLRU) stats() CacheStats {
+	if l == nil {
+		return CacheStats{}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return CacheStats{Entries: l.ll.Len(), Capacity: l.max, Hits: l.hits, Misses: l.misses, Evictions: l.evictions}
 }

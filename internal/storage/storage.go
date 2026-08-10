@@ -1422,6 +1422,9 @@ func (s *Store) Init(ctx context.Context) error {
 	if err := s.migrate(ctx); err != nil {
 		return err
 	}
+	if err := s.initUsageHourlyRollups(ctx); err != nil {
+		return err
+	}
 	if err := s.migrateGoalContinuityV2(ctx); err != nil {
 		return err
 	}
@@ -10502,6 +10505,11 @@ func (s *Store) cacheUsageMetricsWindow(ctx context.Context, since, until int64,
 }
 
 func (s *Store) cacheUsageSummary(ctx context.Context, since, until int64) (CacheUsageMetricRow, error) {
+	if rolled, ok, err := s.cacheUsageSummaryHourlyWindow(ctx, since, until); err != nil {
+		return CacheUsageMetricRow{}, err
+	} else if ok {
+		return rolled, nil
+	}
 	var row CacheUsageMetricRow
 	err := s.rdb.QueryRowContext(ctx, `
 SELECT COUNT(*),
@@ -10773,6 +10781,11 @@ func (s *Store) CacheUsageBucketsWindow(ctx context.Context, since, until, bucke
 	if bucketSeconds <= 0 {
 		bucketSeconds = 3600
 	}
+	if rolled, err := s.cacheUsageHourlyWindow(ctx, since, until, bucketSeconds); err != nil {
+		return nil, err
+	} else if rolled != nil {
+		return rolled, nil
+	}
 	rows, err := s.rdb.QueryContext(ctx, `
 SELECT (created_at / ?) * ? AS bucket,
        COUNT(*),
@@ -11039,6 +11052,11 @@ func (s *Store) UsageTimeseriesWindow(ctx context.Context, since, until, bucketS
 	cutover := s.UsageAccuracyCutover(ctx)
 	if since < cutover {
 		since = cutover
+	}
+	if rolled, err := s.usageTimeseriesHourlyWindow(ctx, since, until, bucketSeconds); err != nil {
+		return nil, err
+	} else if rolled != nil {
+		return rolled, nil
 	}
 	rows, err := s.rdb.QueryContext(ctx, `
 SELECT (created_at / ?) * ? AS bucket,

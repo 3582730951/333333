@@ -1,0 +1,1 @@
+function e(){try{return typeof AbortController>`u`?null:new AbortController}catch{return null}}function t(e){return e?.signal}function n(e){try{e?.abort?.()}catch{}}export{t as n,e as r,n as t};

@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react';
-import * as PoolUI from '../../components/pool/index.jsx';
+import { Button, LoadingState } from '../../components/pool/index.jsx';
 import { IconRefresh } from '../../components/pool/icons.jsx';
 import LoadErrorBannerBase from '../../components/LoadErrorBanner.jsx';
 import PageHeaderBase, { Panel as PanelBase } from '../../components/PageHeader.jsx';
@@ -13,7 +13,6 @@ import { t } from '../../lib/i18n.js';
 import { usePortalUsageDashboardData } from '../../features/portal/queries/usage';
 import type { PortalUsageRow } from '../../features/portal/model/usage';
 
-const { Button, LoadingState } = PoolUI as any;
 const LoadErrorBanner = LoadErrorBannerBase as any;
 const PageHeader = PageHeaderBase as any;
 const Panel = PanelBase as any;

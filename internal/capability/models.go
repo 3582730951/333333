@@ -1545,7 +1545,13 @@ func BuildAnthropicModelsResponse(capabilities []storage.ModelCapability) ([]byt
 			slug = ClaudeFacingKiroModelID(slug)
 		}
 		appendModel(slug)
-		if c.Context1MState == Context1MSupported && c.NativeMaxContextWindow >= 1_000_000 &&
+		// Claude Code recognizes [1m] locally and keeps a 1M client transcript.
+		// Native 1M accounts remain preferred by the scheduler; a verified Claude
+		// model with a smaller native window can still expose the alias because the
+		// Messages router falls back to its real window and triggers native client
+		// compaction before crossing it.
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(slug)), "claude") &&
+			c.NativeContextWindow > 0 &&
 			!strings.HasSuffix(strings.ToLower(strings.TrimSpace(slug)), "[1m]") {
 			appendModel(slug + "[1m]")
 		}

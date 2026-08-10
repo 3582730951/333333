@@ -136,6 +136,7 @@ type Server struct {
 	usageEnqueueMu        sync.Mutex
 	usageJournalAcked     atomic.Uint64
 	usagePending          sync.WaitGroup
+	usageDashboardCache   *usageDashboardResponseCache
 	asyncWG               sync.WaitGroup
 	asyncMu               sync.RWMutex
 	asyncClosed           bool
@@ -198,7 +199,8 @@ type Server struct {
 	// failureStreaks counts consecutive upstream 5xx responses per account so a dead
 	// upstream is benched instead of absorbing traffic forever. In-memory and TTL'd;
 	// see failure_streak.go.
-	failureStreaks failureStreakTable
+	failureStreaks      failureStreakTable
+	upstreamPrewarmOnce sync.Once
 }
 
 func NewServer(dep Dependencies) *Server {
@@ -245,6 +247,7 @@ func NewServer(dep Dependencies) *Server {
 		claudeRefresh:       newClaudeRefreshGates(),
 		antigravityRefresh:  newAntigravityRefreshFlights(),
 		kiro:                kiro.NewManager(dep.Store, dep.Upstream, dep.Config),
+		usageDashboardCache: newUsageDashboardResponseCache(),
 		claudeCacheFlights:  map[string]chan struct{}{},
 		codexCacheFlights:   map[string]chan struct{}{},
 		claudeCacheDiagPrev: map[string]string{},
@@ -301,8 +304,33 @@ func NewServer(dep Dependencies) *Server {
 	if s.scheduler != nil {
 		s.scheduler.UpdateConfig(s.effectiveSchedulerConfig(context.Background()))
 	}
+	if s.upstream != nil && s.scheduler != nil {
+		s.upstream.SetEgressObserver(s.scheduler.ObserveEgress)
+	}
 	s.routes()
 	return s
+}
+
+func (s *Server) startUpstreamEgressPrewarm() {
+	if s == nil || s.store == nil || s.upstream == nil {
+		return
+	}
+	s.upstreamPrewarmOnce.Do(func() {
+		supervisor.GoOnce("upstream-egress-prewarm", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			egresses, err := s.store.ListEgressProfiles(ctx)
+			if err != nil {
+				return
+			}
+			for _, egress := range egresses {
+				if ctx.Err() != nil {
+					return
+				}
+				_ = s.upstream.PrepareEgress(egress)
+			}
+		})
+	})
 }
 
 func superInstructMemoryPath(cfg config.Config) string {
@@ -342,6 +370,7 @@ func (s *Server) StartRuntime() error {
 		}
 		s.startAsyncWriter()
 		s.startGoalCompactionWorkers()
+		s.startUpstreamEgressPrewarm()
 	})
 	return s.runtimeStartErr
 }

@@ -502,6 +502,9 @@ func TestBuildAnthropicModelsResponseUsesClaudeFacingKiroModelIDs(t *testing.T) 
 	if !ids["claude-opus-4-8"] {
 		t.Fatalf("Claude-facing Kiro model alias missing: %s", body)
 	}
+	if !ids["claude-sonnet-4-6[1m]"] {
+		t.Fatalf("verified 200K Claude model is missing the client-1M auto-compaction alias: %s", body)
+	}
 	if ids["claude-opus-4.8"] {
 		t.Fatalf("Kiro-native dotted model leaked into Claude Code catalog: %s", body)
 	}

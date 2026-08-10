@@ -1,5 +1,5 @@
 import React from 'react';
-import * as PoolUI from '../components/pool/index.jsx';
+import { Tag, Button, Typography, Banner, Drawer } from '../components/pool/index.jsx';
 import { IconRefresh } from '../components/pool/icons.jsx';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import PageHeader, { Panel } from '../components/PageHeader.jsx';
@@ -12,7 +12,6 @@ import { t } from '../lib/i18n.js';
 import { useSystemMetricsData } from '../features/observability/queries/system';
 import type { SupervisorEvent, SupervisorModule, SystemProcess } from '../features/observability/model/system';
 
-const { Tag, Button, Typography, Banner, Drawer } = PoolUI as any;
 const { HeatStrip, RadialGauge, RankedBars, StackedMeter } = MicroCharts as any;
 const ErrorBanner = LoadErrorBanner as any;
 const DataTable = ResourceTable as any;

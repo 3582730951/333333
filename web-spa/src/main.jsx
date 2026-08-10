@@ -11,7 +11,7 @@ import { ToastViewport } from './components/pool/index.jsx';
 import { requireDocumentElement } from './lib/browserDocument.js';
 import { getLocalItem } from './lib/browserStorage.js';
 import { addWindowListener } from './lib/browserLifecycle.js';
-import { getLocale, syncDocumentLanguage } from './lib/i18n.js';
+import { getLocale, loadLocale, syncDocumentLanguage } from './lib/i18n.js';
 import './styles/tokens.css';
 import './styles/base.css';
 import './styles/layout.css';
@@ -32,6 +32,7 @@ try {
   document.documentElement.dataset.theme = 'light';
 }
 
+await loadLocale(getLocale());
 syncDocumentLanguage();
 
 const disposeGlobalErrorHandlers = installGlobalErrorHandlers();

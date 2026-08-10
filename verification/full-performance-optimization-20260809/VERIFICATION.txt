@@ -1,0 +1,95 @@
+Branch / field: cache-hit-optimization / performance_pipeline_v2
+
+Artifacts:
+  /workspace/verification/full-performance-optimization-20260809/MODIFIED_FILE
+  /workspace/verification/full-performance-optimization-20260809/DIFF_FILE
+  /workspace/verification/full-performance-optimization-20260809/VERIFICATION.txt
+  /workspace/verification/full-performance-optimization-20260809/ROLLBACK.sh
+
+BASELINE
+Command:
+docker run --rm -v /tmp/full-performance-baseline-20260809:/workspace -w /workspace -e GOCACHE=/tmp/go-cache -e GOMODCACHE=/tmp/go-mod -v codex-go125-perf-base-cache:/tmp/go-cache -v codex-go125-mod:/tmp/go-mod golang:1.25.12-trixie go test ./internal/bodysource ./internal/storage ./internal/scheduler ./internal/upstream ./internal/api -count=1
+Input: baseline tree efd4940f3d3c53890cf7e2682c39694de4566a4e exported at /tmp/full-performance-baseline-20260809
+Literal output/result:
+ok  	codex-account-pool/internal/bodysource	0.519s
+ok  	codex-account-pool/internal/storage	24.311s
+ok  	codex-account-pool/internal/scheduler	15.581s
+ok  	codex-account-pool/internal/upstream	5.062s
+ok  	codex-account-pool/internal/api	205.087s
+Exit status: 0
+
+MODIFIED
+Command:
+docker run --rm -v /workspace:/workspace -w /workspace -e GOCACHE=/tmp/go-cache -e GOMODCACHE=/tmp/go-mod -v codex-go125-perf-modified-proof-cache:/tmp/go-cache -v codex-go125-mod:/tmp/go-mod golang:1.25.12-trixie go test ./internal/bodysource ./internal/storage ./internal/scheduler ./internal/upstream ./internal/api -count=1
+Input: staged modified working tree (performance_pipeline_v2)
+Literal output/result:
+ok  	codex-account-pool/internal/bodysource	0.184s
+ok  	codex-account-pool/internal/storage	46.505s
+ok  	codex-account-pool/internal/scheduler	31.077s
+ok  	codex-account-pool/internal/upstream	5.252s
+ok  	codex-account-pool/internal/api	257.077s
+Exit status: 0
+
+ROLLBACK
+Command:
+/workspace/verification/full-performance-optimization-20260809/ROLLBACK.sh /tmp/full-performance-rollback-20260809
+Input: independent worktree populated from the final modified tree
+Literal output/result:
+ROLLBACK_RESULT=restored tree=efd4940f3d3c53890cf7e2682c39694de4566a4e target=/tmp/full-performance-rollback-20260809
+Exit status: 0
+Post-rollback command:
+docker run --rm -v /tmp/full-performance-rollback-20260809:/workspace -w /workspace -e GOCACHE=/tmp/go-cache -e GOMODCACHE=/tmp/go-mod -v codex-go125-perf-rollback-cache:/tmp/go-cache -v codex-go125-mod:/tmp/go-mod golang:1.25.12-trixie go test ./internal/bodysource ./internal/storage ./internal/scheduler ./internal/upstream ./internal/api -count=1
+Post-rollback literal output/result:
+ok  	codex-account-pool/internal/bodysource	0.458s
+ok  	codex-account-pool/internal/storage	26.655s
+ok  	codex-account-pool/internal/scheduler	17.226s
+ok  	codex-account-pool/internal/upstream	5.342s
+ok  	codex-account-pool/internal/api	227.942s
+Post-rollback exit status: 0
+Restored behavior/status: index/worktree hash equals efd4940f3d3c53890cf7e2682c39694de4566a4e and the baseline package suite passes.
+
+PERFORMANCE BENCHMARK
+Command:
+docker run --rm -v /workspace:/workspace -w /workspace -e GOCACHE=/tmp/go-cache -e GOMODCACHE=/tmp/go-mod -v codex-go125-perf-bench-cache:/tmp/go-cache -v codex-go125-mod:/tmp/go-mod golang:1.25.12-trixie go test ./internal/storage -run '^$' -bench '^BenchmarkUsageHourlyRollup$' -benchtime=10x -count=1
+Literal result:
+BenchmarkUsageHourlyRollup/hourly_rollup-16               10  11515652 ns/op
+BenchmarkUsageHourlyRollup/raw_usage_records-16           10  50163787 ns/op
+PASS
+ok  codex-account-pool/internal/storage  2.080s
+Exit status: 0
+
+FRONTEND RELEASE
+Command:
+npm run build
+Literal result:
+Build budget passed: 193179 HTML initial static-graph JS gzip bytes across 13 assets
+Admin configured automatic prefetch upper bound: 241292 cumulative JS gzip bytes across 32 assets (48113 bytes after initial)
+Portal configured automatic prefetch upper bound: 207238 cumulative JS gzip bytes across 24 assets (14059 bytes after initial)
+embedded console release verified: 129 files, 14 entry assets
+Exit status: 0
+
+FULL REPOSITORY
+Command:
+docker run --rm -v /workspace:/workspace -w /workspace -e GOCACHE=/tmp/go-cache -e GOMODCACHE=/tmp/go-mod -v codex-go125-perf-all-final-cache:/tmp/go-cache -v codex-go125-mod:/tmp/go-mod golang:1.25.12-trixie go test ./... -count=1
+Result: every Go package passed; representative literal lines:
+ok  codex-account-pool/internal/api  225.720s
+ok  codex-account-pool/internal/console  1.202s
+ok  codex-account-pool/internal/scheduler  17.672s
+ok  codex-account-pool/internal/storage  26.823s
+ok  codex-account-pool/internal/supervisor  2.883s
+ok  codex-account-pool/internal/upstream  6.025s
+Exit status: 0
+
+FRONTEND TESTS
+The 38 test files were executed as two explicit shards to stay below the low-memory worker-start limit.
+Shard 1 literal result:
+Test Files  25 passed (25)
+Tests       117 passed (117)
+Duration    397.13s
+Exit status: 0
+Shard 2 literal result:
+Test Files  13 passed (13)
+Tests       103 passed (103)
+Duration    402.63s
+Exit status: 0
+Combined: 38 files and 220 tests passed.

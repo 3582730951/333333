@@ -110,3 +110,39 @@ func TestStreamCopyFlushesCompletePrefixAndRetainsHalfFrame(t *testing.T) {
 		})
 	}
 }
+
+func TestStreamCopyImmediatelyFlushesFirstEventThenMicroBatches(t *testing.T) {
+	reader, writer := io.Pipe()
+	dst := newFlushSnapshotWriter()
+	done := make(chan error, 1)
+	go func() { done <- streamCopy(dst, reader) }()
+
+	first := []byte("data: first\n\n")
+	second := []byte("data: second\n\n")
+	third := []byte("data: third\n\n")
+	_, _ = writer.Write(first)
+	select {
+	case snapshot := <-dst.flushes:
+		if !bytes.Equal(snapshot, first) {
+			t.Fatalf("first event snapshot=%q", snapshot)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first event was not flushed immediately")
+	}
+	_, _ = writer.Write(second)
+	_, _ = writer.Write(third)
+	select {
+	case snapshot := <-dst.flushes:
+		want := append(append([]byte(nil), first...), second...)
+		want = append(want, third...)
+		if !bytes.Equal(snapshot, want) {
+			t.Fatalf("micro-batch snapshot=%q want=%q", snapshot, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("micro-batch timer did not flush")
+	}
+	_ = writer.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

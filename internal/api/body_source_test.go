@@ -98,6 +98,26 @@ func TestRequestBodyBytesReusesContiguousCapturedBody(t *testing.T) {
 	}
 }
 
+func TestPassthroughRequestReusesCapturedBodySource(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.6-sol","input":"zero-copy"}`)
+	source := bodysource.Bytes(raw)
+	request := httptest.NewRequest("POST", "/v1/alpha/search", bytes.NewReader(raw))
+	request = request.WithContext(contextWithBodySource(request.Context(), source))
+	selected, closeRequest, err := requestWithPassthroughBody(request, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bodySourceFromContext(selected.Context()); got != source {
+		t.Fatalf("passthrough source=%T want original %T", got, source)
+	}
+	closeRequest()
+	reader, err := source.Open()
+	if err != nil {
+		t.Fatalf("request close took ownership of middleware source: %v", err)
+	}
+	_ = reader.Close()
+}
+
 func TestAffinityWithMetaMatchesLegacyPrecedence(t *testing.T) {
 	tests := []struct {
 		name   string

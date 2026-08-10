@@ -83,6 +83,14 @@ func (s *Server) adminUsageDashboard(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	if s.usageDashboardCache != nil {
+		s.usageDashboardCache.Serve(w, r, s.adminUsageDashboardFresh)
+		return
+	}
+	s.adminUsageDashboardFresh(w, r)
+}
+
+func (s *Server) adminUsageDashboardFresh(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	meta, err := s.currentUsageCompleteness(r.Context(), now.Unix())
 	if err != nil {

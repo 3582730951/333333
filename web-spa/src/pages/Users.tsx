@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import * as PoolUI from '../components/pool/index.jsx';
+import { ActionMenu, Button, Modal, Form, Toast, Tag } from '../components/pool/index.jsx';
 import { IconDelete, IconEdit, IconRefresh, IconPlus } from '../components/pool/icons.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
@@ -13,7 +13,6 @@ import {
   useCreateUserMutation, useDeleteUserMutation, useUpdateUserMutation, useUsersData,
 } from '../features/access/queries/users.ts';
 
-const { ActionMenu, Button, Modal, Form, Toast, Tag } = PoolUI as any;
 const DataTable = ResourceTable as any;
 const MobileRow = MobileResourceCell as any;
 const SummaryRail = MetricRail as any;

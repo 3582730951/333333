@@ -382,7 +382,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			return outcomeDone
 		}
 	}
-	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
+	route := scheduler.Route{
 		Group:                 group,
 		AllowedProviders:      allowedProviders,
 		Affinity:              affinity,
@@ -402,7 +402,24 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		Exclude:               exclude,
 		OnWait:                schedulerWaitCallback(r.Context()),
 		SkipWait:              userGroupFallbackProbe(r.Context()),
-	})
+	}
+	lease, err := s.scheduler.Select(r.Context(), route)
+	virtualContext1M := false
+	standardContextFallback := false
+	// Prefer an account that genuinely exposes 1M. When none is schedulable, keep
+	// Claude Code's client-side 1M mode but route against the selected account's
+	// normal window; the shared guard below asks the client to compact before that
+	// real boundary. This makes the fallback explicit instead of sending a 1M beta
+	// marker to an account that did not prove the entitlement.
+	if err != nil && strings.EqualFold(routeContextMode, "1m") {
+		fallbackRoute := route
+		fallbackRoute.ContextMode = ""
+		if fallbackLease, fallbackErr := s.scheduler.Select(r.Context(), fallbackRoute); fallbackErr == nil {
+			lease, err = fallbackLease, nil
+			standardContextFallback = true
+			virtualContext1M = strings.EqualFold(requestedClaudeModelFromContext(r.Context()).ContextMode, "1m")
+		}
+	}
 	if err != nil {
 		if errors.Is(err, scheduler.ErrBoundAccountUnavailable) {
 			writePoolCodeError(w, http.StatusConflict, "bound_account_unavailable", "the account bound to this session is unavailable")
@@ -418,6 +435,23 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		s.writePublicNoAccountError(r.Context(), w, status, group, strings.Join(allowedProviders, ","), model, err)
 		return outcomeDone
 	}
+	resolvedForContext := firstNonEmpty(lease.ResolvedModel, model)
+	if standardContextFallback {
+		providerModel := requestedClaudeModelFromContext(r.Context())
+		providerModel.ContextMode = ""
+		r = r.WithContext(withRequestedClaudeModel(r.Context(), providerModel))
+		r = withoutAnthropicContext1MBeta(r)
+	}
+	if virtualContext1M {
+		w.Header().Set("X-MiCliProxy-Context-Mode", "virtual_1m")
+	}
+	if !countTokens && !compaction {
+		if plan, compactRequired := s.selectedClaudeAutoCompactPlan(r.Context(), raw, lease, resolvedForContext, routeContextMode, virtualContext1M); compactRequired {
+			lease.Release()
+			writeClaudeAutoCompactRequired(w, plan)
+			return outcomeDone
+		}
+	}
 	if lease.Account.Provider == "kiro" {
 		if countTokens {
 			return s.kiroCountTokensWithLease(w, r, raw, affinity, lease)
@@ -426,6 +460,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	}
 	if lease.Account.Provider == "antigravity" {
 		if countTokens {
+			lease.Release()
 			writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": virtual.EstimateTokensJSON(raw)})
 			return outcomeDone
 		}
@@ -941,8 +976,8 @@ func streamCopyRewrite(w http.ResponseWriter, body io.Reader, scrubber *streamre
 	if scrubber == nil || scrubber.Empty() {
 		return streamCopy(w, body)
 	}
-	flusher, _ := w.(http.Flusher)
 	rw := scrubber.NewRewriter()
+	batch := newAdaptiveSSEBatch(w)
 	bufp := sseBufPool.Get().(*[]byte)
 	defer sseBufPool.Put(bufp)
 	buf := *bufp
@@ -950,25 +985,24 @@ func streamCopyRewrite(w http.ResponseWriter, body io.Reader, scrubber *streamre
 		if len(p) == 0 {
 			return nil
 		}
-		if _, err := w.Write(p); err != nil {
-			return err
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return nil
+		return batch.append(p)
 	}
 	for {
 		n, readErr := body.Read(buf)
 		if n > 0 {
 			if err := writeOut(rw.Write(buf[:n])); err != nil {
+				batch.abort()
 				return err
 			}
 		}
 		if readErr != nil {
 			if readErr == io.EOF {
-				return writeOut(rw.Flush())
+				if err := writeOut(rw.Flush()); err != nil {
+					return err
+				}
+				return batch.close()
 			}
+			batch.abort()
 			return readErr
 		}
 	}

@@ -16,8 +16,11 @@ import (
 )
 
 const (
-	candidateIndexTTL       = time.Second
-	candidateIndexRetention = 30 * time.Second
+	// Account/capability mutations already bump selectionGeneration and invalidate
+	// this cache explicitly. A five-second hot TTL avoids rebuilding high-cardinality
+	// route indexes every second without delaying configuration publication.
+	candidateIndexTTL       = 5 * time.Second
+	candidateIndexRetention = 2 * time.Minute
 	candidateIndexMaxKeys   = 4096
 )
 
@@ -67,14 +70,14 @@ func candidateIndexKey(route Route, cfg config.Config) string {
 func (s *Scheduler) candidateIndexSnapshot(ctx context.Context, selection *accountSelectionSnapshot, route Route) (*routeCandidateIndex, error) {
 	key := candidateIndexKey(route, s.Config())
 	now := time.Now()
-	indexes, _ := s.candidateIndexes.Load().(map[string]*routeCandidateIndex)
-	if index := indexes[key]; index != nil && index.selectionGeneration == selection.generation && now.Sub(index.builtAt) < candidateIndexTTL {
+	loaded, _ := s.candidateIndexes.Load(key)
+	if index, _ := loaded.(*routeCandidateIndex); index != nil && index.selectionGeneration == selection.generation && now.Sub(index.builtAt) < candidateIndexTTL {
 		return index, nil
 	}
 	s.candidateRefreshMu.Lock()
 	defer s.candidateRefreshMu.Unlock()
-	indexes, _ = s.candidateIndexes.Load().(map[string]*routeCandidateIndex)
-	if index := indexes[key]; index != nil && index.selectionGeneration == selection.generation && time.Since(index.builtAt) < candidateIndexTTL {
+	loaded, _ = s.candidateIndexes.Load(key)
+	if index, _ := loaded.(*routeCandidateIndex); index != nil && index.selectionGeneration == selection.generation && time.Since(index.builtAt) < candidateIndexTTL {
 		return index, nil
 	}
 	index, err := s.buildCandidateIndex(ctx, selection, route, key)
@@ -82,16 +85,54 @@ func (s *Scheduler) candidateIndexSnapshot(ctx context.Context, selection *accou
 		return nil, err
 	}
 	atomic.AddInt64(&s.metrics.CandidateIndexBuilds, 1)
-	next := make(map[string]*routeCandidateIndex, min(len(indexes)+1, candidateIndexMaxKeys))
-	for existingKey, existing := range indexes {
-		if existingKey == key || now.Sub(existing.builtAt) >= candidateIndexRetention || len(next) >= candidateIndexMaxKeys-1 {
-			continue
-		}
-		next[existingKey] = existing
+	if _, existed := s.candidateIndexes.Load(key); !existed {
+		s.candidateIndexCount.Add(1)
 	}
-	next[key] = index
-	s.candidateIndexes.Store(next)
+	s.candidateIndexes.Store(key, index)
+	s.pruneCandidateIndexes(now, key)
 	return index, nil
+}
+
+func (s *Scheduler) clearCandidateIndexes() {
+	s.candidateRefreshMu.Lock()
+	defer s.candidateRefreshMu.Unlock()
+	s.candidateIndexes.Range(func(key, _ interface{}) bool {
+		s.candidateIndexes.Delete(key)
+		return true
+	})
+	s.candidateIndexCount.Store(0)
+}
+
+func (s *Scheduler) pruneCandidateIndexes(now time.Time, keepKey string) {
+	if s.candidateIndexCount.Load() <= candidateIndexMaxKeys {
+		return
+	}
+	var oldestKey interface{}
+	var oldestAt time.Time
+	s.candidateIndexes.Range(func(key, value interface{}) bool {
+		index, _ := value.(*routeCandidateIndex)
+		if index == nil {
+			if _, loaded := s.candidateIndexes.LoadAndDelete(key); loaded {
+				s.candidateIndexCount.Add(-1)
+			}
+			return true
+		}
+		if key != keepKey && now.Sub(index.builtAt) >= candidateIndexRetention {
+			if _, loaded := s.candidateIndexes.LoadAndDelete(key); loaded {
+				s.candidateIndexCount.Add(-1)
+			}
+			return true
+		}
+		if key != keepKey && (oldestKey == nil || index.builtAt.Before(oldestAt)) {
+			oldestKey, oldestAt = key, index.builtAt
+		}
+		return true
+	})
+	if s.candidateIndexCount.Load() > candidateIndexMaxKeys && oldestKey != nil {
+		if _, loaded := s.candidateIndexes.LoadAndDelete(oldestKey); loaded {
+			s.candidateIndexCount.Add(-1)
+		}
+	}
 }
 
 func (s *Scheduler) buildCandidateIndex(ctx context.Context, selection *accountSelectionSnapshot, route Route, key string) (*routeCandidateIndex, error) {

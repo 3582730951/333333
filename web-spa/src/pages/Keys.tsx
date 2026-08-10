@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useMemo } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import * as PoolUI from '../components/pool/index.jsx';
+import { Button, Toast } from '../components/pool/index.jsx';
 import { IconPlus, IconRefresh } from '../components/pool/icons.jsx';
 import ApiKeyCreateModal from '../components/ApiKeyCreateModal.tsx';
 import ApiKeyEditModal from '../components/ApiKeyEditModal.tsx';
@@ -19,7 +19,6 @@ import {
   useUpdateAdminKeyMutation,
 } from '../features/access/queries/keys.ts';
 
-const { Button, Toast } = PoolUI as any;
 const CreateModal = ApiKeyCreateModal as any;
 const EditModal = ApiKeyEditModal as any;
 const KeysTable = ApiKeysTable as any;

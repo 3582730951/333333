@@ -68,7 +68,9 @@ func ParseOAuthAntigravity(accessToken, refreshToken, email, projectID string, e
 		Scopes:               append([]string(nil), scopes...),
 		AntigravityProjectID: projectID,
 		AntigravityBaseURL:   "",
-		AntigravityUserAgent: "antigravity/hub/2.2.1 darwin/arm64",
+		// Empty means process-managed. Persisting the fallback version here pinned
+		// every account to the version that happened to ship at import time.
+		AntigravityUserAgent: "",
 	}, nil
 }
 

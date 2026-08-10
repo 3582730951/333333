@@ -127,6 +127,7 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 		UserAgent:       creds.UserAgent,
 		Body:            raw,
 		Stream:          stream,
+		SensitiveWords:  s.cfg.SensitiveWordsFor("antigravity"),
 		MaxOutputTokens: s.antigravityCatalogMaxOutputTokens(ctx, lease.Account.ID, resolvedModel),
 	}
 	doRequest := func() (*upstream.Response, storage.EgressProfile, error) {

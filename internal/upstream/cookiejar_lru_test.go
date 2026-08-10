@@ -3,6 +3,9 @@ package upstream
 import (
 	"testing"
 	"time"
+
+	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/storage"
 )
 
 func TestJarLRUReusesSameJar(t *testing.T) {
@@ -59,5 +62,27 @@ func TestJarLRUExpiresIdleJar(t *testing.T) {
 	now = now.Add(time.Hour)
 	if next := l.getOrCreate("key"); next == first {
 		t.Fatal("expired jar was reused")
+	}
+}
+
+func TestCacheLimitsAndTransportLRUEviction(t *testing.T) {
+	jar, transport, tlsClients := cacheLimitsForMemory(32 << 20)
+	if jar != 4096 || transport != 64 || tlsClients != 64 {
+		t.Fatalf("low-memory limits=(%d,%d,%d)", jar, transport, tlsClients)
+	}
+	client := NewClient(config.Default())
+	client.transportMax = 2
+	if _, err := client.transportForEgressMode(storage.EgressProfile{ID: "direct", Type: "direct"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.transportForEgressMode(storage.EgressProfile{ID: "direct", Type: "direct"}, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.transportForEgress(storage.EgressProfile{ID: "proxy", Type: "http_proxy", Endpoint: "http://127.0.0.1:8080"}); err != nil {
+		t.Fatal(err)
+	}
+	stats := client.CacheStats().Transports
+	if stats.Entries != 2 || stats.Evictions != 1 || stats.Capacity != 2 {
+		t.Fatalf("transport stats=%+v", stats)
 	}
 }
