@@ -241,6 +241,10 @@ func (s *Server) writePublicNoAccountError(ctx context.Context, w http.ResponseW
 	// requests routed to two empty groups over 14 hours and no way to filter for them.
 	case noAccountEmptyPool(err):
 		reason = "group_has_no_accounts"
+		// The public response is intentionally generic, so carry target-scoped
+		// semantics through in-process route writers without exposing internals to
+		// the client. This lets a replay-safe request leave a stale empty binding.
+		markUserGroupRouteFailure(w, "no_account", true, true)
 	case counters.ModelUnsupported > 0:
 		reason = "model_unsupported"
 	}

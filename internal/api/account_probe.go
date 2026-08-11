@@ -11,7 +11,6 @@ import (
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
 	kirowire "codex-account-pool/internal/kiro"
-	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
@@ -40,7 +39,11 @@ func (s *Server) probeAccountModels(ctx context.Context, account storage.Account
 	if err != nil {
 		return nil, err
 	}
-	egress, err := s.store.GetEgressProfile(ctx, binding.PrimaryEgressID)
+	binding, err = s.store.EffectiveEgressBinding(ctx, binding)
+	if err != nil {
+		return nil, err
+	}
+	egress, err := s.store.ResolvePrimaryEgressBinding(ctx, binding)
 	if err != nil {
 		return nil, err
 	}
@@ -162,20 +165,6 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 		// runtime capability evidence and replace unrelated rows.
 		if !custom.AutoDiscoverModels {
 			return s.store.ListCapabilities(ctx, account.ID)
-		}
-		if len(custom.EgressIDs) > 0 && s.scheduler != nil {
-			lease, selectErr := s.scheduler.Select(ctx, scheduler.Route{
-				Group:              account.GroupName,
-				Provider:           provider,
-				PreferredEgressIDs: custom.EgressIDs,
-				RequiredAccountID:  account.ID,
-				SkipWait:           true,
-			})
-			if selectErr != nil {
-				return nil, selectErr
-			}
-			defer lease.Release()
-			binding, egress = lease.Binding, lease.Egress
 		}
 		return s.probeCustomModels(ctx, account, token, binding, egress, provider)
 	}
@@ -924,6 +913,11 @@ func (s *Server) adminRefresh(w http.ResponseWriter, r *http.Request, accountID 
 			writeError(w, http.StatusBadGateway, err)
 			return
 		}
+		binding, err = s.store.EffectiveEgressBinding(r.Context(), binding)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
 		egress, err := s.store.ResolvePrimaryEgressBinding(r.Context(), binding)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err)
@@ -956,6 +950,11 @@ func (s *Server) adminRefresh(w http.ResponseWriter, r *http.Request, accountID 
 			return
 		}
 		binding, err := s.store.GetEgressBinding(r.Context(), accountID)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		binding, err = s.store.EffectiveEgressBinding(r.Context(), binding)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err)
 			return

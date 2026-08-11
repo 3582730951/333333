@@ -245,6 +245,10 @@ func (s *Server) importAndValidateKiro(ctx context.Context, account storage.Acco
 	if err != nil {
 		return err
 	}
+	binding, err = s.store.EffectiveEgressBinding(ctx, binding)
+	if err != nil {
+		return err
+	}
 	egress, err := s.store.ResolvePrimaryEgressBinding(ctx, binding)
 	if err != nil {
 		return err

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -794,13 +793,14 @@ func probeEarlyCodexSSEFailure(body io.Reader) ([]byte, leakfilter.CodexFailureF
 	return prefix, failure, terminal, err
 }
 
-// earlySSECreatedIdleRelease is the small grace window after a standalone
-// response.created frame. It preserves the useful early-error probe for a
-// coalesced created+failed response while letting a genuine long-poll stream
-// reach the heartbeat relay before its first keepalive is due.
-const earlySSECreatedIdleRelease = 25 * time.Millisecond
+// earlySSEIdleRelease bounds every read performed by the early-error probe,
+// including the first one. Upstream headers can arrive before the first SSE
+// frame; without this bound the gateway can hold downstream headers forever and
+// a client-side request timeout turns a healthy long-poll into an empty HTTP 200.
+// The read-ahead reader retains the in-flight read for the normal relay.
+const earlySSEIdleRelease = 25 * time.Millisecond
 
-var errEarlySSEProbeIdle = errors.New("early SSE probe idle after response.created")
+var errEarlySSEProbeIdle = errors.New("early SSE probe idle")
 
 type earlySSEReadResult struct {
 	data []byte
@@ -808,7 +808,7 @@ type earlySSEReadResult struct {
 }
 
 // earlySSEReadAhead owns the one outstanding upstream read while the initial
-// SSE probe waits briefly for an error immediately following response.created.
+// SSE probe waits briefly for an early terminal error.
 // If that wait expires, the same reader is handed to the normal relay; it then
 // consumes the pending read rather than issuing a concurrent read on resp.Body.
 type earlySSEReadAhead struct {
@@ -907,8 +907,9 @@ func (r *earlySSEReadAhead) readWithIdle(p []byte, idle time.Duration) (int, err
 }
 
 // probeEarlyCodexSSEFailureWithIdleRelease mirrors probeEarlyCodexSSEFailure,
-// but releases a live stream after a tiny post-created grace window. The returned
-// reader must be used for the remaining relay because it owns an in-flight read.
+// but releases a live stream after a tiny idle grace window, even when the first
+// SSE frame has not arrived yet. The returned reader must be used for the
+// remaining relay because it owns an in-flight read.
 func probeEarlyCodexSSEFailureWithIdleRelease(body io.Reader, idle time.Duration) ([]byte, io.Reader, leakfilter.CodexFailureFrame, bool, error) {
 	reader := newEarlySSEReadAhead(body)
 	var failure leakfilter.CodexFailureFrame
@@ -916,7 +917,6 @@ func probeEarlyCodexSSEFailureWithIdleRelease(body io.Reader, idle time.Duration
 	tmp := make([]byte, 4096)
 	processed := 0
 	frames := 0
-	sawCreated := false
 	for len(buf) < earlySSEMaxBytes && frames < earlySSEMaxFrames {
 		committedInBatch := false
 		for {
@@ -938,9 +938,6 @@ func probeEarlyCodexSSEFailureWithIdleRelease(body io.Reader, idle time.Duration
 			if codexSSEFrameCommitsContent(frame) {
 				committedInBatch = true
 			}
-			if bytes.Contains(bytes.ToLower(frame), []byte("response.created")) {
-				sawCreated = true
-			}
 			processed = end
 			if frames >= earlySSEMaxFrames {
 				return buf, reader, failure, false, nil
@@ -949,11 +946,7 @@ func probeEarlyCodexSSEFailureWithIdleRelease(body io.Reader, idle time.Duration
 		if committedInBatch {
 			return buf, reader, failure, false, nil
 		}
-		readIdle := time.Duration(0)
-		if sawCreated {
-			readIdle = idle
-		}
-		n, err := reader.readWithIdle(tmp, readIdle)
+		n, err := reader.readWithIdle(tmp, idle)
 		if errors.Is(err, errEarlySSEProbeIdle) {
 			return buf, reader, failure, false, nil
 		}

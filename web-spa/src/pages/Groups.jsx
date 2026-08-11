@@ -7,7 +7,6 @@ import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import { MetricRail, TagList, TextClamp } from '../components/DisplayPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
-import OrderedEgressSelect from '../components/OrderedEgressSelect.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
@@ -330,32 +329,33 @@ function formatTime(value) {
 
 function AccountGroupEditor({ editor, profiles, saving, onCancel, onSave }) {
   const [name, setName] = useState(editor?.row?.name || '');
-  const [selectedEgresses, setSelectedEgresses] = useState(groupEgressIDs(editor?.row));
+  const [selectedEgress, setSelectedEgress] = useState(groupEgressIDs(editor?.row)[0] || '');
   const options = useMemo(() => egressOptions(profiles), [profiles]);
   const editing = editor?.mode === 'edit';
   return (
     <div className="pool-form pool-group-editor">
       <Form.Input label="分组名" value={name} onChange={setName} disabled={editing} placeholder="例如：codex-primary" />
       <div className="pool-field pool-field--top">
-        <span className="pool-field__label">有序出口</span>
-        <OrderedEgressSelect
-          value={selectedEgresses}
-          onChange={setSelectedEgresses}
-          options={options}
+        <span className="pool-field__label">分组出口</span>
+        <Select
+          value={selectedEgress}
+          onChange={setSelectedEgress}
+          optionList={[{ label: '系统默认直连', value: '' }, ...options]}
           disabled={saving}
-          help="账号导入或移动到此分组后，请求时动态继承这里的出口顺序；不会复制到账号记录。"
+          style={{ width: '100%' }}
         />
+        <span className="pool-field__help">分组内账号统一使用这一个出口；账号详情中单独指定的出口优先。</span>
       </div>
       {editing ? (
         <Banner
           type="info"
           title={`${editor.row.account_count || 0} 个账号动态继承`}
-          description="首项为主出口，其余按顺序作为备用出口。修改后下一次请求立即使用新顺序。"
+          description="修改后，所有未单独指定出口的账号会在下一次请求立即使用这个出口。"
         />
       ) : null}
       <div className="pool-modal-actions">
         <Button onClick={onCancel} disabled={saving}>取消</Button>
-        <Button theme="solid" loading={saving} disabled={!name.trim()} onClick={() => onSave({ name: name.trim(), egress_ids: selectedEgresses })}>保存</Button>
+        <Button theme="solid" loading={saving} disabled={!name.trim()} onClick={() => onSave({ name: name.trim(), egress_ids: selectedEgress ? [selectedEgress] : [] })}>保存</Button>
       </div>
     </div>
   );
@@ -1172,10 +1172,10 @@ export default function Groups() {
       },
     },
     {
-      title: '有序出口', key: 'egresses',
+      title: '分组出口', key: 'egresses',
       render: (_, row) => {
-        const ids = groupEgressIDs(row);
-        return ids.length ? <TagList items={ids.map((id, index) => `${index === 0 ? '主' : `备${index}`} · ${id}`)} max={4} /> : <span className="pool-muted">系统默认</span>;
+        const id = groupEgressIDs(row)[0];
+        return id ? <Tag color="blue">{id}</Tag> : <span className="pool-muted">系统默认直连</span>;
       },
     },
     { title: '最近测活/更新', key: 'updated', width: 190, render: (_, row) => <TextClamp muted>{formatTime(row.last_probe_at || row.updated_at)}</TextClamp> },
@@ -1288,7 +1288,7 @@ export default function Groups() {
   // rather than one page-wide figure.
   const accountTotal = data.groups.reduce((sum, row) => sum + (Number(row.account_count) || 0), 0);
   const healthyTotal = data.groups.reduce((sum, row) => sum + (Number(row.active_account_count) || 0), 0);
-  const multiEgressCount = data.groups.filter((row) => groupEgressIDs(row).length > 1).length;
+  const configuredEgressCount = data.groups.filter((row) => groupEgressIDs(row).length > 0).length;
   // undefined, not 0, when there is no denominator: MetricRail draws a track for any finite share,
   // so returning 0 here put an empty track under 健康账号 while 账号总数 was still 0 -- reading as
   // "measured 0% healthy" when the truth is that no accounts exist to measure. This keeps the
@@ -1298,7 +1298,7 @@ export default function Groups() {
     { label: '账号池分组', value: data.groups.length },
     { label: '账号总数', value: accountTotal },
     { label: '健康账号', value: healthyTotal, share: ratio(healthyTotal, accountTotal), tone: 'success' },
-    { label: '多出口分组', value: multiEgressCount, share: ratio(multiEgressCount, data.groups.length) },
+    { label: '已指定出口', value: configuredEgressCount, share: ratio(configuredEgressCount, data.groups.length) },
   ];
   const userGroupCount = data.userGroups.length;
   const mixedTargetCount = data.userGroups.filter((row) => new Set((row.targets || []).map((target) => canonicalTarget(target).kind)).size > 1).length;

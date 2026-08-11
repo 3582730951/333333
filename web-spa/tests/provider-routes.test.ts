@@ -33,7 +33,6 @@ describe('provider invocation routes', () => {
   it('provides roving focus and standard radio keyboard selection for transport profiles', () => {
     render(React.createElement(ProviderEditor, {
       editor: { mode: 'create', values: providerFormValues() },
-      egressOptions: [],
       saving: false,
       onCancel: () => undefined,
       onSave: () => undefined,

@@ -134,7 +134,7 @@ func TestEligibleCandidateCountHonorsExclusionsAndPersistentCooldowns(t *testing
 	}
 }
 
-func TestCodexPressureUsesStandbyCapacityWhenPrimaryIsFull(t *testing.T) {
+func TestCodexPressureDoesNotUseSecondaryGroupOutletWhenPrimaryIsFull(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
 	const model = "gpt-pressure-multi-egress"
@@ -170,8 +170,8 @@ func TestCodexPressureUsesStandbyCapacityWhenPrimaryIsFull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.EligibleAccounts != 1 || snapshot.AvailableAccounts != 1 || snapshot.SaturatedAccounts != 0 || snapshot.InFlight != 1 {
-		t.Fatalf("standby capacity was hidden from Codex pressure: %+v", snapshot)
+	if snapshot.EligibleAccounts != 1 || snapshot.AvailableAccounts != 0 || snapshot.SaturatedAccounts != 1 || snapshot.InFlight != 1 {
+		t.Fatalf("secondary group outlet participated in pressure capacity: %+v", snapshot)
 	}
 }
 

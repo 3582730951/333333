@@ -28,13 +28,6 @@ var ErrStrictUnavailable = errors.New("strict sticky account unavailable")
 var ErrBoundAccountUnavailable = errors.New("bound account unavailable")
 
 const (
-	codexEgressOutcomeWindow   = 30 * time.Minute
-	codexEgressOutcomeCacheTTL = 5 * time.Second
-	codexEgressPriorAttempts   = int64(10)
-	codexEgressPriorSuccesses  = int64(9)
-)
-
-const (
 	schedulerLoadShardCount      = 64
 	schedulerEWMAEntriesPerShard = 64
 )
@@ -197,23 +190,13 @@ type Scheduler struct {
 	kiroBlockLogMu  sync.Mutex
 	kiroBlockLogged map[string]struct{}
 
-	// egressCache is a process-level cache for egress profiles used by selectEgress.
-	// It is separate from the request-scoped egressCache in selectFresh so that concurrent
-	// requests share the same cached egress profiles, avoiding repeated DB lookups for
-	// standby egresses (which are resolved per-candidate, not once per request).
+	// egressCache is a process-level cache for the one effective egress selected for
+	// each account. It is separate from the request-scoped cache so concurrent requests
+	// avoid repeated DB lookups for the same group/account outlet.
 	egressCache      sync.Map // map[string]storage.EgressProfile
 	egressCacheTime  time.Time
 	egressCacheTTL   time.Duration
 	egressCacheMutex sync.RWMutex
-
-	// Recent Codex transport outcomes change independently from account/egress
-	// configuration, so they use a short immutable snapshot cache of their own.
-	// A refresh failure publishes an empty snapshot for one TTL and degrades to
-	// healthy least-inflight routing rather than blocking admission.
-	egressOutcomeMu        sync.RWMutex
-	egressOutcomeRefreshMu sync.Mutex
-	egressOutcomeAt        time.Time
-	egressOutcomes         map[string]storage.CodexEgressRecentOutcome
 
 	// providerCache caches provider inference results (from token shape) per account.
 	// Provider is set explicitly on import for new accounts, so the cache is only hit
@@ -428,9 +411,9 @@ type Route struct {
 	// token budgets. A plain cooldown may be ignored only when no recheck is pending,
 	// which covers success-header quota telemetry rather than an upstream rejection.
 	AllowCodexGoalQuotaGrace bool
-	// PreferredEgressIDs is an ordered provider-level override. The first outlet
-	// is primary and the remaining outlets are attempted before another account.
-	// Account bindings remain operational metadata and are not rewritten.
+	// PreferredEgressIDs is retained for wire/source compatibility with older callers.
+	// Runtime inference ignores it: the selected account's persisted primary egress is
+	// authoritative, so a group/provider cannot silently move that account to another IP.
 	PreferredEgressIDs    []string
 	KiroEndpointAllowlist []string
 	KiroDefaultRegion     string
@@ -761,18 +744,11 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 	if route.Group == "" {
 		route.Group = cfg.DefaultGroup
 	}
-	// Account-pool groups own the runtime outlet order. Resolve it for every
-	// selection so imports and account moves inherit group changes dynamically;
-	// no egress configuration is copied back to the account binding. An explicit
-	// provider-level order takes precedence for custom provider routes.
-	if len(route.PreferredEgressIDs) == 0 {
-		group, err := s.store.GetGroup(ctx, route.Group)
-		if err == nil {
-			route.PreferredEgressIDs = append([]string(nil), group.EgressIDs...)
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return Lease{}, err
-		}
+	groupEgressID, groupErr := s.groupPrimaryEgressID(ctx, route.Group)
+	if groupErr != nil {
+		return Lease{}, groupErr
 	}
+	route.PreferredEgressIDs = []string{groupEgressID}
 	if strings.TrimSpace(route.RequiredAccountID) != "" {
 		if route.Exclude[route.RequiredAccountID] {
 			return Lease{}, fmt.Errorf("%w: account=%s", ErrBoundAccountUnavailable, route.RequiredAccountID)
@@ -1518,11 +1494,8 @@ func (s *Scheduler) egressTemporarilyUnavailable(ctx context.Context, binding st
 	if binding.CooldownUntil > now && !ignoreBindingCooldown {
 		return true
 	}
-	ids := append([]string{binding.PrimaryEgressID}, binding.StandbyIDs()...)
-	for _, id := range ids {
-		if e, err := s.store.GetEgressProfile(ctx, id); err == nil && (e.CooldownUntil > now || e.Health == "cooldown" || e.Health == "tripped") {
-			return true
-		}
+	if e, err := s.store.GetEgressProfile(ctx, binding.PrimaryEgressID); err == nil && (e.CooldownUntil > now || e.Health == "cooldown" || e.Health == "tripped") {
+		return true
 	}
 	return false
 }
@@ -1848,7 +1821,7 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	}
 	binding := snapshot.Binding
 	if route.RequiredEgressID == "" {
-		binding = routeEgressBinding(binding, accountID, route.PreferredEgressIDs)
+		binding = effectiveAccountEgressBinding(binding, accountID, firstRouteValue(route.PreferredEgressIDs...))
 	} else {
 		// A required account+egress pair is persisted server-side session identity.
 		// Group/provider outlet reorderings apply only to fresh work and must not
@@ -1888,9 +1861,6 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	egress, ok = s.applyBoundSidecar(ctx, binding, egress, now, egressCache)
 	if !ok {
 		return Lease{}, leaseBlockEgressUnavailable, false
-	}
-	if route.RequiredEgressID == "" {
-		binding = selectedEgressBinding(binding, accountID, egress.ID)
 	}
 	coordinated, reason, coordinateErr := s.acquireCoordinatedLease(ctx, accountID, egress, cfg.AccountTokenBudget, route)
 	if coordinateErr != nil {
@@ -1937,56 +1907,47 @@ func (s *Scheduler) acquireCoordinatedLease(ctx context.Context, accountID strin
 	})
 }
 
-func bindingContainsEgress(binding storage.AccountEgressBinding, egressID string) bool {
-	if binding.PrimaryEgressID == egressID {
-		return true
+func (s *Scheduler) groupPrimaryEgressID(ctx context.Context, groupName string) (string, error) {
+	group, err := s.store.GetGroup(ctx, strings.TrimSpace(groupName))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return storage.DefaultDirectEgressID, nil
+		}
+		return "", err
 	}
-	for _, standby := range binding.StandbyIDs() {
-		if standby == egressID {
-			return true
+	for _, id := range group.EgressIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			return id, nil
 		}
 	}
-	return false
+	if id := strings.TrimSpace(group.DefaultEgressID); id != "" {
+		return id, nil
+	}
+	return storage.DefaultDirectEgressID, nil
 }
 
-func routeEgressBinding(binding storage.AccountEgressBinding, accountID string, orderedIDs []string) storage.AccountEgressBinding {
+// effectiveAccountEgressBinding applies the single-outlet precedence contract:
+// an explicit account pin wins; otherwise the current group primary wins. Standby
+// lists are legacy metadata and never participate in inference routing.
+func effectiveAccountEgressBinding(binding storage.AccountEgressBinding, accountID, groupEgressID string) storage.AccountEgressBinding {
 	binding.AccountID = strings.TrimSpace(accountID)
-	if len(orderedIDs) == 0 {
-		return binding
-	}
-	seen := make(map[string]struct{}, len(orderedIDs))
-	clean := make([]string, 0, len(orderedIDs))
-	for _, id := range orderedIDs {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			continue
+	accountScoped := strings.EqualFold(strings.TrimSpace(binding.BindingScope), storage.EgressBindingScopeAccount)
+	if !strings.EqualFold(strings.TrimSpace(binding.BindingScope), storage.EgressBindingScopeAccount) {
+		binding.BindingScope = storage.EgressBindingScopeGroup
+		if groupEgressID = strings.TrimSpace(groupEgressID); groupEgressID != "" {
+			binding.PrimaryEgressID = groupEgressID
 		}
-		if _, duplicate := seen[id]; duplicate {
-			continue
+	} else {
+		binding.BindingScope = storage.EgressBindingScopeAccount
+	}
+	binding.PrimaryEgressID = strings.TrimSpace(binding.PrimaryEgressID)
+	binding.StandbyEgressIDs = ""
+	if binding.AccountID != "" && binding.PrimaryEgressID != "" {
+		if !accountScoped || strings.TrimSpace(binding.CookieJarKey) == "" {
+			binding.CookieJarKey = binding.AccountID + ":" + binding.PrimaryEgressID
 		}
-		seen[id] = struct{}{}
-		clean = append(clean, id)
-	}
-	if len(clean) == 0 {
-		return binding
-	}
-	binding.PrimaryEgressID = clean[0]
-	binding.StandbyEgressIDs = strings.Join(clean[1:], ",")
-	if binding.AccountID != "" {
-		binding.CookieJarKey = binding.AccountID + ":" + clean[0]
 	}
 	return binding
-}
-
-func selectedEgressBinding(binding storage.AccountEgressBinding, accountID, selectedID string) storage.AccountEgressBinding {
-	selectedID = strings.TrimSpace(selectedID)
-	if selectedID == "" {
-		return binding
-	}
-	ordered := make([]string, 0, 2+len(binding.StandbyIDs()))
-	ordered = append(ordered, selectedID, binding.PrimaryEgressID)
-	ordered = append(ordered, binding.StandbyIDs()...)
-	return routeEgressBinding(binding, accountID, ordered)
 }
 
 func (s *Scheduler) currentLoad(accountID string) (int, int64) {
@@ -2456,18 +2417,12 @@ func (s *Scheduler) diagnoseStickyUnavailability(ctx context.Context, accountID 
 	return fmt.Errorf("%w: account %s unavailable (unknown reason)", ErrStrictUnavailable, accountID)
 }
 
-// selectEgress resolves the egress an account will use now: its primary if not on
-// cooldown and healthy, else the first healthy standby. egressCache (when non-nil)
-// memoizes GetEgressProfile lookups by id within a single selection so accounts that
-// share an egress do not each re-read the same row; pass nil to read through.
+// selectEgress resolves exactly the account/group primary. A disabled, unhealthy,
+// cooled-down or saturated primary makes the account unavailable; inference never
+// rotates to legacy standby metadata.
 func (s *Scheduler) selectEgress(ctx context.Context, binding storage.AccountEgressBinding, now int64, egressCache map[string]storage.EgressProfile, ignoreBindingCooldown bool) (storage.EgressProfile, bool) {
 	if ignoreBindingCooldown || binding.CooldownUntil <= now {
 		if egress, err := s.egressProfile(ctx, binding.PrimaryEgressID, egressCache); err == nil && EgressHealthy(egress, now) {
-			return egress, true
-		}
-	}
-	for _, standbyID := range binding.StandbyIDs() {
-		if egress, err := s.egressProfile(ctx, standbyID, egressCache); err == nil && EgressHealthy(egress, now) {
 			return egress, true
 		}
 	}
@@ -2584,6 +2539,10 @@ func (s *Scheduler) shortestCooldown(ctx context.Context, group, provider, model
 		if err != nil {
 			continue
 		}
+		binding, err = s.store.EffectiveEgressBinding(ctx, binding)
+		if err != nil {
+			continue
+		}
 		// Recheck-pending accounts won't become available the moment their cooldown
 		// elapses (they must pass a probe first), so they are not something to wait on.
 		if binding.RecheckPending && !account.IgnoreRateLimitControls {
@@ -2683,148 +2642,7 @@ func (s *Scheduler) selectEgressWithCache(ctx context.Context, binding storage.A
 			return egress, true
 		}
 	}
-	for _, standbyID := range binding.StandbyIDs() {
-		if egress, ok := s.egressProfileWithCache(ctx, standbyID, now, reqCache, procCache); ok && EgressHealthy(egress, now) {
-			return egress, true
-		}
-	}
 	return storage.EgressProfile{}, false
-}
-
-// selectFreshEgressWithCache applies weighted least-request routing to healthy
-// Codex outlets. Recent posterior success probability is the weight, while
-// MaxConcurrency remains only a hard admission ceiling. Thus a 91% outlet receives
-// somewhat more work than a 90% outlet instead of monopolizing the pool until it
-// fills, and an arbitrarily large configured limit cannot manufacture priority.
-// A saturated primary therefore cannot hide a standby that still has capacity.
-func (s *Scheduler) selectFreshEgressWithCache(ctx context.Context, binding storage.AccountEgressBinding, now int64, ignoreBindingCooldown bool, reqCache *map[string]storage.EgressProfile, procCache *sync.RWMutex, outcomes map[string]storage.CodexEgressRecentOutcome) (storage.EgressProfile, int, int, bool, bool) {
-	ids := append([]string{binding.PrimaryEgressID}, binding.StandbyIDs()...)
-	var selected storage.EgressProfile
-	selectedEgressLoad := 0
-	selectedSidecarLoad := 0
-	selectedSuccessBucket := 0
-	selectedPressure := 0
-	selectedLatency := int64(0)
-	found := false
-	capacityBlocked := false
-	for index, id := range ids {
-		id = strings.TrimSpace(id)
-		if id == "" || (index == 0 && !ignoreBindingCooldown && binding.CooldownUntil > now) {
-			continue
-		}
-		egress, ok := s.egressProfileWithCache(ctx, id, now, reqCache, procCache)
-		if !ok || !EgressHealthy(egress, now) {
-			continue
-		}
-		egress, ok = s.applyBoundSidecarWithCache(ctx, binding, egress, now, reqCache, procCache)
-		if !ok {
-			continue
-		}
-		egressLoad, sidecarLoad := s.currentEgressLoads(egress)
-		if concurrencyLimited(egress.MaxConcurrency, egressLoad) {
-			capacityBlocked = true
-			continue
-		}
-		if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" && sidecarID != egress.ID {
-			if concurrencyLimited(egress.TransportSidecarMaxConcurrency, sidecarLoad) {
-				capacityBlocked = true
-				continue
-			}
-		}
-		successBucket := 0
-		if outcomes != nil {
-			successBucket = codexEgressSuccessBucket(outcomes[egress.ID])
-		}
-		if successBucket < 1 {
-			successBucket = 1
-		}
-		liveSuccess, liveLatency := s.egressEWMAQuality(egress.ID)
-		successBucket = successBucket * liveSuccess / 100
-		if successBucket < 1 {
-			successBucket = 1
-		}
-		effectiveLatency := egress.LatencyMillis
-		if liveLatency > 0 {
-			effectiveLatency = int64(liveLatency)
-		}
-		pressure := egressLoad + sidecarLoad + 1
-		lowerWeightedPressure := found && int64(pressure)*int64(selectedSuccessBucket) < int64(selectedPressure)*int64(successBucket)
-		equalWeightedPressure := found && int64(pressure)*int64(selectedSuccessBucket) == int64(selectedPressure)*int64(successBucket)
-		if !found || lowerWeightedPressure ||
-			(equalWeightedPressure && egressLoad < selectedEgressLoad) ||
-			(equalWeightedPressure && egressLoad == selectedEgressLoad && sidecarLoad < selectedSidecarLoad) ||
-			(equalWeightedPressure && egressLoad == selectedEgressLoad && sidecarLoad == selectedSidecarLoad && effectiveLatency < selectedLatency) {
-			selected = egress
-			selectedEgressLoad = egressLoad
-			selectedSidecarLoad = sidecarLoad
-			selectedSuccessBucket = successBucket
-			selectedPressure = pressure
-			selectedLatency = effectiveLatency
-			found = true
-		}
-	}
-	return selected, selectedEgressLoad, selectedSidecarLoad, capacityBlocked, found
-}
-
-// codexEgressSuccessBucket returns a deterministic routing rank. A bounded 90%
-// Beta prior lets a genuinely unobserved outlet share traffic with an ordinary
-// healthy outlet, while real failures immediately lower its rank. In particular,
-// an outlet with nineteen observed failures no longer outranks a mature 100%
-// outlet merely because it has not crossed an arbitrary sample-count threshold.
-// The posterior mean is rounded to one percentage point so sub-percent noise
-// cannot defeat load balance.
-func codexEgressSuccessBucket(outcome storage.CodexEgressRecentOutcome) int {
-	attempts := outcome.Attempts
-	if attempts < 0 {
-		attempts = 0
-	}
-	successes := outcome.Successes
-	if successes < 0 {
-		successes = 0
-	}
-	if successes > attempts {
-		successes = attempts
-	}
-	numerator := (successes + codexEgressPriorSuccesses) * 100
-	denominator := attempts + codexEgressPriorAttempts
-	bucket := int((numerator + denominator/2) / denominator)
-	if bucket > 100 {
-		return 100
-	}
-	return bucket
-}
-
-func (s *Scheduler) recentCodexEgressOutcomes(ctx context.Context) map[string]storage.CodexEgressRecentOutcome {
-	now := time.Now()
-	s.egressOutcomeMu.RLock()
-	rows := s.egressOutcomes
-	at := s.egressOutcomeAt
-	s.egressOutcomeMu.RUnlock()
-	if rows != nil && now.Sub(at) < codexEgressOutcomeCacheTTL {
-		return rows
-	}
-
-	s.egressOutcomeRefreshMu.Lock()
-	defer s.egressOutcomeRefreshMu.Unlock()
-	now = time.Now()
-	s.egressOutcomeMu.RLock()
-	rows = s.egressOutcomes
-	at = s.egressOutcomeAt
-	s.egressOutcomeMu.RUnlock()
-	if rows != nil && now.Sub(at) < codexEgressOutcomeCacheTTL {
-		return rows
-	}
-
-	refreshed, err := s.store.ListRecentCodexEgressOutcomes(ctx, now.Add(-codexEgressOutcomeWindow).Unix())
-	if err != nil {
-		log.Printf("[SCHEDULER] recent Codex egress outcome refresh failed: %v", err)
-		refreshed = map[string]storage.CodexEgressRecentOutcome{}
-	}
-	s.egressOutcomeMu.Lock()
-	s.egressOutcomes = refreshed
-	s.egressOutcomeAt = now
-	s.egressOutcomeMu.Unlock()
-	return refreshed
 }
 
 func (s *Scheduler) currentEgressLoads(egress storage.EgressProfile) (int, int) {

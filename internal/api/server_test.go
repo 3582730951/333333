@@ -3022,7 +3022,7 @@ func TestStatefulStrictStickyWaitsForPinnedAccountCapacity(t *testing.T) {
 	}
 }
 
-func TestCFRetryToStandbyAndRecordsEvent(t *testing.T) {
+func TestCFEventDoesNotRotateLegacyStandbyAndRecordsEvent(t *testing.T) {
 	var count int
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		count++
@@ -3047,9 +3047,12 @@ func TestCFRetryToStandbyAndRecordsEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusForbidden {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	if count != 1 {
+		t.Fatalf("CF response rotated to legacy standby: request count=%d", count)
 	}
 	events, err := h.store.ListCFEvents(context.Background(), 10)
 	if err != nil || len(events) != 1 || events[0].CFRay != "ray-1" {
@@ -3176,7 +3179,7 @@ func TestAccountSidecarBindingWrapsSelectedProxyEndToEnd(t *testing.T) {
 	}
 }
 
-func TestAccountSidecarBindingSurvivesCFStandbyRetry(t *testing.T) {
+func TestAccountSidecarBindingKeepsSelectedProxyOnCF(t *testing.T) {
 	proxies := make(chan string, 2)
 	var requestCount atomic.Int32
 	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3232,16 +3235,20 @@ func TestAccountSidecarBindingSurvivesCFStandbyRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusForbidden {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
 	}
-	if requestCount.Load() != 2 {
-		t.Fatalf("sidecar request count = %d, want primary + standby", requestCount.Load())
+	if requestCount.Load() != 1 {
+		t.Fatalf("sidecar request count = %d, want selected primary only", requestCount.Load())
 	}
-	gotProxies := []string{<-proxies, <-proxies}
-	if gotProxies[0] != primaryURL || gotProxies[1] != standbyURL {
-		t.Fatalf("sidecar retry proxies = %#v, want [%q %q]", gotProxies, primaryURL, standbyURL)
+	if got := <-proxies; got != primaryURL {
+		t.Fatalf("sidecar selected proxy = %q, want %q", got, primaryURL)
+	}
+	select {
+	case got := <-proxies:
+		t.Fatalf("sidecar rotated to legacy standby proxy %q", got)
+	default:
 	}
 }
 

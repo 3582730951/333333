@@ -198,6 +198,70 @@ func TestCodexResponsesStreamFlushesFirstFrameBeforeTail(t *testing.T) {
 	released = true
 }
 
+func TestCodexResponsesStreamFlushesHeadersBeforeFirstEvent(t *testing.T) {
+	releaseFirstEvent := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseFirstEvent)
+		}
+	}()
+
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-releaseFirstEvent
+		_, _ = io.WriteString(w, "event: response.created\n"+
+			`data: {"type":"response.created","response":{"id":"resp_delayed","model":"gpt"}}`+"\n\n"+
+			"event: response.completed\n"+
+			`data: {"type":"response.completed","response":{"id":"resp_delayed","status":"completed","model":"gpt","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n"+
+			"data: [DONE]\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	})
+	h.importAccount(t, "codex-delayed", "upstream-delayed", "access-delayed")
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	response := make(chan result, 1)
+	go func() {
+		resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"gpt","stream":true,"input":"wait for first event"}`))
+		response <- result{resp: resp, err: err}
+	}()
+
+	var resp *http.Response
+	select {
+	case got := <-response:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		resp = got.resp
+	case <-time.After(500 * time.Millisecond):
+		close(releaseFirstEvent)
+		released = true
+		got := <-response
+		if got.resp != nil {
+			got.resp.Body.Close()
+		}
+		t.Fatal("Codex response headers were held while the upstream waited for its first SSE event")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	close(releaseFirstEvent)
+	released = true
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCodexResponsesStreamIgnoresLegacyFullCaptureLimit(t *testing.T) {
 	largeDelta := strings.Repeat("streaming-content-", 128)
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {

@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
@@ -57,6 +59,68 @@ func deepseekMock(t *testing.T) http.HandlerFunc {
 		default:
 			t.Fatalf("unexpected custom-provider upstream path %s", r.URL.Path)
 		}
+	}
+}
+
+func TestCustomNativeResponsesFlushesHeadersBeforeFirstEvent(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseUpstream := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseUpstream()
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("native Responses path = %q", r.URL.Path)
+			http.Error(w, "wrong path", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(entered)
+		<-release
+		_, _ = io.WriteString(w, "event: response.completed\n"+
+			`data: {"type":"response.completed","response":{"id":"resp-delayed","status":"completed","output":[]}}`+"\n\n")
+	})
+	const model = "delayed-codex-model"
+	setupProtocolMatrixProvider(t, h, model, storage.CustomProviderProtocolResponses, model)
+	provider, found, err := h.store.GetCustomProvider(t.Context(), model)
+	if err != nil || !found {
+		t.Fatalf("load custom provider: found=%v err=%v", found, err)
+	}
+	provider.TransportProfile = storage.CustomProviderTransportCodexCLI
+	if err := h.store.UpsertCustomProvider(t.Context(), provider); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &http.Client{Transport: &http.Transport{ResponseHeaderTimeout: 750 * time.Millisecond}}
+	req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(
+		`{"model":"delayed-codex-model","stream":true,"input":"hello"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		releaseUpstream()
+		t.Fatalf("gateway withheld stream headers until first event: %v", err)
+	}
+	defer resp.Body.Close()
+	select {
+	case <-entered:
+	default:
+		t.Fatal("upstream did not flush its response headers")
+	}
+	if resp.StatusCode != http.StatusOK || !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("downstream stream headers status=%d headers=%#v", resp.StatusCode, resp.Header)
+	}
+	releaseUpstream()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil || !bytes.Contains(raw, []byte("response.completed")) {
+		t.Fatalf("delayed stream body=%s err=%v", raw, err)
 	}
 }
 

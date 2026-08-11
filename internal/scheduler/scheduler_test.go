@@ -190,7 +190,7 @@ func TestSelectDynamicallyInheritsOrderedGroupEgressWithoutRewritingAccount(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lease.Egress.ID != "group-primary" || lease.Binding.PrimaryEgressID != "group-primary" || lease.Binding.StandbyEgressIDs != "group-standby" {
+	if lease.Egress.ID != "group-primary" || lease.Binding.PrimaryEgressID != "group-primary" || lease.Binding.StandbyEgressIDs != "" || lease.Binding.BindingScope != storage.EgressBindingScopeGroup {
 		lease.Release()
 		t.Fatalf("lease did not inherit ordered group egress: egress=%+v binding=%+v", lease.Egress, lease.Binding)
 	}
@@ -217,7 +217,46 @@ func TestSelectDynamicallyInheritsOrderedGroupEgressWithoutRewritingAccount(t *t
 	}
 }
 
-func TestFreshSelectionUsesStandbyWhenPrimaryIsFull(t *testing.T) {
+func TestExplicitAccountEgressOverridesGroupWithoutBalancing(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "account-egress-override", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"group-only-egress", "account-only-egress", "legacy-standby"} {
+		if err := store.UpsertEgressProfile(ctx, storage.EgressProfile{
+			ID: id, Type: "http_proxy", Endpoint: "http://" + id + ".example:8080", Health: "healthy", MaxConcurrency: 4,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"group-only-egress", "legacy-standby"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertEgressBinding(ctx, storage.AccountEgressBinding{
+		AccountID: account.ID, PrimaryEgressID: "account-only-egress", StandbyEgressIDs: "legacy-standby",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	lease, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Egress.ID != "account-only-egress" || lease.Binding.BindingScope != storage.EgressBindingScopeAccount || lease.Binding.StandbyEgressIDs != "" {
+		t.Fatalf("explicit account outlet was not authoritative: egress=%+v binding=%+v", lease.Egress, lease.Binding)
+	}
+}
+
+func TestFreshSelectionDoesNotBalanceOntoSecondaryGroupOutlet(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
 	account := storage.Account{ID: "multi-egress-account", GroupName: "cyber", Provider: "codex", Status: "active"}
@@ -249,16 +288,8 @@ func TestFreshSelectionUsesStandbyWhenPrimaryIsFull(t *testing.T) {
 	if primary.Egress.ID != "egress-a" {
 		t.Fatalf("first fresh lease egress=%q, want ordered tie-break egress-a", primary.Egress.ID)
 	}
-	standby, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
-	if err != nil {
-		t.Fatalf("full primary removed an account with standby capacity: %v", err)
-	}
-	defer standby.Release()
-	if standby.Account.ID != account.ID || standby.Egress.ID != "egress-b" {
-		t.Fatalf("standby lease account=%q egress=%q, want %q on egress-b", standby.Account.ID, standby.Egress.ID, account.ID)
-	}
-	if standby.Binding.PrimaryEgressID != "egress-b" || standby.Binding.StandbyEgressIDs != "egress-a" || standby.Binding.CookieJarKey != account.ID+":egress-b" {
-		t.Fatalf("selected standby was not rotated into lease binding: %+v", standby.Binding)
+	if _, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", SkipWait: true}); err == nil {
+		t.Fatal("full group primary balanced onto the secondary outlet")
 	}
 }
 
@@ -307,17 +338,12 @@ func TestInvalidateEgressCachePublishesCooldownImmediately(t *testing.T) {
 	if _, cached := s.egressCache.Load("cached-primary"); cached {
 		t.Fatal("egress cache still contains the pre-cooldown profile")
 	}
-	second, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer second.Release()
-	if second.Egress.ID != "cached-standby" {
-		t.Fatalf("post-invalidation egress=%q, want cached-standby", second.Egress.ID)
+	if _, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", SkipWait: true}); err == nil {
+		t.Fatal("post-invalidation routing used the secondary group outlet")
 	}
 }
 
-func TestFreshStandbyRotatesStoredBindingWithoutPreferredEgresses(t *testing.T) {
+func TestExplicitAccountBindingDoesNotRotateToStoredStandby(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
 	account := storage.Account{ID: "stored-standby-account", GroupName: "cyber", Provider: "codex", Status: "active"}
@@ -343,17 +369,12 @@ func TestFreshStandbyRotatesStoredBindingWithoutPreferredEgresses(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer primary.Release()
-	standby, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer standby.Release()
-	if standby.Egress.ID != "stored-standby" || standby.Binding.PrimaryEgressID != "stored-standby" || standby.Binding.StandbyEgressIDs != "stored-primary" || standby.Binding.CookieJarKey != account.ID+":stored-standby" {
-		t.Fatalf("stored standby lease was not rotated and re-namespaced: egress=%s binding=%+v", standby.Egress.ID, standby.Binding)
+	if _, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", SkipWait: true}); err == nil {
+		t.Fatal("explicit account primary balanced onto its legacy standby")
 	}
 }
 
-func TestFreshSelectionBalancesAbsoluteInflightAcrossUnequalLimits(t *testing.T) {
+func TestFreshSelectionUsesOnlyFirstGroupOutlet(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
 	account := storage.Account{ID: "unequal-egress-account", GroupName: "cyber", Provider: "codex", Status: "active"}
@@ -393,12 +414,12 @@ func TestFreshSelectionBalancesAbsoluteInflightAcrossUnequalLimits(t *testing.T)
 		leases = append(leases, lease)
 		counts[lease.Egress.ID]++
 	}
-	if counts["egress-us-huge"] != 10 || counts["egress-jp-16"] != 10 {
-		t.Fatalf("unequal hard limits skewed fresh traffic: counts=%v", counts)
+	if counts["egress-us-huge"] != 20 || counts["egress-jp-16"] != 0 {
+		t.Fatalf("secondary group outlet received balanced traffic: counts=%v", counts)
 	}
 }
 
-func TestCodexFreshSelectionWeightsConcurrentLoadBySuccessProbability(t *testing.T) {
+func TestCodexEgressQualityDoesNotOverrideGroupOutlet(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
 	account := storage.Account{ID: "weighted-egress-account", GroupName: "cyber", Provider: "codex", Status: "active"}
@@ -421,14 +442,10 @@ func TestCodexFreshSelectionWeightsConcurrentLoadBySuccessProbability(t *testing
 	if err := store.UpdateGroup(ctx, group); err != nil {
 		t.Fatal(err)
 	}
-	// With the bounded prior these observations produce posterior buckets 90
-	// and 70 exactly.  The configured limit of the first outlet is deliberately
-	// enormous: it is a ceiling, not a routing weight.
+	// Historical transport quality is diagnostic-only and cannot override the
+	// group's selected outlet.
 	insertCodexEgressOutcomeSamples(t, store, "egress-p90-huge", 100, 90)
 	insertCodexEgressOutcomeSamples(t, store, "egress-p70", 100, 68)
-	if high, low := codexEgressSuccessBucket(storage.CodexEgressRecentOutcome{Attempts: 100, Successes: 90}), codexEgressSuccessBucket(storage.CodexEgressRecentOutcome{Attempts: 100, Successes: 68}); high != 90 || low != 70 {
-		t.Fatalf("posterior buckets high=%d low=%d, want 90/70", high, low)
-	}
 
 	s := New(store, config.Default())
 	leases := make([]Lease, 0, 160)
@@ -446,8 +463,8 @@ func TestCodexFreshSelectionWeightsConcurrentLoadBySuccessProbability(t *testing
 		leases = append(leases, lease)
 		counts[lease.Egress.ID]++
 	}
-	if high, low := counts["egress-p90-huge"], counts["egress-p70"]; high < 89 || high > 91 || low < 69 || low > 71 {
-		t.Fatalf("weighted 90/70 routing was monopolized: counts=%v", counts)
+	if counts["egress-p90-huge"] != 160 || counts["egress-p70"] != 0 {
+		t.Fatalf("quality weighting overrode the group outlet: counts=%v", counts)
 	}
 }
 
@@ -487,7 +504,7 @@ func TestCodexFreshSelectionDoesNotForceKnownFailingColdEgress(t *testing.T) {
 	}
 }
 
-func TestCodexFreshSelectionExploresUnobservedEgressAtComparableQuality(t *testing.T) {
+func TestCodexFreshSelectionDoesNotExploreSecondaryGroupOutlet(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
 	account := storage.Account{ID: "bounded-exploration-account", GroupName: "cyber", Provider: "codex", Status: "active"}
@@ -525,19 +542,8 @@ func TestCodexFreshSelectionExploresUnobservedEgressAtComparableQuality(t *testi
 		t.Fatal(err)
 	}
 	defer second.Release()
-	if second.Egress.ID != "unobserved-egress" {
-		t.Fatalf("unobserved outlet was not explored under comparable quality: %s", second.Egress.ID)
-	}
-}
-
-func TestCodexEgressSuccessBucketsIgnoreSubPercentNoise(t *testing.T) {
-	a := codexEgressSuccessBucket(storage.CodexEgressRecentOutcome{Attempts: 1000, Successes: 850})
-	b := codexEgressSuccessBucket(storage.CodexEgressRecentOutcome{Attempts: 1000, Successes: 851})
-	if a != b {
-		t.Fatalf("one-sample noise crossed a one-percent routing bucket: %d != %d", a, b)
-	}
-	if noSamples, nineteen := codexEgressSuccessBucket(storage.CodexEgressRecentOutcome{}), codexEgressSuccessBucket(storage.CodexEgressRecentOutcome{Attempts: 19}); noSamples <= nineteen || noSamples > 100 || nineteen >= 50 {
-		t.Fatalf("exploration ranks no-sample=%d nineteen-sample=%d", noSamples, nineteen)
+	if second.Egress.ID != "mature-egress" {
+		t.Fatalf("secondary group outlet was explored: %s", second.Egress.ID)
 	}
 }
 
@@ -624,7 +630,7 @@ func TestRequiredAccountAndEgressIgnoreFreshOutletReordering(t *testing.T) {
 	}
 }
 
-func TestSelectProviderEgressOrderOverridesAccountPoolGroup(t *testing.T) {
+func TestSelectIgnoresProviderEgressOrderInFavorOfGroup(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
 	account := storage.Account{ID: "provider-egress-account", GroupName: "cyber", Provider: "relay", Status: "active"}
@@ -654,15 +660,15 @@ func TestSelectProviderEgressOrderOverridesAccountPoolGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lease.Release()
-	if lease.Egress.ID != "provider-outlet" {
-		t.Fatalf("provider egress did not override group egress: %+v", lease.Egress)
+	if lease.Egress.ID != "pool-outlet" {
+		t.Fatalf("provider egress overrode group egress: %+v", lease.Egress)
 	}
-	if lease.Binding.CookieJarKey != account.ID+":provider-outlet" {
+	if lease.Binding.CookieJarKey != account.ID+":pool-outlet" {
 		t.Fatalf("provider cookie namespace = %q", lease.Binding.CookieJarKey)
 	}
 }
 
-func TestProviderEgressReorderRefreshesFreshAndStickyCookieNamespace(t *testing.T) {
+func TestGroupEgressChangeRefreshesFreshAndStickyCookieNamespace(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
 	account := storage.Account{ID: "provider-cookie-account", GroupName: "cyber", Provider: "relay-cookie", Status: "active"}
@@ -675,6 +681,14 @@ func TestProviderEgressReorderRefreshesFreshAndStickyCookieNamespace(t *testing.
 		}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"provider-cookie-a"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
 	}
 	s := New(store, config.Default())
 	affinity := routing.AffinityKey{Hash: "provider-cookie-affinity", Key: "provider-cookie-key", Source: "test"}
@@ -690,6 +704,10 @@ func TestProviderEgressReorderRefreshesFreshAndStickyCookieNamespace(t *testing.
 		t.Fatalf("fresh provider namespace = egress=%s key=%q", lease.Egress.ID, lease.Binding.CookieJarKey)
 	}
 	lease.Release()
+	group.EgressIDs = []string{"provider-cookie-b"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
 
 	lease, err = s.Select(ctx, Route{
 		Group: "cyber", Provider: "relay-cookie", Affinity: affinity,

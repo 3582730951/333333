@@ -28,7 +28,7 @@ func TestCustomProviderSelectsEndpointByDownstreamPath(t *testing.T) {
 	defer chatUpstream.Close()
 	responsesUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		responsesCalls.Add(1)
-		if r.URL.Path != "/responses-base/v1/responses" {
+		if r.URL.Path != "/responses-base/v1/responses" && r.URL.Path != "/responses-base/v1/responses/compact" {
 			t.Errorf("responses route path=%q", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -66,6 +66,7 @@ func TestCustomProviderSelectsEndpointByDownstreamPath(t *testing.T) {
 	}{
 		{path: "/v1/chat/completions", body: `{"model":"multi-model","messages":[{"role":"user","content":"chat"}]}`},
 		{path: "/v1/responses", body: `{"model":"multi-model","input":"responses"}`},
+		{path: "/v1/responses/compact", body: `{"model":"multi-model","input":[{"role":"user","content":"compact this"}]}`},
 	}
 	for _, request := range requests {
 		resp, err := http.Post(h.pool.URL+request.path, "application/json", strings.NewReader(request.body))
@@ -78,7 +79,7 @@ func TestCustomProviderSelectsEndpointByDownstreamPath(t *testing.T) {
 			t.Fatalf("%s status=%d body=%s", request.path, resp.StatusCode, raw)
 		}
 	}
-	if chatCalls.Load() != 1 || responsesCalls.Load() != 1 {
+	if chatCalls.Load() != 1 || responsesCalls.Load() != 2 {
 		t.Fatalf("route calls chat=%d responses=%d", chatCalls.Load(), responsesCalls.Load())
 	}
 }

@@ -1,15 +1,16 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { ActionMenu, Button, Toast, Tag, Modal, Form, Select, Typography } from '../components/pool/index.jsx';
-import { IconRefresh, IconEdit, IconPlus } from '../components/pool/icons.jsx';
-import { get, post } from '../api.js';
+import { IconRefresh, IconEdit, IconPlus, IconDelete } from '../components/pool/icons.jsx';
+import { get, post, del } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import MobileResourceCell from '../components/MobileResourceCell.jsx';
-import { ActionGroup, MetricRail, TextClamp } from '../components/DisplayPrimitives.jsx';
+import { MetricRail, TextClamp } from '../components/DisplayPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import EgressProfileForm from '../components/EgressProfileForm.jsx';
 import CopyCodeBlock from '../components/CopyCodeBlock.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
+import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
 import { loadResourceGroup } from '../lib/resource.js';
 
@@ -143,6 +144,17 @@ export default function Egress() {
     formApi.current?.submitForm?.();
   }, []);
 
+  const { run: removeProfile, running: removingProfile, isRunning: isRemovingProfile } = useKeyedAsyncAction(async (row) => {
+    try {
+      await del(`/admin/egress-profiles/${encodeURIComponent(row.id)}`);
+      Toast.success(`已删除出口 ${row.name || row.id}`);
+      if (savedProfile?.id === row.id) setSavedProfile(null);
+      await load();
+    } catch (err) {
+      showErrorToast(err);
+    }
+  });
+
   const { run: savePool, running: savingPool } = useAsyncAction(async (vals) => {
     try {
       await post('/admin/egress-pools', { ...poolEditing, ...vals, purpose: 'registration' });
@@ -236,9 +248,29 @@ export default function Egress() {
   };
 
   const renderActions = (row) => (
-    <ActionGroup minWidth={88} compact>
-      <Button size="small" icon={<IconEdit />} onClick={() => openEdit(row)}>编辑</Button>
-    </ActionGroup>
+    <ActionMenu
+      label={`出口 ${row.name || row.id} 操作`}
+      items={[
+        {
+          label: '编辑',
+          icon: <IconEdit />,
+          disabled: saving || removingProfile,
+          onSelect: () => openEdit(row),
+        },
+        {
+          label: isRemovingProfile(row.id) ? '删除中' : '删除',
+          icon: <IconDelete />,
+          destructive: true,
+          disabled: row.id === 'egress_direct' || saving || (removingProfile && !isRemovingProfile(row.id)),
+          confirm: {
+            title: `删除出口 ${row.name || row.id}？`,
+            description: '删除后不可恢复。若分组、账号、Sidecar、活动会话或注册池仍在引用，系统会拒绝删除并提示先解除引用。',
+            confirmText: '删除',
+          },
+          onSelect: () => removeProfile(row),
+        },
+      ]}
+    />
   );
 
   const columns = [
@@ -357,7 +389,7 @@ export default function Egress() {
       <PageHeader title="出口 / 代理" subtitle={`共 ${rows.length} 个出口 · curl_cffi sidecar / 住宅代理 / WARP / CLIPProxy`}
         actions={<>
           <Button icon={<IconPlus />} onClick={() => setPoolEditing({ id: '', name: '', purpose: 'registration', assignment_strategy: 'sticky_least_used' })}>新建注册池</Button>
-          <Button icon={<IconPlus />} onClick={() => openEdit(null)}>新建</Button>
+          <Button icon={<IconPlus />} theme="solid" onClick={() => openEdit(null)}>新增出口</Button>
           <Button icon={<IconRefresh />} onClick={load}>刷新</Button>
         </>} />
       <section className="pool-egress-quickstart">

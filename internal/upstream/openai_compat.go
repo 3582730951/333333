@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -27,6 +28,53 @@ func IsCustomProvider(provider string) bool {
 	default:
 		return true
 	}
+}
+
+func customCodexResponsesProfile(spec Request) bool {
+	if spec.PassThrough || spec.MinimalProbe {
+		return false
+	}
+	if strings.TrimSpace(spec.TransportProfile) != storage.CustomProviderTransportCodexCLI ||
+		strings.TrimSpace(spec.UpstreamProtocol) != storage.CustomProviderProtocolResponses {
+		return false
+	}
+	path := strings.ToLower(strings.SplitN(strings.TrimSpace(spec.DownstreamPath), "?", 2)[0])
+	return strings.Contains(path, "/responses")
+}
+
+// prepareOpenAICompatCodexRequest makes the custom-provider Codex profile match
+// the contract advertised by the console: headers, client_metadata, and the small
+// set of Responses transport fields all come from one canonical identity. Generic
+// native-Responses providers remain byte-for-byte pass-through.
+func (c *Client) prepareOpenAICompatCodexRequest(spec *Request) error {
+	if spec == nil || !customCodexResponsesProfile(*spec) {
+		return nil
+	}
+	spec.codexResolvedClientVersion = c.resolveCodexClientVersion(*spec)
+	if err := spec.loadBody(); err != nil {
+		return err
+	}
+	isCompact := strings.Contains(strings.ToLower(spec.DownstreamPath), "/responses/compact")
+	responsesLite := CodexRequestUsesResponsesLite(spec.bodyBytes)
+	if isCompact && responsesLite {
+		setRequestBody(spec, normalizeCodexResponsesLiteCompactBody(spec.bodyBytes))
+	} else if !isCompact {
+		setRequestBody(spec, normalizeCodexResponsesBody(spec.bodyBytes, spec.BaseURL, responsesLite))
+	}
+
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(spec.bodyBytes, &fields)
+	setRequestBody(spec, normalizeCodexReasoningEffortForWireWithFields(spec.bodyBytes, fields))
+	setRequestBody(spec, stripCodexResponsesPromptCacheRetentionWithFields(spec.bodyBytes, fields))
+	metadata := c.newCodexRequestMetadataWithResponsesLite(*spec, responsesLite)
+	spec.codexMetadata = &metadata
+	setRequestBody(spec, normalizeCodexPromptCacheKeyForProfileWithFields(spec.bodyBytes, fields, metadata))
+	if !isCompact {
+		setRequestBody(spec, applyCodexClientMetadataWithFields(spec.bodyBytes, fields, metadata, false))
+	}
+	setRequestBody(spec, stripCodexResponsesHTTPGenerateWithFields(spec.bodyBytes, fields))
+	setRequestBody(spec, stripCodexTopLevelTransportCorrelatorsWithFields(spec.bodyBytes, fields))
+	return nil
 }
 
 // doOpenAICompatible performs a request against a custom OpenAI-compatible provider
@@ -204,20 +252,40 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 
 func (c *Client) applyOpenAICompatCodexIdentity(dst http.Header, spec Request) {
 	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
-	originator := codexThreadOriginator(spec.Headers)
+	threadOriginator := codexThreadOriginator(spec.Headers)
+	processOriginator := codexProcessOriginator(spec.Headers, threadOriginator)
 	version := c.codexClientVersionForRequest(spec)
-	dst.Set("User-Agent", id.CodexUserAgentForOriginator(originator, version))
-	setHeaderPreserveCase(dst, "Originator", originator)
+	dst.Set("User-Agent", id.CodexUserAgentForOriginator(processOriginator, version))
+	setHeaderPreserveCase(dst, "Originator", threadOriginator)
 	setHeaderPreserveCase(dst, "version", version)
 	if beta := mergeCodexBetaFeatures(getHeaderFold(spec.Headers, "x-codex-beta-features")); beta != "" {
 		setHeaderPreserveCase(dst, "x-codex-beta-features", beta)
 	}
 	if strings.Contains(strings.ToLower(spec.DownstreamPath), "responses") {
-		metadata := c.newCodexRequestMetadata(spec)
+		metadata := spec.codexMetadata
+		if metadata == nil {
+			generated := c.newCodexRequestMetadata(spec)
+			metadata = &generated
+		}
 		setHeaderPreserveCase(dst, "session-id", metadata.sessionID)
 		setHeaderPreserveCase(dst, "thread-id", metadata.threadID)
 		setHeaderPreserveCase(dst, "x-client-request-id", metadata.threadID)
 		setHeaderPreserveCase(dst, "x-codex-window-id", metadata.windowID)
+		if metadata.turnMetadataHeader != "" {
+			setHeaderPreserveCase(dst, "x-codex-turn-metadata", metadata.turnMetadataHeader)
+		}
+		if metadata.parentThreadID != "" {
+			setHeaderPreserveCase(dst, "x-codex-parent-thread-id", metadata.parentThreadID)
+		}
+		if metadata.subagent != "" {
+			setHeaderPreserveCase(dst, codexSubagentHeader, metadata.subagent)
+		}
+		if metadata.turnState != "" {
+			setHeaderPreserveCase(dst, "x-codex-turn-state", metadata.turnState)
+		}
+		if metadata.responsesLite {
+			setHeaderPreserveCase(dst, codexResponsesLiteHeader, "true")
+		}
 	}
 }
 

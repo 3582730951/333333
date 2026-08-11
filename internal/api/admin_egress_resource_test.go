@@ -16,7 +16,7 @@ func TestAdminGroupAssignEgressUpdatesOnlyGroupEgress(t *testing.T) {
 	source := readAPISource(t, "admin_config.go")
 	body := functionBody(t, source, "adminGroupAssignEgress")
 	if !strings.Contains(body, ".UpdateGroup(") || !strings.Contains(body, "group.EgressIDs") {
-		t.Fatal("adminGroupAssignEgress should update the ordered group egress list")
+		t.Fatal("adminGroupAssignEgress should update the group's single egress")
 	}
 	for _, bad := range []string{
 		".GetEgressBinding(r.Context(), acc.ID)",
@@ -46,6 +46,12 @@ func TestAdminGroupAssignEgressLeavesAccountBindingUnchanged(t *testing.T) {
 		"primary_egress_id":"group-primary",
 		"standby_egress_ids":["group-standby"]
 	}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("standby egress should be rejected, got %d: %s", code, raw)
+	}
+	code, raw = grpReq(t, h, http.MethodPost, "/admin/groups/cyber/assign-egress", `{
+		"primary_egress_id":"group-primary"
+	}`)
 	if code != http.StatusOK {
 		t.Fatalf("assign egress = %d: %s", code, raw)
 	}
@@ -60,8 +66,8 @@ func TestAdminGroupAssignEgressLeavesAccountBindingUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(group.EgressIDs) != 2 || group.EgressIDs[0] != "group-primary" || group.EgressIDs[1] != "group-standby" {
-		t.Fatalf("group egress order = %#v", group.EgressIDs)
+	if len(group.EgressIDs) != 1 || group.EgressIDs[0] != "group-primary" {
+		t.Fatalf("group egress = %#v", group.EgressIDs)
 	}
 	binding, err := h.store.GetEgressBinding(context.Background(), account.ID)
 	if err != nil {
@@ -99,6 +105,44 @@ func TestAdminDeleteReferencedEgressProfileReturnsConflict(t *testing.T) {
 	}
 }
 
+func TestAdminGroupRejectsMultipleInferenceEgresses(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	upsertTestEgressProfile(t, h, "single-group-a")
+	upsertTestEgressProfile(t, h, "single-group-b")
+	code, body := grpReq(t, h, http.MethodPost, "/admin/groups", `{
+		"name":"multiple-egress-group",
+		"egress_ids":["single-group-a","single-group-b"]
+	}`)
+	if code != http.StatusBadRequest || !strings.Contains(string(body), `"code":"invalid_request"`) {
+		t.Fatalf("multiple group egresses = %d: %s", code, body)
+	}
+}
+
+func TestAdminDeleteIgnoresInactiveLegacyGroupStandbyButProtectsDefaultDirect(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	upsertTestEgressProfile(t, h, "legacy-active-primary")
+	upsertTestEgressProfile(t, h, "legacy-inactive-standby")
+	if _, err := h.store.DB().ExecContext(t.Context(), `UPDATE groups SET default_egress_id=?, egress_ids=? WHERE name=?`,
+		"legacy-active-primary", `["legacy-active-primary","legacy-inactive-standby"]`, "cyber"); err != nil {
+		t.Fatal(err)
+	}
+	accountID := h.importAccount(t, "legacy-standby-account", "upstream-legacy-standby-account", "access-legacy-standby-account")
+	if err := h.store.UpsertEgressBinding(t.Context(), storage.AccountEgressBinding{
+		AccountID: accountID, BindingScope: storage.EgressBindingScopeAccount,
+		PrimaryEgressID: "legacy-active-primary", StandbyEgressIDs: "legacy-inactive-standby",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	code, body := grpReq(t, h, http.MethodDelete, "/admin/egress-profiles/legacy-inactive-standby", "")
+	if code != http.StatusOK {
+		t.Fatalf("delete inactive legacy standby = %d: %s", code, body)
+	}
+	code, body = grpReq(t, h, http.MethodDelete, "/admin/egress-profiles/"+storage.DefaultDirectEgressID, "")
+	if code != http.StatusConflict || !strings.Contains(string(body), `"code":"egress_in_use"`) {
+		t.Fatalf("delete system direct egress = %d: %s", code, body)
+	}
+}
+
 func TestAdminEgressPoolDeleteCannotDeleteSameIDEgressProfile(t *testing.T) {
 	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
 	upsertTestEgressProfile(t, h, "shared-resource-id")
@@ -115,7 +159,7 @@ func TestAdminEgressPoolDeleteCannotDeleteSameIDEgressProfile(t *testing.T) {
 	}
 }
 
-func TestAdminEgressProfileMutationInvalidatesSchedulerCache(t *testing.T) {
+func TestAdminEgressProfileMutationInvalidatesSchedulerCacheWithoutStandbyFallback(t *testing.T) {
 	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
 	ctx := context.Background()
 	upsertTestEgressProfile(t, h, "cache-primary")
@@ -153,12 +197,9 @@ func TestAdminEgressProfileMutationInvalidatesSchedulerCache(t *testing.T) {
 		t.Fatalf("update cached profile = %d: %s", code, raw)
 	}
 
-	second, err := h.app.scheduler.Select(ctx, scheduler.Route{Group: "cyber", Provider: "codex"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer second.Release()
-	if second.Egress.ID != "cache-standby" {
-		t.Fatalf("profile mutation remained cached: egress=%q", second.Egress.ID)
+	second, err := h.app.scheduler.Select(ctx, scheduler.Route{Group: "cyber", Provider: "codex", SkipWait: true})
+	if err == nil {
+		second.Release()
+		t.Fatalf("cooled primary remained cached or rotated to legacy standby: egress=%q", second.Egress.ID)
 	}
 }

@@ -2594,7 +2594,7 @@ codexSuccess:
 			var terminalStream bool
 			var probeErr error
 			if keepalive := s.streamKeepAliveInterval(r.Context()); keepalive > 0 {
-				idleRelease := earlySSECreatedIdleRelease
+				idleRelease := earlySSEIdleRelease
 				if keepalive < idleRelease {
 					idleRelease = keepalive
 				}
@@ -2865,6 +2865,7 @@ codexSuccess:
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
 			w.WriteHeader(resp.StatusCode)
+			flushWriter(w)
 			uscan := usage.NewStreamScanner("codex")
 			nativeRecorder := s.newCodexStreamLedgerRecorder(r.Context())
 			defer nativeRecorder.Close()
@@ -2918,6 +2919,7 @@ codexSuccess:
 		recordingStream := io.TeeReader(streamBody, streamRecorder)
 		s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
+		flushWriter(w)
 		streamCtx := r.Context()
 		if rf := s.responseRuleFilter(streamCtx, "codex", func() string {
 			if isChat {
@@ -3533,9 +3535,6 @@ func (s *Server) doWithCFRetry(ctx context.Context, req upstream.Request, lease 
 		if ctx.Err() == nil {
 			s.recordCodexUpstreamAttempt(ctx, mapping, lease, req.Egress, "egress_failure", 0)
 		}
-		if !strict {
-			return s.doCodexStandbyEgressRetries(ctx, req, lease, nil, nil, err)
-		}
 		return nil, req.Egress, err
 	}
 	if resp.StatusCode < 400 {
@@ -3561,7 +3560,6 @@ func (s *Server) doWithCFRetry(ctx context.Context, req upstream.Request, lease 
 	if detection.Matched && cf.Recordable(detection) {
 		s.recordCodexUpstreamAttempt(ctx, mapping, lease, req.Egress, "egress_failure", resp.StatusCode)
 		egressFailureRecorded = true
-		s.handleCFEvent(ctx, req.Account, req.Egress, resp.StatusCode, detection)
 	}
 	if strict {
 		resp.Body = io.NopCloser(bytes.NewReader(body))
@@ -3573,95 +3571,8 @@ func (s *Server) doWithCFRetry(ctx context.Context, req upstream.Request, lease 
 	if !egressFailureRecorded {
 		s.recordCodexUpstreamAttempt(ctx, mapping, lease, req.Egress, "egress_failure", resp.StatusCode)
 	}
-	return s.doCodexStandbyEgressRetries(ctx, req, lease, resp, body, nil)
-}
-
-// doCodexStandbyEgressRetries exhausts the selected account's ordered standby
-// outlets before the caller is allowed to move to another account or user-group
-// target. It is called only before downstream response commitment.
-func (s *Server) doCodexStandbyEgressRetries(ctx context.Context, req upstream.Request, lease scheduler.Lease, fallback *upstream.Response, fallbackBody []byte, fallbackErr error) (*upstream.Response, storage.EgressProfile, error) {
-	retryBinding := lease.Binding
-	retryBinding.AccountID = req.Account.ID
-	standbys := append([]string(nil), retryBinding.StandbyIDs()...)
-
-	// A CF handler may have appended a WARP standby to the account binding. Merge
-	// only newly-added standbys into the dynamic group/provider order; replacing the
-	// whole binding here would resurrect a stale account-level primary.
-	if updated, err := s.store.GetEgressBinding(ctx, req.Account.ID); err == nil {
-		if retryBinding.SidecarEgressID == "" {
-			retryBinding.SidecarEgressID = updated.SidecarEgressID
-		}
-		seen := map[string]bool{req.Egress.ID: true}
-		for _, id := range standbys {
-			seen[id] = true
-		}
-		for _, id := range updated.StandbyIDs() {
-			if id = strings.TrimSpace(id); id != "" && !seen[id] {
-				seen[id] = true
-				standbys = append(standbys, id)
-			}
-		}
-	}
-
-	lastResp, lastBody, lastEgress, lastErr := fallback, fallbackBody, req.Egress, fallbackErr
-	for _, standbyID := range standbys {
-		if standbyID == "" || standbyID == req.Egress.ID {
-			continue
-		}
-		standby, err := s.store.GetEgressProfile(ctx, standbyID)
-		if err != nil || !scheduler.EgressHealthy(standby, storage.Now()) {
-			continue
-		}
-		standby, err = s.store.ApplySidecarEgressBinding(ctx, retryBinding, standby)
-		if err != nil {
-			// Explicit sidecar bindings are fail-closed on the retry path too.
-			continue
-		}
-		retryReq := req
-		retryReq.Egress = standby
-		retryReq.CookieJarKey = req.Account.ID + ":" + standby.ID
-		mapping := codexSessionMappingFromContext(ctx)
-		s.recordCodexUpstreamAttempt(ctx, mapping, lease, standby, "transport_attempted", 0)
-		retryResp, err := s.doCodexUpstream(ctx, retryReq)
-		if err != nil {
-			if ctx.Err() == nil {
-				s.recordCodexUpstreamAttempt(ctx, mapping, lease, standby, "egress_failure", 0)
-			}
-			lastErr = err
-			continue
-		}
-		if retryResp.StatusCode < http.StatusBadRequest {
-			return retryResp, standby, nil
-		}
-		retryBody, drainErr := upstream.DrainAndClose(retryResp.Body)
-		if drainErr != nil {
-			if ctx.Err() == nil {
-				s.recordCodexUpstreamAttempt(ctx, mapping, lease, standby, "egress_failure", retryResp.StatusCode)
-			}
-			lastErr = drainErr
-			continue
-		}
-		lastResp, lastBody, lastEgress, lastErr = retryResp, retryBody, standby, nil
-		detection := cf.Detect(retryResp.StatusCode, retryResp.Header, retryBody)
-		egressFailureRecorded := false
-		if detection.Matched && !cf.EdgeOnly(detection) && cf.Recordable(detection) {
-			s.recordCodexUpstreamAttempt(ctx, mapping, lease, standby, "egress_failure", retryResp.StatusCode)
-			egressFailureRecorded = true
-			s.handleCFEvent(ctx, req.Account, standby, retryResp.StatusCode, detection)
-		}
-		if (!detection.Matched || cf.EdgeOnly(detection)) && retryResp.StatusCode < http.StatusInternalServerError {
-			retryResp.Body = io.NopCloser(bytes.NewReader(retryBody))
-			return retryResp, standby, nil
-		}
-		if !egressFailureRecorded && !(detection.Matched && cf.EdgeOnly(detection)) {
-			s.recordCodexUpstreamAttempt(ctx, mapping, lease, standby, "egress_failure", retryResp.StatusCode)
-		}
-	}
-	if lastResp != nil {
-		lastResp.Body = io.NopCloser(bytes.NewReader(lastBody))
-		return lastResp, lastEgress, nil
-	}
-	return nil, lastEgress, lastErr
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return resp, req.Egress, nil
 }
 
 // ignoredRateLimitRetryFloor is deliberately a variable so focused gateway tests
@@ -3714,9 +3625,8 @@ func (s *Server) retryCodexSameAccountAfterRateLimit(ctx context.Context, lease 
 		if err := waitForIgnoredRateLimitRetry(ctx, delay); err != nil {
 			return nil, lease.Egress, err
 		}
-		// Strict=true intentionally disables the ordinary standby-egress CF retry.
-		// This opt-in loop must remain on the exact account/egress lease, including
-		// for non-CPA Codex requests.
+		// This opt-in loop remains on the exact account/egress lease, including for
+		// non-CPA Codex requests.
 		resp, egress, err := s.doWithCFRetry(ctx, request(), lease, true)
 		if err != nil {
 			return nil, egress, err
@@ -3743,16 +3653,10 @@ func (s *Server) retryCodexSameAccountAfterRateLimit(ctx context.Context, lease 
 }
 
 // handleCFEvent is the single reaction point for a confirmed Cloudflare event. It
-// records the event (the existing StormBreaker cooldown/quarantine ladder) and then
-// applies the WARP ladder:
-//
-//   - CF on a normal egress (direct/proxy/sidecar): assign the account a WARP exit as
-//     a standby (≤3 accounts/exit). Because scheduler.selectEgress serves a cooled
-//     binding via its standby, the account keeps working through WARP during the
-//     cooldown instead of dropping out of the pool — the fix for "动不动就冷却".
-//   - CF on a WARP exit itself: the exit's IP is flagged. Repair it in the background
-//     (solver first, then re-register for a fresh IP) so the live request fails fast
-//     to a fresh account while the exit is restored for subsequent traffic.
+// records the event through the existing StormBreaker cooldown/quarantine ladder.
+// It never mutates an account's outlet selection: group inheritance or an explicit
+// account override remains authoritative. When that selected outlet is itself WARP,
+// repair the same outlet in the background for subsequent traffic.
 func (s *Server) handleCFEvent(ctx context.Context, account storage.Account, egress storage.EgressProfile, status int, detection cf.Detection) {
 	if account.IgnoreRateLimitControls {
 		// Do not feed this account into StormBreaker's cooldown/quarantine ladder.
@@ -3765,18 +3669,11 @@ func (s *Server) handleCFEvent(ctx context.Context, account storage.Account, egr
 	// StormBreaker may synchronously trip the shared egress profile. Publish that
 	// health/cooldown mutation before another fresh request reads the 30s cache.
 	s.scheduler.InvalidateEgressCache()
-	if s.warp == nil || !s.warp.Enabled() {
-		return
-	}
-	if s.warp.IsWarpExit(egress.ID) {
+	if s.warp != nil && s.warp.Enabled() && s.warp.IsWarpExit(egress.ID) {
 		go func() {
 			defer supervisor.Recover("warp-exit-recovery")
 			s.recoverWarpExit(context.Background(), account, egress)
 		}()
-		return
-	}
-	if _, err := s.warp.AssignCFAccount(ctx, account.ID); err != nil {
-		log.Printf("warp: assign account %s on CF: %v", account.ID, err)
 	}
 }
 

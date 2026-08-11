@@ -121,6 +121,24 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 	if err != nil {
 		return nil, err
 	}
+	groups, err := s.store.ListGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	groupEgresses := make(map[string]string, len(groups))
+	for _, group := range groups {
+		id := strings.TrimSpace(group.DefaultEgressID)
+		for _, candidate := range group.EgressIDs {
+			if candidate = strings.TrimSpace(candidate); candidate != "" {
+				id = candidate
+				break
+			}
+		}
+		if id == "" {
+			id = storage.DefaultDirectEgressID
+		}
+		groupEgresses[group.Name] = id
+	}
 	usages, err := s.store.UsageSummaryByAccountIDs(ctx, accountIDs)
 	if err != nil {
 		return nil, err
@@ -162,6 +180,12 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 			view.APIKeyPresent = accountprovider.UsesAPIKey(view.Provider, *token) && accountprovider.Credential(view.Provider, *token) != ""
 		}
 		if binding, ok := bindings[account.ID]; ok {
+			if !strings.EqualFold(strings.TrimSpace(binding.BindingScope), storage.EgressBindingScopeAccount) {
+				binding.BindingScope = storage.EgressBindingScopeGroup
+				binding.PrimaryEgressID = firstNonEmpty(groupEgresses[account.GroupName], storage.DefaultDirectEgressID)
+				binding.StandbyEgressIDs = ""
+				binding.CookieJarKey = account.ID + ":" + binding.PrimaryEgressID
+			}
 			view.Egress = &binding
 		}
 		if usage, ok := usages[account.ID]; ok {

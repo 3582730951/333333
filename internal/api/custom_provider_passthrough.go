@@ -101,14 +101,13 @@ func (s *Server) handleCustomProviderPassthroughWithModel(
 	}
 
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
-		Group:              policy.Group,
-		Provider:           provider.ID,
-		PreferredEgressIDs: provider.EgressIDs,
-		Model:              routeModel,
-		EstimatedTokens:    virtual.EstimateTokensJSON(raw),
-		Affinity:           affinity,
-		ImmutableAffinity:  immutableResource,
-		SkipWait:           userGroupFallbackProbe(r.Context()),
+		Group:             policy.Group,
+		Provider:          provider.ID,
+		Model:             routeModel,
+		EstimatedTokens:   virtual.EstimateTokensJSON(raw),
+		Affinity:          affinity,
+		ImmutableAffinity: immutableResource,
+		SkipWait:          userGroupFallbackProbe(r.Context()),
 	})
 	if err != nil {
 		if errors.Is(err, scheduler.ErrBoundAccountUnavailable) {

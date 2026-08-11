@@ -648,9 +648,14 @@ func (c *Client) Do(ctx context.Context, req Request) (resp *Response, err error
 	if req.Provider == "antigravity" {
 		return nil, errors.New("antigravity requests must use the native Antigravity transport")
 	}
-	// Custom OpenAI-Chat-Completions-compatible provider (DeepSeek, Kimi, …): a clean
-	// Bearer-auth OpenAI client, no Codex/Claude fingerprint and no body normalization.
+	// Custom providers normally use a clean OpenAI-compatible request. A provider
+	// explicitly configured with the Codex CLI Responses profile is different: the
+	// profile promises the Codex session/body contract as well as its headers, so
+	// normalize those few transport fields before the shared custom dispatcher.
 	if IsCustomProvider(req.Provider) {
+		if err := c.prepareOpenAICompatCodexRequest(&req); err != nil {
+			return nil, err
+		}
 		return c.doOpenAICompatible(ctx, req)
 	}
 	req.codexResolvedClientVersion = c.resolveCodexClientVersion(req)

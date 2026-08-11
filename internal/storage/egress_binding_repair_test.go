@@ -59,7 +59,7 @@ func TestInitRepairsMissingEgressBindingUsingGroupDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if binding.PrimaryEgressID != "egress_group_default" || binding.CookieJarKey != "acc-missing-binding:egress_group_default" {
+	if binding.PrimaryEgressID != "egress_group_default" || binding.CookieJarKey != "acc-missing-binding:egress_group_default" || binding.BindingScope != EgressBindingScopeGroup {
 		t.Fatalf("binding = %+v, want repaired group default", binding)
 	}
 }
@@ -93,7 +93,7 @@ func TestUpsertAccountDefaultsToGroupEgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if binding.PrimaryEgressID != "egress_group_default" {
-		t.Fatalf("primary egress = %q, want group default", binding.PrimaryEgressID)
+	if binding.PrimaryEgressID != "egress_group_default" || binding.BindingScope != EgressBindingScopeGroup {
+		t.Fatalf("binding = %+v, want group default scope", binding)
 	}
 }

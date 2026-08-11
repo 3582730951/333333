@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -611,6 +612,12 @@ func (s *Server) dispatchUserGroupTrafficFallback(
 		if fallbackRequest.Body != nil {
 			_ = fallbackRequest.Body.Close()
 		}
+		if markCanceledUserGroupAttempt(r.Context(), attempt) {
+			detail := userGroupRouteDiagnosticDetail(r, resolvedRaw, fallback.UserGroupID, attempt)
+			s.recordRouteAttempt(requestIDFromContext(r.Context()), -1, "user_group:"+fallback.UserGroupID, "traffic_fallback", userGroupRouteStatusClass(attempt), "", detail)
+			_ = attempt.Close()
+			return true
+		}
 
 		status := attempt.Status()
 		if _, terminalFailure := attempt.TerminalFailure(); terminalFailure {
@@ -768,6 +775,12 @@ retryUserGroupRoute:
 		stopCapacityHeartbeat()
 		if candidate.Body != nil {
 			_ = candidate.Body.Close()
+		}
+		if markCanceledUserGroupAttempt(r.Context(), attempt) {
+			detail := userGroupRouteDiagnosticDetail(r, resolvedRaw, pol.UserGroupID, attempt)
+			s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, userGroupRouteStatusClass(attempt), "", detail)
+			_ = attempt.Close()
+			return true
 		}
 
 		if choiceState != nil && choiceState.Used() {
@@ -1080,16 +1093,22 @@ func safeUpstreamErrorCodeClass(raw string) (string, bool) {
 }
 
 func userGroupRouteStatusClass(attempt *userGroupAttemptWriter) string {
+	if attempt == nil {
+		return "unknown"
+	}
 	if failure, ok := attempt.TerminalFailure(); ok {
 		if failure.ErrorCode == "cyber_policy" {
 			return "upstream_cyber_policy"
 		}
 		return "upstream_terminal_failure"
 	}
-	status := attempt.Status()
-	if attempt.bodyErr != nil {
-		return "local_response_storage"
+	if attempt.routeFailureClass != "" {
+		return attempt.routeFailureClass
 	}
+	if attempt.bodyErr != nil {
+		return userGroupRouteLocalFailureClass(attempt.bodyErr)
+	}
+	status := attempt.Status()
 	if attempt.probeClass != "" {
 		return attempt.probeClass
 	}
@@ -1151,26 +1170,29 @@ func replayUserGroupRequestBody(ctx context.Context, original []byte) (io.ReadCl
 }
 
 type userGroupAttemptWriter struct {
-	downstream     http.ResponseWriter
-	header         http.Header
-	status         int
-	body           *bodysource.SpoolBuffer
-	bodyErr        error
-	probeBody      []byte
-	probeReserved  int64
-	probeTail      []byte
-	probeRetryable bool
-	probePermanent bool
-	probeClass     string
-	ctx            context.Context
-	options        bodysource.CaptureOptions
-	speculative    bool
-	probe          bool
-	probeTruncated bool
-	committed      bool
-	stream         bool
-	responses      *responsesRouteAliasTracker
-	terminal       *leakfilter.CodexFailureFrame
+	downstream            http.ResponseWriter
+	header                http.Header
+	status                int
+	body                  *bodysource.SpoolBuffer
+	bodyErr               error
+	probeBody             []byte
+	probeReserved         int64
+	probeTail             []byte
+	probeRetryable        bool
+	probePermanent        bool
+	probeClass            string
+	routeFailureClass     string
+	routeFailureRetryable bool
+	routeFailurePermanent bool
+	ctx                   context.Context
+	options               bodysource.CaptureOptions
+	speculative           bool
+	probe                 bool
+	probeTruncated        bool
+	committed             bool
+	stream                bool
+	responses             *responsesRouteAliasTracker
+	terminal              *leakfilter.CodexFailureFrame
 }
 
 func newUserGroupAttemptWriter(ctx context.Context, downstream http.ResponseWriter, stream, trackResponses bool, options bodysource.CaptureOptions, speculative ...bool) *userGroupAttemptWriter {
@@ -1221,19 +1243,33 @@ func (w *userGroupAttemptWriter) writeBuffered(payload []byte) (int, error) {
 	}
 	if w.body == nil {
 		options := w.options
-		w.body, w.bodyErr = bodysource.NewSpoolBuffer(w.ctx, options)
-		if w.bodyErr != nil {
-			return 0, w.bodyErr
+		body, err := bodysource.NewSpoolBuffer(w.ctx, options)
+		if err != nil {
+			w.setBodyError(err)
+			return 0, err
 		}
+		w.body = body
 	}
 	n, err := w.body.Write(payload)
 	if err != nil {
-		w.bodyErr = err
-		w.status = http.StatusServiceUnavailable
-		w.header.Set("Retry-After", "1")
-		w.header.Set("Content-Type", "application/json")
+		w.setBodyError(err)
 	}
 	return n, err
+}
+
+func (w *userGroupAttemptWriter) setBodyError(err error) {
+	if w == nil || err == nil {
+		return
+	}
+	w.bodyErr = err
+	w.status = http.StatusServiceUnavailable
+	w.header.Set("Content-Type", "application/json")
+	switch userGroupRouteLocalFailureClass(err) {
+	case "request_canceled", "request_deadline_exceeded":
+		w.header.Del("Retry-After")
+	default:
+		w.header.Set("Retry-After", "1")
+	}
 }
 
 func (w *userGroupAttemptWriter) writeProbe(payload []byte) (int, error) {
@@ -1334,13 +1370,24 @@ func (w *userGroupAttemptWriter) Status() int {
 func (w *userGroupAttemptWriter) Committed() bool { return w.committed }
 
 func (w *userGroupAttemptWriter) RetryableFailure() bool {
+	if w == nil {
+		return false
+	}
+	if w.routeFailureClass != "" {
+		return w.routeFailureRetryable
+	}
+	// A local capture failure is shared by every route candidate. Retrying a
+	// different account cannot repair it and only multiplies upstream work.
+	if w.bodyErr != nil {
+		return false
+	}
 	if retryableUserGroupTargetStatus(w.Status()) {
 		return true
 	}
 	if w.probe {
 		return w.probeRetryable
 	}
-	if w.body == nil || w.bodyErr != nil {
+	if w.body == nil {
 		return false
 	}
 	r, err := w.body.Open()
@@ -1356,13 +1403,22 @@ func (w *userGroupAttemptWriter) RetryableFailure() bool {
 // request, but they do not rewrite a durable conversation target. Only evidence
 // that the target cannot execute this route permits compare-and-swap migration.
 func (w *userGroupAttemptWriter) PermanentTargetFailure() bool {
+	if w == nil {
+		return false
+	}
+	if w.routeFailureClass != "" {
+		return w.routeFailurePermanent
+	}
+	if w.bodyErr != nil {
+		return false
+	}
 	if w.Status() == http.StatusNotFound {
 		return true
 	}
 	if w.probe {
 		return w.probePermanent
 	}
-	if w.body == nil || w.bodyErr != nil {
+	if w.body == nil {
 		return false
 	}
 	r, err := w.body.Open()
@@ -1438,6 +1494,23 @@ func (w *userGroupAttemptWriter) markCodexTerminalFailure(failure leakfilter.Cod
 	w.terminal = &copy
 }
 
+func (w *userGroupAttemptWriter) markUserGroupRouteFailure(class string, retryable, permanent bool) {
+	if w == nil || strings.TrimSpace(class) == "" {
+		return
+	}
+	w.routeFailureClass = strings.TrimSpace(class)
+	w.routeFailureRetryable = retryable
+	w.routeFailurePermanent = permanent
+}
+
+func markUserGroupRouteFailure(w http.ResponseWriter, class string, retryable, permanent bool) {
+	if marker, ok := w.(interface {
+		markUserGroupRouteFailure(string, bool, bool)
+	}); ok {
+		marker.markUserGroupRouteFailure(class, retryable, permanent)
+	}
+}
+
 func markUserGroupCodexTerminalFailure(w http.ResponseWriter, failure leakfilter.CodexFailureFrame) {
 	if marker, ok := w.(interface {
 		markCodexTerminalFailure(leakfilter.CodexFailureFrame)
@@ -1458,18 +1531,26 @@ func (w *userGroupAttemptWriter) Commit() {
 		var err error
 		body, err = w.body.Open()
 		if err != nil {
-			w.bodyErr = err
-			w.status = http.StatusServiceUnavailable
-			w.header.Set("Retry-After", "1")
-			w.header.Set("Content-Type", "application/json")
+			w.setBodyError(err)
 		}
 	}
 	if w.probeTruncated {
 		w.header.Set("X-Pool-Error-Probe-Truncated", "1")
 	}
+	if w.routeFailureClass != "" {
+		markUserGroupRouteFailure(w.downstream, w.routeFailureClass, w.routeFailureRetryable, w.routeFailurePermanent)
+	} else if w.bodyErr != nil {
+		markUserGroupRouteFailure(w.downstream, userGroupRouteLocalFailureClass(w.bodyErr), false, false)
+	}
 	w.commitHeaders()
 	if w.bodyErr != nil {
-		_, _ = io.WriteString(w.downstream, `{"error":{"type":"resource_exhausted","message":"response buffer exhausted"}}`)
+		switch userGroupRouteLocalFailureClass(w.bodyErr) {
+		case "request_canceled", "request_deadline_exceeded":
+			// The request is already gone. Do not replace the real cancellation
+			// with a synthetic resource-exhausted response in an outer route.
+		default:
+			_, _ = io.WriteString(w.downstream, `{"error":{"type":"resource_exhausted","message":"response buffer exhausted"}}`)
+		}
 	} else if body != nil {
 		_, _ = io.Copy(w.downstream, body)
 	} else if w.probe && len(w.probeBody) > 0 {
@@ -1481,6 +1562,35 @@ func (w *userGroupAttemptWriter) Commit() {
 		_ = body.Close()
 	}
 	_ = w.Close()
+}
+
+func userGroupRouteLocalFailureClass(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "request_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "request_deadline_exceeded"
+	case errors.Is(err, bodysource.ErrBodyTooLarge):
+		return "local_response_too_large"
+	default:
+		return "local_response_storage"
+	}
+}
+
+func markCanceledUserGroupAttempt(ctx context.Context, attempt *userGroupAttemptWriter) bool {
+	if ctx == nil || attempt == nil || attempt.Committed() || ctx.Err() == nil {
+		return false
+	}
+	// Cancellation can race the final non-streaming write: Codex commonly closes
+	// immediately after receiving a complete response. Preserve that already-captured
+	// success so its durable route binding remains available to the next turn. A bare
+	// implicit 200 (no body) is not evidence of success and is still classified as a
+	// canceled attempt instead of creating a false binding or triggering failover.
+	if attempt.Status() < http.StatusBadRequest && attempt.bodyErr == nil && attempt.body != nil && attempt.body.Size() > 0 {
+		return false
+	}
+	attempt.markUserGroupRouteFailure(userGroupRouteLocalFailureClass(ctx.Err()), false, false)
+	return true
 }
 
 func (w *userGroupAttemptWriter) Close() error {

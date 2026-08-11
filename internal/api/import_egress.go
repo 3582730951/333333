@@ -71,10 +71,7 @@ func (s *Server) bindImportedAccountPrimaryEgress(ctx context.Context, accountID
 	if err != nil {
 		return err
 	}
-	primary, err := s.resolveImportPrimaryEgressForGroup(ctx, requested, account.GroupName)
-	if err != nil {
-		return err
-	}
+	requested = strings.TrimSpace(requested)
 	// Re-importing credentials for an existing account must not silently remove its
 	// independently configured sidecar (or standby list). UpsertAccount creates a
 	// default binding for new accounts, so this also covers the fresh-import path.
@@ -82,8 +79,21 @@ func (s *Server) bindImportedAccountPrimaryEgress(ctx context.Context, accountID
 	if getErr != nil && !errors.Is(getErr, sql.ErrNoRows) {
 		return getErr
 	}
+	if requested == "" && strings.EqualFold(strings.TrimSpace(binding.BindingScope), storage.EgressBindingScopeAccount) && strings.TrimSpace(binding.PrimaryEgressID) != "" {
+		return nil
+	}
+	primary, err := s.resolveImportPrimaryEgressForGroup(ctx, requested, account.GroupName)
+	if err != nil {
+		return err
+	}
 	binding.AccountID = accountID
 	binding.PrimaryEgressID = primary
+	binding.StandbyEgressIDs = ""
+	if requested == "" {
+		binding.BindingScope = storage.EgressBindingScopeGroup
+	} else {
+		binding.BindingScope = storage.EgressBindingScopeAccount
+	}
 	binding.CookieJarKey = accountID + ":" + primary
 	return s.store.UpsertEgressBinding(ctx, binding)
 }

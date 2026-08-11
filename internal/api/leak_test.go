@@ -111,6 +111,58 @@ func TestProbeEarlyCodexSSEFailureReleasesSafetyBufferingWithoutWaiting(t *testi
 	}
 }
 
+func TestProbeEarlyCodexSSEFailureReleasesBeforeFirstFrame(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	type result struct {
+		prefix []byte
+		relay  io.Reader
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		prefix, relay, _, _, err := probeEarlyCodexSSEFailureWithIdleRelease(reader, 10*time.Millisecond)
+		done <- result{prefix: prefix, relay: relay, err: err}
+	}()
+
+	var got result
+	select {
+	case got = <-done:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if len(got.prefix) != 0 || got.relay == nil {
+			t.Fatalf("idle release prefix=%q relay=%v", got.prefix, got.relay)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("early SSE probe held the response while waiting for its first frame")
+	}
+
+	stream := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"resp_delayed"}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_delayed","status":"completed"}}` + "\n\n"
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(writer, stream)
+		if closeErr := writer.Close(); err == nil {
+			err = closeErr
+		}
+		writeDone <- err
+	}()
+	relayed, err := io.ReadAll(got.relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	if string(relayed) != stream {
+		t.Fatalf("read-ahead relay changed delayed stream: got=%q want=%q", relayed, stream)
+	}
+}
+
 func TestProbeEarlyClaudeSSEFailureDetectsErrorBeforeMessageStart(t *testing.T) {
 	stream := "event: error\n" +
 		"data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This account has hit its usage limit.\"}}\n\n"

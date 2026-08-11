@@ -537,6 +537,11 @@ func (s *Server) claudeOAuthEgress(ctx context.Context, accountID string) (stora
 		s.auditClaudeOAuthEgressDegraded(ctx, "binding_lookup_failed", err)
 		return storage.EgressProfile{}, "", fmt.Errorf("claude oauth egress binding unavailable: %w", err)
 	}
+	binding, err = s.store.EffectiveEgressBinding(ctx, binding)
+	if err != nil {
+		s.auditClaudeOAuthEgressDegraded(ctx, "binding_resolution_failed", err)
+		return storage.EgressProfile{}, "", fmt.Errorf("claude oauth egress binding unavailable: %w", err)
+	}
 	primary, err := s.store.GetEgressProfile(ctx, binding.PrimaryEgressID)
 	if err != nil {
 		s.auditClaudeOAuthEgressDegraded(ctx, "primary_egress_lookup_failed", err)

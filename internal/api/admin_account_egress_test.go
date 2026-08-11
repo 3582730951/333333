@@ -55,7 +55,7 @@ func TestAdminEgressBindingValidatesReferencedProfiles(t *testing.T) {
 	}
 }
 
-func TestAdminEgressBindingNormalizesStandbyAndCookieJar(t *testing.T) {
+func TestAdminEgressBindingRejectsStandbyAndPinsSingleAccountOutlet(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	accountID := h.importAccount(t, "egress-normalize", "up-egress-normalize", "tok-egress-normalize")
 	upsertTestEgressProfile(t, h, "egress_alt")
@@ -66,8 +66,15 @@ func TestAdminEgressBindingNormalizesStandbyAndCookieJar(t *testing.T) {
 		"standby_egress_ids":["", "egress_alt", "egress_backup", "egress_backup", "egress_direct"],
 		"cookie_jar_key":"stale:key"
 	}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("standby binding status = %d, want 400: %s", code, raw)
+	}
+	code, raw = grpReq(t, h, http.MethodPost, "/admin/accounts/"+accountID+"/egress-binding", `{
+		"primary_egress_id":" egress_alt ",
+		"cookie_jar_key":"stale:key"
+	}`)
 	if code != http.StatusOK {
-		t.Fatalf("save binding = %d: %s", code, raw)
+		t.Fatalf("save single binding = %d: %s", code, raw)
 	}
 	var binding storage.AccountEgressBinding
 	if err := json.Unmarshal(raw, &binding); err != nil {
@@ -76,8 +83,8 @@ func TestAdminEgressBindingNormalizesStandbyAndCookieJar(t *testing.T) {
 	if binding.PrimaryEgressID != "egress_alt" {
 		t.Fatalf("primary = %q, want egress_alt", binding.PrimaryEgressID)
 	}
-	if binding.StandbyEgressIDs != "egress_backup,egress_direct" {
-		t.Fatalf("standby = %q, want normalized backup,direct", binding.StandbyEgressIDs)
+	if binding.StandbyEgressIDs != "" || binding.BindingScope != storage.EgressBindingScopeAccount {
+		t.Fatalf("single account binding = %+v", binding)
 	}
 	if binding.CookieJarKey != accountID+":egress_alt" {
 		t.Fatalf("cookie_jar_key = %q, want account:primary", binding.CookieJarKey)
@@ -155,6 +162,38 @@ func TestSaveImportedAccountUsesGroupDefaultEgress(t *testing.T) {
 	}
 	if binding.PrimaryEgressID != "egress_group_default" {
 		t.Fatalf("primary egress = %q, want group default %q", binding.PrimaryEgressID, group.DefaultEgressID)
+	}
+	if binding.BindingScope != storage.EgressBindingScopeGroup {
+		t.Fatalf("import binding scope = %q, want group", binding.BindingScope)
+	}
+}
+
+func TestAdminEgressBindingCanReturnToGroupInheritance(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	accountID := h.importAccount(t, "inherit-egress", "up-inherit-egress", "tok-inherit-egress")
+	upsertTestProxyEgressProfile(t, h, "group-inherited-egress")
+	upsertTestProxyEgressProfile(t, h, "account-pinned-egress")
+	group, err := h.store.GetGroup(context.Background(), config.DefaultGroupName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"group-inherited-egress"}
+	if err := h.store.UpdateGroup(context.Background(), group); err != nil {
+		t.Fatal(err)
+	}
+	if code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+accountID+"/egress-binding", `{"primary_egress_id":"account-pinned-egress"}`); code != http.StatusOK {
+		t.Fatalf("pin account egress = %d: %s", code, raw)
+	}
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+accountID+"/egress-binding", `{"inherit_group_egress":true}`)
+	if code != http.StatusOK {
+		t.Fatalf("inherit group egress = %d: %s", code, raw)
+	}
+	var binding storage.AccountEgressBinding
+	if err := json.Unmarshal(raw, &binding); err != nil {
+		t.Fatal(err)
+	}
+	if binding.BindingScope != storage.EgressBindingScopeGroup || binding.PrimaryEgressID != "group-inherited-egress" || binding.StandbyEgressIDs != "" {
+		t.Fatalf("inherited binding = %+v", binding)
 	}
 }
 

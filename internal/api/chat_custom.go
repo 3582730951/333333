@@ -120,12 +120,11 @@ func (s *Server) customProviderForModel(ctx context.Context, model, group string
 			targetModel = model
 		}
 		lease, err := s.scheduler.Select(ctx, scheduler.Route{
-			Group:              group,
-			Provider:           provider.ID,
-			PreferredEgressIDs: provider.EgressIDs,
-			Model:              targetModel,
-			EstimatedTokens:    virtual.EstimateTokensJSON(body),
-			SkipWait:           true,
+			Group:           group,
+			Provider:        provider.ID,
+			Model:           targetModel,
+			EstimatedTokens: virtual.EstimateTokensJSON(body),
+			SkipWait:        true,
 		})
 		if err != nil {
 			continue
@@ -224,75 +223,6 @@ type customCall struct {
 	provider string
 }
 
-func customProviderRetryableEgressStatus(status int) bool {
-	switch status {
-	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return true
-	default:
-		return false
-	}
-}
-
-func customProviderEgressesAfter(ids []string, selected string) []string {
-	selected = strings.TrimSpace(selected)
-	seen := make(map[string]struct{}, len(ids))
-	found := false
-	out := make([]string, 0, len(ids))
-	for _, rawID := range ids {
-		id := strings.TrimSpace(rawID)
-		if id == "" {
-			continue
-		}
-		if _, duplicate := seen[id]; duplicate {
-			continue
-		}
-		seen[id] = struct{}{}
-		if !found {
-			found = id == selected
-			continue
-		}
-		out = append(out, id)
-	}
-	if !found {
-		return nil
-	}
-	return out
-}
-
-func customProviderOrderedEgresses(provider storage.CustomProvider, lease scheduler.Lease) []string {
-	if len(provider.EgressIDs) > 0 {
-		return provider.EgressIDs
-	}
-	ids := make([]string, 0, 1+len(lease.Binding.StandbyIDs()))
-	if primary := strings.TrimSpace(lease.Binding.PrimaryEgressID); primary != "" {
-		ids = append(ids, primary)
-	}
-	ids = append(ids, lease.Binding.StandbyIDs()...)
-	return ids
-}
-
-func (s *Server) selectCustomProviderEgress(ctx context.Context, provider storage.CustomProvider, accountID, model, routeGroup string, affinity routing.AffinityKey, body []byte, exclude map[string]bool, egressIDs []string) (scheduler.Lease, []string, bool) {
-	for len(egressIDs) > 0 {
-		egressID := egressIDs[0]
-		egressIDs = egressIDs[1:]
-		lease, err := s.scheduler.Select(ctx, scheduler.Route{
-			Group:              routeGroup,
-			Provider:           provider.ID,
-			PreferredEgressIDs: provider.EgressIDs,
-			RequiredAccountID:  accountID,
-			RequiredEgressID:   egressID,
-			Affinity:           affinity,
-			Model:              model,
-			EstimatedTokens:    virtual.EstimateTokensJSON(body),
-			Exclude:            exclude,
-		})
-		if err == nil {
-			return lease, egressIDs, true
-		}
-	}
-	return scheduler.Lease{}, egressIDs, false
-}
-
 func customProviderDownstreamScope(r *http.Request) string {
 	identity := "anonymous"
 	if r != nil {
@@ -337,9 +267,6 @@ func customProviderScopedAffinity(r *http.Request, provider storage.CustomProvid
 
 func customProviderCookieJarKey(r *http.Request, lease scheduler.Lease, provider storage.CustomProvider) string {
 	base := lease.Binding.CookieJarKey
-	if len(provider.EgressIDs) > 0 && strings.TrimSpace(lease.Egress.ID) != "" {
-		base = lease.Account.ID + ":" + strings.TrimSpace(lease.Egress.ID)
-	}
 	if strings.TrimSpace(base) == "" {
 		base = lease.Account.ID + ":" + strings.TrimSpace(lease.Egress.ID)
 	}
@@ -422,14 +349,13 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 	}
 	affinity := customProviderScopedAffinity(r, provider, routing.ExtractAffinityKey(r, body))
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
-		Group:              routeGroup,
-		Provider:           provider.ID,
-		PreferredEgressIDs: provider.EgressIDs,
-		Affinity:           affinity,
-		Model:              model,
-		EstimatedTokens:    virtual.EstimateTokensJSON(body),
-		Exclude:            exclude,
-		SkipWait:           userGroupFallbackProbe(r.Context()),
+		Group:           routeGroup,
+		Provider:        provider.ID,
+		Affinity:        affinity,
+		Model:           model,
+		EstimatedTokens: virtual.EstimateTokensJSON(body),
+		Exclude:         exclude,
+		SkipWait:        userGroupFallbackProbe(r.Context()),
 	})
 	if err != nil {
 		status, _ := noAccountHTTPStatus(err)
@@ -468,57 +394,29 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 			_ = s.settleBillingHoldIfHeld(r.Context(), holdID, "abandoned")
 		}
 	}()
-	remainingEgressIDs := customProviderEgressesAfter(customProviderOrderedEgresses(provider, lease), lease.Egress.ID)
-	var resp *upstream.Response
-	var requestErr error
-	var prefetchedErrorBody []byte
-	prefetchedError := false
-	// Hoisted: the body is identical across egress rotations, and digesting a long prompt
-	// once per retry would put avoidable CPU on the request path.
+	// One wire attempt always uses the selected account's persisted primary outlet.
+	// Failover may choose another account, but it may not rotate this account onto a
+	// group/provider/standby outlet and thereby change its network identity.
 	attemptBodyHash := diagnosticBodyHash(body)
-	for {
-		resp, requestErr = s.upstream.Do(r.Context(), upstream.Request{
-			Method:           http.MethodPost,
-			Provider:         provider.ID,
-			BaseURL:          strings.TrimSpace(provider.BaseURL),
-			TransportProfile: provider.TransportProfile,
-			UpstreamProtocol: provider.UpstreamProtocol,
-			DownstreamPath:   upstreamPath,
-			Headers:          r.Header.Clone(),
-			Body:             bodysource.Bytes(body),
-			Account:          lease.Account,
-			Token:            token,
-			Egress:           lease.Egress,
-			CookieJarKey:     customProviderCookieJarKey(r, lease, provider),
-			OSHint:           s.osHint(body, lease.Egress),
-		})
-		// Recorded per wire attempt, inside the loop, so an egress rotation leaves one row
-		// per exit rather than only the outcome that happened to be last. Without this the
-		// provider_attempts table could only ever describe antigravity: an export whose
-		// single largest failure cluster was 1512 relay 5xx contained zero rows for it.
-		s.recordProviderAttempt(requestIDFromContext(r.Context()), lease.Account.ID, provider.ID, "inference",
-			diagnosticResponseStatus(resp), diagnosticWireErrorClass(diagnosticResponseStatus(resp), requestErr),
-			attemptBodyHash, diagnosticRetryAfter(resp))
-		if requestErr == nil && (resp == nil || !customProviderRetryableEgressStatus(resp.StatusCode) || len(remainingEgressIDs) == 0) {
-			break
-		}
-		if requestErr == nil && resp != nil {
-			prefetchedErrorBody = readUpstreamErrorBody(resp.Body)
-			prefetchedError = true
-			_ = resp.Body.Close()
-		}
-		lease.Release()
-		nextLease, remaining, ok := s.selectCustomProviderEgress(r.Context(), provider, lease.Account.ID, model, routeGroup, affinity, body, exclude, remainingEgressIDs)
-		remainingEgressIDs = remaining
-		if !ok {
-			break
-		}
-		lease = nextLease
-		resp = nil
-		requestErr = nil
-		prefetchedErrorBody = nil
-		prefetchedError = false
-	}
+	resp, requestErr := s.upstream.Do(r.Context(), upstream.Request{
+		Method:           http.MethodPost,
+		Provider:         provider.ID,
+		BaseURL:          strings.TrimSpace(provider.BaseURL),
+		TransportProfile: provider.TransportProfile,
+		UpstreamProtocol: provider.UpstreamProtocol,
+		DownstreamPath:   upstreamPath,
+		Headers:          r.Header.Clone(),
+		Body:             bodysource.Bytes(body),
+		Model:            model,
+		Account:          lease.Account,
+		Token:            token,
+		Egress:           lease.Egress,
+		CookieJarKey:     customProviderCookieJarKey(r, lease, provider),
+		OSHint:           s.osHint(body, lease.Egress),
+	})
+	s.recordProviderAttempt(requestIDFromContext(r.Context()), lease.Account.ID, provider.ID, "inference",
+		diagnosticResponseStatus(resp), diagnosticWireErrorClass(diagnosticResponseStatus(resp), requestErr),
+		attemptBodyHash, diagnosticRetryAfter(resp))
 	if requestErr != nil {
 		_ = s.settleBillingHold(r.Context(), holdID, "failed_before_response")
 		if attemptsRemaining > 1 {
@@ -533,11 +431,8 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 		return customCall{}, false
 	}
 	if resp.StatusCode >= 400 {
-		errBody := prefetchedErrorBody
-		if !prefetchedError {
-			errBody = readUpstreamErrorBody(resp.Body)
-			_ = resp.Body.Close()
-		}
+		errBody := readUpstreamErrorBody(resp.Body)
+		_ = resp.Body.Close()
 		entrypoint := "custom_openai"
 		switch strings.TrimSpace(upstreamPath) {
 		case "/responses", "responses":
@@ -638,6 +533,7 @@ func (s *Server) handleChatViaCustom(w http.ResponseWriter, r *http.Request, raw
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
+		flushWriter(w)
 		uscan := usage.NewStreamScanner("openai_chat")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "chat_completions", model, cc.resp.StatusCode), provider.ID)
 		terminal, _ := streamCopyRewriteValidated(rw, io.TeeReader(cc.resp.Body, uscan), cc.scrubber, customSSEChatCompletions, s.leakScrubEnabled(r.Context()))
@@ -705,6 +601,7 @@ func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
+		flushWriter(w)
 		uscan := usage.NewStreamScanner("openai_chat")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "custom_openai", model, cc.resp.StatusCode), provider.ID)
 		chatStreamToResponsesSSE(rw, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber, bridge.Plan)
@@ -735,7 +632,11 @@ func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request
 // future Responses fields/events.
 func (s *Server) handleNativeResponsesViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
 	stream := isStreamRequest(raw)
-	cc, ok := s.callCustom(w, r, provider, raw, model, routeGroup, "codex", "/responses")
+	upstreamPath := "/responses"
+	if r != nil && r.URL != nil && strings.Contains(strings.ToLower(r.URL.Path), "/responses/compact") {
+		upstreamPath = "/responses/compact"
+	}
+	cc, ok := s.callCustom(w, r, provider, raw, model, routeGroup, "codex", upstreamPath)
 	if !ok {
 		return
 	}
@@ -746,6 +647,7 @@ func (s *Server) handleNativeResponsesViaCustom(w http.ResponseWriter, r *http.R
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(cc.resp.StatusCode)
+		flushWriter(w)
 		uscan := usage.NewStreamScanner("codex")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "responses", model, cc.resp.StatusCode), provider.ID)
 		terminal, _ := streamCopyRewriteValidated(rw, io.TeeReader(cc.resp.Body, uscan), cc.scrubber, customSSEResponses, s.leakScrubEnabled(r.Context()))
@@ -790,6 +692,7 @@ func (s *Server) handleChatViaNativeResponsesCustom(w http.ResponseWriter, r *ht
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(cc.resp.StatusCode)
+		flushWriter(w)
 		uscan := usage.NewStreamScanner("codex")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "chat_completions", model, cc.resp.StatusCode), provider.ID)
 		responsesStreamToChatSSE(rw, io.TeeReader(cc.resp.Body, uscan), model, chatStreamUsageRequested(raw), cc.scrubber)
@@ -839,6 +742,7 @@ func (s *Server) handleChatViaAnthropicMessagesCustom(w http.ResponseWriter, r *
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(cc.resp.StatusCode)
+		flushWriter(w)
 		uscan := usage.NewStreamScanner("claude")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "chat_completions", model, cc.resp.StatusCode), provider.ID)
 		anthropicStreamToChatSSE(rw, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber, chatStreamUsageRequested(raw))
@@ -894,6 +798,7 @@ func (s *Server) handleResponsesViaAnthropicMessagesCustom(w http.ResponseWriter
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(cc.resp.StatusCode)
+		flushWriter(w)
 		uscan := usage.NewStreamScanner("claude")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "responses", model, cc.resp.StatusCode), provider.ID)
 		anthropicStreamToResponsesCustomSSE(rw, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber, bridge.Plan)
@@ -946,6 +851,7 @@ func (s *Server) handleMessagesViaResponsesCustom(w http.ResponseWriter, r *http
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(cc.resp.StatusCode)
+		flushWriter(w)
 		uscan := usage.NewStreamScanner("codex")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "claude_messages", model, cc.resp.StatusCode), provider.ID)
 		// The goal history is the downstream Anthropic body, not the Responses body
@@ -985,6 +891,7 @@ func (s *Server) handleMessagesViaResponsesCustom(w http.ResponseWriter, r *http
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(cc.resp.StatusCode)
+		flushWriter(w)
 		_ = anthropicMessageJSONToSSE(w, out)
 		return
 	}
@@ -1028,6 +935,7 @@ func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request,
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
+		flushWriter(w)
 		uscan := usage.NewStreamScanner("openai_chat")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "claude_messages", model, cc.resp.StatusCode), provider.ID)
 		goalOut, finishGoal := s.captureCustomMessagesGoalStream(r.Context(), r, raw, rw)
@@ -1079,6 +987,7 @@ func (s *Server) handleNativeAnthropicMessagesViaCustom(w http.ResponseWriter, r
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(cc.resp.StatusCode)
+		flushWriter(w)
 		uscan := usage.NewStreamScanner("claude")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "claude_messages", model, cc.resp.StatusCode), provider.ID)
 		goalOut, finishGoal := s.captureCustomMessagesGoalStream(r.Context(), r, raw, rw)

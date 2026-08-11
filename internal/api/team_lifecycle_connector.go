@@ -90,6 +90,10 @@ func (c *nativeTeamLifecycleConnector) boundRaw(
 	if err != nil {
 		return nil, teamflow.Permanent("team_egress_not_bound", errors.New("team lifecycle account egress is not bound"))
 	}
+	binding, err = c.store.EffectiveEgressBinding(ctx, binding)
+	if err != nil {
+		return nil, teamflow.Permanent("team_egress_unavailable", errors.New("team lifecycle account egress is unavailable"))
+	}
 	egress, err := c.store.ResolvePrimaryEgressBinding(ctx, binding)
 	if err != nil {
 		return nil, teamflow.Permanent("team_egress_unavailable", errors.New("team lifecycle account egress is unavailable"))

@@ -410,6 +410,11 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		res.Err = err
 		return res
 	}
+	binding, err = s.store.EffectiveEgressBinding(ctx, binding)
+	if err != nil {
+		res.Err = err
+		return res
+	}
 	egress, err := s.store.ResolvePrimaryEgressBinding(ctx, binding)
 	if err != nil {
 		res.Err = err
@@ -942,7 +947,10 @@ func (s *Server) adminGroups(w http.ResponseWriter, r *http.Request) {
 // applyGroupFieldsFromBody decodes a partial group update (pointer fields = only the
 // provided keys change) from the request body and applies it onto g. Shared by the
 // cyber back-compat handler, group create, and the generic PATCH /admin/groups/<name>.
-var errInvalidGroupPolicy = errors.New("account pool groups cannot contain user policy")
+var (
+	errInvalidGroupPolicy  = errors.New("account pool groups cannot contain user policy")
+	errMultipleGroupEgress = errors.New("account pool groups support one inference egress; configure an account override for exceptions")
+)
 
 func applyGroupFieldsFromBody(g *storage.Group, body io.Reader) error {
 	var req struct {
@@ -1010,7 +1018,11 @@ func applyGroupFieldsFromBody(g *storage.Group, body io.Reader) error {
 		g.EgressIDs = []string{g.DefaultEgressID}
 	}
 	if req.EgressIDs != nil {
-		g.EgressIDs = *req.EgressIDs
+		ids := normalizeNonEmptyStrings(*req.EgressIDs)
+		if len(ids) > 1 {
+			return errMultipleGroupEgress
+		}
+		g.EgressIDs = ids
 	}
 	return nil
 }
@@ -1186,25 +1198,18 @@ func (s *Server) adminGroupAssignEgress(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	primary := strings.TrimSpace(req.PrimaryEgressID)
-	// Validate referenced egresses exist before touching any binding.
-	for _, id := range append([]string{}, append(req.StandbyEgressID, primary)...) {
+	if len(normalizeNonEmptyStrings(req.StandbyEgressID)) > 0 {
+		writeError(w, http.StatusBadRequest, errMultipleGroupEgress)
+		return
+	}
+	// Validate the one referenced egress before touching the group.
+	for _, id := range []string{primary} {
 		if strings.TrimSpace(id) == "" {
 			continue
 		}
 		if _, err := s.store.GetEgressProfile(r.Context(), id); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("egress %q not found", id))
 			return
-		}
-	}
-	standby := make([]string, 0, len(req.StandbyEgressID))
-	seen := map[string]bool{}
-	if primary != "" {
-		seen[primary] = true
-	}
-	for _, id := range req.StandbyEgressID {
-		if id = strings.TrimSpace(id); id != "" && !seen[id] {
-			seen[id] = true
-			standby = append(standby, id)
 		}
 	}
 	group, err := s.store.GetGroup(r.Context(), groupName)
@@ -1216,9 +1221,9 @@ func (s *Server) adminGroupAssignEgress(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	group.EgressIDs = append([]string{}, standby...)
+	group.EgressIDs = nil
 	if primary != "" {
-		group.EgressIDs = append([]string{primary}, standby...)
+		group.EgressIDs = []string{primary}
 	}
 	if err := s.store.UpdateGroup(r.Context(), group); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1229,13 +1234,13 @@ func (s *Server) adminGroupAssignEgress(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	w.Header().Add("Warning", `299 codex-pool "assign-egress no longer rewrites accounts; the group egress order is inherited dynamically"`)
+	w.Header().Add("Warning", `299 codex-pool "assign-egress no longer rewrites accounts; the single group egress is inherited dynamically"`)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"group":               groupName,
 		"accounts_updated":    0,
 		"accounts_inheriting": accountCount,
 		"primary_egress":      primary,
-		"standby_egress":      standby,
+		"standby_egress":      []string{},
 		"egress_ids":          group.EgressIDs,
 		"set_group_default":   true,
 		"deprecated_request":  req.SetGroupDefault,

@@ -713,10 +713,9 @@ func TestRuntimeEvidenceDoesNotEraseLiveCatalogAuthority(t *testing.T) {
 	}
 }
 
-func TestListRoutableCapabilitiesUsesHealthyStandbyEgress(t *testing.T) {
+func TestListRoutableCapabilitiesIgnoresHealthyStandbyWhenPrimaryUnavailable(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
-	now := Now()
 	account := Account{ID: "standby-capability", GroupName: "cyber", Provider: "codex", Status: "active"}
 	if err := store.UpsertAccount(ctx, account, AccountToken{AccessToken: "token"}); err != nil {
 		t.Fatal(err)
@@ -728,7 +727,7 @@ func TestListRoutableCapabilitiesUsesHealthyStandbyEgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.UpsertEgressBinding(ctx, AccountEgressBinding{
-		AccountID: account.ID, PrimaryEgressID: "blocked-primary", StandbyEgressIDs: "healthy-standby", CooldownUntil: now + 3600,
+		AccountID: account.ID, PrimaryEgressID: "blocked-primary", StandbyEgressIDs: "healthy-standby", BindingScope: EgressBindingScopeAccount,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -742,18 +741,18 @@ func TestListRoutableCapabilitiesUsesHealthyStandbyEgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(caps) != 1 || caps[0].ModelSlug != "gpt-standby" {
-		t.Fatalf("healthy standby capability missing: %+v", caps)
+	if len(caps) != 0 {
+		t.Fatalf("healthy standby incorrectly made the account routable: %+v", caps)
 	}
-	if err := store.SetEgressHealth(ctx, "healthy-standby", "disabled"); err != nil {
+	if err := store.SetEgressHealth(ctx, "blocked-primary", "healthy"); err != nil {
 		t.Fatal(err)
 	}
 	caps, err = store.ListRoutableCapabilities(ctx, "cyber")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(caps) != 0 {
-		t.Fatalf("account without a usable egress remained visible: %+v", caps)
+	if len(caps) != 1 || caps[0].ModelSlug != "gpt-standby" {
+		t.Fatalf("healthy primary capability missing: %+v", caps)
 	}
 }
 

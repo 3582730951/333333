@@ -81,10 +81,61 @@ func (s *Store) ApplySidecarEgressBinding(ctx context.Context, binding AccountEg
 	return wrapped, nil
 }
 
+// EffectiveEgressBinding resolves the single runtime outlet for an account. Group
+// scope follows the group's current first egress; account scope keeps the explicit
+// pin. Legacy standby lists are never considered by inference/probe traffic.
+func (s *Store) EffectiveEgressBinding(ctx context.Context, binding AccountEgressBinding) (AccountEgressBinding, error) {
+	binding.AccountID = strings.TrimSpace(binding.AccountID)
+	if binding.AccountID == "" {
+		return AccountEgressBinding{}, errors.New("account egress binding requires account_id")
+	}
+	accountScoped := strings.EqualFold(strings.TrimSpace(binding.BindingScope), EgressBindingScopeAccount)
+	if !strings.EqualFold(strings.TrimSpace(binding.BindingScope), EgressBindingScopeAccount) {
+		account, err := s.GetAccount(ctx, binding.AccountID)
+		if err != nil {
+			return AccountEgressBinding{}, err
+		}
+		group, err := s.GetGroup(ctx, account.GroupName)
+		if err != nil {
+			return AccountEgressBinding{}, err
+		}
+		binding.BindingScope = EgressBindingScopeGroup
+		binding.PrimaryEgressID = ""
+		for _, id := range group.EgressIDs {
+			if id = strings.TrimSpace(id); id != "" {
+				binding.PrimaryEgressID = id
+				break
+			}
+		}
+		if binding.PrimaryEgressID == "" {
+			binding.PrimaryEgressID = strings.TrimSpace(group.DefaultEgressID)
+		}
+		if binding.PrimaryEgressID == "" {
+			binding.PrimaryEgressID = DefaultDirectEgressID
+		}
+	} else {
+		binding.BindingScope = EgressBindingScopeAccount
+		binding.PrimaryEgressID = strings.TrimSpace(binding.PrimaryEgressID)
+	}
+	if binding.PrimaryEgressID == "" {
+		return AccountEgressBinding{}, errors.New("effective account egress is empty")
+	}
+	binding.StandbyEgressIDs = ""
+	if !accountScoped || strings.TrimSpace(binding.CookieJarKey) == "" {
+		binding.CookieJarKey = binding.AccountID + ":" + binding.PrimaryEgressID
+	}
+	return binding, nil
+}
+
 // ResolvePrimaryEgressBinding loads the binding's primary IP egress and applies
 // its optional sidecar transport. Background auth/model/quota probes use this so
 // they follow the same fingerprint-safe path as scheduled inference requests.
 func (s *Store) ResolvePrimaryEgressBinding(ctx context.Context, binding AccountEgressBinding) (EgressProfile, error) {
+	var err error
+	binding, err = s.EffectiveEgressBinding(ctx, binding)
+	if err != nil {
+		return EgressProfile{}, err
+	}
 	egress, err := s.GetEgressProfile(ctx, binding.PrimaryEgressID)
 	if err != nil {
 		return EgressProfile{}, err

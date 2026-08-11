@@ -161,14 +161,11 @@ func (s *Scheduler) normalizeAcrossRoute(ctx context.Context, route *Route) erro
 	if route.Group == "" {
 		route.Group = s.Config().DefaultGroup
 	}
-	if len(route.PreferredEgressIDs) == 0 {
-		group, err := s.store.GetGroup(ctx, route.Group)
-		if err == nil {
-			route.PreferredEgressIDs = append([]string(nil), group.EgressIDs...)
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
+	egressID, err := s.groupPrimaryEgressID(ctx, route.Group)
+	if err != nil {
+		return err
 	}
+	route.PreferredEgressIDs = []string{egressID}
 	return nil
 }
 

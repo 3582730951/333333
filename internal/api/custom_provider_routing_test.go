@@ -160,6 +160,80 @@ func TestCustomClaudeProviderMappingRoutesToRelayAndAdminTest(t *testing.T) {
 	}
 }
 
+func TestCustomCodexProviderAdminTestUsesProductionSSEWireShape(t *testing.T) {
+	var mu sync.Mutex
+	var wireBody string
+	var wireHeaders http.Header
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("Codex relay path = %q, want /v1/responses", r.URL.Path)
+			http.Error(w, "wrong path", http.StatusNotFound)
+			return
+		}
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		wireBody = string(raw)
+		wireHeaders = r.Header.Clone()
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\n"+
+			`data: {"type":"response.created","response":{"id":"resp-probe","status":"in_progress"}}`+"\n\n"+
+			"event: response.completed\n"+
+			`data: {"type":"response.completed","response":{"id":"resp-probe","status":"completed","output":[]}}`+"\n\n")
+	})
+	provider := storage.CustomProvider{
+		ID: "codex-wire-relay", Name: "Codex Wire Relay", BaseURL: h.upstream.URL + "/v1",
+		UpstreamProtocol: storage.CustomProviderProtocolResponses,
+		TransportProfile: storage.CustomProviderTransportCodexCLI,
+		Enabled:          true, AutoDiscoverModels: false, Models: []string{"gpt-5.6-sol"},
+	}
+	if err := h.store.UpsertCustomProvider(t.Context(), provider); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertAccount(t.Context(), storage.Account{
+		ID: "codex-wire-account", Label: "codex wire", GroupName: h.app.cfg.DefaultGroup,
+		Provider: provider.ID, Status: "active",
+	}, storage.AccountToken{OpenAIAPIKey: "codex-wire-key"}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, raw := postJSONForTest(t, h.pool.URL+"/admin/providers/"+provider.ID+"/test", map[string]interface{}{
+		"model": "gpt-5.6-sol",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Codex provider test status=%d body=%s", resp.StatusCode, raw)
+	}
+	var result customProviderModelTestResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.OK || result.HTTPStatus != http.StatusOK || result.ErrorCode != "" {
+		t.Fatalf("Codex provider test result = %+v", result)
+	}
+	mu.Lock()
+	gotBody, gotHeaders := wireBody, wireHeaders.Clone()
+	mu.Unlock()
+	var request map[string]interface{}
+	if err := json.Unmarshal([]byte(gotBody), &request); err != nil {
+		t.Fatal(err)
+	}
+	metadata, _ := request["client_metadata"].(map[string]interface{})
+	if request["stream"] != true || strings.TrimSpace(request["instructions"].(string)) == "" || request["store"] != false ||
+		gotHeaders.Get("Accept") != "text/event-stream" || gotHeaders.Get("Authorization") != "Bearer codex-wire-key" ||
+		metadata["session_id"] != gotHeaders.Get("Session-Id") || metadata["thread_id"] != gotHeaders.Get("Thread-Id") {
+		t.Fatalf("Codex production probe wire mismatch headers=%#v body=%s", gotHeaders, gotBody)
+	}
+}
+
+func TestValidateSuccessfulCustomResponsesSSERejectsFailedTerminal(t *testing.T) {
+	header := http.Header{"Content-Type": []string{"text/event-stream"}}
+	failed := []byte("event: response.failed\n" +
+		`data: {"type":"response.failed","response":{"id":"resp-failed","status":"failed"}}` + "\n\n")
+	if err := validateSuccessfulCustomResponsesSSE(header, failed); err == nil {
+		t.Fatal("failed Responses terminal was accepted as a successful provider probe")
+	}
+}
+
 func TestCustomNativeAnthropicToolsUseExplicitAutoChoice(t *testing.T) {
 	const model = "native-anthropic-tool-model"
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -744,7 +818,7 @@ func TestExplicitDisabledCustomProviderReturnsVisibleError(t *testing.T) {
 	}
 }
 
-func TestAdminCustomProviderTestUsesConfiguredProductionEgress(t *testing.T) {
+func TestAdminCustomProviderTestUsesAccountGroupEgressAndIgnoresProviderLegacyEgress(t *testing.T) {
 	var mu sync.Mutex
 	proxyCalls := 0
 	var proxyMethods []string
@@ -779,12 +853,21 @@ func TestAdminCustomProviderTestUsesConfiguredProductionEgress(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	group, err := h.store.GetGroup(t.Context(), h.app.cfg.DefaultGroup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"admin-test-provider-egress"}
+	if err := h.store.UpdateGroup(t.Context(), group); err != nil {
+		t.Fatal(err)
+	}
 	provider := storage.CustomProvider{
 		ID: "admin-test-egress-relay", Name: "Admin Test Egress Relay",
 		BaseURL:          "http://relay.invalid/v1",
 		UpstreamProtocol: storage.CustomProviderProtocolAnthropicMessages,
-		EgressIDs:        []string{"admin-test-provider-egress"},
-		Enabled:          true, Models: []string{"claude-sonnet-5"},
+		// This obsolete provider-level value must not participate in selection.
+		EgressIDs: []string{"egress_direct"},
+		Enabled:   true, Models: []string{"claude-sonnet-5"},
 	}
 	if err := h.store.UpsertCustomProvider(t.Context(), provider); err != nil {
 		t.Fatal(err)

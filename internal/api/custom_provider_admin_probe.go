@@ -29,8 +29,10 @@ type customProviderModelTestResult struct {
 	ResponseSample string `json:"response_sample,omitempty"`
 }
 
-// adminCustomProviderModelTest sends one minimal, non-streaming request through
-// the exact provider URL/protocol/account/egress path used by production traffic.
+// adminCustomProviderModelTest sends one minimal request through the exact provider
+// URL/protocol/account/egress path used by production traffic. A Codex CLI Responses
+// profile is tested as SSE because that profile is streaming-only; generic providers
+// retain their native non-streaming probe.
 // The administrator supplies the downstream model; configured mapping determines
 // the target relay model and both are returned in the result.
 func (s *Server) adminCustomProviderModelTest(w http.ResponseWriter, r *http.Request, providerID string) {
@@ -95,6 +97,8 @@ func (s *Server) adminCustomProviderModelTest(w http.ResponseWriter, r *http.Req
 	headers := http.Header{}
 	var body []byte
 	probeOSHint := ""
+	codexResponsesProbe := provider.UpstreamProtocol == storage.CustomProviderProtocolResponses &&
+		provider.TransportProfile == storage.CustomProviderTransportCodexCLI
 	switch provider.UpstreamProtocol {
 	case storage.CustomProviderProtocolAnthropicMessages:
 		result.UpstreamPath = "/messages"
@@ -103,7 +107,7 @@ func (s *Server) adminCustomProviderModelTest(w http.ResponseWriter, r *http.Req
 	case storage.CustomProviderProtocolResponses:
 		result.UpstreamPath = "/responses"
 		body, _ = json.Marshal(map[string]interface{}{
-			"model": targetModel, "max_output_tokens": 1, "stream": false, "input": "Reply OK",
+			"model": targetModel, "max_output_tokens": 1, "stream": codexResponsesProbe, "input": "Reply OK",
 		})
 	default:
 		result.UpstreamPath = "/chat/completions"
@@ -120,7 +124,7 @@ func (s *Server) adminCustomProviderModelTest(w http.ResponseWriter, r *http.Req
 		// header set real traffic will use, rather than one inferred from the path.
 		UpstreamProtocol: provider.UpstreamProtocol,
 		Headers:          headers, Account: account, Token: token, Egress: lease.Egress,
-		CookieJarKey: customProviderCookieJarKey(r, lease, provider), MinimalProbe: true,
+		CookieJarKey: customProviderCookieJarKey(r, lease, provider), MinimalProbe: !codexResponsesProbe,
 		OSHint: probeOSHint,
 	}
 	probe.SetBodyBytes(body)
@@ -141,7 +145,9 @@ func (s *Server) adminCustomProviderModelTest(w http.ResponseWriter, r *http.Req
 		result.ErrorCode = "response_read_error"
 	case response.StatusCode < 200 || response.StatusCode >= 300:
 		result.ErrorCode = providerProbeErrorCode(response.StatusCode, raw, nil)
-	case validateCustomUpstreamJSONResponse(provider.UpstreamProtocol, raw) != nil:
+	case codexResponsesProbe && validateSuccessfulCustomResponsesSSE(response.Header, raw) != nil:
+		result.ErrorCode = "invalid_upstream_response"
+	case !codexResponsesProbe && validateCustomUpstreamJSONResponse(provider.UpstreamProtocol, raw) != nil:
 		result.ErrorCode = "invalid_upstream_response"
 	default:
 		result.OK = true
@@ -171,6 +177,22 @@ func (s *Server) adminCustomProviderModelTest(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, result)
 }
 
+func validateSuccessfulCustomResponsesSSE(header http.Header, raw []byte) error {
+	if !isEventStream(header) {
+		return errors.New("Codex Responses probe requires text/event-stream")
+	}
+	tracker := &customSSETerminalTracker{protocol: customSSEResponses}
+	_, _ = tracker.Write(raw)
+	tracker.finish()
+	if !tracker.terminal {
+		return errors.New("Codex Responses stream has no terminal event")
+	}
+	if !tracker.success {
+		return errors.New("Codex Responses stream did not complete successfully")
+	}
+	return nil
+}
+
 func (s *Server) customProviderTestLease(r *http.Request, provider storage.CustomProvider, model string) (scheduler.Lease, storage.AccountToken, error) {
 	accounts, err := s.store.ListAccounts(r.Context())
 	if err != nil {
@@ -181,12 +203,11 @@ func (s *Server) customProviderTestLease(r *http.Request, provider storage.Custo
 			continue
 		}
 		lease, selectErr := s.scheduler.Select(r.Context(), scheduler.Route{
-			Group:              account.GroupName,
-			Provider:           provider.ID,
-			PreferredEgressIDs: provider.EgressIDs,
-			RequiredAccountID:  account.ID,
-			Model:              model,
-			SkipWait:           true,
+			Group:             account.GroupName,
+			Provider:          provider.ID,
+			RequiredAccountID: account.ID,
+			Model:             model,
+			SkipWait:          true,
 		})
 		if selectErr != nil {
 			continue

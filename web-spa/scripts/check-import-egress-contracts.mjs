@@ -22,11 +22,11 @@ if (!/动态继承/.test(oauth) || !/不复制到账号记录/.test(oauth)) {
 }
 
 const providers = read('pages/Providers.jsx');
-if (!/\/admin\/egress-profiles/.test(providers)) {
-  problems.push('Providers page must load /admin/egress-profiles for ordered provider egress selection.');
+if (/\/admin\/egress-profiles/.test(providers) || /OrderedEgressSelect/.test(providers)) {
+  problems.push('Providers must not select or load an egress; account/group routing owns the outlet.');
 }
-if (!/egress_ids:\s*Array\.isArray\(values\.egress_ids\)/.test(providers) || !/OrderedEgressSelect/.test(providers)) {
-  problems.push('Providers must submit and edit ordered egress_ids.');
+if (!/egress_ids:\s*\[\]/.test(providers) || !/提供商不再覆盖出口/.test(providers)) {
+  problems.push('Providers must clear legacy egress_ids and explain that provider egress overrides are retired.');
 }
 if (/egress_id:\s*values\.egress_id/.test(providers) || /field="egress_id"/.test(providers)) {
   problems.push('Providers import-key must inherit its account-pool group egress instead of copying egress_id.');
@@ -36,11 +36,21 @@ const groups = read('pages/Groups.jsx');
 if (!/\/admin\/egress-profiles/.test(groups)) {
   problems.push('Groups page must load /admin/egress-profiles.');
 }
-if (!/egress_ids/.test(groups) || !/OrderedEgressSelect/.test(groups)) {
-  problems.push('Groups page must submit and edit ordered egress_ids.');
+if (!/egress_ids:\s*selectedEgress\s*\?\s*\[selectedEgress\]\s*:\s*\[\]/.test(groups) || /OrderedEgressSelect/.test(groups)) {
+  problems.push('Groups page must submit exactly zero or one inference egress.');
 }
-if (!/动态继承/.test(groups) || !/主出口/.test(groups)) {
-  problems.push('Groups page must explain dynamic inheritance and primary/standby order.');
+if (!/账号详情中单独指定的出口优先/.test(groups) || !/统一使用这一个出口/.test(groups)) {
+  problems.push('Groups page must explain single-outlet inheritance and account override precedence.');
+}
+
+const accountDrawer = read('components/AccountDrawer.jsx');
+if (!/inherit_group_egress:\s*true/.test(accountDrawer) || !/binding_scope/.test(accountDrawer)) {
+  problems.push('Account drawer must expose explicit-vs-group routing and allow restoring group inheritance.');
+}
+
+const egress = read('pages/Egress.jsx');
+if (!/del\(`\/admin\/egress-profiles\//.test(egress) || !/destructive:\s*true/.test(egress)) {
+  problems.push('Egress page must expose a confirmed destructive delete action.');
 }
 
 if (problems.length) {

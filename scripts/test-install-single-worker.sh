@@ -224,6 +224,28 @@ PY
   ! grep -q 'CODEX_POOL_SUPER_INSTRUCT_LOCAL_ENABLED' scripts/install.sh || die "cloud installer still exports a global Super-Instruct override"
   unset WITH_SUPER_INSTRUCT
 }
+
+test_lossless_upgrade_contract() {
+  local activate_body legacy_body reauth_body systemd_body cleanup_body
+  activate_body="$(sed -n '/^activate_staged_release()/,/^}/p' scripts/install.sh)"
+  legacy_body="$(sed -n '/^destroy_legacy_worker_process()/,/^}/p' scripts/install.sh)"
+  reauth_body="$(sed -n '/^activate_codex_reauth_worker()/,/^}/p' scripts/install.sh)"
+  systemd_body="$(sed -n '/^install_systemd_unit()/,/^}/p' scripts/install.sh)"
+  cleanup_body="$(sed -n '/^deployment_exit_cleanup()/,/^}/p' scripts/install.sh)"
+
+  [[ "$activate_body" == *'pause_handoff_admission'* && "$activate_body" == *'resume_handoff_admission'* ]] ||
+    die "release activation does not bracket the switch with admission pause/resume"
+  [[ "$activate_body" == *'while true; do'* && "$activate_body" == *'preserving them until natural completion'* ]] ||
+    die "release activation still has a destructive in-flight drain deadline"
+  [[ "$legacy_body" != *'SIGKILL'* && "$legacy_body" == *'preserving it instead of forcing client-visible errors'* ]] ||
+    die "legacy upgrade can still force-kill established connections"
+  [[ "$reauth_body" != *'systemctl restart'* && "$reauth_body" == *'next cold start'* ]] ||
+    die "upgrade still hot-restarts the active Codex reauth worker"
+  [[ "$systemd_body" != *'systemctl restart "${SERVICE_NAME}-sidecar.service"'* && "$systemd_body" == *'Sidecar update staged'* ]] ||
+    die "upgrade still hot-restarts the shared sidecar"
+  [[ "$cleanup_body" == *'resume_handoff_admission'* ]] ||
+    die "installer failure cleanup does not automatically resume queued requests"
+}
 reclaim_superseded_install_resources "release-current"
 [[ ! -e "$PROC_ROOT/555" && -e "$PROC_ROOT/666/exe" ]]
 [[ -L "$PROC_ROOT/777/exe" ]]
@@ -233,5 +255,6 @@ reclaim_superseded_install_resources "release-current"
 
 test_release_super_instruct_permissions
 test_fresh_config_preserves_codex_client_policy
+test_lossless_upgrade_contract
 
 printf '%s\n' "single-worker installer lifecycle: OK"

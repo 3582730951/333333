@@ -1123,14 +1123,17 @@ VALUES(?, ?, ?, ?, ?, ?, ?)`,
 	if strings.TrimSpace(item.PrimaryEgressID) == "" {
 		item.PrimaryEgressID = DefaultDirectEgressID
 	}
+	if strings.TrimSpace(item.BindingScope) == "" {
+		item.BindingScope = EgressBindingScopeAccount
+	}
 	if item.CookieJarKey == "" {
 		item.CookieJarKey = account.ID + ":" + item.PrimaryEgressID
 	}
 	if _, err := tx.ExecContext(ctx, `
-	INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at)
-	VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, binding_scope, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at)
+	VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		account.ID, item.PrimaryEgressID, item.StandbyEgressIDs, item.SidecarEgressID,
-		item.CookieJarKey, item.CooldownUntil, boolInt(item.RecheckPending),
+		item.BindingScope, item.CookieJarKey, item.CooldownUntil, boolInt(item.RecheckPending),
 		item.CreatedAt, item.UpdatedAt,
 	); err != nil {
 		return err

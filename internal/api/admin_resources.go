@@ -29,11 +29,47 @@ func (s *Server) adminEgressBinding(w http.ResponseWriter, r *http.Request, acco
 			writeError(w, http.StatusNotFound, err)
 			return
 		}
+		binding, err = s.store.EffectiveEgressBinding(r.Context(), binding)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, binding)
 	case http.MethodPost:
 		var req map[string]json.RawMessage
 		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		account, err := s.store.GetAccount(r.Context(), accountID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(w, http.StatusNotFound, err)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		bindingScope := storage.EgressBindingScopeAccount
+		if raw, ok := req["binding_scope"]; ok {
+			if err := json.Unmarshal(raw, &bindingScope); err != nil {
+				writeError(w, http.StatusBadRequest, errors.New("binding_scope must be a string"))
+				return
+			}
+		}
+		if raw, ok := req["inherit_group_egress"]; ok {
+			var inherit bool
+			if err := json.Unmarshal(raw, &inherit); err != nil {
+				writeError(w, http.StatusBadRequest, errors.New("inherit_group_egress must be a boolean"))
+				return
+			}
+			if inherit {
+				bindingScope = storage.EgressBindingScopeGroup
+			}
+		}
+		bindingScope = strings.ToLower(strings.TrimSpace(bindingScope))
+		if bindingScope != storage.EgressBindingScopeGroup && bindingScope != storage.EgressBindingScopeAccount {
+			writeError(w, http.StatusBadRequest, errors.New("binding_scope must be group or account"))
 			return
 		}
 		var primary string
@@ -44,16 +80,15 @@ func (s *Server) adminEgressBinding(w http.ResponseWriter, r *http.Request, acco
 			}
 		}
 		primary = strings.TrimSpace(primary)
-		if primary == "" {
-			writeError(w, http.StatusBadRequest, errors.New("primary_egress_id required"))
-			return
-		}
-		if _, err := s.store.GetAccount(r.Context(), accountID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				writeError(w, http.StatusNotFound, err)
+		if bindingScope == storage.EgressBindingScopeGroup {
+			primary, err = s.resolveImportPrimaryEgressForGroup(r.Context(), "", account.GroupName)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
 				return
 			}
-			writeError(w, http.StatusInternalServerError, err)
+		}
+		if primary == "" {
+			writeError(w, http.StatusBadRequest, errors.New("primary_egress_id required"))
 			return
 		}
 		if _, err := s.store.GetEgressProfile(r.Context(), primary); err != nil {
@@ -68,19 +103,14 @@ func (s *Server) adminEgressBinding(w http.ResponseWriter, r *http.Request, acco
 			}
 			binding = storage.AccountEgressBinding{AccountID: accountID}
 		}
-		standby := binding.StandbyIDs()
 		if raw, ok := req["standby_egress_ids"]; ok {
 			ids, err := parseStandbyEgressIDs(raw)
 			if err != nil {
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}
-			standby = ids
-		}
-		standby = normalizeStandbyEgressIDs(primary, standby)
-		for _, id := range standby {
-			if _, err := s.store.GetEgressProfile(r.Context(), id); err != nil {
-				writeError(w, http.StatusBadRequest, fmt.Errorf("egress %q not found", id))
+			if len(ids) > 0 {
+				writeError(w, http.StatusBadRequest, errors.New("standby_egress_ids is no longer used; assign one group or account outlet"))
 				return
 			}
 		}
@@ -111,7 +141,8 @@ func (s *Server) adminEgressBinding(w http.ResponseWriter, r *http.Request, acco
 		}
 		binding.AccountID = accountID
 		binding.PrimaryEgressID = primary
-		binding.StandbyEgressIDs = strings.Join(standby, ",")
+		binding.StandbyEgressIDs = ""
+		binding.BindingScope = bindingScope
 		binding.SidecarEgressID = sidecarID
 		binding.CookieJarKey = accountID + ":" + primary
 		if err := s.store.UpsertEgressBinding(r.Context(), binding); err != nil {
@@ -119,6 +150,11 @@ func (s *Server) adminEgressBinding(w http.ResponseWriter, r *http.Request, acco
 			return
 		}
 		got, err := s.store.GetEgressBinding(r.Context(), accountID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		got, err = s.store.EffectiveEgressBinding(r.Context(), got)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return

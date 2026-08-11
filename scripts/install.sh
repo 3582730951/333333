@@ -58,7 +58,11 @@ EGRESS_TCP_PORT_OVERRIDE=""
 EGRESS_UDP_PORT_OVERRIDE=""
 # HEALTH_TIMEOUT bounds private-worker and post-switch /readyz gates.
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
-DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-300}"
+# DRAIN_TIMEOUT is now a progress-report interval, not a destructive deadline.
+# A superseded worker is never killed while it still owns an HTTP/SSE/WebSocket
+# request; zero keeps the default 30-second progress cadence. This can make an
+# upgrade wait for a genuinely long stream, which is intentional and lossless.
+DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-30}"
 WORKER_DESTROY_TIMEOUT="${WORKER_DESTROY_TIMEOUT:-30}"
 DEPLOY_LOCK_FILE="${DEPLOY_LOCK_FILE:-/var/lock/codex-pool-install.lock}"
 HANDOFF_CONTROL_SOCKET="${HANDOFF_CONTROL_SOCKET:-${DATA_DIR%/}/run/handoff-control.sock}"
@@ -190,6 +194,7 @@ Environment overrides:
   LISTEN_ADDR, ADMIN_TOKEN, PUBLIC_URL, OPEN_FIREWALL,
   SIDECAR_ADDR, SIDECAR_VENV, SIDECAR_INSTALL_DIR, SIDECAR_COOKIE_DIR,
   INSTALL_GO, GO_INSTALL_VERSION, GO_INSTALL_ROOT, GO_BIN, HEALTH_TIMEOUT,
+  DRAIN_TIMEOUT (progress log interval; active requests are never force-closed),
   SKIP_OS_PACKAGES, GO_TARBALL_SHA256,
   WITH_REGISTRATION, NODE_MIN_MAJOR, NODE_INSTALL_MAJOR, NODE_BIN, CHROME_BIN,
   REGISTRAR_SOURCE, REGISTRAR_INSTALL, PY_REGISTRAR_SOURCE,
@@ -1468,8 +1473,16 @@ wait_for_service_health() {
 
 activate_codex_reauth_worker() {
   bool_enabled "$WITH_REGISTRATION" || return 0
-  log "Restarting ${SERVICE_NAME}-reauth.service for release ${RELEASE_ID}"
-  if ! run_root systemctl restart "${SERVICE_NAME}-reauth.service" ||
+  if run_root systemctl is-active --quiet "${SERVICE_NAME}-reauth.service" 2>/dev/null; then
+    log "Codex reauth worker is active; leaving its running sessions untouched (new release staged for its next cold start)"
+    if wait_for_service_health "$(codex_reauth_base_url)/healthz" "$HEALTH_TIMEOUT" "existing Codex reauth worker"; then
+      return 0
+    fi
+    run_root systemctl --no-pager --full status "${SERVICE_NAME}-reauth.service" >&2 || true
+    return 1
+  fi
+  log "Starting ${SERVICE_NAME}-reauth.service for release ${RELEASE_ID}"
+  if ! run_root systemctl start "${SERVICE_NAME}-reauth.service" ||
     ! wait_for_service_health "$(codex_reauth_base_url)/healthz" "$HEALTH_TIMEOUT" "Codex reauth worker"; then
     run_root systemctl --no-pager --full status "${SERVICE_NAME}-reauth.service" >&2 || true
     return 1
@@ -1480,7 +1493,9 @@ restore_codex_reauth_worker_after_rollback() {
   bool_enabled "$WITH_REGISTRATION" || return 0
   if run_root test -x "${APP_DIR%/}/current/codex-reauth/codex_reauth_worker.py" &&
     run_root test -x "${APP_DIR%/}/current/registrar-python-venv/bin/python"; then
-    run_root systemctl restart "${SERVICE_NAME}-reauth.service" || return 1
+    if ! run_root systemctl is-active --quiet "${SERVICE_NAME}-reauth.service" 2>/dev/null; then
+      run_root systemctl start "${SERVICE_NAME}-reauth.service" || return 1
+    fi
     wait_for_service_health "$(codex_reauth_base_url)/healthz" "$HEALTH_TIMEOUT" "Codex reauth rollback"
     return $?
   fi
@@ -1709,20 +1724,24 @@ destroy_stale_worker_instances() {
 }
 
 destroy_legacy_worker_process() {
-  local unit="${SERVICE_NAME}.service" pid state
+  local unit="${SERVICE_NAME}.service" pid state next_report
   pid="$(run_root systemctl show "$unit" --property=MainPID --value 2>/dev/null || true)"
   state="$(run_root systemctl show "$unit" --property=ActiveState --value 2>/dev/null || true)"
   if [[ "$state" == "active" || "$state" == "activating" || "$state" == "deactivating" || "$pid" =~ ^[1-9][0-9]*$ ]]; then
-    log "Destroying superseded legacy worker process in ${unit}"
+    log "Draining superseded legacy worker process in ${unit}"
     run_root systemctl stop --no-block "$unit" >/dev/null 2>&1 || true
-    if ! wait_worker_unit_destroyed "$unit" "$WORKER_DESTROY_TIMEOUT"; then
-      run_root systemctl kill --kill-who=all --signal=SIGKILL "$unit" >/dev/null 2>&1 || true
-      run_root systemctl stop "$unit" >/dev/null 2>&1 || true
-    fi
+    next_report=$((SECONDS + 30))
+    while ! worker_unit_destroyed "$unit"; do
+      if (( SECONDS >= next_report )); then
+        warn "Legacy worker is still draining established connections; preserving it instead of forcing client-visible errors"
+        next_report=$((next_report + 30))
+      fi
+      sleep 1
+    done
   fi
   run_root systemctl disable "$unit" >/dev/null 2>&1 || true
   run_root systemctl reset-failed "$unit" >/dev/null 2>&1 || true
-  worker_unit_destroyed "$unit" || die "legacy worker process is still running after forced destruction"
+  worker_unit_destroyed "$unit" || die "legacy worker process did not finish its graceful drain"
 }
 
 superseded_release_process() {
@@ -1943,7 +1962,7 @@ activate_staged_release() {
   }
 
   local new_socket="${DATA_DIR%/}/run/worker-${RELEASE_ID}.sock"
-  local old_socket old_release old_worker_release="" inflight="unknown" started health_url had_handoff=0
+  local old_socket old_release old_worker_release="" inflight="unknown" started next_report report_every health_url had_handoff=0
   [[ "$DRAIN_TIMEOUT" =~ ^[0-9]+$ ]] || die "DRAIN_TIMEOUT must be a non-negative integer: ${DRAIN_TIMEOUT}"
   [[ "$WORKER_DESTROY_TIMEOUT" =~ ^[0-9]+$ ]] || die "WORKER_DESTROY_TIMEOUT must be a non-negative integer: ${WORKER_DESTROY_TIMEOUT}"
   (( ${#new_socket} < 104 )) || die "worker Unix socket path is too long: ${new_socket}"
@@ -2020,17 +2039,21 @@ activate_staged_release() {
   if [[ -n "$old_socket" && "$old_socket" != "$new_socket" ]]; then
     OLD_WORKER_DRAINED=0
     started="$SECONDS"
-    while (( SECONDS - started < DRAIN_TIMEOUT )); do
+    report_every="$DRAIN_TIMEOUT"
+    (( report_every > 0 )) || report_every=30
+    next_report=$((SECONDS + report_every))
+    while true; do
       inflight="$(worker_inflight "$old_socket")"
       if [[ "$inflight" == "0" ]]; then
         log "Previous worker ${old_worker_release} drained"
         break
       fi
+      if (( SECONDS >= next_report )); then
+        warn "Previous worker ${old_worker_release} still owns ${inflight:-unknown} in-flight connection(s); preserving them until natural completion"
+        next_report=$((next_report + report_every))
+      fi
       sleep 1
     done
-    if [[ "$inflight" != "0" ]]; then
-      warn "previous worker still has ${inflight:-unknown} in-flight connection(s) after ${DRAIN_TIMEOUT}s; enforcing the bounded drain deadline"
-    fi
     destroy_worker_instance "$old_worker_release" "$old_socket" || die "failed to destroy previous worker ${old_worker_release}"
     ACTIVATION_OLD_DESTROYED=1
   fi
@@ -2349,17 +2372,20 @@ EOF
       activate_staged_release
       run_root systemctl --no-pager --full status "${HANDOFF_SERVICE_NAME}.service" || true
 
-      # Restart the sidecar only when its source changed (or it is not running): an
-      # unchanged sidecar is left alone so its in-flight upstream streams are never cut.
+      # Never hot-restart a live shared sidecar during an upgrade. Both old and new
+      # workers may own streams through it; the staged release is picked up on the
+      # sidecar's next normal cold start. A fresh/inactive install starts it now.
       if bool_enabled "$WITH_SIDECAR"; then
-        if [[ "${SIDECAR_CHANGED:-1}" == "1" && "${OLD_WORKER_DRAINED:-1}" != "1" ]]; then
-          warn "Previous worker still streams through the existing sidecar; deferring the sidecar version switch to avoid severing HTTP/SSE/WS traffic"
-        elif [[ "${SIDECAR_CHANGED:-1}" == "1" ]] || ! run_root systemctl is-active --quiet "${SERVICE_NAME}-sidecar.service"; then
-          log "Restarting ${SERVICE_NAME}-sidecar.service"
-          run_root systemctl restart "${SERVICE_NAME}-sidecar.service" || true
-          run_root systemctl --no-pager --full status "${SERVICE_NAME}-sidecar.service" || true
+        if run_root systemctl is-active --quiet "${SERVICE_NAME}-sidecar.service" 2>/dev/null; then
+          if [[ "${SIDECAR_CHANGED:-1}" == "1" ]]; then
+            log "Sidecar update staged; leaving the active process and its streams untouched until the next cold start"
+          else
+            log "Sidecar unchanged; leaving ${SERVICE_NAME}-sidecar.service running (no stream cut)"
+          fi
         else
-          log "Sidecar unchanged; leaving ${SERVICE_NAME}-sidecar.service running (no stream cut)"
+          log "Starting ${SERVICE_NAME}-sidecar.service"
+          run_root systemctl start "${SERVICE_NAME}-sidecar.service" || true
+          run_root systemctl --no-pager --full status "${SERVICE_NAME}-sidecar.service" || true
         fi
       fi
 

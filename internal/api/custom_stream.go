@@ -108,6 +108,7 @@ type customSSETerminalTracker struct {
 	protocol customSSEProtocol
 	pending  []byte
 	terminal bool
+	success  bool
 }
 
 func (t *customSSETerminalTracker) Write(p []byte) (int, error) {
@@ -143,6 +144,7 @@ func (t *customSSETerminalTracker) observe(frame []byte) {
 	trimmed := strings.TrimSpace(string(data))
 	if t.protocol == customSSEChatCompletions && trimmed == "[DONE]" {
 		t.terminal = true
+		t.success = true
 		return
 	}
 	if trimmed == "" || trimmed == "[DONE]" {
@@ -159,14 +161,25 @@ func (t *customSSETerminalTracker) observe(frame []byte) {
 	switch t.protocol {
 	case customSSEChatCompletions:
 		_, hasError := envelope["error"]
-		t.terminal = hasError || eventType == "error"
+		if hasError || eventType == "error" {
+			t.terminal = true
+		}
 	case customSSEResponses:
 		switch eventType {
-		case "response.completed", "response.incomplete", "response.failed", "response.error", "error":
+		case "response.completed":
+			t.terminal = true
+			t.success = true
+		case "response.incomplete", "response.failed", "response.error", "error":
 			t.terminal = true
 		}
 	case customSSEAnthropicMessages:
-		t.terminal = eventType == "message_stop" || eventType == "error"
+		switch eventType {
+		case "message_stop":
+			t.terminal = true
+			t.success = true
+		case "error":
+			t.terminal = true
+		}
 	}
 }
 

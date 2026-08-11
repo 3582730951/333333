@@ -35,7 +35,7 @@ func setupCustomEgressRetryProvider(t *testing.T, h *testHarness, providerID, mo
 	return accountID
 }
 
-func TestCustomProviderTransportFailureUsesStandbyOnSameAccount(t *testing.T) {
+func TestCustomProviderLegacyEgressMetadataDoesNotOverrideGroupOutlet(t *testing.T) {
 	var mu sync.Mutex
 	order := []string{}
 	appendOrder := func(value string) {
@@ -55,7 +55,7 @@ func TestCustomProviderTransportFailureUsesStandbyOnSameAccount(t *testing.T) {
 	defer primaryProxy.Close()
 
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		appendOrder("standby")
+		appendOrder("group-direct")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, dsChatResp)
 	})
@@ -79,16 +79,16 @@ func TestCustomProviderTransportFailureUsesStandbyOnSameAccount(t *testing.T) {
 	mu.Lock()
 	gotOrder := append([]string(nil), order...)
 	mu.Unlock()
-	if strings.Join(gotOrder, ",") != "primary,standby" {
+	if strings.Join(gotOrder, ",") != "group-direct" {
 		t.Fatalf("egress order = %v", gotOrder)
 	}
 	requests := h.requests()
 	if len(requests) != 1 || requests[0].Auth != "Bearer sk-custom-transport" {
-		t.Fatalf("standby changed account or replayed upstream: account=%s requests=%+v", accountID, requests)
+		t.Fatalf("group outlet changed account or replayed upstream: account=%s requests=%+v", accountID, requests)
 	}
 }
 
-func TestCustomProviderInheritsOrderedGroupEgressBeforeAccountFailover(t *testing.T) {
+func TestCustomProviderUsesOnlyFirstGroupEgress(t *testing.T) {
 	var mu sync.Mutex
 	order := []string{}
 	newFailingProxy := func(name string, status int) *httptest.Server {
@@ -128,7 +128,7 @@ func TestCustomProviderInheritsOrderedGroupEgressBeforeAccountFailover(t *testin
 	if err := h.store.UpdateGroup(context.Background(), group); err != nil {
 		t.Fatal(err)
 	}
-	accountID := setupCustomEgressRetryProvider(t, h, "custom-group-egress", "custom-group-egress-model", nil)
+	setupCustomEgressRetryProvider(t, h, "custom-group-egress", "custom-group-egress-model", nil)
 
 	resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"custom-group-egress-model","messages":[{"role":"user","content":"retry"}]}`))
 	if err != nil {
@@ -136,17 +136,17 @@ func TestCustomProviderInheritsOrderedGroupEgressBeforeAccountFailover(t *testin
 	}
 	raw, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(raw), `"type":"server_error"`) {
 		t.Fatalf("status=%d body=%s", resp.StatusCode, raw)
 	}
 	mu.Lock()
 	gotOrder := append([]string(nil), order...)
 	mu.Unlock()
-	if strings.Join(gotOrder, ",") != "primary,standby-1,standby-2" {
-		t.Fatalf("inherited egress order = %v", gotOrder)
+	if strings.Join(gotOrder, ",") != "primary" {
+		t.Fatalf("single inherited egress order = %v", gotOrder)
 	}
 	requests := h.requests()
-	if len(requests) != 1 || requests[0].Auth != "Bearer sk-custom-group-egress" {
-		t.Fatalf("standby changed account or replayed upstream: account=%s requests=%+v", accountID, requests)
+	if len(requests) != 0 {
+		t.Fatalf("legacy standby egress reached upstream: requests=%+v", requests)
 	}
 }

@@ -224,13 +224,14 @@ UPDATE accounts SET registration_method=?,registration_task_id=?,updated_at=? WH
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO account_egress_bindings(
-  account_id,primary_egress_id,standby_egress_ids,sidecar_egress_id,cookie_jar_key,
+  account_id,primary_egress_id,standby_egress_ids,sidecar_egress_id,binding_scope,cookie_jar_key,
   cooldown_until,recheck_pending,created_at,updated_at
-) VALUES(?,?,'','',?,0,0,?,?)
+) VALUES(?,?,'','','account',?,0,0,?,?)
 ON CONFLICT(account_id) DO UPDATE SET
   primary_egress_id=excluded.primary_egress_id,
   standby_egress_ids='',
   sidecar_egress_id='',
+  binding_scope='account',
   cookie_jar_key=excluded.cookie_jar_key,
   cooldown_until=0,
   recheck_pending=0,

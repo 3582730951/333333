@@ -16,8 +16,11 @@
 # First install (binds 0.0.0.0:8787, full feature set):
 #     sudo ./install.sh
 # Running the same command again auto-detects the managed config/database/release
-# and takes the backup-protected update path. Override only when provisioning an
-# intentionally separate fresh tree:
+# and takes the backup-protected update path. During its atomic worker handoff,
+# established HTTP/SSE/WebSocket requests remain on the old worker and new requests
+# wait without receiving a synthetic upstream/downstream error; admission resumes
+# automatically on success or rollback. Shared auxiliary services are staged but not
+# hot-restarted. Override only when provisioning an intentionally separate fresh tree:
 #     sudo ./install.sh --fresh-install
 #
 # Any scripts/install.sh flag passes straight through, e.g.:

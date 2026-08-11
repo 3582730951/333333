@@ -179,7 +179,7 @@ func TestAdminProvidersPersistsMultipleInvocationRoutes(t *testing.T) {
 	}
 }
 
-func TestAdminProvidersPartialPatchPreservesProtocolAndRoutingFields(t *testing.T) {
+func TestAdminProvidersPartialPatchPreservesProtocolAndModelsButClearsLegacyEgress(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	upsertTestEgressProfile(t, h, "provider-patch-egress")
 	code, raw := grpReq(t, h, http.MethodPost, "/admin/providers", `{
@@ -205,8 +205,8 @@ func TestAdminProvidersPartialPatchPreservesProtocolAndRoutingFields(t *testing.
 	if got.Enabled || got.UpstreamProtocol != storage.CustomProviderProtocolAnthropicMessages || got.TransportProfile != storage.CustomProviderTransportClaudeCode {
 		t.Fatalf("partial patch changed provider protocol/profile: %+v", got)
 	}
-	if len(got.EgressIDs) != 1 || got.EgressIDs[0] != "provider-patch-egress" || len(got.Models) != 1 || got.Models[0] != "claude-test" {
-		t.Fatalf("partial patch changed provider routing fields: %+v", got)
+	if len(got.EgressIDs) != 0 || len(got.Models) != 1 || got.Models[0] != "claude-test" {
+		t.Fatalf("partial patch did not clear provider egress or changed models: %+v", got)
 	}
 }
 

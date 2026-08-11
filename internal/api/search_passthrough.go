@@ -189,12 +189,11 @@ func (s *Server) customProviderForSearchModel(
 			targetModel = model
 		}
 		lease, err := s.scheduler.Select(ctx, scheduler.Route{
-			Group:              group,
-			Provider:           provider.ID,
-			PreferredEgressIDs: provider.EgressIDs,
-			Model:              targetModel,
-			EstimatedTokens:    virtual.EstimateTokensJSON(body),
-			SkipWait:           true,
+			Group:           group,
+			Provider:        provider.ID,
+			Model:           targetModel,
+			EstimatedTokens: virtual.EstimateTokensJSON(body),
+			SkipWait:        true,
 		})
 		if err != nil {
 			continue

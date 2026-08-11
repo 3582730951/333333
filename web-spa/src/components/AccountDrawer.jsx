@@ -116,6 +116,19 @@ export default function AccountDrawer({
     }
   });
 
+  const { run: inheritGroupEgress, running: inheritingGroupEgress } = useAsyncAction(async () => {
+    if (!account) return;
+    try {
+      const saved = await post(`/admin/accounts/${encodeURIComponent(account.id)}/egress-binding`, {
+        inherit_group_egress: true,
+      });
+      Toast.success('已恢复为随分组出口');
+      void onUpdated?.(account.id, saved);
+    } catch (err) {
+      showErrorToast(err);
+    }
+  });
+
   const { run: saveGroup, running: savingGroup } = useAsyncAction(async () => {
     if (!account || !selectedGroup) return;
     try {
@@ -403,6 +416,12 @@ export default function AccountDrawer({
       <Panel title="出口绑定" style={{ marginBottom: 14 }}>
         {!binding ? <Typography.Text type="tertiary">暂无出口绑定数据</Typography.Text> : (
           <>
+            <Row
+              k="路由来源"
+              v={binding.binding_scope === 'account'
+                ? <Tag color="blue" size="small">账号单独指定</Tag>
+                : <Tag color="green" size="small">随分组</Tag>}
+            />
             <Row k="默认出口" v={binding.primary_egress_id || '—'} />
             <div style={{ display: 'flex', gap: 8, alignItems: 'center', margin: '8px 0' }}>
               <Select
@@ -423,6 +442,16 @@ export default function AccountDrawer({
                 onClick={saveDefaultEgress}
               >保存</Button>
             </div>
+            {binding.binding_scope === 'account' ? (
+              <Button
+                size="small"
+                theme="borderless"
+                loading={inheritingGroupEgress}
+                disabled={savingDefaultEgress}
+                onClick={inheritGroupEgress}
+                style={{ marginBottom: 8 }}
+              >恢复为随分组出口</Button>
+            ) : null}
             <Row k="TLS/HTTP2 Sidecar" v={primaryAlreadySidecar ? '默认出口本身已是 Sidecar' : (binding.sidecar_egress_id || '未绑定')} />
             {!primaryAlreadySidecar ? (
               <Select
@@ -443,7 +472,6 @@ export default function AccountDrawer({
                 实际链路：Sidecar → {selectedProfile?.name || selectedEgress} → 上游；出口 IP、冷却与审计仍归属默认出口。
               </Typography.Text>
             ) : null}
-            <Row k="备用出口" v={binding.standby_egress_ids || '—'} />
             <Row k="冷却至" v={binding.cooldown_until ? fmtRelative(binding.cooldown_until) : '—'} />
             <Row k="待复测" v={binding.recheck_pending ? <Tag color="amber" size="small">是</Tag> : '否'} />
           </>

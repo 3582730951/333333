@@ -152,9 +152,8 @@ type Group struct {
 	// writes reject non-empty policy values.
 	ForceModel  string `json:"force_model"`
 	ForceEffort string `json:"force_effort"`
-	// DefaultEgressID is the deprecated single-outlet alias. EgressIDs is the ordered
-	// runtime source of truth (primary first, then standbys); a legacy row with only
-	// DefaultEgressID is exposed as a one-element EgressIDs list.
+	// DefaultEgressID is the deprecated alias. EgressIDs contains at most the one
+	// group-owned inference outlet; legacy standby entries are ignored on read.
 	DefaultEgressID string   `json:"default_egress_id"`
 	EgressIDs       []string `json:"egress_ids"`
 	// egressIDsConfigured distinguishes an explicitly saved [] from a legacy row
@@ -834,10 +833,18 @@ type GroupEgressPolicy struct {
 	UpdatedAt          int64  `json:"updated_at"`
 }
 
+const (
+	EgressBindingScopeGroup   = "group"
+	EgressBindingScopeAccount = "account"
+)
+
 type AccountEgressBinding struct {
 	AccountID        string `json:"account_id"`
 	PrimaryEgressID  string `json:"primary_egress_id"`
 	StandbyEgressIDs string `json:"standby_egress_ids"`
+	// BindingScope is "group" for the normal inherited route and "account" only
+	// after an operator or import explicitly pins this account to its own outlet.
+	BindingScope string `json:"binding_scope"`
 	// SidecarEgressID is an optional transport wrapper. Primary/standby egresses
 	// continue to own the exit IP, cooldown, concurrency and CF attribution; the
 	// sidecar only supplies the TLS/HTTP2 fingerprint and chains through whichever
@@ -1912,6 +1919,7 @@ CREATE TABLE IF NOT EXISTS account_egress_bindings(
   primary_egress_id TEXT NOT NULL,
   standby_egress_ids TEXT NOT NULL DEFAULT '',
   sidecar_egress_id TEXT NOT NULL DEFAULT '',
+  binding_scope TEXT NOT NULL DEFAULT 'group',
   cookie_jar_key TEXT NOT NULL DEFAULT '',
   cooldown_until INTEGER NOT NULL DEFAULT 0,
   recheck_pending INTEGER NOT NULL DEFAULT 0,
@@ -2706,6 +2714,9 @@ ON CONFLICT(account_id) DO NOTHING`,
 		// Optional account-level TLS/HTTP2 transport wrapper. The selected primary or
 		// standby remains the real IP egress; this sidecar chains through it.
 		`ALTER TABLE account_egress_bindings ADD COLUMN sidecar_egress_id TEXT NOT NULL DEFAULT ''`,
+		// Runtime egress precedence: groups own the single inference outlet unless an
+		// account is explicitly pinned by the operator/import path.
+		`ALTER TABLE account_egress_bindings ADD COLUMN binding_scope TEXT NOT NULL DEFAULT 'group'`,
 		// SMS multi-platform tracking: record which provider + country a registration
 		// used, and what it cost, so the local stats API can aggregate per-platform
 		// per-country success rates (Phase 7 — additive migration).
@@ -3187,6 +3198,9 @@ func scanGroup(scan func(...interface{}) error, g *Group) (Group, error) {
 	} else {
 		g.EgressIDs = []string{}
 	}
+	if len(g.EgressIDs) > 1 {
+		g.EgressIDs = g.EgressIDs[:1]
+	}
 	return *g, nil
 }
 
@@ -3221,6 +3235,9 @@ func prepareGroupEgress(g *Group) string {
 		ids = []string{g.DefaultEgressID}
 	}
 	ids = normalizeOrderedIDs(ids)
+	if len(ids) > 1 {
+		ids = ids[:1]
+	}
 	g.EgressIDs = ids
 	if len(ids) > 0 {
 		g.DefaultEgressID = ids[0]
@@ -5480,7 +5497,7 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 		SELECT a.id, a.label, a.group_name, a.upstream_account_id, a.chatgpt_user_id,
 		       a.email, a.plan_type, a.provider, a.status, a.is_fedramp, a.ignore_rate_limit_controls, a.quarantine_until,
 		       a.quarantine_reason, a.created_at, a.updated_at,
-		       b.account_id, b.primary_egress_id, b.standby_egress_ids, b.sidecar_egress_id, b.cookie_jar_key, b.cooldown_until,
+		       b.account_id, b.primary_egress_id, b.standby_egress_ids, b.sidecar_egress_id, b.binding_scope, b.cookie_jar_key, b.cooldown_until,
 		       b.recheck_pending, b.created_at, b.updated_at,
 		       COALESCE(e.id,''), COALESCE(e.name,''), COALESCE(e.type,''), COALESCE(e.endpoint,''),
 		       COALESCE(e.chain_proxy,''), COALESCE(e.region,''), COALESCE(e.exit_ip,''),
@@ -5513,7 +5530,7 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 			&a.Account.ChatGPTUserID, &a.Account.Email, &a.Account.PlanType, &a.Account.Provider,
 			&a.Account.Status, &isFedramp, &ignoreRateLimitControls, &a.Account.QuarantineUntil, &a.Account.QuarantineReason,
 			&a.Account.CreatedAt, &a.Account.UpdatedAt,
-			&a.Binding.AccountID, &a.Binding.PrimaryEgressID, &a.Binding.StandbyEgressIDs, &a.Binding.SidecarEgressID, &a.Binding.CookieJarKey,
+			&a.Binding.AccountID, &a.Binding.PrimaryEgressID, &a.Binding.StandbyEgressIDs, &a.Binding.SidecarEgressID, &a.Binding.BindingScope, &a.Binding.CookieJarKey,
 			&a.Binding.CooldownUntil, &recheck, &a.Binding.CreatedAt, &a.Binding.UpdatedAt,
 			&a.Egress.ID, &a.Egress.Name, &a.Egress.Type, &a.Egress.Endpoint,
 			&a.Egress.ChainProxy, &a.Egress.Region, &a.Egress.ExitIP,
@@ -6796,10 +6813,24 @@ func (s *Store) ListCapabilities(ctx context.Context, accountID string) ([]Model
 // excluded.
 func (s *Store) ListRoutableCapabilities(ctx context.Context, group string) ([]ModelCapability, error) {
 	now := Now()
+	groupConfig, err := s.GetGroup(ctx, group)
+	if err != nil {
+		return nil, err
+	}
+	groupEgressID := strings.TrimSpace(groupConfig.DefaultEgressID)
+	for _, id := range groupConfig.EgressIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			groupEgressID = id
+			break
+		}
+	}
+	if groupEgressID == "" {
+		groupEgressID = DefaultDirectEgressID
+	}
 	rows, err := s.rdb.QueryContext(ctx, `SELECT c.account_id, c.model_slug, c.availability_state, c.context_1m_state, c.context_1m_source,
 c.native_context_window, c.native_max_context_window, c.effective_context_window_percent, c.auto_compact_token_limit,
 c.visibility, c.etag, c.raw_model_json_hash, c.raw_model_json, c.source, c.last_probe_at,
-b.primary_egress_id, b.standby_egress_ids, b.sidecar_egress_id, b.cooldown_until,
+b.primary_egress_id, b.standby_egress_ids, b.sidecar_egress_id, b.binding_scope, b.cooldown_until,
 a.ignore_rate_limit_controls
 FROM account_model_capabilities c
 JOIN accounts a ON a.id = c.account_id
@@ -6826,7 +6857,7 @@ ORDER BY c.account_id, c.model_slug`, group, now)
 		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.AvailabilityState, &c.Context1MState, &c.Context1MSource,
 			&c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit,
 			&c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.RawModelJSON, &c.Source, &c.LastProbeAt,
-			&binding.PrimaryEgressID, &binding.StandbyEgressIDs, &binding.SidecarEgressID, &binding.CooldownUntil,
+			&binding.PrimaryEgressID, &binding.StandbyEgressIDs, &binding.SidecarEgressID, &binding.BindingScope, &binding.CooldownUntil,
 			&ignoreRateLimitControls); err != nil {
 			return nil, err
 		}
@@ -6875,6 +6906,10 @@ ORDER BY c.account_id, c.model_slug`, group, now)
 		if !checked[accountID] {
 			checked[accountID] = true
 			binding := item.binding
+			if !strings.EqualFold(strings.TrimSpace(binding.BindingScope), EgressBindingScopeAccount) {
+				binding.PrimaryEgressID = groupEgressID
+			}
+			binding.StandbyEgressIDs = ""
 			if sidecarID := strings.TrimSpace(binding.SidecarEgressID); sidecarID != "" {
 				sidecar, ok := loadEgress(sidecarID)
 				if !ok || !IsSidecarEgress(sidecar) || strings.TrimSpace(sidecar.Endpoint) == "" || !egressHealthy(sidecar) {
@@ -6884,14 +6919,6 @@ ORDER BY c.account_id, c.model_slug`, group, now)
 			if item.ignoreRateLimitControls || binding.CooldownUntil <= now {
 				if egress, ok := loadEgress(binding.PrimaryEgressID); ok && egressHealthy(egress) {
 					routable[accountID] = true
-				}
-			}
-			if !routable[accountID] {
-				for _, standbyID := range binding.StandbyIDs() {
-					if egress, ok := loadEgress(standbyID); ok && egressHealthy(egress) {
-						routable[accountID] = true
-						break
-					}
 				}
 			}
 		}
@@ -7351,6 +7378,9 @@ func (s *Store) DeleteEgressProfile(ctx context.Context, id string) error {
 	if id == "" {
 		return errors.New("egress id required")
 	}
+	if id == DefaultDirectEgressID {
+		return fmt.Errorf("%w: system_default:%s", ErrEgressInUse, id)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -7372,11 +7402,8 @@ func (s *Store) DeleteEgressProfile(ctx context.Context, id string) error {
 		if strings.TrimSpace(idsJSON) == "" && strings.TrimSpace(legacyID) != "" {
 			ids = []string{strings.TrimSpace(legacyID)}
 		}
-		for _, candidate := range ids {
-			if candidate == id {
-				references = append(references, "account_pool_group:"+name)
-				break
-			}
+		if len(ids) > 0 && ids[0] == id {
+			references = append(references, "account_pool_group:"+name)
 		}
 	}
 	if err := groupRows.Err(); err != nil {
@@ -7384,29 +7411,6 @@ func (s *Store) DeleteEgressProfile(ctx context.Context, id string) error {
 		return err
 	}
 	_ = groupRows.Close()
-
-	providerRows, err := tx.QueryContext(ctx, `SELECT id, egress_ids FROM custom_providers`)
-	if err != nil {
-		return err
-	}
-	for providerRows.Next() {
-		var providerID, idsJSON string
-		if err := providerRows.Scan(&providerID, &idsJSON); err != nil {
-			_ = providerRows.Close()
-			return err
-		}
-		for _, candidate := range decodeStringList(idsJSON) {
-			if candidate == id {
-				references = append(references, "model_provider:"+providerID)
-				break
-			}
-		}
-	}
-	if err := providerRows.Err(); err != nil {
-		_ = providerRows.Close()
-		return err
-	}
-	_ = providerRows.Close()
 
 	poolRows, err := tx.QueryContext(ctx, `SELECT pool_id FROM egress_pool_members WHERE egress_id = ?`, id)
 	if err != nil {
@@ -7426,25 +7430,18 @@ func (s *Store) DeleteEgressProfile(ctx context.Context, id string) error {
 	}
 	_ = poolRows.Close()
 
-	bindingRows, err := tx.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id FROM account_egress_bindings`)
+	bindingRows, err := tx.QueryContext(ctx, `SELECT account_id, primary_egress_id, sidecar_egress_id, binding_scope FROM account_egress_bindings`)
 	if err != nil {
 		return err
 	}
 	for bindingRows.Next() {
-		var accountID, primaryID, standbyIDs, sidecarID string
-		if err := bindingRows.Scan(&accountID, &primaryID, &standbyIDs, &sidecarID); err != nil {
+		var accountID, primaryID, sidecarID, bindingScope string
+		if err := bindingRows.Scan(&accountID, &primaryID, &sidecarID, &bindingScope); err != nil {
 			_ = bindingRows.Close()
 			return err
 		}
-		inUse := primaryID == id || sidecarID == id
-		if !inUse {
-			for _, candidate := range (AccountEgressBinding{StandbyEgressIDs: standbyIDs}).StandbyIDs() {
-				if candidate == id {
-					inUse = true
-					break
-				}
-			}
-		}
+		accountScoped := strings.EqualFold(strings.TrimSpace(bindingScope), EgressBindingScopeAccount)
+		inUse := sidecarID == id || (accountScoped && primaryID == id)
 		if inUse {
 			references = append(references, "account_binding:"+accountID)
 		}
@@ -7888,10 +7885,10 @@ ON CONFLICT(account_id) DO NOTHING`, account.ID, primaryEgressID, account.ID+":"
 }
 
 func (s *Store) GetEgressBinding(ctx context.Context, accountID string) (AccountEgressBinding, error) {
-	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE account_id = ?`, accountID)
+	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, binding_scope, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE account_id = ?`, accountID)
 	var b AccountEgressBinding
 	var recheck int
-	err := row.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.SidecarEgressID, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt)
+	err := row.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.SidecarEgressID, &b.BindingScope, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt)
 	b.RecheckPending = recheck != 0
 	return b, err
 }
@@ -7901,7 +7898,7 @@ func (s *Store) ListEgressBindingsByAccountIDs(ctx context.Context, accountIDs [
 	if len(accountIDs) == 0 {
 		return out, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`)`, stringArgs(accountIDs)...)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, binding_scope, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`)`, stringArgs(accountIDs)...)
 	if err != nil {
 		return nil, err
 	}
@@ -7909,7 +7906,7 @@ func (s *Store) ListEgressBindingsByAccountIDs(ctx context.Context, accountIDs [
 	for rows.Next() {
 		var b AccountEgressBinding
 		var recheck int
-		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.SidecarEgressID, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.SidecarEgressID, &b.BindingScope, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, err
 		}
 		b.RecheckPending = recheck != 0
@@ -7920,6 +7917,15 @@ func (s *Store) ListEgressBindingsByAccountIDs(ctx context.Context, accountIDs [
 
 func (s *Store) UpsertEgressBinding(ctx context.Context, b AccountEgressBinding) error {
 	now := Now()
+	b.BindingScope = strings.ToLower(strings.TrimSpace(b.BindingScope))
+	if b.BindingScope == "" {
+		// Direct callers historically use UpsertEgressBinding to make a deliberate
+		// account assignment. Automatic creation paths insert scope=group explicitly.
+		b.BindingScope = EgressBindingScopeAccount
+	}
+	if b.BindingScope != EgressBindingScopeGroup && b.BindingScope != EgressBindingScopeAccount {
+		return fmt.Errorf("invalid egress binding scope %q", b.BindingScope)
+	}
 	if b.CookieJarKey == "" {
 		b.CookieJarKey = b.AccountID + ":" + b.PrimaryEgressID
 	}
@@ -7928,17 +7934,18 @@ func (s *Store) UpsertEgressBinding(ctx context.Context, b AccountEgressBinding)
 	}
 	b.UpdatedAt = now
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, binding_scope, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id) DO UPDATE SET
  primary_egress_id = excluded.primary_egress_id,
  standby_egress_ids = excluded.standby_egress_ids,
  sidecar_egress_id = excluded.sidecar_egress_id,
+ binding_scope = excluded.binding_scope,
  cookie_jar_key = excluded.cookie_jar_key,
  cooldown_until = excluded.cooldown_until,
  recheck_pending = excluded.recheck_pending,
  updated_at = excluded.updated_at`,
-		b.AccountID, b.PrimaryEgressID, b.StandbyEgressIDs, b.SidecarEgressID, b.CookieJarKey, b.CooldownUntil, boolInt(b.RecheckPending), b.CreatedAt, b.UpdatedAt)
+		b.AccountID, b.PrimaryEgressID, b.StandbyEgressIDs, b.SidecarEgressID, b.BindingScope, b.CookieJarKey, b.CooldownUntil, boolInt(b.RecheckPending), b.CreatedAt, b.UpdatedAt)
 	return err
 }
 
@@ -8049,7 +8056,7 @@ WHERE account_id = ? AND provider = ? AND model = ? AND limiter_type = ?`,
 // probe. Gating on cooldown_until <= now means the initial cooldown window (often a
 // server-signaled Retry-After) is always honored before the first probe.
 func (s *Store) ListBindingsNeedingRecheck(ctx context.Context, now int64) ([]AccountEgressBinding, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE recheck_pending = 1 AND cooldown_until <= ?`, now)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, binding_scope, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE recheck_pending = 1 AND cooldown_until <= ?`, now)
 	if err != nil {
 		return nil, err
 	}
@@ -8058,7 +8065,7 @@ func (s *Store) ListBindingsNeedingRecheck(ctx context.Context, now int64) ([]Ac
 	for rows.Next() {
 		var b AccountEgressBinding
 		var recheck int
-		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.SidecarEgressID, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.SidecarEgressID, &b.BindingScope, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, err
 		}
 		b.RecheckPending = recheck != 0
@@ -8102,7 +8109,7 @@ func (s *Store) AddStandbyEgress(ctx context.Context, accountID, egressID string
 // can pack accounts ≤N per exit. Bounded by the account count and only read on CF
 // events / assignment, never the hot path.
 func (s *Store) ListEgressBindings(ctx context.Context) ([]AccountEgressBinding, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings`)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, binding_scope, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings`)
 	if err != nil {
 		return nil, err
 	}
@@ -8111,7 +8118,7 @@ func (s *Store) ListEgressBindings(ctx context.Context) ([]AccountEgressBinding,
 	for rows.Next() {
 		var b AccountEgressBinding
 		var recheck int
-		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.SidecarEgressID, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.SidecarEgressID, &b.BindingScope, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, err
 		}
 		b.RecheckPending = recheck != 0

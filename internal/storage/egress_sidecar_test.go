@@ -142,3 +142,64 @@ func TestUnavailableSidecarDoesNotAdvertiseRoutableCapabilities(t *testing.T) {
 	}
 	assertHidden()
 }
+
+func TestEffectiveEgressBindingFollowsGroupUnlessAccountExplicitlyOverrides(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"group-egress-a", "group-egress-b"} {
+		if err := store.UpsertEgressProfile(ctx, EgressProfile{ID: id, Type: "direct", Health: "healthy"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"group-egress-a"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+	account := Account{ID: "effective-egress-account", GroupName: group.Name, Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := store.GetEgressBinding(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.BindingScope != EgressBindingScopeGroup {
+		t.Fatalf("new account binding scope = %q, want group", binding.BindingScope)
+	}
+
+	group.EgressIDs = []string{"group-egress-b"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+	effective, err := store.EffectiveEgressBinding(ctx, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effective.PrimaryEgressID != "group-egress-b" || effective.BindingScope != EgressBindingScopeGroup ||
+		effective.CookieJarKey != account.ID+":group-egress-b" || effective.StandbyEgressIDs != "" {
+		t.Fatalf("group-inherited binding = %+v", effective)
+	}
+
+	if err := store.UpsertEgressBinding(ctx, AccountEgressBinding{
+		AccountID: account.ID, PrimaryEgressID: "group-egress-a", StandbyEgressIDs: "group-egress-b",
+		BindingScope: EgressBindingScopeAccount,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	explicit, err := store.GetEgressBinding(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective, err = store.EffectiveEgressBinding(ctx, explicit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effective.PrimaryEgressID != "group-egress-a" || effective.BindingScope != EgressBindingScopeAccount ||
+		effective.CookieJarKey != account.ID+":group-egress-a" || effective.StandbyEgressIDs != "" {
+		t.Fatalf("explicit account binding = %+v", effective)
+	}
+}

@@ -289,35 +289,20 @@ func (s *Server) persistAntigravityGoalContinuity(ctx context.Context, r *http.R
 	}
 }
 
-// doAntigravityWithEgressRetry exhausts the selected account's ordered outlets
-// before the API layer is allowed to move to another account. Only transport
-// failures and upstream 5xx responses are outlet-retryable; auth, quota, safety,
-// and request validation remain account/model decisions.
+// doAntigravityWithEgressRetry retries Antigravity's maintained endpoint variants
+// on the one outlet selected for the account. Outlet selection remains owned by the
+// account/group routing contract; transport failures never rotate to legacy standby
+// metadata.
 func (s *Server) doAntigravityWithEgressRetry(ctx context.Context, req upstream.AntigravityRequest, lease scheduler.Lease) (*upstream.Response, storage.EgressProfile, error) {
 	send := func(egress storage.EgressProfile, wireReq upstream.AntigravityRequest) (*upstream.Response, error) {
 		cookieJarKey := lease.Binding.CookieJarKey
-		if strings.TrimSpace(egress.ID) != "" {
+		if strings.TrimSpace(cookieJarKey) == "" {
 			cookieJarKey = lease.Account.ID + ":" + egress.ID
 		}
 		return s.upstream.DoAntigravity(ctx, egress, cookieJarKey, wireReq)
 	}
 
 	egresses := []storage.EgressProfile{lease.Egress}
-	for _, standbyID := range lease.Binding.StandbyIDs() {
-		standbyID = strings.TrimSpace(standbyID)
-		if standbyID == "" || standbyID == lease.Egress.ID {
-			continue
-		}
-		standby, err := s.store.GetEgressProfile(ctx, standbyID)
-		if err != nil || !scheduler.EgressHealthy(standby, storage.Now()) {
-			continue
-		}
-		standby, err = s.store.ApplySidecarEgressBinding(ctx, lease.Binding, standby)
-		if err != nil {
-			continue
-		}
-		egresses = append(egresses, standby)
-	}
 
 	type attemptTarget struct {
 		egress storage.EgressProfile

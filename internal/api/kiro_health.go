@@ -110,6 +110,12 @@ func (s *Server) runKiroInferenceHealthProbe(r *http.Request, account storage.Ac
 		s.recordKiroInferenceProbeAudit(ctx, account, result)
 		return result
 	}
+	binding, err = s.store.EffectiveEgressBinding(ctx, binding)
+	if err != nil {
+		result.Err = err
+		s.recordKiroInferenceProbeAudit(ctx, account, result)
+		return result
+	}
 	egress, err := s.store.ResolvePrimaryEgressBinding(ctx, binding)
 	if err != nil {
 		result.Err = err

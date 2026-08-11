@@ -156,12 +156,13 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 			p.TransportProfile = storage.CustomProviderTransportClaudeCode
 		}
 		if req.EgressIDs != nil {
-			if err := s.validateOrderedEgressIDs(r, *req.EgressIDs); err != nil {
-				writeError(w, http.StatusBadRequest, err)
-				return
+			if len(normalizeNonEmptyStrings(*req.EgressIDs)) > 0 {
+				w.Header().Add("Warning", `299 codex-pool "provider egress_ids is ignored; account override or account-pool group egress is used"`)
 			}
-			p.EgressIDs = *req.EgressIDs
 		}
+		// Provider-level outlet ordering was retired. Always clear legacy values on
+		// save so provider protocol configuration cannot override account routing.
+		p.EgressIDs = nil
 		if req.Enabled != nil {
 			p.Enabled = *req.Enabled
 		}
@@ -225,21 +226,29 @@ func defaultProtocolForTransportProfile(profile string) string {
 }
 
 func (s *Server) validateOrderedEgressIDs(r *http.Request, ids []string) error {
-	seen := make(map[string]struct{}, len(ids))
-	for _, rawID := range ids {
-		id := strings.TrimSpace(rawID)
-		if id == "" {
-			continue
-		}
-		if _, duplicate := seen[id]; duplicate {
-			continue
-		}
-		seen[id] = struct{}{}
+	for _, id := range normalizeNonEmptyStrings(ids) {
 		if _, err := s.store.GetEgressProfile(r.Context(), id); err != nil {
 			return errors.New("egress " + id + " not found")
 		}
 	}
 	return nil
+}
+
+func normalizeNonEmptyStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 // adminProviderAction handles DELETE /admin/providers/{id}.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/routing"
+	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 )
 
@@ -530,6 +532,117 @@ func TestUserGroupAttemptWriterFindsRetryMarkerAcrossSpoolChunks(t *testing.T) {
 	}
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestUserGroupAttemptWriterDoesNotRetryCanceledLocalCapture(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := newUserGroupAttemptWriter(ctx, httptest.NewRecorder(), false, false, bodysource.CaptureOptions{
+		MaxBytes: 1 << 20, MemoryThreshold: 64 << 10, Budget: bodysource.NewBudget(64<<10, 1<<20),
+	})
+	cancel()
+	w.WriteHeader(http.StatusServiceUnavailable)
+	if _, err := io.WriteString(w, `{"error":{"type":"server_error"}}`); !errors.Is(err, context.Canceled) {
+		t.Fatalf("capture error=%v, want context canceled", err)
+	}
+	if w.RetryableFailure() || w.PermanentTargetFailure() || userGroupRouteStatusClass(w) != "request_canceled" {
+		t.Fatalf("canceled classification retryable=%v permanent=%v class=%q", w.RetryableFailure(), w.PermanentTargetFailure(), userGroupRouteStatusClass(w))
+	}
+	if got := w.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("canceled request advertised Retry-After=%q", got)
+	}
+	_ = w.Close()
+}
+
+func TestUserGroupAttemptWriterPropagatesLocalFailureWithoutRetry(t *testing.T) {
+	outer := newUserGroupAttemptWriter(context.Background(), httptest.NewRecorder(), false, false, bodysource.CaptureOptions{
+		MaxBytes: 1 << 20, MemoryThreshold: 64 << 10, Budget: bodysource.NewBudget(64<<10, 1<<20),
+	})
+	inner := newUserGroupAttemptWriter(context.Background(), outer, false, false, bodysource.CaptureOptions{
+		MaxBytes: 1, MemoryThreshold: 1, Budget: bodysource.NewBudget(1, 1),
+	})
+	inner.WriteHeader(http.StatusServiceUnavailable)
+	if _, err := io.WriteString(inner, "too large"); !errors.Is(err, bodysource.ErrBodyTooLarge) {
+		t.Fatalf("inner capture error=%v, want body too large", err)
+	}
+	inner.Commit()
+	if outer.RetryableFailure() || outer.PermanentTargetFailure() || userGroupRouteStatusClass(outer) != "local_response_too_large" {
+		t.Fatalf("outer classification retryable=%v permanent=%v class=%q", outer.RetryableFailure(), outer.PermanentTargetFailure(), userGroupRouteStatusClass(outer))
+	}
+	_ = outer.Close()
+}
+
+func TestDispatchUserGroupRouteCandidatesStopsAfterRequestCancellation(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	for _, group := range []string{"cancel-primary", "cancel-secondary"} {
+		if err := h.store.CreateGroup(t.Context(), storage.Group{Name: group}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	createRouteTestGroup(t, h, "ug_cancel_route", []storage.TargetRef{
+		{Kind: storage.TargetKindAccountPoolGroup, ID: "cancel-primary"},
+		{Kind: storage.TargetKindAccountPoolGroup, ID: "cancel-secondary"},
+	}, nil)
+	raw := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":"cancel"}`)
+	base := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx, cancel := context.WithCancel(base.Context())
+	req := base.WithContext(ctx)
+	recorder := httptest.NewRecorder()
+	attempts := 0
+	handled := h.app.dispatchUserGroupRouteCandidates(recorder, req, raw, raw, downstreamPolicy{UserGroupID: "ug_cancel_route"}, func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusOK)
+		cancel()
+	})
+	if !handled || attempts != 1 || recorder.Body.Len() != 0 {
+		t.Fatalf("handled=%v attempts=%d downstream_bytes=%d", handled, attempts, recorder.Body.Len())
+	}
+	rows := h.app.diagnosticRouteAttempts()
+	if len(rows) != 1 || rows[0].StatusClass != "request_canceled" {
+		t.Fatalf("route diagnostics=%+v", rows)
+	}
+}
+
+func TestEmptyBoundPoolFailureMigratesToHealthyTarget(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	for _, group := range []string{"empty-bound", "healthy-replacement"} {
+		if err := h.store.CreateGroup(t.Context(), storage.Group{Name: group}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	empty := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: "empty-bound"}
+	healthy := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: "healthy-replacement"}
+	const groupID = "ug_empty_bound_migration"
+	createRouteTestGroup(t, h, groupID, []storage.TargetRef{empty, healthy}, nil)
+	raw := []byte(`{"model":"gpt-5.6-sol","stream":false,"input":"migrate"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("Thread-Id", "empty-bound-root")
+	affinity := routing.ExtractAffinityKey(req, raw)
+	if err := h.store.UpsertUserGroupTargetBinding(t.Context(), storage.UserGroupTargetBinding{
+		UserGroupID: groupID, AffinityKey: affinity.Hash, Target: empty,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	var targets []storage.TargetRef
+	handled := h.app.dispatchUserGroupRouteCandidates(recorder, req, raw, raw, downstreamPolicy{UserGroupID: groupID}, func(w http.ResponseWriter, candidate *http.Request) {
+		target, _ := userGroupRouteOverride(candidate.Context())
+		targets = append(targets, target)
+		if target == empty {
+			h.app.writePublicNoAccountError(candidate.Context(), w, http.StatusServiceUnavailable, empty.ID, "codex", "gpt-5.6-sol", &scheduler.NoAccountError{
+				Group: empty.ID, Model: "gpt-5.6-sol", EmptyPool: true,
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"id": "resp_replacement", "status": "completed"})
+	})
+	if !handled || recorder.Code != http.StatusOK || !reflect.DeepEqual(targets, []storage.TargetRef{empty, healthy}) {
+		t.Fatalf("handled=%v status=%d targets=%+v body=%s", handled, recorder.Code, targets, recorder.Body.String())
+	}
+	binding, found, err := h.store.GetUserGroupTargetBinding(t.Context(), groupID, affinity.Hash, "")
+	if err != nil || !found || binding.Target != healthy {
+		t.Fatalf("replacement binding=%+v found=%v err=%v", binding, found, err)
 	}
 }
 

@@ -12,7 +12,6 @@ import VendorLogo from '../components/VendorLogo.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
-import OrderedEgressSelect from '../components/OrderedEgressSelect.jsx';
 
 const splitModels = (value) => String(value || '')
   .split(/[\n,]/)
@@ -105,20 +104,6 @@ const protocolLabel = (protocol) => {
   return 'OpenAI · Chat';
 };
 
-const egressOptionList = (profiles = []) => {
-  const out = [];
-  const seen = new Set();
-  const add = (profile) => {
-    const id = String(profile?.id || '').trim();
-    if (!id || seen.has(id)) return;
-    seen.add(id);
-    out.push({ label: `${profile.name || id} (${profile.type || 'direct'})`, value: id });
-  };
-  add({ id: 'egress_direct', name: 'egress_direct', type: 'direct' });
-  for (const profile of profiles || []) add(profile);
-  return out;
-};
-
 export const providerFormValues = (row) => ({
   id: row?.id || '',
   name: row?.name || '',
@@ -126,7 +111,6 @@ export const providerFormValues = (row) => ({
   upstream_protocol: row?.upstream_protocol || 'chat_completions',
   transport_profile: row?.transport_profile || 'generic',
   routes: Array.isArray(row?.routes) ? row.routes.map((route) => ({ ...route })) : [],
-  egress_ids: Array.isArray(row?.egress_ids) ? row.egress_ids : [],
   enabled: row?.enabled !== false,
   auto_discover_models: row?.auto_discover_models !== false,
   models_text: joinModels(row?.models),
@@ -143,7 +127,7 @@ export const providerRoutesPayload = (routes) => (Array.isArray(routes) ? routes
   }))
   .filter((route) => route.downstream_path);
 
-export function ProviderEditor({ editor, egressOptions, saving, onCancel, onSave }) {
+export function ProviderEditor({ editor, saving, onCancel, onSave }) {
   const [values, setValues] = useState(() => editor?.values || providerFormValues());
   const transportProfileRefs = useRef([]);
   const setValue = (key, value) => setValues((current) => ({ ...current, [key]: value }));
@@ -255,16 +239,11 @@ export function ProviderEditor({ editor, egressOptions, saving, onCancel, onSave
           </div>
         ))}
       </div>
-      <div className="pool-field pool-field--top">
-        <span className="pool-field__label">有序出口</span>
-        <OrderedEgressSelect
-          value={values.egress_ids}
-          onChange={(egress_ids) => setValue('egress_ids', egress_ids)}
-          options={egressOptions}
-          disabled={saving}
-          help="首项为主出口，先穷尽该提供商的备用出口，再切换用户分组中的其他目标。"
-        />
-      </div>
+      <Banner
+        type="info"
+        title="出口由账号路由决定"
+        description="请求优先使用账号单独指定的出口；账号未单独配置时，严格使用所属账号池分组的唯一出口。提供商不再覆盖出口。"
+      />
       <div className="pool-user-group-grid">
         <label className="pool-inline-switch"><Form.Switch value={values.enabled} onChange={(value) => setValue('enabled', value)} /><span>启用提供商</span></label>
         <label className="pool-inline-switch"><Form.Switch value={values.auto_discover_models} onChange={(value) => setValue('auto_discover_models', value)} /><span>自动发现模型</span></label>
@@ -298,10 +277,6 @@ export default function Providers() {
     return rowsOf(await get('/admin/providers', undefined, { signal }));
   }, []);
   const { data: rows = [], loading, error, lastRefresh, reload: load } = useAsyncResource(fetchRows, [fetchRows], { initialData: [] });
-  const fetchEgressRows = useCallback(async ({ signal }) => rowsOf(await get('/admin/egress-profiles', undefined, { signal })), []);
-  const { data: egressRows = [] } = useAsyncResource(fetchEgressRows, [fetchEgressRows], { initialData: [] });
-  const egressOptions = egressOptionList(egressRows);
-
   const { run: saveProvider, running: savingProvider } = useAsyncAction(async (values) => {
     try {
       const identity = `${values.id || ''} ${values.name || ''}`.toLowerCase();
@@ -322,7 +297,9 @@ export default function Providers() {
         base_url: values.base_url,
         upstream_protocol: upstreamProtocol,
         transport_profile: transportProfile,
-        egress_ids: Array.isArray(values.egress_ids) ? values.egress_ids : [],
+        // Provider-level egress balancing was removed. Clear legacy values whenever
+        // an existing provider is saved so routing remains account/group-owned.
+        egress_ids: [],
         enabled: values.enabled !== false,
         auto_discover_models: values.auto_discover_models !== false,
         models: splitModels(values.models_text),
@@ -455,14 +432,6 @@ export default function Providers() {
       width: 220,
       render: renderModels,
     },
-    {
-      title: '出口',
-      dataIndex: 'egress_ids',
-      width: 180,
-      render: (ids) => Array.isArray(ids) && ids.length
-        ? <TagList items={ids.map((id, index) => `${index === 0 ? '主' : `备${index}`} · ${id}`)} max={3} />
-        : <span className="pool-muted">系统默认</span>,
-    },
     { title: '发现', dataIndex: 'auto_discover_models', width: 72, render: (v) => (v === false ? '关闭' : '开启') },
     { title: '启用', dataIndex: 'enabled', width: 72, render: (v) => (v === false ? '否' : '是') },
     {
@@ -486,7 +455,6 @@ export default function Providers() {
             { label: '协议', value: protocolLabel(row.upstream_protocol) },
             { label: '调用路径', value: row.routes?.length ? `${row.routes.length} 条覆盖` : '默认单路径' },
             { label: '画像', value: row.transport_profile || 'generic' },
-            { label: '出口', value: row.egress_ids?.length ? row.egress_ids.join(' → ') : '系统默认' },
             { label: '模型', value: renderModels(row.models, row) },
             { label: '发现', value: row.auto_discover_models === false ? '关闭' : '开启' },
           ]}
@@ -532,7 +500,7 @@ export default function Providers() {
         footer={null}
         maskClosable={!savingProvider}
       >
-        {editor ? <ProviderEditor key={`${editor.mode}:${editorValues.id}`} editor={{ ...editor, values: editorValues }} egressOptions={egressOptions} saving={savingProvider} onCancel={() => setEditor(null)} onSave={saveProvider} /> : null}
+        {editor ? <ProviderEditor key={`${editor.mode}:${editorValues.id}`} editor={{ ...editor, values: editorValues }} saving={savingProvider} onCancel={() => setEditor(null)} onSave={saveProvider} /> : null}
       </Modal>
 
       <Modal
@@ -546,7 +514,7 @@ export default function Providers() {
           <Form onSubmit={importKey} labelPosition="top">
             <Form.Input field="api_key" label="API Key" mode="password" rules={[{ required: true }]} />
             <Form.Input field="label" label="账号标签" placeholder={importer.name || importer.id} />
-            <div className="pool-field__help">无需配置分组；账号会自动加入系统默认账号池分组并继承其有序出口。</div>
+            <div className="pool-field__help">无需配置分组；账号会自动加入系统默认账号池分组并继承其唯一出口。</div>
             <Button htmlType="submit" theme="solid" loading={importingKey} style={{ marginTop: 12 }}>导入</Button>
           </Form>
         ) : null}
@@ -578,7 +546,7 @@ export default function Providers() {
         {/* 第二句原本写"结果同时显示下游模型与目标模型"，而下面 583 行就是
             `{requested_model} → {target_model}`——等于用文字描述紧邻的界面本身。留下的第一句
             才是看不出来的信息：这不是连通性测试，而是走完整条链路。 */}
-        <div className="pool-field__help">请求会经过该提供商的 Base URL、协议画像、API Key、出口及模型映射。</div>
+        <div className="pool-field__help">请求会经过该提供商的 Base URL、协议画像、API Key 与模型映射；出口由测试账号的单独配置或所属分组决定。</div>
         {testResult ? (
           <div className="pool-resource-summary" style={{ marginTop: 12 }}>
             <strong>{testResult.ok ? '到达成功' : '测试失败'}</strong>

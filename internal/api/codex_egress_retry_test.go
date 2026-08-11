@@ -11,7 +11,7 @@ import (
 	"codex-account-pool/internal/storage"
 )
 
-func TestCodexTransportFailureExhaustsStandbyBeforeFailover(t *testing.T) {
+func TestCodexTransportFailureDoesNotRotateLegacyStandby(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"id":"resp_standby","output_text":"ok"}`)
 	})
@@ -34,12 +34,12 @@ func TestCodexTransportFailureExhaustsStandbyBeforeFailover(t *testing.T) {
 	}
 	raw, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d body=%s", resp.StatusCode, raw)
 	}
 	requests := h.requests()
-	if len(requests) != 1 || requests[0].AccountID != "upstream-standby-transport" {
-		t.Fatalf("standby request changed account or replayed: %+v", requests)
+	if len(requests) != 0 {
+		t.Fatalf("legacy standby reached upstream: %+v", requests)
 	}
 	rows, err := h.store.ListCodexUpstreamAttemptDiagnostics(context.Background())
 	if err != nil {
@@ -58,8 +58,8 @@ func TestCodexTransportFailureExhaustsStandbyBeforeFailover(t *testing.T) {
 	if !statesByEgress["unreachable-primary"]["transport_attempted"] || !statesByEgress["unreachable-primary"]["egress_failure"] {
 		t.Fatalf("primary transport outcome attribution=%v rows=%+v", statesByEgress, rows)
 	}
-	if !statesByEgress[storage.DefaultDirectEgressID]["transport_attempted"] || !statesByEgress[storage.DefaultDirectEgressID]["terminal_success"] {
-		t.Fatalf("standby transport start/terminal not attributed to real exit: %v rows=%+v", statesByEgress, rows)
+	if len(statesByEgress[storage.DefaultDirectEgressID]) != 0 {
+		t.Fatalf("legacy standby received diagnostics despite being ignored: %v rows=%+v", statesByEgress, rows)
 	}
 	outcomes, err := h.store.ListRecentCodexEgressOutcomes(context.Background(), storage.Now()-60)
 	if err != nil {
@@ -68,12 +68,12 @@ func TestCodexTransportFailureExhaustsStandbyBeforeFailover(t *testing.T) {
 	if primary := outcomes["unreachable-primary"]; primary.Attempts != 1 || primary.Successes != 0 {
 		t.Fatalf("primary classified outcome=%+v, want one exit failure", primary)
 	}
-	if standby := outcomes[storage.DefaultDirectEgressID]; standby.Attempts != 1 || standby.Successes != 1 {
-		t.Fatalf("standby classified outcome=%+v, want one terminal success", standby)
+	if _, used := outcomes[storage.DefaultDirectEgressID]; used {
+		t.Fatalf("legacy standby received an outcome: %+v", outcomes[storage.DefaultDirectEgressID])
 	}
 }
 
-func TestCodexRetryable5xxUsesOrderedStandbyOnSameAccount(t *testing.T) {
+func TestCodexRetryable5xxDoesNotRotateLegacyStandby(t *testing.T) {
 	order := make(chan string, 2)
 	primaryProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		order <- "primary"
@@ -105,15 +105,20 @@ func TestCodexRetryable5xxUsesOrderedStandbyOnSameAccount(t *testing.T) {
 	}
 	raw, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d body=%s", resp.StatusCode, raw)
 	}
-	if first, second := <-order, <-order; first != "primary" || second != "standby" {
-		t.Fatalf("egress order = [%s %s], want [primary standby]", first, second)
+	if first := <-order; first != "primary" {
+		t.Fatalf("egress order starts with %q, want primary", first)
+	}
+	select {
+	case extra := <-order:
+		t.Fatalf("request rotated to legacy standby %q", extra)
+	default:
 	}
 	requests := h.requests()
-	if len(requests) != 1 || requests[0].AccountID != "upstream-standby-5xx" {
-		t.Fatalf("standby request changed account or replayed: %+v", requests)
+	if len(requests) != 0 {
+		t.Fatalf("legacy standby reached upstream: %+v", requests)
 	}
 	outcomes, err := h.store.ListRecentCodexEgressOutcomes(context.Background(), storage.Now()-60)
 	if err != nil {
@@ -122,18 +127,20 @@ func TestCodexRetryable5xxUsesOrderedStandbyOnSameAccount(t *testing.T) {
 	if primary := outcomes["failing-primary"]; primary.Attempts != 1 || primary.Successes != 0 {
 		t.Fatalf("retry-triggering 5xx outcome=%+v, want exactly one primary failure", primary)
 	}
-	if standby := outcomes[storage.DefaultDirectEgressID]; standby.Attempts != 1 || standby.Successes != 1 {
-		t.Fatalf("5xx standby outcome=%+v, want one terminal success", standby)
+	if _, used := outcomes[storage.DefaultDirectEgressID]; used {
+		t.Fatalf("legacy standby received an outcome: %+v", outcomes[storage.DefaultDirectEgressID])
 	}
 }
 
-func TestCodexStandbyEdgeOnly5xxIsNotEgressFailure(t *testing.T) {
+func TestCodexOrdinary5xxNeverReachesLegacyEdgeStandby(t *testing.T) {
 	primaryProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = io.WriteString(w, `{"error":{"message":"ordinary upstream 5xx"}}`)
 	}))
 	defer primaryProxy.Close()
+	edgeHits := make(chan struct{}, 1)
 	edgeProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		edgeHits <- struct{}{}
 		w.Header().Set("cf-ray", "edge-only-standby")
 		w.Header().Set("content-type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -165,8 +172,16 @@ func TestCodexStandbyEdgeOnly5xxIsNotEgressFailure(t *testing.T) {
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	select {
+	case <-edgeHits:
+		t.Fatal("ordinary 5xx rotated to legacy edge standby")
+	default:
+	}
+	if requests := h.requests(); len(requests) != 0 {
+		t.Fatalf("final legacy direct standby reached upstream: %+v", requests)
 	}
 	outcomes, err := h.store.ListRecentCodexEgressOutcomes(context.Background(), storage.Now()-60)
 	if err != nil {
@@ -175,10 +190,10 @@ func TestCodexStandbyEdgeOnly5xxIsNotEgressFailure(t *testing.T) {
 	if primary := outcomes["ordinary-5xx-primary"]; primary.Attempts != 1 || primary.Successes != 0 {
 		t.Fatalf("ordinary primary 5xx outcome=%+v", primary)
 	}
-	if _, classified := outcomes["edge-only-5xx-standby"]; classified {
-		t.Fatalf("edge-only standby response depressed exit probability: %+v", outcomes["edge-only-5xx-standby"])
+	if _, used := outcomes["edge-only-5xx-standby"]; used {
+		t.Fatalf("legacy edge standby received an outcome: %+v", outcomes["edge-only-5xx-standby"])
 	}
-	if final := outcomes[storage.DefaultDirectEgressID]; final.Attempts != 1 || final.Successes != 1 {
-		t.Fatalf("final standby outcome=%+v", final)
+	if _, used := outcomes[storage.DefaultDirectEgressID]; used {
+		t.Fatalf("legacy direct standby received an outcome: %+v", outcomes[storage.DefaultDirectEgressID])
 	}
 }
