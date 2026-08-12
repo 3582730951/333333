@@ -42,6 +42,33 @@ type guardedWebSocketReader struct {
 	reader *bytes.Reader
 }
 
+func TestCodexResponsesWebSocketHTTPSModesKeepRecoverySeparate(t *testing.T) {
+	preferred := NewCodexResponsesWebSocketSession()
+	preferred.PreferHTTPS()
+	if !preferred.UseHTTPSFallback() {
+		t.Fatal("preferred HTTPS did not select the HTTP/SSE bridge")
+	}
+	if preferred.HTTPSFallbackNeedsRecovery() {
+		t.Fatal("first-turn HTTPS preference manufactured a WebSocket recovery")
+	}
+
+	failed := NewCodexResponsesWebSocketSession()
+	failed.MarkHTTPSFallback()
+	if !failed.UseHTTPSFallback() || !failed.HTTPSFallbackNeedsRecovery() {
+		t.Fatal("WebSocket failure did not retain its pending context recovery")
+	}
+	// Selecting the already-active HTTPS transport on the retry must not erase
+	// the pending recovery before a real HTTP terminal is observed.
+	failed.PreferHTTPS()
+	if !failed.HTTPSFallbackNeedsRecovery() {
+		t.Fatal("HTTPS transport selection cleared recovery before completion")
+	}
+	failed.CompleteHTTPSRecovery()
+	if !failed.UseHTTPSFallback() || failed.HTTPSFallbackNeedsRecovery() {
+		t.Fatal("completed recovery did not become a native HTTPS continuation")
+	}
+}
+
 func (r *guardedWebSocketReader) Read(payload []byte) (int, error) {
 	r.source.mu.Lock()
 	if len(payload) > r.source.maxReadBuffer {

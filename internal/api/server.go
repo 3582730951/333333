@@ -1098,7 +1098,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		s.tryServeAutoKiroGPT(w, r, kiroRaw, bodyMetaForView(capturedMeta, originalRaw, kiroRaw), model, affinityGroup, isChat, isCompact, pol) {
 		return
 	}
-	// CPA-style stateless passthrough (default). Make every native Codex turn
+	// Explicit CPA-style stateless compatibility mode. Make native Codex turns
 	// self-contained so ANY account can serve it and seamless failover is lossless:
 	// strip the two server-side-state signals the client carries — previous_response_id
 	// (body) and x-codex-turn-state (header). degradedResponsesReplay removes both from
@@ -1111,26 +1111,19 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// to see cannot arise. Chat completions carry their history in `messages` and never
 	// hold server-side state, so they are unaffected.
 	if !isChat && s.codexStatelessPassthrough(r.Context()) && serverSideStateWithMeta(path, r, raw, bodyMetaForView(capturedMeta, originalRaw, raw)) {
-		if codexResponsesWebSocketUsesHTTPSFallback(r.Context()) {
+		if codexResponsesWebSocketNeedsHTTPSRecovery(r.Context()) {
 			// response.append carries only the current delta. After its persistent
 			// upstream WebSocket has failed, simply deleting previous_response_id
 			// would silently discard the earlier turns (and can orphan tool outputs).
 			// Rebuild the durable goal/journal into one self-contained HTTP request,
-			// then keep all later turns on the stateless HTTPS bridge.
+			// then use its completed HTTP response as the native continuation point.
 			contextError := leakfilter.ResponsesContextErrorPreviousResponseNotFound
 			retry, mode, recovered := s.recoverResponsesContext(r.Context(), raw, r.Header, contextError)
-			// The HTTPS bridge is explicitly stateless. A degraded recovery has
-			// already converted an orphaned client tool output into inert user
-			// context while preserving its result; re-check the recovered payload,
-			// not the original stateful append. Checking the original made every
-			// valid WebSocket-to-HTTPS fallback loop forever on
-			// codex_tool_context_unrecoverable even though the retry was safe.
-			unpaired := recovered && responsesHasUnpairedToolOutput(retry.Raw, leakfilter.ResponsesContextErrorNone)
-			if !recovered || unpaired {
-				code := "codex_context_epoch_retired"
-				if unpaired {
-					code = codexMappingErrorCode(errCodexToolContextUnrecoverable)
-				}
+			// An orphaned tool result must never be converted into a user message:
+			// that makes a payload such as {} look like the entire new prompt and
+			// causes an upstream model to describe the empty result instead of
+			// continuing the task. Only a lossless replay may move such a result.
+			if code := codexHTTPSFallbackRecoveryErrorCode(raw, retry, mode, recovered, contextError); code != "" {
 				s.auditCodexMappingFailure(r.Context(), code)
 				s.writeCodexSessionMappingError(w, isStreamRequest(raw), code)
 				return
@@ -1150,6 +1143,16 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 				Detail: "stateless_http_replay",
 			})
 		} else {
+			// This opt-in mode may discard previous_response_id for ordinary text,
+			// but it must not relabel a detached tool result as user input. Without
+			// its matching call, an output like {} is semantically meaningless and
+			// can provoke a false upstream answer about the script returning no data.
+			if responsesHasUnpairedToolOutput(raw, leakfilter.ResponsesContextErrorPreviousResponseNotFound) {
+				code := codexMappingErrorCode(errCodexToolContextUnrecoverable)
+				s.auditCodexMappingFailure(r.Context(), code)
+				s.writeCodexSessionMappingError(w, isStreamRequest(raw), code)
+				return
+			}
 			raw = degradedResponsesReplay(raw)
 			if r.Header.Get("X-Codex-Turn-State") != "" {
 				r = r.Clone(r.Context())
@@ -1872,7 +1875,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		codexUseWebSocket = false
 	}
 	if forceCodexResponsesWebSocket(r.Context()) && webSocketSession != nil && !codexUseWebSocket {
-		webSocketSession.MarkHTTPSFallback()
+		webSocketSession.PreferHTTPS()
 	}
 	requestForTokenWithIdentity := func(t storage.AccountToken, requestBody []byte, requestHeaders http.Header, requestIdentity *upstream.CodexIdentitySnapshot) upstream.Request {
 		requestOSHint := osHint
@@ -3466,11 +3469,10 @@ func codexRemoteCompactionV2Request(r *http.Request, requestBody []byte) bool {
 // this state is used exclusively to migrate a tree whose bound account or upstream
 // previous_response_id became unavailable.
 func (s *Server) persistCodexGoalContinuity(ctx context.Context, r *http.Request, requestBody, responseBody []byte) {
-	// A downstream WebSocket that has switched permanently to HTTPS rebuilds each
-	// response.append as a self-contained turn and intentionally disables native
-	// session mapping. It still needs the encrypted Goal chain advanced so the next
-	// append can resolve the just-completed HTTP response id without losing history.
-	if (!s.codexSessionMappingEnabled(ctx) && !codexResponsesWebSocketUsesHTTPSFallback(ctx)) || !s.goalContinuityEnabled(ctx) {
+	// The one recovery turn after a WebSocket-to-HTTPS transition temporarily
+	// disables native session mapping. It still needs the encrypted Goal chain
+	// advanced so a failed retry can be resumed without losing history.
+	if (!s.codexSessionMappingEnabled(ctx) && !codexResponsesWebSocketNeedsHTTPSRecovery(ctx)) || !s.goalContinuityEnabled(ctx) {
 		return
 	}
 	if _, err := s.persistGoalContinuity(ctx, r, "codex", requestBody, responseBody); err != nil {

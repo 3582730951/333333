@@ -516,13 +516,8 @@ func diskGuardChanged(previous, current DiskGuardSnapshot) bool {
 		previous.JournalWritable != current.JournalWritable ||
 		previous.SpoolWritable != current.SpoolWritable ||
 		previous.AdmissionBlocked != current.AdmissionBlocked ||
-		previous.ContextsDeleted != current.ContextsDeleted ||
-		previous.GoalsDeleted != current.GoalsDeleted ||
-		previous.GoalBytesReclaimed != current.GoalBytesReclaimed ||
 		previous.GoalStorageTargetBytes != current.GoalStorageTargetBytes ||
 		previous.GoalStorageReserveBytes != current.GoalStorageReserveBytes ||
-		previous.CodexMappingsDeleted != current.CodexMappingsDeleted ||
-		previous.RouteBindingsDeleted != current.RouteBindingsDeleted ||
 		previous.LastError != current.LastError
 }
 

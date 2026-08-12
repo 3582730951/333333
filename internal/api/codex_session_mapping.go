@@ -419,13 +419,12 @@ func (s *Server) codexStatelessPassthrough(ctx context.Context) bool {
 	// optimization for zero stability gain and cannot produce the cross-account 409/400
 	// this mode exists to prevent, so stateless passthrough never applies to a WS turn.
 	//
-	// Once that upstream connection has failed and the session has permanently switched
-	// to the HTTPS bridge, the premise is reversed: completeAppend's response id is
-	// connection-scoped and the HTTP transport rejects it. Force the fallback leg through
-	// the lossless stateless rebuild path regardless of the operator's ordinary HTTP
-	// setting. This also disables fresh CPA mappings for later turns on that bridge.
+	// Once that upstream connection has failed, the first HTTPS turn must replace
+	// its connection-scoped response id with a lossless durable replay. A completed
+	// HTTP response then becomes the native continuation point, so later HTTPS turns
+	// keep mapping enabled and must not rebuild the full history again.
 	if forceCodexResponsesWebSocket(ctx) {
-		return codexResponsesWebSocketUsesHTTPSFallback(ctx)
+		return codexResponsesWebSocketNeedsHTTPSRecovery(ctx)
 	}
 	return s.flagEnabled(ctx, "codex_stateless_passthrough", s.cfg.CodexStatelessPassthrough)
 }

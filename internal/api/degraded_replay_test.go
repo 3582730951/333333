@@ -219,7 +219,7 @@ func TestResponsesRecoveryEligibleForTurnStateHeaderOnly(t *testing.T) {
 	}
 }
 
-func TestStatelessHTTPSFallbackRecoveryNeutralizesOriginalOrphan(t *testing.T) {
+func TestStatelessHTTPSFallbackRecoveryNeverAdmitsNeutralizedOriginalOrphan(t *testing.T) {
 	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
 	body := []byte(`{"model":"gpt","previous_response_id":"resp_lost_ws","input":[{"type":"custom_tool_call_output","call_id":"call_finished","output":"preserve this result"}]}`)
 	retry, mode, recovered := h.app.recoverResponsesContext(
@@ -230,6 +230,9 @@ func TestStatelessHTTPSFallbackRecoveryNeutralizesOriginalOrphan(t *testing.T) {
 	)
 	if !recovered || mode != "degraded" {
 		t.Fatalf("fallback recovery mode=%q recovered=%v", mode, recovered)
+	}
+	if code := codexHTTPSFallbackRecoveryErrorCode(body, retry, mode, recovered, leakfilter.ResponsesContextErrorPreviousResponseNotFound); code != "codex_tool_context_unrecoverable" {
+		t.Fatalf("degraded orphan admission code=%q", code)
 	}
 	if responsesHasUnpairedToolOutput(retry.Raw, leakfilter.ResponsesContextErrorNone) {
 		t.Fatalf("recovered HTTPS payload still has an orphaned tool output: %s", retry.Raw)

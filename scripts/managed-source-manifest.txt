@@ -903,6 +903,7 @@ scripts/maintenance/reclaim-disk-space.sh
 scripts/maintenance/reclaim-space-now.sh
 scripts/managed-source-manifest.txt
 scripts/prune-managed-source.sh
+scripts/reap-old-release.sh
 scripts/rollback-release.sh
 scripts/selftest.sh
 scripts/test-install-single-worker.sh

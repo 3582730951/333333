@@ -110,6 +110,9 @@ func TestUsageLimitCooldown(t *testing.T) {
 	if usageLimitCooldown(429, []byte(`{"error":"You exceeded your current quota"}`)) != 1800 {
 		t.Fatal("quota signal → 1800s")
 	}
+	if usageLimitCooldown(402, []byte(`{"error":"balance exhausted"}`)) != 1800 {
+		t.Fatal("payment required → 1800s")
+	}
 	if usageLimitCooldown(401, []byte(`{"error":{"type":"usage_limit_reached"}}`)) != 1800 {
 		t.Fatal("usage_limit body → 1800s even on 401")
 	}

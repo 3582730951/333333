@@ -454,6 +454,14 @@ func TestDiagnosticArtifactGCUsesTrashAndRefusesSymlinks(t *testing.T) {
 	if err != nil || persisted.State != storage.StorageResourceDeleted {
 		t.Fatalf("regular resource=%+v err=%v", persisted, err)
 	}
+	var severity string
+	var diagnosticGap int
+	if err := h.store.DB().QueryRowContext(ctx, `SELECT severity,diagnostic_gap FROM diagnostic_events WHERE event_type='storage_gc' ORDER BY created_at DESC LIMIT 1`).Scan(&severity, &diagnosticGap); err != nil {
+		t.Fatal(err)
+	}
+	if severity != "info" || diagnosticGap != 0 {
+		t.Fatalf("normal diagnostic GC severity/gap=%q/%d, want info/0", severity, diagnosticGap)
+	}
 
 	outside := filepath.Join(t.TempDir(), "outside")
 	if err := os.WriteFile(outside, []byte("must remain"), 0o600); err != nil {

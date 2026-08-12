@@ -397,7 +397,7 @@ export DO_NOT_TRACK=1                               # 额外关会话质量问�
 把整个项目文件夹重新上传到 VPS 覆盖后，在项目目录里执行：
 
 ```bash
-sudo ./update.sh             # 清空编译缓存 + 全量重编译 + 重装(含内嵌 UI/sidecar) + 重启
+sudo ./update.sh             # 清空编译缓存 + 全量重编译 + 重装(含内嵌 UI/sidecar) + 原子热切换
 sudo ./update.sh --minimal   # 只更新 Go 网关
 sudo ./update.sh --no-tests  # 跳过 go test，加快更新
 sudo ./update.sh --open-firewall  # 顺便在 ufw/firewalld 放行监听端口
@@ -410,11 +410,15 @@ sudo ./update.sh --open-firewall  # 顺便在 ufw/firewalld 放行监听端口
   少量行，占空间的是用量/账本历史，压缩后通常只剩零头。备份前会做**磁盘空间预检**：空间不足会直接中止
   （不会半途部署或塞满磁盘），可按提示清盘、`BACKUP_DIR=<更大分区>`、或 `SKIP_BACKUP=1` 后重试。
   恢复：停服后 `gunzip -c <备份>.sqlite3.gz > <db路径>` 再启动。
+- **安装不等待长连接**：构建和安装期间旧版本继续服务；新 worker 通过健康检查后，稳定 handoff 在一个极短的
+  admission barrier 内原子切换，新请求立即进入新版本。切换前已经建立的 HTTP/SSE/WebSocket 连接继续由旧
+  worker 完成，`install.sh` 不等待它们；独立的 systemd reaper 在后台确认旧 worker 的 inflight 稳定归零后，
+  再优雅停止旧进程并删除旧 socket、unit 状态、release 目录和失效的 `previous` 链接，全程不使用强制终止。
 - **可调环境变量**：`LISTEN_ADDR`、`BACKUP_DIR`、`BACKUP_KEEP`（默认 10）、`SKIP_BACKUP=1`、
   `CLEAN_MODCACHE=1`、`DATA_DIR`/`DATABASE_PATH`/`SERVICE_NAME`（一般无需设置，脚本会从 systemd 单元自动发现）。
 
 **为什么以后加新功能也不用改 `update.sh`**：它是**通用脚本**——只做「备份账号 → 清缓存 → 调用项目内的
 `scripts/install.sh` 从源码重编译重装 → 重启 → 校验」。新功能随文件夹一起上传即可，因为：①二进制每次从
 当前源码全量重编译（含内嵌 UI）；②新增的数据库表/列由启动时的**幂等增量迁移**自动建好，新增配置项由
-`normalize()` 自动填默认值；③构建/部署的所有步骤都集中在随项目上传的 `install.sh` 里。所以无论日后加什么
+`normalize()` 自动填默认值；③构建/部署、原子切流与后台回收都集中在随项目上传的 `install.sh` 里。所以无论日后加什么
 功能，流程始终是「覆盖文件夹 → `sudo ./update.sh`」一条命令，`update.sh` 本身保持不变。

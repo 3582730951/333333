@@ -1985,6 +1985,7 @@ func TestDownstreamResponsesWebSocketRejectsInvalidUpstreamResponseContract(t *t
 }
 
 func TestDownstreamResponsesWebSocketBridgesPersistentHTTPSFallback(t *testing.T) {
+	const callID = "call-empty-script-result"
 	var webSocketAttempts atomic.Int32
 	var httpAttempts atomic.Int32
 	upgrader := websocket.Upgrader{}
@@ -2007,7 +2008,7 @@ func TestDownstreamResponsesWebSocketBridgesPersistentHTTPSFallback(t *testing.T
 				t.Errorf("fresh upstream root carried previous_response_id: %s", root)
 				return
 			}
-			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_ws_1","object":"response","model":"gpt-5.5","status":"completed","output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_ws_1","object":"response","model":"gpt-5.5","status":"completed","output":[{"type":"custom_tool_call","id":"ctc-empty-script-result","call_id":"`+callID+`","name":"exec","input":"{}"}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`))
 			for {
 				_, continuation, readErr := conn.ReadMessage()
 				if readErr != nil {
@@ -2027,20 +2028,30 @@ func TestDownstreamResponsesWebSocketBridgesPersistentHTTPSFallback(t *testing.T
 		case http.MethodPost:
 			attempt := httpAttempts.Add(1)
 			body, _ := io.ReadAll(r.Body)
-			if bytes.Contains(body, []byte(`"previous_response_id"`)) || r.Header.Get("X-Codex-Turn-State") != "" {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusBadRequest)
-				_, _ = io.WriteString(w, `{"error":{"message":"{\"detail\":\"Unsupported parameter: previous_response_id\"}","type":"upstream_error"},"status":400,"type":"error"}`)
-				return
-			}
-			if !bytes.Contains(body, []byte(`"name":"tool_search"`)) || !bytes.Contains(body, []byte("SKILL.md")) {
-				t.Errorf("HTTPS bridge lost Codex skills/tool payload: %s", body)
+			if bytes.Contains(body, []byte("[Earlier tool result]")) || bytes.Contains(body, []byte("Script completed successfully")) {
+				t.Errorf("HTTPS bridge degraded the tool result into user text: %s", body)
 			}
 			servedTurn := attempt + 1
-			for turn := int32(1); turn <= servedTurn; turn++ {
-				if !bytes.Contains(body, []byte(fmt.Sprintf("turn %d", turn))) {
-					t.Errorf("HTTPS turn %d was not rebuilt with turn %d: %s", servedTurn, turn, body)
+			if attempt == 1 {
+				if bytes.Contains(body, []byte(`"previous_response_id"`)) || r.Header.Get("X-Codex-Turn-State") != "" {
+					t.Errorf("first HTTPS recovery retained WebSocket state: %s", body)
 				}
+				callIndex := bytes.Index(body, []byte(`"type":"custom_tool_call"`))
+				outputIndex := bytes.Index(body, []byte(`"type":"custom_tool_call_output"`))
+				if callIndex < 0 || outputIndex <= callIndex || bytes.Count(body, []byte(callID)) != 2 || !bytes.Contains(body, []byte(`"output":"{}"`)) {
+					t.Errorf("lossless HTTPS recovery did not preserve the empty tool result and its call: %s", body)
+				}
+			} else {
+				wantPrevious := fmt.Sprintf(`"previous_response_id":"resp_https_%d"`, servedTurn-1)
+				if !bytes.Contains(body, []byte(wantPrevious)) {
+					t.Errorf("native HTTPS turn %d lost %s: %s", servedTurn, wantPrevious, body)
+				}
+				if bytes.Contains(body, []byte(callID)) {
+					t.Errorf("native HTTPS turn %d rebuilt old tool history again: %s", servedTurn, body)
+				}
+			}
+			if !bytes.Contains(body, []byte(fmt.Sprintf("turn %d", servedTurn))) && attempt > 1 {
+				t.Errorf("native HTTPS turn %d lost its current input: %s", servedTurn, body)
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = fmt.Fprintf(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_https_%d\",\"object\":\"response\",\"model\":\"gpt-5.5\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\ndata: [DONE]\n\n", servedTurn)
@@ -2104,7 +2115,12 @@ func TestDownstreamResponsesWebSocketBridgesPersistentHTTPSFallback(t *testing.T
 		if turn > 1 {
 			requestType = "response.append"
 		}
-		request := fmt.Sprintf(`{"type":%q,"model":"gpt-5.5","input":[{"role":"developer","content":"Use the repository SKILL.md instructions."},{"role":"user","content":"turn %d"}],"tools":[{"type":"function","name":"tool_search","description":"Find an installed skill","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}],"stream":true}`, requestType, turn)
+		request := ""
+		if turn == 2 {
+			request = fmt.Sprintf(`{"type":%q,"model":"gpt-5.5","input":[{"type":"custom_tool_call_output","call_id":%q,"output":"{}"}],"stream":true}`, requestType, callID)
+		} else {
+			request = fmt.Sprintf(`{"type":%q,"model":"gpt-5.5","input":[{"role":"developer","content":"Use the repository SKILL.md instructions."},{"role":"user","content":"turn %d"}],"tools":[{"type":"custom","name":"exec","description":"Run a script","format":{"type":"text"}}],"stream":true}`, requestType, turn)
+		}
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
 			t.Fatal(err)
 		}
@@ -2114,7 +2130,103 @@ func TestDownstreamResponsesWebSocketBridgesPersistentHTTPSFallback(t *testing.T
 		t.Fatalf("known-broken upstream WebSocket was retried %d times", got)
 	}
 	if got := httpAttempts.Load(); got != 3 {
-		t.Fatalf("HTTPS bridge attempts=%d, want one rebuilt request for turns 2 through 4", got)
+		t.Fatalf("HTTPS bridge attempts=%d, want one recovery and two native continuations", got)
+	}
+}
+
+func TestDownstreamResponsesWebSocketPreferredSidecarHTTPSKeepsNativeToolContext(t *testing.T) {
+	const callID = "call-sidecar-empty-result"
+	var sidecarAttempts atomic.Int32
+	secondBodyCh := make(chan []byte, 1)
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/proxy" {
+			t.Errorf("sidecar path=%s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		attempt := sidecarAttempts.Add(1)
+		responseID := "resp_sidecar_1"
+		output := `[{"type":"custom_tool_call","id":"ctc-sidecar-empty-result","call_id":"` + callID + `","name":"exec","input":"{}"}]`
+		if attempt == 1 {
+			if bytes.Contains(body, []byte(`"previous_response_id"`)) {
+				t.Errorf("first preferred-HTTPS request carried prior state: %s", body)
+			}
+		} else {
+			secondBodyCh <- append([]byte(nil), body...)
+			responseID = "resp_sidecar_2"
+			output = `[]`
+		}
+		upstreamHeaders, _ := json.Marshal(http.Header{"Content-Type": []string{"text/event-stream"}})
+		w.Header().Set("x-sidecar-upstream-status", "200")
+		w.Header().Set("x-sidecar-upstream-headers-b64", base64.StdEncoding.EncodeToString(upstreamHeaders))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":%q,\"object\":\"response\",\"model\":\"gpt-5.5\",\"status\":\"completed\",\"output\":%s,\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\ndata: [DONE]\n\n", responseID, output)
+	}))
+	defer sidecar.Close()
+
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {
+		t.Error("sidecar-bound WebSocket turn reached the direct upstream")
+	})
+	enableCodexSessionMappingForTest(h)
+	accountID := h.importAccount(t, "preferred-sidecar-https", "upstream-preferred-sidecar-https", "access-preferred-sidecar-https")
+	bindSidecarEgress(t, h, accountID, sidecar.URL)
+
+	wsURL := "ws" + strings.TrimPrefix(h.pool.URL, "http") + "/v1/responses"
+	header := http.Header{}
+	header.Set("Session-Id", "client-preferred-sidecar-https")
+	header.Set("Thread-Id", "client-preferred-sidecar-https")
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		if response != nil && response.Body != nil {
+			body, _ := io.ReadAll(response.Body)
+			response.Body.Close()
+			t.Fatalf("downstream dial: %v status=%d body=%s", err, response.StatusCode, body)
+		}
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	writeAndWait := func(request, responseID string) {
+		t.Helper()
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		for {
+			_, event, readErr := conn.ReadMessage()
+			if readErr != nil {
+				t.Fatalf("read %s: %v", responseID, readErr)
+			}
+			if bytes.Contains(event, []byte(`"type":"response.completed"`)) {
+				if !bytes.Contains(event, []byte(responseID)) {
+					t.Fatalf("completed event=%s, want %s", event, responseID)
+				}
+				return
+			}
+			if bytes.Contains(event, []byte(`"type":"response.failed"`)) || bytes.Contains(event, []byte(`"type":"error"`)) {
+				t.Fatalf("terminal error while waiting for %s: %s", responseID, event)
+			}
+		}
+	}
+	writeAndWait(`{"type":"response.create","model":"gpt-5.5","input":"run the script","tools":[{"type":"custom","name":"exec","description":"Run a script","format":{"type":"text"}}],"stream":true}`, "resp_sidecar_1")
+	writeAndWait(`{"type":"response.append","model":"gpt-5.5","input":[{"type":"custom_tool_call_output","call_id":"`+callID+`","output":"{}"}],"stream":true}`, "resp_sidecar_2")
+
+	if sidecarAttempts.Load() != 2 {
+		t.Fatalf("sidecar attempts=%d, want 2", sidecarAttempts.Load())
+	}
+	secondBody := <-secondBodyCh
+	if !bytes.Contains(secondBody, []byte(`"previous_response_id":"resp_sidecar_1"`)) ||
+		!bytes.Contains(secondBody, []byte(`"type":"custom_tool_call_output"`)) ||
+		!bytes.Contains(secondBody, []byte(`"output":"{}"`)) ||
+		bytes.Contains(secondBody, []byte("[Earlier tool result]")) {
+		t.Fatalf("preferred HTTPS changed native tool continuation: %s", secondBody)
+	}
+	var migrations int
+	if err := h.store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM audit_log WHERE action='codex_context_migrated' AND reason='websocket_https_fallback'`).Scan(&migrations); err != nil {
+		t.Fatal(err)
+	}
+	if migrations != 0 {
+		t.Fatalf("preferred first-turn HTTPS manufactured %d WebSocket migrations", migrations)
 	}
 }
 
@@ -2866,6 +2978,30 @@ func TestCodexStatelessPassthroughSurvivesDeadBoundAccount(t *testing.T) {
 		if upstreamTurnStates[i] != "" {
 			t.Fatalf("upstream attempt %d leaked X-Codex-Turn-State=%q", i, upstreamTurnStates[i])
 		}
+	}
+}
+
+func TestCodexStatelessPassthroughRejectsOrphanedEmptyToolResult(t *testing.T) {
+	var upstreamAttempts atomic.Int32
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {
+		upstreamAttempts.Add(1)
+	})
+	h.app.cfg.CodexStatelessPassthrough = true
+	h.importAccount(t, "stateless-orphan", "upstream-stateless-orphan", "access-stateless-orphan")
+
+	request := `{"model":"gpt","stream":true,"previous_response_id":"resp_missing_call","input":[{"type":"custom_tool_call_output","call_id":"call_missing","output":"{}"}]}`
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"type":"response.failed"`)) ||
+		!bytes.Contains(body, []byte(`"code":"codex_tool_context_unrecoverable"`)) {
+		t.Fatalf("unsafe stateless tool result status=%d body=%s", resp.StatusCode, body)
+	}
+	if upstreamAttempts.Load() != 0 || bytes.Contains(body, []byte("Script completed successfully")) {
+		t.Fatalf("orphan reached upstream or produced a false answer: attempts=%d body=%s", upstreamAttempts.Load(), body)
 	}
 }
 

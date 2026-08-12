@@ -446,6 +446,10 @@ func bodySnippet(body []byte, n int) string {
 // usageLimitCooldown returns how many seconds to bench an account whose upstream
 // response indicates a usage/rate limit. Returns 0 when not a limit.
 func usageLimitCooldown(status int, body []byte) int64 {
+	if status == http.StatusPaymentRequired {
+		log.Printf("[RATE-LIMIT-DETECT] status=402 body_len=%d", len(body))
+		return 1800
+	}
 	if usageLimitSignal(body) {
 		log.Printf("[RATE-LIMIT-DETECT] matched rate/quota signal status=%d body_len=%d", status, len(body))
 		return 1800
@@ -475,7 +479,7 @@ func usageLimitSignal(body []byte) bool {
 // Cloudflare-derived controls. Authentication failures and ordinary request
 // errors remain visible and retain their existing remediation behavior.
 func ignoresRateLimitControls(status int, header http.Header, body []byte) bool {
-	if status == http.StatusTooManyRequests || usageLimitSignal(body) {
+	if status == http.StatusPaymentRequired || status == http.StatusTooManyRequests || usageLimitSignal(body) {
 		return true
 	}
 	return cf.Detect(status, header, body).Matched

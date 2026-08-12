@@ -606,3 +606,20 @@ func (s *Server) recoverResponsesContext(ctx context.Context, body []byte, heade
 		Header: stripCodexServerStateHeaders(header),
 	}, "degraded", true
 }
+
+// codexHTTPSFallbackRecoveryErrorCode is the final admission gate before a
+// WebSocket continuation is replayed over HTTPS. Degraded replay is acceptable
+// for ordinary text deltas, but never for an orphaned client tool result: turning
+// that result into user text makes values such as {} look like the whole prompt.
+func codexHTTPSFallbackRecoveryErrorCode(body []byte, retry codexRetryRequest, mode string, recovered bool, contextError leakfilter.ResponsesContextErrorKind) string {
+	originalOrphan := responsesHasUnpairedToolOutput(body, contextError)
+	unpairedRetry := recovered && responsesHasUnpairedToolOutput(retry.Raw, leakfilter.ResponsesContextErrorNone)
+	unsafeDegradedToolResult := recovered && mode != "rebuilt" && originalOrphan
+	if recovered && !unpairedRetry && !unsafeDegradedToolResult {
+		return ""
+	}
+	if originalOrphan || unpairedRetry {
+		return codexMappingErrorCode(errCodexToolContextUnrecoverable)
+	}
+	return "codex_context_epoch_retired"
+}

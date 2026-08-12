@@ -226,25 +226,109 @@ PY
 }
 
 test_lossless_upgrade_contract() {
-  local activate_body legacy_body reauth_body systemd_body cleanup_body
+  local activate_body legacy_body reauth_body systemd_body cleanup_body reaper_body schedule_body
   activate_body="$(sed -n '/^activate_staged_release()/,/^}/p' scripts/install.sh)"
   legacy_body="$(sed -n '/^destroy_legacy_worker_process()/,/^}/p' scripts/install.sh)"
   reauth_body="$(sed -n '/^activate_codex_reauth_worker()/,/^}/p' scripts/install.sh)"
   systemd_body="$(sed -n '/^install_systemd_unit()/,/^}/p' scripts/install.sh)"
   cleanup_body="$(sed -n '/^deployment_exit_cleanup()/,/^}/p' scripts/install.sh)"
+  schedule_body="$(sed -n '/^schedule_release_reaper()/,/^}/p' scripts/install.sh)"
+  reaper_body="$(cat scripts/reap-old-release.sh)"
 
   [[ "$activate_body" == *'pause_handoff_admission'* && "$activate_body" == *'resume_handoff_admission'* ]] ||
     die "release activation does not bracket the switch with admission pause/resume"
-  [[ "$activate_body" == *'while true; do'* && "$activate_body" == *'preserving them until natural completion'* ]] ||
-    die "release activation still has a destructive in-flight drain deadline"
+  [[ "$activate_body" == *'schedule_release_reaper'* && "$activate_body" == *'reclaimed asynchronously'* ]] ||
+    die "release activation does not delegate the old worker to a background reaper"
+  [[ "$activate_body" == *'resume_handoff_admission'*'schedule_release_reaper'* && "$schedule_body" == *'systemctl enable'* && "$schedule_body" == *'systemctl start --no-block'* ]] ||
+    die "old-release drain starts before cutover completes or blocks install.sh"
+  [[ "$activate_body" != *'while true; do'* && "$activate_body" != *'worker_inflight'* && "$activate_body" != *'destroy_worker_instance "$old_worker_release"'* ]] ||
+    die "install.sh still waits for or destroys the old worker synchronously"
   [[ "$legacy_body" != *'SIGKILL'* && "$legacy_body" == *'preserving it instead of forcing client-visible errors'* ]] ||
     die "legacy upgrade can still force-kill established connections"
   [[ "$reauth_body" != *'systemctl restart'* && "$reauth_body" == *'next cold start'* ]] ||
     die "upgrade still hot-restarts the active Codex reauth worker"
   [[ "$systemd_body" != *'systemctl restart "${SERVICE_NAME}-sidecar.service"'* && "$systemd_body" == *'Sidecar update staged'* ]] ||
     die "upgrade still hot-restarts the shared sidecar"
+  [[ "$systemd_body" == *'${SERVICE_NAME}-reaper@.service'* && "$systemd_body" == *'TimeoutStopSec=infinity'* ]] ||
+    die "systemd units do not preserve an unbounded background graceful drain"
+  [[ "$systemd_body" != *'reclaim_superseded_install_resources "$RELEASE_ID"'* ]] ||
+    die "systemd installation still performs synchronous old-release reclamation"
+  [[ "$reaper_body" == *'worker_inflight'* && "$reaper_body" == *'QUIET_SECONDS'* && "$reaper_body" == *'rm -rf -- "$release_dir"'* ]] ||
+    die "background reaper does not wait for stable zero inflight and reclaim the release"
+  [[ "$reaper_body" != *'SIGKILL'* && "$reaper_body" != *'kill -KILL'* ]] ||
+    die "background reaper can force-kill an established request"
   [[ "$cleanup_body" == *'resume_handoff_admission'* ]] ||
     die "installer failure cleanup does not automatically resume queued requests"
+}
+
+test_background_reaper_contract() {
+  local fixture="$DATA_DIR/reaper-fixture" fake_bin="$DATA_DIR/reaper-bin"
+  local fake_state="$DATA_DIR/reaper-stopped" fake_log="$DATA_DIR/reaper-systemctl.log"
+  local release="release-drained"
+  mkdir -p "$fixture/app/releases/$release" "$fixture/app/releases/release-current" "$fixture/data/run" "$fake_bin"
+  : >"$fixture/app/releases/$release/$APP_NAME"
+  : >"$fixture/data/run/worker-$release.sock"
+  ln -s "$fixture/app/releases/release-current" "$fixture/app/current"
+  ln -s "$fixture/app/releases/$release" "$fixture/app/previous"
+
+  cat >"$fake_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\n' "$*" >>"${REAPER_FAKE_LOG:?}"
+case "${1:-}" in
+  show)
+    if [[ " $* " == *" --property=ActiveState "* ]]; then
+      if [[ -e "${REAPER_FAKE_STATE:?}" ]]; then printf 'inactive\n'; else printf 'active\n'; fi
+    elif [[ -e "${REAPER_FAKE_STATE:?}" ]]; then
+      printf '0\n'
+    else
+      printf '4321\n'
+    fi
+    ;;
+  stop)
+    : >"${REAPER_FAKE_STATE:?}"
+    ;;
+esac
+EOF
+  cat >"$fake_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' '{"ok":true,"inflight":0}'
+EOF
+  chmod +x "$fake_bin/systemctl" "$fake_bin/curl"
+
+  PATH="$fake_bin:$PATH" REAPER_FAKE_STATE="$fake_state" REAPER_FAKE_LOG="$fake_log" \
+    CODEX_POOL_REAPER_QUIET_SECONDS=0 CODEX_POOL_REAPER_REPORT_SECONDS=1 \
+    bash scripts/reap-old-release.sh \
+      --service-name "$SERVICE_NAME" --app-dir "$fixture/app" --data-dir "$fixture/data" \
+      --lock-file "$fixture/deploy.lock" --app-name "$APP_NAME" \
+      --handoff-name "$HANDOFF_NAME" --release "$release" >/dev/null
+
+  [[ ! -e "$fixture/app/releases/$release" && ! -e "$fixture/data/run/worker-$release.sock" ]] ||
+    die "background reaper did not remove the drained worker resources"
+  [[ ! -e "$fixture/app/previous" && ! -L "$fixture/app/previous" && -d "$fixture/app/releases/release-current" ]] ||
+    die "background reaper removed the current release or left a dangling previous link"
+  grep -Fq "stop --no-block ${SERVICE_NAME}-worker@${release}.service" "$fake_log" ||
+    die "background reaper did not gracefully stop the drained worker"
+  ! grep -Eq 'SIGKILL|kill .*KILL' "$fake_log" ||
+    die "background reaper force-killed the drained worker"
+
+  release="release-revived"
+  mkdir -p "$fixture/app/releases/$release"
+  : >"$fixture/app/releases/$release/$APP_NAME"
+  : >"$fixture/data/run/worker-$release.sock"
+  ln -sfn "$fixture/app/releases/$release" "$fixture/app/current"
+  rm -f "$fake_state" "$fake_log"
+  : >"$fake_log"
+  PATH="$fake_bin:$PATH" REAPER_FAKE_STATE="$fake_state" REAPER_FAKE_LOG="$fake_log" \
+    CODEX_POOL_REAPER_QUIET_SECONDS=0 CODEX_POOL_REAPER_REPORT_SECONDS=1 \
+    bash scripts/reap-old-release.sh \
+      --service-name "$SERVICE_NAME" --app-dir "$fixture/app" --data-dir "$fixture/data" \
+      --lock-file "$fixture/deploy.lock" --app-name "$APP_NAME" \
+      --handoff-name "$HANDOFF_NAME" --release "$release" >/dev/null
+  [[ -d "$fixture/app/releases/$release" && -e "$fixture/data/run/worker-$release.sock" ]] ||
+    die "background reaper removed a release that became current during drain"
+  ! grep -Fq "stop --no-block ${SERVICE_NAME}-worker@${release}.service" "$fake_log" ||
+    die "background reaper stopped a release that became current during drain"
 }
 reclaim_superseded_install_resources "release-current"
 [[ ! -e "$PROC_ROOT/555" && -e "$PROC_ROOT/666/exe" ]]
@@ -256,5 +340,6 @@ reclaim_superseded_install_resources "release-current"
 test_release_super_instruct_permissions
 test_fresh_config_preserves_codex_client_policy
 test_lossless_upgrade_contract
+test_background_reaper_contract
 
 printf '%s\n' "single-worker installer lifecycle: OK"

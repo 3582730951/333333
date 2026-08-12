@@ -42,9 +42,16 @@ type CodexResponsesWebSocketSession struct {
 	// WebSocket may be reused for sequential turns of one mapped thread, but never
 	// for a different root/branch or a post-compaction window whose handshake
 	// headers would otherwise describe the prior identity.
-	identityKey  string
-	closed       bool
-	httpFallback bool
+	identityKey string
+	closed      bool
+	// httpFallback selects the HTTP/SSE transport for the rest of this
+	// downstream WebSocket. httpsRecoveryRequired is narrower: it is set only
+	// when an established/attempted upstream WebSocket is retired, so the next
+	// turn must replace its connection-scoped response id with a durable replay.
+	// Keeping these states separate lets a sidecar-backed session use HTTPS from
+	// its first turn without repeatedly rebuilding otherwise-valid HTTP context.
+	httpFallback          bool
+	httpsRecoveryRequired bool
 }
 
 func NewCodexResponsesWebSocketSession() *CodexResponsesWebSocketSession {
@@ -65,27 +72,61 @@ func (s *CodexResponsesWebSocketSession) Close() error {
 	return err
 }
 
-// UseHTTPSFallback reports whether this downstream WebSocket session has already
-// observed an upstream WebSocket handshake/transport failure. Once set, later
-// turns stay on the HTTP/SSE bridge instead of repeating a known-broken handshake.
+// UseHTTPSFallback reports whether this downstream WebSocket session uses the
+// HTTP/SSE bridge. This includes both an intentional first-turn HTTPS preference
+// and a fallback after an upstream WebSocket failure.
 func (s *CodexResponsesWebSocketSession) UseHTTPSFallback() bool {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
 	return s.httpFallback
 }
 
+// HTTPSFallbackNeedsRecovery reports whether the HTTP/SSE bridge still needs one
+// lossless replacement for context created on the retired upstream WebSocket.
+func (s *CodexResponsesWebSocketSession) HTTPSFallbackNeedsRecovery() bool {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return s.httpsRecoveryRequired
+}
+
+// PreferHTTPS selects the HTTP/SSE bridge without manufacturing a recovery when
+// the session has never opened an upstream WebSocket. If policy changes after a
+// connection was established, retiring that connection does require recovery.
+func (s *CodexResponsesWebSocketSession) PreferHTTPS() {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	s.httpFallback = true
+	if s.conn != nil {
+		s.httpsRecoveryRequired = true
+		_ = s.conn.Close()
+		s.conn = nil
+	}
+	s.egressID = ""
+	s.identityKey = ""
+}
+
 // MarkHTTPSFallback atomically retires any upstream WebSocket and makes the
-// session's remaining turns use HTTP/SSE. The downstream WebSocket remains open.
+// session's remaining turns use HTTP/SSE. Its connection-scoped context must be
+// recovered exactly once before native HTTP continuation can resume.
 func (s *CodexResponsesWebSocketSession) MarkHTTPSFallback() {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
 	s.httpFallback = true
+	s.httpsRecoveryRequired = true
 	if s.conn != nil {
 		_ = s.conn.Close()
 		s.conn = nil
 	}
 	s.egressID = ""
 	s.identityKey = ""
+}
+
+// CompleteHTTPSRecovery marks a completed HTTP response as the new native
+// continuation point. Later turns remain on HTTPS but no longer rebuild history.
+func (s *CodexResponsesWebSocketSession) CompleteHTTPSRecovery() {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	s.httpsRecoveryRequired = false
 }
 
 // ForwardProcessed relays Codex's response.processed acknowledgement on the same

@@ -58,10 +58,10 @@ EGRESS_TCP_PORT_OVERRIDE=""
 EGRESS_UDP_PORT_OVERRIDE=""
 # HEALTH_TIMEOUT bounds private-worker and post-switch /readyz gates.
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
-# DRAIN_TIMEOUT is now a progress-report interval, not a destructive deadline.
-# A superseded worker is never killed while it still owns an HTTP/SSE/WebSocket
-# request; zero keeps the default 30-second progress cadence. This can make an
-# upgrade wait for a genuinely long stream, which is intentional and lossless.
+# DRAIN_TIMEOUT controls only the background reaper's progress-log cadence. It is
+# not an installation deadline: install.sh returns after the atomic traffic switch,
+# while the superseded worker keeps its established HTTP/SSE/WebSocket requests and
+# is reclaimed automatically after they finish.
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-30}"
 WORKER_DESTROY_TIMEOUT="${WORKER_DESTROY_TIMEOUT:-30}"
 DEPLOY_LOCK_FILE="${DEPLOY_LOCK_FILE:-/var/lock/codex-pool-install.lock}"
@@ -77,13 +77,11 @@ ACTIVATION_PENDING=0
 ACTIVATION_OLD_RELEASE=""
 ACTIVATION_OLD_SOCKET=""
 ACTIVATION_OLD_WORKER_RELEASE=""
-ACTIVATION_OLD_DESTROYED=0
 ACTIVATION_NEW_RELEASE=""
 # Set by install_sidecar: 1 when the sidecar source changed (or first install), 0 when
 # unchanged — lets the restart block skip a needless sidecar restart that would sever
 # in-flight upstream streams.
 SIDECAR_CHANGED=1
-OLD_WORKER_DRAINED=1
 
 if [[ -n "${BIN_DIR:-}" ]]; then
   BIN_DIR_EXPLICIT=1
@@ -194,7 +192,7 @@ Environment overrides:
   LISTEN_ADDR, ADMIN_TOKEN, PUBLIC_URL, OPEN_FIREWALL,
   SIDECAR_ADDR, SIDECAR_VENV, SIDECAR_INSTALL_DIR, SIDECAR_COOKIE_DIR,
   INSTALL_GO, GO_INSTALL_VERSION, GO_INSTALL_ROOT, GO_BIN, HEALTH_TIMEOUT,
-  DRAIN_TIMEOUT (progress log interval; active requests are never force-closed),
+  DRAIN_TIMEOUT (background drain log interval; install never waits for streams),
   SKIP_OS_PACKAGES, GO_TARBALL_SHA256,
   WITH_REGISTRATION, NODE_MIN_MAJOR, NODE_INSTALL_MAJOR, NODE_BIN, CHROME_BIN,
   REGISTRAR_SOURCE, REGISTRAR_INSTALL, PY_REGISTRAR_SOURCE,
@@ -1349,6 +1347,11 @@ EOF
   run_root ln -sfn "${APP_DIR%/}/current/${HANDOFF_NAME}" "${BIN_DIR}/${HANDOFF_NAME}"
   run_root install -m 0755 "${PROJECT_ROOT}/scripts/clear-context-journal.sh" "${BIN_DIR}/codex-pool-clear-context"
   run_root install -m 0755 "${PROJECT_ROOT}/scripts/rollback-release.sh" "${BIN_DIR}/codex-pool-rollback"
+  # Keep the drain/reclaim helper outside immutable releases. A reaper may outlive
+  # the installer and the release it is deleting. Replace it by rename so a reaper
+  # already reading the previous script keeps a stable inode through the next update.
+  run_root install -m 0755 "${PROJECT_ROOT}/scripts/reap-old-release.sh" "${APP_DIR%/}/bin/.${APP_NAME}-reaper.next"
+  run_root mv -f "${APP_DIR%/}/bin/.${APP_NAME}-reaper.next" "${APP_DIR%/}/bin/${APP_NAME}-reaper"
   run_root install -m 0755 "${BUILD_DIR}/gateway-bin"/gateway-* "${APP_DIR}/bin/"
 
   if [[ -f "$CONFIG_FILE" ]]; then
@@ -1514,12 +1517,6 @@ wait_worker_ready() {
   return 1
 }
 
-worker_inflight() {
-  local socket="$1" payload
-  payload="$(curl --noproxy '*' --silent --max-time 2 --unix-socket "$socket" http://localhost/readyz 2>/dev/null || true)"
-  printf '%s' "$payload" | sed -n 's/.*"inflight":[[:space:]]*\([0-9][0-9]*\).*/\1/p'
-}
-
 handoff_public_base_url() {
   local port host
   port="$(listen_port "$LISTEN_ADDR")"
@@ -1642,6 +1639,66 @@ resume_handoff_admission() {
 
 valid_worker_release_id() {
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+}
+
+schedule_release_reaper() {
+  local release="$1" unit
+  if [[ "$release" != "_legacy" ]] && ! valid_worker_release_id "$release"; then
+    warn "Refusing malformed release reaper id: ${release}"
+    return 1
+  fi
+  unit="${SERVICE_NAME}-reaper@${release}.service"
+  # A oneshot service normally makes `systemctl start` wait until ExecStart exits.
+  # --no-block is essential here: long SSE/WebSocket requests remain owned by the
+  # previous worker, while install.sh returns as soon as the new release is live.
+  # Enable the instance until it succeeds so an unexpected reboot resumes cleanup.
+  run_root systemctl enable "$unit" >/dev/null || return 1
+  if ! run_root systemctl start --no-block "$unit" >/dev/null; then
+    run_root systemctl disable "$unit" >/dev/null 2>&1 || true
+    return 1
+  fi
+  log "Background drain/reclaim scheduled: ${unit}"
+}
+
+schedule_superseded_release_reapers() {
+  local current_release="$1" protected_release="${2:-}" unit release socket path
+  local -A scheduled=()
+
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    release="${unit#${SERVICE_NAME}-worker@}"
+    release="${release%.service}"
+    valid_worker_release_id "$release" || die "malformed loaded worker unit: ${unit}"
+    [[ "$release" != "$current_release" && "$release" != "$protected_release" ]] || continue
+    scheduled["$release"]=1
+  done < <(
+    {
+      run_root systemctl list-units --type=service --all --plain --no-legend "${SERVICE_NAME}-worker@*.service" 2>/dev/null || true
+      run_root systemctl list-unit-files --type=service --no-legend "${SERVICE_NAME}-worker@*.service" 2>/dev/null || true
+    } | awk '{print $1}' | grep -F "${SERVICE_NAME}-worker@" | grep -E '@[^[:space:]]+\.service$' | sort -u || true
+  )
+
+  while IFS= read -r socket; do
+    [[ -n "$socket" ]] || continue
+    release="${socket##*/worker-}"
+    release="${release%.sock}"
+    valid_worker_release_id "$release" || die "malformed stale worker socket: ${socket}"
+    [[ "$release" != "$current_release" && "$release" != "$protected_release" ]] || continue
+    scheduled["$release"]=1
+  done < <(run_root find "${DATA_DIR%/}/run" -maxdepth 1 \( -type s -o -type l \) -name 'worker-*.sock' -print 2>/dev/null || true)
+
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    release="${path##*/}"
+    [[ "$release" != .staging-* ]] || continue
+    valid_worker_release_id "$release" || die "malformed stale release directory: ${path}"
+    [[ "$release" != "$current_release" && "$release" != "$protected_release" ]] || continue
+    scheduled["$release"]=1
+  done < <(run_root find "${APP_DIR%/}/releases" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort)
+
+  for release in "${!scheduled[@]}"; do
+    schedule_release_reaper "$release" || return 1
+  done
 }
 
 worker_unit_destroyed() {
@@ -1854,18 +1911,18 @@ verify_single_active_worker() {
   log "Single-worker invariant verified: ${expected} (MainPID=${pid})"
 }
 
+verify_current_worker_active() {
+  local current_release="$1" unit state pid
+  unit="${SERVICE_NAME}-worker@${current_release}.service"
+  state="$(run_root systemctl show "$unit" --property=ActiveState --value 2>/dev/null || true)"
+  pid="$(run_root systemctl show "$unit" --property=MainPID --value 2>/dev/null || true)"
+  [[ "$state" == "active" && "$pid" =~ ^[1-9][0-9]*$ ]] ||
+    die "new worker is not active after cutover: ${unit} state=${state:-unknown} pid=${pid:-0}"
+  log "Current worker verified: ${unit} (MainPID=${pid}); older workers may still be draining"
+}
+
 rollback_pending_activation() {
   (( ACTIVATION_PENDING == 1 )) || return 0
-  if (( ACTIVATION_OLD_DESTROYED == 1 )); then
-    warn "Previous worker is already destroyed; completing convergence on the verified new release"
-    atomic_symlink "$RELEASE_DIR" "${APP_DIR%/}/current" || return 1
-    atomic_symlink "${DATA_DIR%/}/run/worker-${ACTIVATION_NEW_RELEASE}.sock" "${DATA_DIR%/}/run/active-worker.sock" || return 1
-    destroy_stale_worker_instances "$ACTIVATION_NEW_RELEASE" || return 1
-    destroy_legacy_worker_process || return 1
-    verify_single_active_worker "$ACTIVATION_NEW_RELEASE" || return 1
-    ACTIVATION_PENDING=0
-    return 0
-  fi
   warn "Rolling back the incomplete traffic switch before reopening admission"
   if [[ -n "$ACTIVATION_OLD_RELEASE" && -n "$ACTIVATION_OLD_SOCKET" ]]; then
     atomic_symlink "$ACTIVATION_OLD_RELEASE" "${APP_DIR%/}/current" || return 1
@@ -1880,8 +1937,10 @@ rollback_pending_activation() {
     destroy_worker_instance "$ACTIVATION_NEW_RELEASE" "${DATA_DIR%/}/run/worker-${ACTIVATION_NEW_RELEASE}.sock" || return 1
   fi
   if [[ -n "$ACTIVATION_OLD_WORKER_RELEASE" ]]; then
-    destroy_stale_worker_instances "$ACTIVATION_OLD_WORKER_RELEASE" || return 1
-    verify_single_active_worker "$ACTIVATION_OLD_WORKER_RELEASE" || return 1
+    # Older generations may still own streams from an earlier successful update.
+    # Rollback only destroys the failed candidate above; it must not collapse those
+    # independently draining workers into a single-process invariant.
+    verify_current_worker_active "$ACTIVATION_OLD_WORKER_RELEASE" || return 1
   fi
   restore_codex_reauth_worker_after_rollback ||
     warn "previous Codex reauth worker did not recover during activation rollback"
@@ -1914,6 +1973,7 @@ start_handoff_for_legacy_migration() {
     # Do not wait for the old service's long graceful drain. SIGTERM closes its copy
     # of the listener immediately; established streams remain in that old process.
     log "Handing new connections off from legacy ${SERVICE_NAME}.service without waiting for its streams"
+    run_root systemctl set-property --runtime "${SERVICE_NAME}.service" TimeoutStopUSec=infinity >/dev/null 2>&1 || true
     run_root systemctl stop --no-block "${SERVICE_NAME}.service" || true
   fi
 
@@ -1943,8 +2003,8 @@ start_handoff_for_legacy_migration() {
   if (( LEGACY_SERVICE_ACTIVE == 1 )); then
     # With an already-active .socket both processes briefly share its listening file
     # description. The old server stops accepting, but keeps every established stream.
+    run_root systemctl set-property --runtime "${SERVICE_NAME}.service" TimeoutStopUSec=infinity >/dev/null 2>&1 || true
     run_root systemctl stop --no-block "${SERVICE_NAME}.service" || true
-    OLD_WORKER_DRAINED=0
   fi
   wait_handoff_public_instance "$RELEASE_ID" || die "new handoff did not become the public listener"
 }
@@ -1962,19 +2022,20 @@ activate_staged_release() {
   }
 
   local new_socket="${DATA_DIR%/}/run/worker-${RELEASE_ID}.sock"
-  local old_socket old_release old_worker_release="" inflight="unknown" started next_report report_every health_url had_handoff=0
+  local old_socket old_release old_release_id="" old_worker_release="" protected_release="" health_url had_handoff=0
   [[ "$DRAIN_TIMEOUT" =~ ^[0-9]+$ ]] || die "DRAIN_TIMEOUT must be a non-negative integer: ${DRAIN_TIMEOUT}"
   [[ "$WORKER_DESTROY_TIMEOUT" =~ ^[0-9]+$ ]] || die "WORKER_DESTROY_TIMEOUT must be a non-negative integer: ${WORKER_DESTROY_TIMEOUT}"
   (( ${#new_socket} < 104 )) || die "worker Unix socket path is too long: ${new_socket}"
   old_socket="$(run_root readlink "${DATA_DIR%/}/run/active-worker.sock" 2>/dev/null || true)"
   old_release="$(run_root readlink "${APP_DIR%/}/current" 2>/dev/null || true)"
+  if [[ -n "$old_release" ]]; then
+    old_release_id="${old_release##*/}"
+    valid_worker_release_id "$old_release_id" || old_release_id=""
+  fi
   if [[ -n "$old_socket" && "$old_socket" != "$new_socket" ]]; then
     old_worker_release="${old_socket##*/worker-}"
     old_worker_release="${old_worker_release%.sock}"
     valid_worker_release_id "$old_worker_release" || die "malformed active worker socket target: ${old_socket}"
-    # Remove leftovers from any previously interrupted deployment before a new
-    # candidate is introduced. The currently active worker is the sole exception.
-    destroy_stale_worker_instances "$old_worker_release"
   fi
 
   log "Starting staged worker ${RELEASE_ID} on ${new_socket}"
@@ -1992,7 +2053,6 @@ activate_staged_release() {
   ACTIVATION_OLD_RELEASE="$old_release"
   ACTIVATION_OLD_SOCKET="$old_socket"
   ACTIVATION_OLD_WORKER_RELEASE="$old_worker_release"
-  ACTIVATION_OLD_DESTROYED=0
   ACTIVATION_NEW_RELEASE="$RELEASE_ID"
   # The new worker is fully ready before the admission barrier closes. Requests which
   # began earlier remain pinned to the old worker; only not-yet-admitted requests wait.
@@ -2036,32 +2096,29 @@ activate_staged_release() {
   resume_handoff_admission || die "release switched but queued request admission did not resume"
   log "Release ${RELEASE_ID} is active; stable public listener was not restarted"
 
+  verify_current_worker_active "$RELEASE_ID"
   if [[ -n "$old_socket" && "$old_socket" != "$new_socket" ]]; then
-    OLD_WORKER_DRAINED=0
-    started="$SECONDS"
-    report_every="$DRAIN_TIMEOUT"
-    (( report_every > 0 )) || report_every=30
-    next_report=$((SECONDS + report_every))
-    while true; do
-      inflight="$(worker_inflight "$old_socket")"
-      if [[ "$inflight" == "0" ]]; then
-        log "Previous worker ${old_worker_release} drained"
-        break
-      fi
-      if (( SECONDS >= next_report )); then
-        warn "Previous worker ${old_worker_release} still owns ${inflight:-unknown} in-flight connection(s); preserving them until natural completion"
-        next_report=$((next_report + report_every))
-      fi
-      sleep 1
-    done
-    destroy_worker_instance "$old_worker_release" "$old_socket" || die "failed to destroy previous worker ${old_worker_release}"
-    ACTIVATION_OLD_DESTROYED=1
+    protected_release="$old_worker_release"
+  elif (( LEGACY_SERVICE_ACTIVE == 1 )); then
+    protected_release="$old_release_id"
   fi
-  destroy_stale_worker_instances "$RELEASE_ID"
-  destroy_legacy_worker_process
-  verify_single_active_worker "$RELEASE_ID"
+
+  # Interrupted older deployments can leave disabled units, sockets, or immutable
+  # release trees behind. Give each one an independent non-blocking reaper too. The
+  # just-scheduled predecessor is protected from a duplicate legacy cleanup path.
+  schedule_superseded_release_reapers "$RELEASE_ID" "$protected_release" ||
+    die "new release is live, but stale release reapers could not all be started"
+  if [[ -n "$old_socket" && "$old_socket" != "$new_socket" ]]; then
+    schedule_release_reaper "$old_worker_release" ||
+      die "new release is live, but the previous worker reaper could not be started"
+  elif (( LEGACY_SERVICE_ACTIVE == 1 )); then
+    # The legacy process has no private worker socket. Its dedicated reaper waits
+    # for the non-blocking graceful stop started during listener migration.
+    schedule_release_reaper _legacy ||
+      die "new release is live, but the legacy worker reaper could not be started"
+  fi
   ACTIVATION_PENDING=0
-  OLD_WORKER_DRAINED=1
+  log "Release ${RELEASE_ID} accepted the handoff; old releases will be reclaimed asynchronously"
 }
 
 install_systemd_unit() {
@@ -2071,7 +2128,7 @@ install_systemd_unit() {
     return 0
   fi
 
-  local database_parent read_write_paths tmp unit handoff_unit worker_unit sidecar_unit reauth_unit extra_env admin_env no_new_priv warp_dir_env legacy_pid
+  local database_parent read_write_paths tmp unit handoff_unit worker_unit reaper_unit sidecar_unit reauth_unit extra_env admin_env no_new_priv warp_dir_env legacy_pid
   local node_registrar_unit_dir python_registrar_unit_dir python_registrar_unit_venv
   if systemd_running && ! run_root systemctl is-active --quiet "${HANDOFF_SERVICE_NAME}.service" 2>/dev/null; then
     legacy_pid="$(run_root systemctl show "${SERVICE_NAME}.service" --property=MainPID --value 2>/dev/null || true)"
@@ -2231,7 +2288,9 @@ Environment="CODEX_POOL_INSTANCE_ID=%i"${admin_env}${extra_env}
 ExecStart=${APP_DIR%/}/releases/%i/${APP_NAME} --config ${CONFIG_FILE} --release-id %i --deployment-role auto --unix-socket ${DATA_DIR%/}/run/worker-%i.sock
 Restart=on-failure
 RestartSec=3
-TimeoutStopSec=300
+# The worker reaper sends SIGTERM only after worker-local inflight has remained at
+# zero. Infinity is a final safety net for durable-write flushes during shutdown.
+TimeoutStopSec=infinity
 NoNewPrivileges=${no_new_priv}
 PrivateTmp=true
 ProtectSystem=strict
@@ -2243,6 +2302,30 @@ WantedBy=multi-user.target
 EOF
   log "Installing A/B worker template to ${worker_unit}"
   run_root install -m 0644 "$tmp" "$worker_unit"
+  rm -f "$tmp"
+
+  reaper_unit="${SYSTEMD_DIR%/}/${SERVICE_NAME}-reaper@.service"
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
+[Unit]
+Description=Codex Pool background drain and release reaper %i
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+Environment="CODEX_POOL_REAPER_REPORT_SECONDS=${DRAIN_TIMEOUT}"
+ExecStart=${APP_DIR%/}/bin/${APP_NAME}-reaper --service-name ${SERVICE_NAME} --app-dir ${APP_DIR} --data-dir ${DATA_DIR} --lock-file ${DEPLOY_LOCK_FILE} --app-name ${APP_NAME} --handoff-name ${HANDOFF_NAME} --release %i
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=infinity
+TimeoutStopSec=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  log "Installing asynchronous release reaper template to ${reaper_unit}"
+  run_root install -m 0644 "$tmp" "$reaper_unit"
   rm -f "$tmp"
 
   # The socket explicitly activates the independently named handoff, never the legacy
@@ -2367,8 +2450,8 @@ EOF
     fi
     if bool_enabled "$START_SERVICE"; then
       # Start and self-test the private A/B worker first. activate_staged_release then
-      # atomically moves only new requests; the old worker remains alive until its
-      # HTTP/SSE/WebSocket in-flight counter reaches zero.
+      # atomically moves new requests and delegates any long old streams to a
+      # background reaper, so installation never waits for their completion.
       activate_staged_release
       run_root systemctl --no-pager --full status "${HANDOFF_SERVICE_NAME}.service" || true
 
@@ -2389,11 +2472,9 @@ EOF
         fi
       fi
 
-      # The new worker and any release-scoped sidecar are now live. Find every
-      # superseded instance, including detached processes no longer represented by
-      # a loaded systemd unit, and release their cgroups, sockets and old artifacts.
-      # Keep only the immutable `previous` target as the runnable rollback copy.
-      reclaim_superseded_install_resources "$RELEASE_ID"
+      # Superseded worker processes, sockets, and immutable releases are owned by
+      # ${SERVICE_NAME}-reaper@*.service. Do not synchronously reclaim them here:
+      # an old worker may legitimately retain a long HTTP/SSE/WebSocket request.
     else
       atomic_symlink "$RELEASE_DIR" "${APP_DIR%/}/current"
       warn "Service installed but not started"

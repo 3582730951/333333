@@ -214,6 +214,12 @@ const (
 	goalReclaimRowsPerStep  = 64
 	goalReclaimBytesPerStep = 8 << 20
 	goalReclaimingState     = "reclaiming"
+	// A tool-heavy goal spends most of its idle lifetime in awaiting_tool_result.
+	// Treating that state as permanently unreclaimable lets a small number of
+	// abandoned sessions pin the entire global budget forever. Fresh waits retain a
+	// grace period, while an active run lease and the foreground protectedGoalID
+	// remain hard fences regardless of age.
+	goalAwaitingToolReclaimGrace = 30 * time.Minute
 )
 
 func (s *Store) estimateGoalChunkStorage(payload string) int64 {
@@ -1087,13 +1093,15 @@ WHERE id=? AND state<>'reclaiming'
 func (s *Store) markNextBudgetGoalReclaiming(ctx context.Context, tx *sql.Tx, now int64, protectedGoalID string) (string, error) {
 	var goalID string
 	var storageBytes, updatedAt int64
+	awaitingCutoff := now - int64(goalAwaitingToolReclaimGrace/time.Second)
 	err := tx.QueryRowContext(ctx, `SELECT s.id,s.storage_bytes,s.updated_at FROM goal_session s
 WHERE s.state<>'reclaiming'
 	  AND s.id<>?
-	  AND s.state IN ('ready','retryable','completed','failed')
+	  AND (s.state IN ('ready','retryable','completed','failed')
+	       OR (s.state='awaiting_tool_result' AND s.updated_at<=?))
 	  AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=s.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)
-ORDER BY CASE s.state WHEN 'completed' THEN 0 WHEN 'failed' THEN 1 WHEN 'ready' THEN 2 ELSE 3 END,
-	         s.updated_at ASC,s.id ASC LIMIT 1`, strings.TrimSpace(protectedGoalID), now).Scan(&goalID, &storageBytes, &updatedAt)
+ORDER BY CASE s.state WHEN 'completed' THEN 0 WHEN 'failed' THEN 1 WHEN 'ready' THEN 2 WHEN 'retryable' THEN 3 ELSE 4 END,
+	         s.updated_at ASC,s.id ASC LIMIT 1`, strings.TrimSpace(protectedGoalID), awaitingCutoff, now).Scan(&goalID, &storageBytes, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -1101,10 +1109,12 @@ ORDER BY CASE s.state WHEN 'completed' THEN 0 WHEN 'failed' THEN 1 WHEN 'ready' 
 		return "", err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE goal_session SET state='reclaiming',updated_at=?
-WHERE id=? AND state IN ('ready','retryable','completed','failed') AND storage_bytes=? AND updated_at=?
+WHERE id=? AND (state IN ('ready','retryable','completed','failed')
+	              OR (state='awaiting_tool_result' AND updated_at<=?))
+	  AND storage_bytes=? AND updated_at=?
 	  AND id<>?
 	  AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=goal_session.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)`,
-		now, goalID, storageBytes, updatedAt, strings.TrimSpace(protectedGoalID), now)
+		now, goalID, awaitingCutoff, storageBytes, updatedAt, strings.TrimSpace(protectedGoalID), now)
 	if err != nil {
 		return "", err
 	}

@@ -25,7 +25,7 @@ import (
 
 type forceCodexResponsesWebSocketKey struct{}
 type codexResponsesWebSocketSessionKey struct{}
-type codexResponsesWebSocketHTTPSFallbackTurnKey struct{}
+type codexResponsesWebSocketHTTPSRecoveryTurnKey struct{}
 
 const (
 	responsesWebSocketHeartbeatInterval = 30 * time.Second
@@ -217,9 +217,9 @@ func codexResponsesWebSocketSession(ctx context.Context) *upstream.CodexResponse
 	return session
 }
 
-func codexResponsesWebSocketUsesHTTPSFallback(ctx context.Context) bool {
-	fallback, _ := ctx.Value(codexResponsesWebSocketHTTPSFallbackTurnKey{}).(bool)
-	return forceCodexResponsesWebSocket(ctx) && fallback
+func codexResponsesWebSocketNeedsHTTPSRecovery(ctx context.Context) bool {
+	recovery, _ := ctx.Value(codexResponsesWebSocketHTTPSRecoveryTurnKey{}).(bool)
+	return forceCodexResponsesWebSocket(ctx) && recovery
 }
 
 func isResponsesWebSocketUpgrade(r *http.Request) bool {
@@ -308,13 +308,12 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 			turnBaseCtx = contextWithUsageEventID(turnBaseCtx, newRequestID())
 			turnBaseCtx = contextWithBodySource(turnBaseCtx, source)
 			turnBaseCtx = contextWithBodyMeta(turnBaseCtx, meta)
-			// Snapshot the transport at turn admission. If this turn itself discovers
-			// a broken upstream WebSocket, it must retain CPA/Goal persistence through
-			// its recovery. Only turns admitted after MarkHTTPSFallback use the
-			// stateless HTTP-rebuild path.
-			httpsFallbackAtStart := session.UseHTTPSFallback()
+			// Snapshot only unresolved cross-transport context at turn admission.
+			// Merely choosing HTTPS from the first turn is not a recovery and must keep
+			// native HTTP previous_response_id continuation enabled.
+			httpsRecoveryAtStart := session.HTTPSFallbackNeedsRecovery()
 			turnCtx := context.WithValue(turnBaseCtx, forceCodexResponsesWebSocketKey{}, true)
-			turnCtx = context.WithValue(turnCtx, codexResponsesWebSocketHTTPSFallbackTurnKey{}, httpsFallbackAtStart)
+			turnCtx = context.WithValue(turnCtx, codexResponsesWebSocketHTTPSRecoveryTurnKey{}, httpsRecoveryAtStart)
 			req := r.Clone(turnCtx)
 			req.Method = http.MethodPost
 			req.Body = body
@@ -322,7 +321,12 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 			req.ContentLength = source.Size()
 			req.Header = r.Header.Clone()
 			req.Header.Set("Content-Type", "application/json")
-			writer := newResponsesWebSocketWriter(baseCtx, downstream, state.observeMeta, bodysource.CaptureOptions{
+			writer := newResponsesWebSocketWriter(baseCtx, downstream, func(event bodysource.BodyMeta) {
+				state.observeMeta(event)
+				if event.Type == "response.completed" && strings.TrimSpace(event.ResponseID) != "" {
+					session.CompleteHTTPSRecovery()
+				}
+			}, bodysource.CaptureOptions{
 				MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
 				Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver, TempFileNamePrefix: "codex-pool-ws-response-*",
 			}, s.identitySecretCached)

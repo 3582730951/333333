@@ -1130,7 +1130,7 @@ func TestEnforceGoalStorageBudgetStepReportsNoProgressWhenAllGoalsAreLive(t *tes
 	}
 }
 
-func TestEnforceGoalStorageBudgetPreservesAwaitingToolSessionWithoutRun(t *testing.T) {
+func TestEnforceGoalStorageBudgetPreservesFreshAwaitingToolSessionWithoutRun(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenInMemory()
 	if err != nil {
@@ -1157,6 +1157,70 @@ func TestEnforceGoalStorageBudgetPreservesAwaitingToolSessionWithoutRun(t *testi
 	}
 	if _, err := store.GetGoalSession(ctx, goal.ID); err != nil {
 		t.Fatalf("awaiting goal was hidden or reclaimed: %v", err)
+	}
+}
+
+func TestEnforceGoalStorageBudgetReclaimsStaleAwaitingToolSessionWithoutRun(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	goal, err := store.CommitGoalTurn(ctx, goalTurnForTest("maintenance-stale-awaiting", "maintenance-stale-awaiting-response", "input", "out"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleAt := Now() - int64(goalAwaitingToolReclaimGrace/time.Second) - 1
+	if _, err := store.DB().ExecContext(ctx, `UPDATE goal_session SET state='awaiting_tool_result',updated_at=? WHERE id=?`, staleAt, goal.ID); err != nil {
+		t.Fatal(err)
+	}
+	var deleted int64
+	for step := 0; step < 8 && deleted == 0; step++ {
+		_, stepDeleted, reclaimErr := store.EnforceGoalStorageBudget(ctx, 1)
+		if reclaimErr != nil {
+			t.Fatal(reclaimErr)
+		}
+		deleted += stepDeleted
+	}
+	if deleted != 1 {
+		t.Fatalf("stale awaiting goal deleted=%d, want 1", deleted)
+	}
+	if _, err := store.GetGoalSession(ctx, goal.ID); !errors.Is(err, ErrGoalNotFound) {
+		t.Fatalf("stale awaiting goal survived storage pressure: %v", err)
+	}
+}
+
+func TestEnforceGoalStorageBudgetPreservesStaleAwaitingToolSessionWithLiveRun(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	goal, err := store.CommitGoalTurn(ctx, goalTurnForTest("maintenance-live-awaiting", "maintenance-live-awaiting-response", "input", "out"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleAt := Now() - int64(goalAwaitingToolReclaimGrace/time.Second) - 1
+	if _, err := store.DB().ExecContext(ctx, `UPDATE goal_session SET state='awaiting_tool_result',updated_at=? WHERE id=?`, staleAt, goal.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireGoalRun(ctx, goal.ID, "live-awaiting-owner", "awaiting_tool_result", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	freed, deleted, err := store.EnforceGoalStorageBudget(ctx, 1)
+	if err != nil || freed != 0 || deleted != 0 {
+		t.Fatalf("live stale awaiting reclaim freed=%d deleted=%d err=%v", freed, deleted, err)
+	}
+	if _, err := store.GetGoalSession(ctx, goal.ID); err != nil {
+		t.Fatalf("live stale awaiting goal was reclaimed: %v", err)
 	}
 }
 

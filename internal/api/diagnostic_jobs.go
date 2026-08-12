@@ -938,7 +938,7 @@ func (s *Server) cleanupEligibleDiagnosticArtifacts(ctx context.Context) {
 			continue
 		}
 		if s.deleteTrashedDiagnosticResource(ctx, dir, trashDir, resource) == nil {
-			s.recordDiagnosticGCGap(ctx, resource)
+			s.recordDiagnosticGCEvent(ctx, resource)
 		}
 	}
 }
@@ -1010,7 +1010,11 @@ func (s *Server) deleteTrashedDiagnosticResource(
 	return s.store.MarkStorageResourceDeleted(ctx, resource)
 }
 
-func (s *Server) recordDiagnosticGCGap(ctx context.Context, resource storage.StorageResource) {
+// recordDiagnosticGCEvent records ordinary artifact lifecycle maintenance. Deleting
+// an expired or explicitly cancelled ZIP does not remove the primary audit, usage,
+// request, or diagnostic-event rows from which a future bundle is generated, so it
+// is neither a warning nor a diagnostic data gap.
+func (s *Server) recordDiagnosticGCEvent(ctx context.Context, resource storage.StorageResource) {
 	alias := ""
 	if len(s.cfg.RuntimeDiagnosticAliasKey) > 0 {
 		alias = diagnosticAlias(s.cfg.RuntimeDiagnosticAliasKey, "JOB", "diagnostic-job", resource.OwnerID)
@@ -1018,11 +1022,11 @@ func (s *Server) recordDiagnosticGCGap(ctx context.Context, resource storage.Sto
 	_ = s.store.AddDiagnosticEvent(ctx, storage.DiagnosticEvent{
 		ID:            "diagevt_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
 		EventType:     "storage_gc",
-		Severity:      "warning",
+		Severity:      "info",
 		EntityType:    "diagnostic_job",
 		EntityAlias:   alias,
 		DetailJSON:    `{"reason":"retention_or_cancellation","resource_type":"diagnostic_artifact"}`,
-		DiagnosticGap: true,
+		DiagnosticGap: false,
 	})
 }
 

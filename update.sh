@@ -18,8 +18,9 @@
 #   2. Clears the Go build cache + .build so the binary is recompiled from scratch.
 #   3. Runs scripts/install.sh (rebuilds the binary incl. the embedded UI, reinstalls
 #      the sidecar, preserves the existing config/admin_token, and atomically switches
-#      a ready worker behind the stable handoff. Active streams drain on the old worker;
-#      shared sidecar/reauth processes are staged without a hot restart.)
+#      a ready worker behind the stable handoff. It returns without waiting for long
+#      streams; a systemd reaper drains and deletes the old worker/release in the
+#      background. Shared sidecar/reauth processes are staged without a hot restart.)
 #      install.sh NEVER writes the DB, so accounts survive.
 #   4. Verifies the account count did not drop, prints the public access URL.
 #

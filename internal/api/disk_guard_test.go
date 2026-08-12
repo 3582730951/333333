@@ -63,6 +63,27 @@ func TestGoalStorageMaintenanceTarget(t *testing.T) {
 	}
 }
 
+func TestDiskGuardChangeIgnoresCumulativeCleanupProgress(t *testing.T) {
+	previous := DiskGuardSnapshot{
+		Level: "normal", DatabaseWritable: true, JournalWritable: true, SpoolWritable: true,
+		GoalStorageTargetBytes:  896 << 20,
+		GoalStorageReserveBytes: 128 << 20,
+	}
+	current := previous
+	current.ContextsDeleted = 10
+	current.GoalsDeleted = 3
+	current.GoalBytesReclaimed = 64 << 20
+	current.CodexMappingsDeleted = 4
+	current.RouteBindingsDeleted = 8
+	if diskGuardChanged(previous, current) {
+		t.Fatal("normal cleanup counters must not emit a storage-pressure transition")
+	}
+	current.Level = "pressure"
+	if !diskGuardChanged(previous, current) {
+		t.Fatal("an operational disk state transition must still be emitted")
+	}
+}
+
 func TestLegacyGoalPolicyUpgradeLetsSaturatedAwaitingToolGoalContinue(t *testing.T) {
 	ctx := context.Background()
 	store, err := storage.OpenInMemory()

@@ -124,6 +124,12 @@ func Classify(ok bool, status int, header http.Header, body []byte) Verdict {
 	if status == 429 {
 		return Verdict{RateLimited, "http_429"}
 	}
+	// OpenAI-compatible providers commonly use 402 for an exhausted prepaid
+	// balance. It is recoverable after the operator adds credit, but selecting the
+	// same account again immediately only creates a tight 402 -> generic 503 loop.
+	if status == http.StatusPaymentRequired {
+		return Verdict{RateLimited, "http_402"}
+	}
 	if status == 401 || status == 403 {
 		return Verdict{AuthExpired, "http_" + strconv.Itoa(status)}
 	}

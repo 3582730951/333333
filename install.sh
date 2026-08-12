@@ -19,7 +19,9 @@
 # and takes the backup-protected update path. During its atomic worker handoff,
 # established HTTP/SSE/WebSocket requests remain on the old worker and new requests
 # wait without receiving a synthetic upstream/downstream error; admission resumes
-# automatically on success or rollback. Shared auxiliary services are staged but not
+# automatically on success or rollback. The installer returns once the ready new worker
+# owns new traffic; a background reaper removes the old process and release storage as
+# soon as its established requests finish. Shared auxiliary services are staged but not
 # hot-restarted. Override only when provisioning an intentionally separate fresh tree:
 #     sudo ./install.sh --fresh-install
 #
