@@ -102,31 +102,6 @@ func (s *Store) initUsageHourlyRollups(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, usageHourlyRollupSchema); err != nil {
 		return err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	var version string
-	err = tx.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, usageHourlyRollupVersion).Scan(&version)
-	if err != nil && err != sql.ErrNoRows {
-		return err
-	}
-	if version != "1" {
-		if _, err = tx.ExecContext(ctx, `DELETE FROM usage_hourly_rollups`); err != nil {
-			return err
-		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO usage_hourly_rollups `+usageRollupColumns+` `+usageRollupSelect("")); err != nil {
-			return fmt.Errorf("backfill usage hourly rollup: %w", err)
-		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`, usageHourlyRollupVersion, "1", Now()); err != nil {
-			return err
-		}
-	}
-	if err = tx.Commit(); err != nil {
-		return err
-	}
-
 	insertTrigger := `CREATE TRIGGER IF NOT EXISTS usage_hourly_rollup_insert AFTER INSERT ON usage_records BEGIN
 INSERT INTO usage_hourly_rollups ` + usageRollupColumns + ` VALUES ` + usageRollupInsertValues("NEW") + usageRollupUpsert + `; END;`
 	updateTrigger := `CREATE TRIGGER IF NOT EXISTS usage_hourly_rollup_update AFTER UPDATE ON usage_records BEGIN
@@ -141,6 +116,92 @@ INSERT INTO usage_hourly_rollups ` + usageRollupColumns + ` ` + usageRollupSelec
 		}
 	}
 	return nil
+}
+
+// usageHourlyRollupReady reports whether every historical raw row has been
+// materialized. Until the marker exists, accelerated readers must stay on the
+// exact raw path: triggers already maintain new rows, but the historical portion
+// may still be empty or only partially rebuilt.
+func (s *Store) usageHourlyRollupReady(ctx context.Context) (bool, error) {
+	if s == nil || s.driver != "sqlite" {
+		return false, nil
+	}
+	var version string
+	err := s.rdb.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, usageHourlyRollupVersion).Scan(&version)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return version == "1", nil
+}
+
+// backfillUsageHourlyRollups rebuilds one UTC hour per transaction after the
+// worker is already serving. The migration is restartable: readers use the raw
+// table until the final marker commits, and a retry discards any partial rollup
+// before recomputing it. INSERT/UPDATE/DELETE triggers serialize with each small
+// transaction, so traffic arriving during the rebuild is neither lost nor
+// double-counted.
+func (s *Store) backfillUsageHourlyRollups(ctx context.Context) error {
+	if s == nil || s.driver != "sqlite" {
+		return nil
+	}
+	ready, err := s.usageHourlyRollupReady(ctx)
+	if err != nil || ready {
+		return err
+	}
+	if _, err = s.db.ExecContext(ctx, `DELETE FROM usage_hourly_rollups`); err != nil {
+		return fmt.Errorf("reset usage hourly rollup: %w", err)
+	}
+
+	rows, err := s.rdb.QueryContext(ctx, `SELECT DISTINCT (created_at/3600)*3600 AS bucket FROM usage_records ORDER BY bucket`)
+	if err != nil {
+		return fmt.Errorf("list usage hourly rollup buckets: %w", err)
+	}
+	buckets := make([]int64, 0, 256)
+	for rows.Next() {
+		var bucket int64
+		if err = rows.Scan(&bucket); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		buckets = append(buckets, bucket)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+
+	for _, bucket := range buckets {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		tx, txErr := s.db.BeginTx(ctx, nil)
+		if txErr != nil {
+			return txErr
+		}
+		if _, txErr = tx.ExecContext(ctx, `DELETE FROM usage_hourly_rollups WHERE bucket=?`, bucket); txErr == nil {
+			_, txErr = tx.ExecContext(ctx, `INSERT INTO usage_hourly_rollups `+usageRollupColumns+` `+usageRollupSelect(`WHERE created_at>=? AND created_at<?`), bucket, bucket+3600)
+		}
+		if txErr == nil {
+			txErr = tx.Commit()
+		} else {
+			_ = tx.Rollback()
+		}
+		if txErr != nil {
+			return fmt.Errorf("backfill usage hourly rollup bucket %d: %w", bucket, txErr)
+		}
+		if err = yieldDeferredStorageWriter(ctx); err != nil {
+			return err
+		}
+	}
+
+	_, err = s.db.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`, usageHourlyRollupVersion, "1", Now())
+	return err
 }
 
 type UsageRollupStats struct {
@@ -167,6 +228,10 @@ func fullUsageRollupBounds(since, until int64) (int64, int64, bool) {
 func (s *Store) usageTimeseriesHourlyWindow(ctx context.Context, since, until, bucketSeconds int64) ([]UsageBucket, error) {
 	if s == nil || s.driver != "sqlite" {
 		return nil, nil
+	}
+	ready, err := s.usageHourlyRollupReady(ctx)
+	if err != nil || !ready {
+		return nil, err
 	}
 	fullStart, fullUntil, ok := fullUsageRollupBounds(since, until)
 	if !ok || bucketSeconds%3600 != 0 {
@@ -209,6 +274,10 @@ GROUP BY output_bucket ORDER BY output_bucket`, bucketSeconds, bucketSeconds, fu
 func (s *Store) cacheUsageHourlyWindow(ctx context.Context, since, until, bucketSeconds int64) ([]CacheUsageBucket, error) {
 	if s == nil || s.driver != "sqlite" {
 		return nil, nil
+	}
+	ready, err := s.usageHourlyRollupReady(ctx)
+	if err != nil || !ready {
+		return nil, err
 	}
 	fullStart, fullUntil, ok := fullUsageRollupBounds(since, until)
 	if !ok || bucketSeconds%3600 != 0 {
@@ -258,12 +327,16 @@ func (s *Store) cacheUsageSummaryHourlyWindow(ctx context.Context, since, until 
 	if s == nil || s.driver != "sqlite" {
 		return CacheUsageMetricRow{}, false, nil
 	}
+	ready, err := s.usageHourlyRollupReady(ctx)
+	if err != nil || !ready {
+		return CacheUsageMetricRow{}, false, err
+	}
 	fullStart, fullUntil, ok := fullUsageRollupBounds(since, until)
 	if !ok {
 		return CacheUsageMetricRow{}, false, nil
 	}
 	var row CacheUsageMetricRow
-	err := s.rdb.QueryRowContext(ctx, `
+	err = s.rdb.QueryRowContext(ctx, `
 SELECT SUM(requests),SUM(real_requests),SUM(hit_requests),SUM(prompt_tokens),SUM(cached_tokens),
        SUM(cache_input_tokens),SUM(cache_miss_tokens),SUM(cache_read_tokens),SUM(cache_creation_tokens),
        SUM(cache_creation_5m_tokens),SUM(cache_creation_1h_tokens),SUM(estimated_requests),

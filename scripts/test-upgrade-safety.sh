@@ -240,6 +240,32 @@ test_manifest_generation_without_git() {
   done
 }
 
+test_build_selected_duplicate_scan() {
+  command -v go >/dev/null 2>&1 || return 0
+  # shellcheck disable=SC1090
+  source "$ROOT/update.sh"
+
+  local fixture="${TMP}/duplicate-scan" output real_output
+  mkdir -p "$fixture/platform" "$fixture/ignored" "$fixture/duplicate"
+  printf 'module duplicate-scan\n\ngo 1.25\n' >"$fixture/go.mod"
+  printf '//go:build unix\n\npackage platform\n\nfunc processAlive() {}\n' >"$fixture/platform/process_unix.go"
+  printf '//go:build windows\n\npackage platform\n\nfunc processAlive() {}\n' >"$fixture/platform/process_windows.go"
+  printf '//go:build ignore\n\npackage ignored\n\nfunc main() {}\n' >"$fixture/ignored/one.go"
+  printf '//go:build ignore\n\npackage ignored\n\nfunc main() {}\n' >"$fixture/ignored/two.go"
+  printf 'package duplicate\n\nfunc staleSource() {}\n' >"$fixture/duplicate/one.go"
+  printf 'package duplicate\n\nfunc staleSource() {}\n' >"$fixture/duplicate/two.go"
+
+  output="$(PROJECT_ROOT="$fixture" find_duplicate_go_decls)"
+  [[ "$output" == *'staleSource 重复声明于'* ]] ||
+    fail "active same-package duplicate was not diagnosed: ${output:-<empty>}"
+  [[ "$output" != *'processAlive'* && "$output" != *'/ignored/'* ]] ||
+    fail "build-constrained files were falsely diagnosed: ${output}"
+
+  real_output="$(PROJECT_ROOT="$ROOT" find_duplicate_go_decls)"
+  [[ -z "$real_output" ]] ||
+    fail "clean repository contains active-build duplicate declarations: ${real_output}"
+}
+
 test_install_dispatch
 test_explicit_listen_addr_resolution
 test_backup_rotation
@@ -248,4 +274,5 @@ test_console_release_guard
 test_console_prune_is_atomic
 test_manifest_generation_without_git
 test_managed_source_manifest_current
-printf 'PASS: install dispatch, bounded backups, managed-source convergence, console release closure, and manifest freshness\n'
+test_build_selected_duplicate_scan
+printf 'PASS: install dispatch, bounded backups, managed-source convergence, console release closure, manifest freshness, and build-aware duplicate scanning\n'

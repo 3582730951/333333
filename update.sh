@@ -367,18 +367,23 @@ remove_stale_sources() {
   return 0
 }
 
-# find_duplicate_go_decls scans every Go package directory for a top-level func or method
-# declared in more than one file of the SAME package — the fingerprint of a stale leftover
-# source file that STALE_SOURCES did not yet cover. It is package-aware (an in-package
-# `package foo` and an external `package foo_test` in the same dir are NOT conflated) and
-# prints one human-readable line per real conflict; prints nothing when the tree is clean.
+# find_duplicate_go_decls scans only files selected by the current Go build. This is
+# important: unix/windows, linux/other, and //go:build ignore files legitimately contain
+# the same declarations and must never be presented as stale sources to delete. Internal
+# tests share their package with production files; external tests keep package foo_test.
+# One human-readable line is printed per real active-build conflict.
 find_duplicate_go_decls() {
+  local dir pkg base f
   command -v awk >/dev/null 2>&1 || return 0
-  find "${PROJECT_ROOT}" -type f -name '*.go' \
-       -not -path '*/.build/*' -not -path '*/vendor/*' 2>/dev/null \
-  | while IFS= read -r f; do
-      awk -v dir="$(dirname "$f")" -v file="$f" '
-        /^package[ \t]/ { pkg=$2; next }
+  command -v go >/dev/null 2>&1 || return 0
+  (
+    cd "${PROJECT_ROOT}" || exit 0
+    go list -e -f '{{- $dir := .Dir -}}{{- $pkg := .Name -}}{{range .GoFiles}}{{printf "%s\t%s\t%s\n" $dir $pkg .}}{{end}}{{range .CgoFiles}}{{printf "%s\t%s\t%s\n" $dir $pkg .}}{{end}}{{range .TestGoFiles}}{{printf "%s\t%s\t%s\n" $dir $pkg .}}{{end}}{{range .XTestGoFiles}}{{printf "%s\t%s_test\t%s\n" $dir $pkg .}}{{end}}' ./... 2>/dev/null || true
+  ) | while IFS="$(printf '\t')" read -r dir pkg base; do
+      [[ -n "$dir" && -n "$pkg" && -n "$base" ]] || continue
+      f="${dir%/}/${base}"
+      [[ -f "$f" ]] || continue
+      awk -v dir="$dir" -v pkg="$pkg" -v file="$f" '
         /^func[ \t]/ {
           s=$0; sub(/^func[ \t]+/,"",s)
           if (substr(s,1,1)=="(") {                       # method: func (r T) Name(
@@ -410,10 +415,9 @@ find_duplicate_go_decls() {
     '
 }
 
-# diagnose_build_failure runs only after scripts/install.sh fails. It turns a cryptic Go
-# "redeclared / already declared" error into an actionable hint that names the exact
-# conflicting files, since that is by far the most common cause of an update that built
-# fine on the dev machine but not on a host that was re-uploaded additively.
+# diagnose_build_failure runs only after scripts/install.sh fails. If the active build
+# truly contains a redeclaration, it names the exact selected files without confusing
+# platform alternatives or standalone build-ignored diagnostic commands with conflicts.
 diagnose_build_failure() {
   local dups
   dups="$(find_duplicate_go_decls)"

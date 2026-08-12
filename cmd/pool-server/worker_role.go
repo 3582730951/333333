@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -104,16 +105,21 @@ func (c *workerRoleController) reconcile(ctx context.Context) {
 		if time.Now().Before(c.nextRenew) {
 			return
 		}
-		renewCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		// SQLite serializes writes. A bounded historical-migration batch can own the
+		// write connection for longer than the old fixed two-second budget even though
+		// the process is healthy. Renew early and allow half a lease period so storage
+		// maintenance cannot repeatedly demote the only active worker.
+		renewCtx, cancel := context.WithTimeout(ctx, leaseRenewTimeout(c.leaseTTL))
 		renewed, err := c.store.RenewMaintenanceLease(renewCtx, c.lease, c.leaseTTL)
 		cancel()
 		if err != nil {
+			log.Printf("worker role: active lease renewal failed owner=%s fencing_token=%d: %v", c.ownerID, c.lease.FencingToken, err)
 			c.deactivateLocked()
 			c.deployment.markStandby()
 			return
 		}
 		c.lease = renewed
-		c.nextRenew = time.Now().Add(c.leaseTTL / 3)
+		c.nextRenew = time.Now().Add(c.leaseTTL / 4)
 		c.deployment.markActive(renewed.FencingToken)
 		return
 	}
@@ -127,6 +133,7 @@ func (c *workerRoleController) reconcile(ctx context.Context) {
 	}
 	activeCtx, activeCancel := context.WithCancel(ctx)
 	if err := c.startActive(activeCtx, lease.FencingToken); err != nil {
+		log.Printf("worker role: active runtime start failed owner=%s fencing_token=%d: %v", c.ownerID, lease.FencingToken, err)
 		activeCancel()
 		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = c.store.ReleaseMaintenanceLease(releaseCtx, lease)
@@ -137,8 +144,16 @@ func (c *workerRoleController) reconcile(ctx context.Context) {
 	c.active = true
 	c.lease = lease
 	c.activeCancel = activeCancel
-	c.nextRenew = time.Now().Add(c.leaseTTL / 3)
+	c.nextRenew = time.Now().Add(c.leaseTTL / 4)
 	c.deployment.markActive(lease.FencingToken)
+}
+
+func leaseRenewTimeout(ttl time.Duration) time.Duration {
+	timeout := ttl / 2
+	if timeout > 10*time.Second {
+		timeout = 10 * time.Second
+	}
+	return timeout
 }
 
 func (c *workerRoleController) desiredActive() bool {

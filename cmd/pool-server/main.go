@@ -164,7 +164,9 @@ func run() int {
 	}
 	defer store.Close()
 
-	if err := store.Init(ctx); err != nil {
+	if err := store.InitWithProgress(ctx, func(phase string) {
+		log.Printf("startup: storage phase=%s elapsed=%s", phase, time.Since(storageInitStarted).Round(time.Millisecond))
+	}); err != nil {
 		log.Printf("init storage: %v", err)
 		reportStartupFailure("init_storage", err)
 		return 1
@@ -436,7 +438,13 @@ func (h *deploymentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *deploymentHandler) serveReady(w http.ResponseWriter, r *http.Request) {
-	ready := h.ready.Load() && !h.draining.Load()
+	// Read the deployment flags once so a concurrent role transition cannot emit
+	// a contradictory payload such as state=draining with ready=true.
+	draining := h.draining.Load()
+	fencingToken := h.fencingToken.Load()
+	active := h.ready.Load() && fencingToken > 0
+	standby := h.standbyReady.Load()
+	ready := active && !draining
 	var checkErr error
 	if ready && h.check != nil {
 		checkCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
@@ -446,10 +454,10 @@ func (h *deploymentHandler) serveReady(w http.ResponseWriter, r *http.Request) {
 	}
 	state := "active"
 	status := http.StatusOK
-	if h.draining.Load() {
+	if draining {
 		state = "draining"
 		status = http.StatusServiceUnavailable
-	} else if h.standbyReady.Load() && !ready {
+	} else if standby && !ready {
 		state = "standby_ready"
 		status = http.StatusServiceUnavailable
 	} else if !ready {
@@ -468,13 +476,17 @@ func (h *deploymentHandler) serveReady(w http.ResponseWriter, r *http.Request) {
 		"inflight":         h.inflight.Load(),
 		"started_at":       h.startedAt.Format(time.RFC3339Nano),
 		"worker_socket":    h.workerAddr,
-		"fencing_token":    h.fencingToken.Load(),
+		"fencing_token":    fencingToken,
 		"checks":           map[string]bool{"storage": checkErr == nil},
 	})
 }
 
 func (h *deploymentHandler) serveStandbyReady(w http.ResponseWriter, r *http.Request) {
-	ready := h.standbyReady.Load() || h.ready.Load()
+	draining := h.draining.Load()
+	fencingToken := h.fencingToken.Load()
+	active := h.ready.Load() && fencingToken > 0
+	standby := h.standbyReady.Load()
+	ready := !draining && (standby || active)
 	var checkErr error
 	if ready && h.check != nil {
 		checkCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
@@ -483,9 +495,9 @@ func (h *deploymentHandler) serveStandbyReady(w http.ResponseWriter, r *http.Req
 		ready = checkErr == nil
 	}
 	state := "standby_ready"
-	if h.ready.Load() && !h.draining.Load() {
+	if active && !draining {
 		state = "active"
-	} else if h.draining.Load() {
+	} else if draining {
 		state = "draining"
 	} else if !ready {
 		state = "starting"
@@ -506,7 +518,7 @@ func (h *deploymentHandler) serveStandbyReady(w http.ResponseWriter, r *http.Req
 		"inflight":         h.inflight.Load(),
 		"started_at":       h.startedAt.Format(time.RFC3339Nano),
 		"worker_socket":    h.workerAddr,
-		"fencing_token":    h.fencingToken.Load(),
+		"fencing_token":    fencingToken,
 		"checks":           map[string]bool{"storage": checkErr == nil},
 	})
 }

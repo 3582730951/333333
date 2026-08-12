@@ -463,38 +463,70 @@ func (s *Store) migrateGoalContinuityV2(ctx context.Context) error {
 	if completed > 0 {
 		return nil
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS goal_payload_chunk(
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS goal_payload_chunk(
 goal_id TEXT NOT NULL,payload_kind TEXT NOT NULL,segment_sequence INTEGER NOT NULL DEFAULT 0,chunk_index INTEGER NOT NULL,
 payload_hash TEXT NOT NULL,payload_bytes INTEGER NOT NULL,encrypted_payload TEXT NOT NULL,created_at INTEGER NOT NULL,
 PRIMARY KEY(goal_id,payload_kind,segment_sequence,chunk_index),FOREIGN KEY(goal_id) REFERENCES goal_session(id) ON DELETE CASCADE)`); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_goal_payload_chunk_history ON goal_payload_chunk(goal_id,payload_kind,segment_sequence,chunk_index)`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_goal_payload_chunk_history ON goal_payload_chunk(goal_id,payload_kind,segment_sequence,chunk_index)`); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE goal_checkpoint SET format_version=1 WHERE format_version<=0`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE goal_checkpoint SET format_version=1 WHERE format_version<=0`); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE goal_segment SET format_version=1 WHERE format_version<=0`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE goal_segment SET format_version=1 WHERE format_version<=0`); err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE goal_session SET storage_bytes=
-COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_checkpoint WHERE goal_id=goal_session.id),0)+
-COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_segment WHERE goal_id=goal_session.id),0)+
-COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_payload_chunk WHERE goal_id=goal_session.id),0)`)
+
+	// Account one goal per transaction. Older builds performed this whole-table
+	// rewrite before opening the listener, so a large continuity store could make
+	// an otherwise healthy staged worker miss the installer readiness deadline.
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id FROM goal_session ORDER BY id`)
 	if err != nil {
 		return err
 	}
-	now := Now()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO NOTHING`, goalContinuityV2MigrationMarker, "1", now); err != nil {
+	goalIDs := make([]string, 0, 128)
+	for rows.Next() {
+		var goalID string
+		if err = rows.Scan(&goalID); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		goalIDs = append(goalIDs, goalID)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
 		return err
 	}
-	return tx.Commit()
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	for _, goalID := range goalIDs {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		tx, txErr := s.db.BeginTx(ctx, nil)
+		if txErr != nil {
+			return txErr
+		}
+		_, txErr = tx.ExecContext(ctx, `UPDATE goal_session SET storage_bytes=
+COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_checkpoint WHERE goal_id=goal_session.id),0)+
+COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_segment WHERE goal_id=goal_session.id),0)+
+			COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_payload_chunk WHERE goal_id=goal_session.id),0)
+WHERE id=?`, goalID)
+		if txErr == nil {
+			txErr = tx.Commit()
+		} else {
+			_ = tx.Rollback()
+		}
+		if txErr != nil {
+			return txErr
+		}
+	}
+	now := Now()
+	_, err = s.db.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO NOTHING`, goalContinuityV2MigrationMarker, "1", now)
+	return err
 }
 
 func hashGoalValue(kind, value string) string {

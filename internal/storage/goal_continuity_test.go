@@ -581,7 +581,7 @@ CREATE TABLE goal_segment(id TEXT PRIMARY KEY,goal_id TEXT NOT NULL,sequence INT
 func TestGoalV2StorageAccountingMigrationIsMarked(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
-	if _, err := store.DB().ExecContext(ctx, `UPDATE settings SET value='1' WHERE key=?`, goalContinuityV2MigrationMarker); err != nil {
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, goalContinuityV2MigrationMarker, "1", Now()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().ExecContext(ctx, `INSERT INTO goal_session(id,protocol,expires_at,created_at,updated_at,storage_bytes) VALUES('post-marker','codex',?,?,?,123)`, Now()+3600, Now(), Now()); err != nil {

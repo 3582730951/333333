@@ -22,7 +22,7 @@ func TestDeploymentHandlerReadinessAndInflight(t *testing.T) {
 		<-release
 		_, _ = io.WriteString(w, "done")
 	}), "release-test", "/tmp/worker-test.sock")
-	h.ready.Store(true)
+	h.markActive(1)
 
 	normalDone := make(chan struct{})
 	go func() {
@@ -48,8 +48,15 @@ func TestDeploymentHandlerReadinessAndInflight(t *testing.T) {
 	h.draining.Store(true)
 	recorder = httptest.NewRecorder()
 	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
-	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"deployment_state":"draining"`) {
+	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"deployment_state":"draining"`) ||
+		!strings.Contains(recorder.Body.String(), `"ready":false`) {
 		t.Fatalf("draining readiness = %d %s", recorder.Code, recorder.Body.String())
+	}
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/standbyz", nil))
+	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"deployment_state":"draining"`) ||
+		!strings.Contains(recorder.Body.String(), `"standby_ready":false`) {
+		t.Fatalf("draining standby readiness = %d %s", recorder.Code, recorder.Body.String())
 	}
 }
 

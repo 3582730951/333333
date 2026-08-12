@@ -58,6 +58,9 @@ EGRESS_TCP_PORT_OVERRIDE=""
 EGRESS_UDP_PORT_OVERRIDE=""
 # HEALTH_TIMEOUT bounds private-worker and post-switch /readyz gates.
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
+# Abort a candidate that is crashing in a loop instead of silently polling the
+# Unix socket for the full health timeout. A transient first restart is allowed.
+WORKER_START_RESTART_LIMIT="${WORKER_START_RESTART_LIMIT:-5}"
 # DRAIN_TIMEOUT controls only the background reaper's progress-log cadence. It is
 # not an installation deadline: install.sh returns after the atomic traffic switch,
 # while the superseded worker keeps its established HTTP/SSE/WebSocket requests and
@@ -192,6 +195,7 @@ Environment overrides:
   LISTEN_ADDR, ADMIN_TOKEN, PUBLIC_URL, OPEN_FIREWALL,
   SIDECAR_ADDR, SIDECAR_VENV, SIDECAR_INSTALL_DIR, SIDECAR_COOKIE_DIR,
   INSTALL_GO, GO_INSTALL_VERSION, GO_INSTALL_ROOT, GO_BIN, HEALTH_TIMEOUT,
+  WORKER_START_RESTART_LIMIT,
   DRAIN_TIMEOUT (background drain log interval; install never waits for streams),
   SKIP_OS_PACKAGES, GO_TARBALL_SHA256,
   WITH_REGISTRATION, NODE_MIN_MAJOR, NODE_INSTALL_MAJOR, NODE_BIN, CHROME_BIN,
@@ -1506,15 +1510,86 @@ restore_codex_reauth_worker_after_rollback() {
 }
 
 wait_worker_ready() {
-  local socket="$1" expected="$2" max="$3" started="$SECONDS" payload
+  local socket="$1" expected="$2" max="$3" started="$SECONDS" payload="" unit
+  local elapsed=0 next_report=0 state="unknown" substate="unknown" pid="0" restarts="0" result=""
+  unit="${SERVICE_NAME}-worker@${expected}.service"
+  [[ "$WORKER_START_RESTART_LIMIT" =~ ^[1-9][0-9]*$ ]] || die "WORKER_START_RESTART_LIMIT must be a positive integer: ${WORKER_START_RESTART_LIMIT}"
   while (( SECONDS - started < max )); do
-    payload="$(curl --noproxy '*' --silent --show-error --max-time 2 --unix-socket "$socket" http://localhost/standbyz 2>/dev/null || true)"
+    payload="$(curl --noproxy '*' --silent --show-error --max-time 2 --unix-socket "$socket" http://localhost/standbyz 2>&1 || true)"
     if [[ "$payload" == *'"standby_ready":true'* && "$payload" == *"\"release_id\":\"${expected}\""* ]]; then
       return 0
+    fi
+
+    elapsed=$((SECONDS - started))
+    state="$(run_root systemctl show "$unit" --property=ActiveState --value 2>/dev/null || true)"
+    restarts="$(run_root systemctl show "$unit" --property=NRestarts --value 2>/dev/null || true)"
+    [[ "$restarts" =~ ^[0-9]+$ ]] || restarts=0
+    if [[ "$state" == "failed" || ( "$state" == "inactive" && "$elapsed" -ge 3 ) ]]; then
+      warn "Staged worker stopped before /standbyz became ready: unit=${unit} state=${state} elapsed=${elapsed}s"
+      return 1
+    fi
+    if (( restarts >= WORKER_START_RESTART_LIMIT )); then
+      warn "Staged worker restarted ${restarts} times before /standbyz became ready; stopping the crash loop"
+      return 1
+    fi
+    if (( elapsed >= next_report )); then
+      substate="$(run_root systemctl show "$unit" --property=SubState --value 2>/dev/null || true)"
+      pid="$(run_root systemctl show "$unit" --property=MainPID --value 2>/dev/null || true)"
+      result="$(run_root systemctl show "$unit" --property=Result --value 2>/dev/null || true)"
+      payload="${payload//$'\n'/ }"
+      warn "Waiting for staged worker: elapsed=${elapsed}s state=${state:-unknown}/${substate:-unknown} pid=${pid:-0} restarts=${restarts} result=${result:-unknown} standby=${payload:0:180}"
+      next_report=$((elapsed + 10))
     fi
     sleep 1
   done
   return 1
+}
+
+WORKER_FAILURE_REPORT=""
+
+capture_worker_startup_failure() {
+  local release="$1" started_epoch="$2" unit socket failure_dir failure_file tmp pid
+  unit="${SERVICE_NAME}-worker@${release}.service"
+  socket="${DATA_DIR%/}/run/worker-${release}.sock"
+  failure_dir="${DATA_DIR%/}/deploy-failures"
+  failure_file="${failure_dir%/}/worker-${release}.log"
+  tmp="$(mktemp)"
+  pid="$(run_root systemctl show "$unit" --property=MainPID --value 2>/dev/null || true)"
+  {
+    printf 'captured_at=%s\nrelease=%s\nunit=%s\nsocket=%s\n' "$(date -u +%FT%TZ)" "$release" "$unit" "$socket"
+    printf '\n[systemctl-show]\n'
+    run_root systemctl show "$unit" \
+      --property=ActiveState,SubState,Result,MainPID,ExecMainPID,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,CPUUsageNSec 2>&1 || true
+    printf '\n[systemctl-status]\n'
+    run_root systemctl --no-pager --full status "$unit" 2>&1 || true
+    printf '\n[unit-journal]\n'
+    run_root journalctl --no-pager --output=short-precise -u "$unit" --since "@${started_epoch}" -n 400 2>&1 || true
+    printf '\n[kernel-oom]\n'
+    run_root journalctl --no-pager --output=short-precise -k --since "@${started_epoch}" 2>&1 \
+      | grep -Ei 'out of memory|oom-kill|killed process|memory cgroup out of memory' || true
+    printf '\n[process]\n'
+    if [[ "$pid" =~ ^[1-9][0-9]*$ && -d "${PROC_ROOT%/}/${pid}" ]]; then
+      run_root cat "${PROC_ROOT%/}/${pid}/status" 2>&1 || true
+      run_root cat "${PROC_ROOT%/}/${pid}/cgroup" 2>&1 || true
+    else
+      printf 'MainPID is not alive: %s\n' "${pid:-0}"
+    fi
+    printf '\n[resources]\n'
+    run_root free -h 2>&1 || true
+    run_root df -h "$DATA_DIR" "$APP_DIR" 2>&1 || true
+    run_root ls -l "$socket" 2>&1 || true
+  } >"$tmp" 2>&1
+
+  if run_root install -d -m 0750 "$failure_dir" && run_root install -m 0640 "$tmp" "$failure_file"; then
+    run_root chown "root:${SERVICE_GROUP}" "$failure_file" 2>/dev/null || true
+    WORKER_FAILURE_REPORT="$failure_file"
+    warn "Staged worker failure report saved to ${failure_file}"
+    run_root tail -n 220 "$failure_file" >&2 || true
+  else
+    warn "Could not persist staged worker failure report; printing the temporary capture"
+    tail -n 220 "$tmp" >&2 || true
+  fi
+  rm -f "$tmp"
 }
 
 handoff_public_base_url() {
@@ -2022,6 +2097,7 @@ activate_staged_release() {
   }
 
   local new_socket="${DATA_DIR%/}/run/worker-${RELEASE_ID}.sock"
+  local new_unit="${SERVICE_NAME}-worker@${RELEASE_ID}.service" startup_started failure_hint=""
   local old_socket old_release old_release_id="" old_worker_release="" protected_release="" health_url had_handoff=0
   [[ "$DRAIN_TIMEOUT" =~ ^[0-9]+$ ]] || die "DRAIN_TIMEOUT must be a non-negative integer: ${DRAIN_TIMEOUT}"
   [[ "$WORKER_DESTROY_TIMEOUT" =~ ^[0-9]+$ ]] || die "WORKER_DESTROY_TIMEOUT must be a non-negative integer: ${WORKER_DESTROY_TIMEOUT}"
@@ -2039,14 +2115,21 @@ activate_staged_release() {
   fi
 
   log "Starting staged worker ${RELEASE_ID} on ${new_socket}"
-  if ! run_root systemctl start "${SERVICE_NAME}-worker@${RELEASE_ID}.service"; then
-    run_root systemctl --no-pager --full status "${SERVICE_NAME}-worker@${RELEASE_ID}.service" >&2 || true
-    die "could not start staged worker ${RELEASE_ID}; active release was not changed"
+  startup_started="$(date +%s)"
+  WORKER_FAILURE_REPORT=""
+  if ! run_root systemctl start "$new_unit"; then
+    capture_worker_startup_failure "$RELEASE_ID" "$startup_started"
+    [[ -z "$WORKER_FAILURE_REPORT" ]] || failure_hint="; failure report: ${WORKER_FAILURE_REPORT}"
+    die "could not start staged worker ${RELEASE_ID}; active release was not changed${failure_hint}"
   fi
   if ! wait_worker_ready "$new_socket" "$RELEASE_ID" "$HEALTH_TIMEOUT"; then
-    run_root systemctl --no-pager --full status "${SERVICE_NAME}-worker@${RELEASE_ID}.service" >&2 || true
-    run_root systemctl stop "${SERVICE_NAME}-worker@${RELEASE_ID}.service" || true
-    die "staged worker ${RELEASE_ID} did not pass /standbyz; active release was not changed"
+    # Capture the whole unit (including every restarted PID and kernel OOM lines)
+    # before cleanup. Querying only the first MainPID after this point cannot explain
+    # the failure because the failed candidate is intentionally stopped below.
+    capture_worker_startup_failure "$RELEASE_ID" "$startup_started"
+    run_root systemctl stop "$new_unit" || true
+    [[ -z "$WORKER_FAILURE_REPORT" ]] || failure_hint="; failure report: ${WORKER_FAILURE_REPORT}"
+    die "staged worker ${RELEASE_ID} did not pass /standbyz; active release was not changed${failure_hint}"
   fi
 
   ACTIVATION_PENDING=1

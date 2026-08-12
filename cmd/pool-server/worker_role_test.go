@@ -102,6 +102,21 @@ func TestWorkerLinkTargetsUsesResolvedExactPath(t *testing.T) {
 	}
 }
 
+func TestLeaseRenewTimeoutLeavesExpiryHeadroom(t *testing.T) {
+	for _, test := range []struct {
+		ttl, want time.Duration
+	}{
+		{100 * time.Millisecond, 50 * time.Millisecond},
+		{time.Second, 500 * time.Millisecond},
+		{15 * time.Second, 7500 * time.Millisecond},
+		{time.Minute, 10 * time.Second},
+	} {
+		if got := leaseRenewTimeout(test.ttl); got != test.want {
+			t.Fatalf("leaseRenewTimeout(%s)=%s want=%s", test.ttl, got, test.want)
+		}
+	}
+}
+
 func replaceWorkerLink(t *testing.T, link, target string) {
 	t.Helper()
 	next := link + ".next"

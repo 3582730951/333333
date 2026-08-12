@@ -19,7 +19,6 @@ const (
 	defaultLogRetentionDays    = 7
 	logCleanupBatchSize        = 1000
 	logCleanupInterval         = 24 * time.Hour
-	logVacuumInterval          = 7 * 24 * time.Hour
 )
 
 func (s *Server) logRetentionDays(ctx context.Context) int {
@@ -52,21 +51,15 @@ func (s *Server) maintainLogRetention(ctx context.Context) {
 		return
 	}
 	log.Printf("[LOG-CLEANUP] retention_days=%d deleted=%d counts=%+v", s.logRetentionDays(ctx), counts.Total(), counts)
-	lastVacuum := s.settingInt64(ctx, logCleanupLastVacuumKey, 0)
-	if lastVacuum > 0 && now-lastVacuum < int64(logVacuumInterval/time.Second) {
-		if err := s.store.CheckpointLogStorage(ctx); err != nil {
-			log.Printf("[LOG-CLEANUP] WAL checkpoint failed: %v", err)
-		}
-		return
-	}
-	compactCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	// Deleted SQLite pages are immediately reusable. VACUUM, however, takes an
+	// exclusive writer for a potentially multi-gigabyte rewrite; running it from a
+	// live worker can starve the active-role lease and every billing write. Keep the
+	// online sweep bounded to row batches plus a WAL checkpoint. Operators can still
+	// request an explicit compacting clear through DELETE /admin/logs.
+	checkpointCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := s.store.ReclaimLogStorage(compactCtx); err != nil {
-		log.Printf("[LOG-CLEANUP] weekly SQLite compaction failed: %v", err)
-		return
-	}
-	if err := s.store.SetSetting(ctx, logCleanupLastVacuumKey, strconv.FormatInt(now, 10)); err != nil {
-		log.Printf("[LOG-CLEANUP] persist compaction time failed: %v", err)
+	if err := s.store.CheckpointLogStorage(checkpointCtx); err != nil {
+		log.Printf("[LOG-CLEANUP] WAL checkpoint failed: %v", err)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -177,5 +178,77 @@ func TestRepairLegacyUsageEventsMatchesDiagnosticStateMachine(t *testing.T) {
 	}
 	if falsePending != 0 || recovered != 4 || duplicateRows != 4 {
 		t.Fatalf("false_pending=%d recovered=%d rows_after_replay=%d", falsePending, recovered, duplicateRows)
+	}
+}
+
+func TestLegacyUsageEventRepairDoesNotBlockListenerStartup(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := Now() - 100
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO billing_holds(id,account_id,estimated_tokens,status,usage_expected,created_at,updated_at)
+VALUES('legacy-deferred','account',100,'stream_probe_failed',1,?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	// A second Init represents the next staged-worker startup. Historical rows
+	// remain untouched until the active-role deferred runner starts.
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var events, expected, marker int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_events WHERE hold_id='legacy-deferred'`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT usage_expected FROM billing_holds WHERE id='legacy-deferred'`).Scan(&expected); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 || expected != 1 {
+		t.Fatalf("synchronous startup repaired history: events=%d expected=%d", events, expected)
+	}
+	if err := store.RunDeferredMigrations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_events WHERE hold_id='legacy-deferred'`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT usage_expected FROM billing_holds WHERE id='legacy-deferred'`).Scan(&expected); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key=?`, legacyUsageEventsRepairMarker).Scan(&marker); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 || expected != 0 || marker != 1 {
+		t.Fatalf("deferred repair events=%d expected=%d marker=%d", events, expected, marker)
+	}
+}
+
+func TestLegacyUsageEventRepairUsesPartialLookupIndexes(t *testing.T) {
+	store := newTestStore(t)
+	rows, err := store.db.Query(`EXPLAIN QUERY PLAN
+SELECT h.id,
+ (SELECT MAX(route_epoch) FROM usage_records u WHERE u.billing_hold_id<>'' AND u.billing_hold_id=h.id),
+ EXISTS(SELECT 1 FROM usage_records u WHERE u.billing_hold_id<>'' AND u.billing_hold_id=h.id AND u.estimated=0)
+FROM billing_holds h
+WHERE NOT EXISTS(SELECT 1 FROM usage_events e WHERE e.hold_id<>'' AND e.hold_id=h.id)
+ORDER BY h.id LIMIT 500`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err = rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(detail)
+		plan.WriteByte('\n')
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	detail := plan.String()
+	if !strings.Contains(detail, "idx_usage_records_billing_hold") || !strings.Contains(detail, "idx_usage_events_hold_id") {
+		t.Fatalf("legacy repair lost partial-index lookup plan:\n%s", detail)
 	}
 }

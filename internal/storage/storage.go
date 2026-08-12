@@ -1389,18 +1389,38 @@ func Now() int64 {
 }
 
 func (s *Store) Init(ctx context.Context) error {
+	return s.init(ctx, nil)
+}
+
+// InitWithProgress is Init with phase notifications for startup supervisors.
+// Notifications are emitted immediately before each bounded schema phase so a
+// stalled upgrade leaves an actionable last-known phase in the service journal.
+func (s *Store) InitWithProgress(ctx context.Context, progress func(string)) error {
+	return s.init(ctx, progress)
+}
+
+func (s *Store) init(ctx context.Context, progress func(string)) error {
+	report := func(phase string) {
+		if progress != nil {
+			progress(phase)
+		}
+	}
 	if s.driver == "postgres" {
+		report("postgres_schema")
 		return s.initPostgres(ctx)
 	}
+	report("sqlite_pragmas")
 	if _, err := s.db.ExecContext(ctx, `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA cache_size=-16384; PRAGMA mmap_size=67108864; PRAGMA temp_store=MEMORY;`); err != nil {
 		return err
 	}
+	report("base_schema")
 	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
 		return err
 	}
 	// goalContinuitySchemaSQL is deliberately additive and runs independently of the
 	// legacy context_journal migration.  Existing installations start dual-writing v2
 	// rows without a risky rewrite of historical snapshots.
+	report("goal_schema")
 	if _, err := s.db.ExecContext(ctx, goalContinuitySchemaSQL); err != nil {
 		return err
 	}
@@ -1408,10 +1428,12 @@ func (s *Store) Init(ctx context.Context) error {
 	// store. They contain encrypted identity metadata plus HMAC aliases only, so an
 	// upgrade can begin exact native previous_response_id routing without rewriting
 	// any historical prompt bodies.
+	report("codex_session_schema")
 	if _, err := s.db.ExecContext(ctx, codexSessionMappingSchemaSQL); err != nil {
 		return err
 	}
 	// Create lifecycle management tables
+	report("runtime_schemas")
 	if _, err := s.db.ExecContext(ctx, lifecycleSchemaSQL); err != nil {
 		return err
 	}
@@ -1426,18 +1448,22 @@ func (s *Store) Init(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, mailboxProfileSchemaSQL); err != nil {
 		return err
 	}
+	report("additive_schema_migrations")
 	if err := s.migrate(ctx); err != nil {
 		return err
 	}
+	report("usage_rollup_schema")
 	if err := s.initUsageHourlyRollups(ctx); err != nil {
 		return err
 	}
+	report("goal_storage_accounting")
 	if err := s.migrateGoalContinuityV2(ctx); err != nil {
 		return err
 	}
-	if err := s.repairLegacyUsageEvents(ctx); err != nil {
-		return err
-	}
+	// Historical usage rollups and legacy billing-event repair are intentionally
+	// deferred until an active listener exists. Their schemas and current-write
+	// triggers are ready here, so no new request loses data.
+	report("small_data_migrations")
 	// New previous_response_id aliases live in affinity_aliases. Legacy rows remain
 	// readable for one compatibility window and are then removed in small batches.
 	if _, err := s.db.ExecContext(ctx, `UPDATE affinity_bindings SET expires_at=updated_at+? WHERE source='previous_response_id' AND expires_at=0`, int64((7*24*time.Hour)/time.Second)); err != nil {
@@ -1449,6 +1475,7 @@ func (s *Store) Init(ctx context.Context) error {
 	if err := s.migrateLifecycle(ctx); err != nil {
 		return err
 	}
+	report("runtime_settings")
 	now := Now()
 	if _, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES('usage_accuracy_cutover_at',?,?) ON CONFLICT(key) DO NOTHING`, strconv.FormatInt(now, 10), now); err != nil {
 		return err
@@ -1489,65 +1516,171 @@ ON CONFLICT(id) DO NOTHING`, DefaultDirectEgressID, now, now)
 	if err := removeUnusedLegacySeedProviders(ctx, s.db); err != nil {
 		return err
 	}
+	report("egress_bindings")
 	if _, err := s.RepairMissingAccountEgressBindings(ctx); err != nil {
 		return err
 	}
+	report("complete")
 	return nil
 }
 
 func (s *Store) repairLegacyUsageEvents(ctx context.Context) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO usage_events(event_id, hold_id, account_id, route_key_hash, route_epoch, estimated_tokens, usage_state, terminal_status, usage_recorded_at, settled_at, created_at, updated_at)
+	const insertBatch = 500
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		// The explicit non-empty predicates match the partial indexes. Without them,
+		// SQLite scans the full usage/event history once per hold even though equality
+		// logically implies a non-empty value; the reported 51k x 51k upgrade then
+		// remains pre-listener for minutes.
+		result, execErr := tx.ExecContext(ctx, `INSERT OR IGNORE INTO usage_events(event_id, hold_id, account_id, route_key_hash, route_epoch, estimated_tokens, usage_state, terminal_status, usage_recorded_at, settled_at, created_at, updated_at)
 SELECT 'legacy_hold:'||h.id, h.id, h.account_id, h.route_key_hash,
- COALESCE((SELECT MAX(route_epoch) FROM usage_records u WHERE u.billing_hold_id=h.id),0), h.estimated_tokens,
- CASE WHEN EXISTS(SELECT 1 FROM usage_records u WHERE u.billing_hold_id=h.id AND u.estimated=0) THEN 'real'
-      WHEN EXISTS(SELECT 1 FROM usage_records u WHERE u.billing_hold_id=h.id) THEN 'estimated' ELSE 'pending' END,
+ COALESCE((SELECT MAX(route_epoch) FROM usage_records u WHERE u.billing_hold_id<>'' AND u.billing_hold_id=h.id),0), h.estimated_tokens,
+ CASE WHEN EXISTS(SELECT 1 FROM usage_records u WHERE u.billing_hold_id<>'' AND u.billing_hold_id=h.id AND u.estimated=0) THEN 'real'
+      WHEN EXISTS(SELECT 1 FROM usage_records u WHERE u.billing_hold_id<>'' AND u.billing_hold_id=h.id) THEN 'estimated' ELSE 'pending' END,
  CASE WHEN h.status='held' THEN '' ELSE h.status END, h.usage_recorded_at,
  CASE WHEN h.status='held' THEN 0 ELSE h.updated_at END, h.created_at, h.updated_at
-FROM billing_holds h WHERE NOT EXISTS(SELECT 1 FROM usage_events e WHERE e.hold_id=h.id)`); err != nil {
-		return err
+FROM billing_holds h
+WHERE NOT EXISTS(SELECT 1 FROM usage_events e WHERE e.hold_id<>'' AND e.hold_id=h.id)
+  AND NOT EXISTS(SELECT 1 FROM usage_events e WHERE e.event_id='legacy_hold:'||h.id)
+ORDER BY h.id LIMIT ?`, insertBatch)
+		inserted := int64(0)
+		if execErr == nil {
+			inserted, execErr = result.RowsAffected()
+		}
+		if execErr == nil {
+			execErr = tx.Commit()
+		} else {
+			_ = tx.Rollback()
+		}
+		if execErr != nil {
+			return execErr
+		}
+		if inserted == 0 {
+			break
+		}
+		if err := yieldDeferredStorageWriter(ctx); err != nil {
+			return err
+		}
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO usage_events(event_id, account_id, route_key_hash, route_epoch, usage_state, usage_recorded_at, created_at, updated_at)
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		result, execErr := tx.ExecContext(ctx, `INSERT OR IGNORE INTO usage_events(event_id, account_id, route_key_hash, route_epoch, usage_state, usage_recorded_at, created_at, updated_at)
 SELECT usage_event_id, account_id, route_key_hash, route_epoch, CASE WHEN estimated=0 THEN 'real' ELSE 'estimated' END, created_at, created_at, created_at
-FROM usage_records WHERE usage_event_id<>''`); err != nil {
-		return err
+FROM usage_records u WHERE usage_event_id<>'' AND NOT EXISTS(SELECT 1 FROM usage_events e WHERE e.event_id=u.usage_event_id)
+ORDER BY u.id LIMIT ?`, insertBatch)
+		inserted := int64(0)
+		if execErr == nil {
+			inserted, execErr = result.RowsAffected()
+		}
+		if execErr == nil {
+			execErr = tx.Commit()
+		} else {
+			_ = tx.Rollback()
+		}
+		if execErr != nil {
+			return execErr
+		}
+		if inserted == 0 {
+			break
+		}
+		if err := yieldDeferredStorageWriter(ctx); err != nil {
+			return err
+		}
 	}
+
 	// These terminal states represent a failed/retried attempt, not missing billing.
 	// The example diagnostic snapshot had 46 such false pending rows at its manifest
 	// boundary (49 by the later CSV boundary); retain true usage rows when present.
-	if _, err = tx.ExecContext(ctx, `UPDATE billing_holds SET usage_expected=0
+	if _, err := s.db.ExecContext(ctx, `UPDATE billing_holds SET usage_expected=0
 WHERE usage_recorded_at=0 AND status IN ('mapped_session_risk_rotating','stream_mapped_session_risk_rotating','stream_probe_failed','stream_interrupted_compensated')`); err != nil {
 		return err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM billing_holds
-WHERE usage_recorded_at=0 AND estimated_tokens>0 AND status IN ('settled','settled_streaming','success_body_rule') ORDER BY id`)
-	if err != nil {
-		return err
-	}
-	var holdIDs []string
-	for rows.Next() {
-		var id string
-		if err = rows.Scan(&id); err != nil {
-			rows.Close()
+
+	const recoveryBatch = 100
+	for {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		holdIDs = append(holdIDs, id)
-	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-	for _, holdID := range holdIDs {
-		if err = s.recoverEstimatedUsageForHold(ctx, tx, holdID, Now()); err != nil {
+		rows, err := s.rdb.QueryContext(ctx, `SELECT h.id FROM billing_holds h JOIN usage_events e ON e.hold_id=h.id
+WHERE h.usage_recorded_at=0 AND h.estimated_tokens>0 AND h.status IN ('settled','settled_streaming','success_body_rule') ORDER BY h.id LIMIT ?`, recoveryBatch)
+		if err != nil {
+			return err
+		}
+		holdIDs := make([]string, 0, recoveryBatch)
+		for rows.Next() {
+			var id string
+			if err = rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			holdIDs = append(holdIDs, id)
+		}
+		if err = rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err = rows.Close(); err != nil {
+			return err
+		}
+		if len(holdIDs) == 0 {
+			return nil
+		}
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		for _, holdID := range holdIDs {
+			if err = s.recoverEstimatedUsageForHold(ctx, tx, holdID, Now()); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+		if err = yieldDeferredStorageWriter(ctx); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+}
+
+func yieldDeferredStorageWriter(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Millisecond):
+		return nil
+	}
+}
+
+const legacyUsageEventsRepairMarker = "legacy_usage_events_repair_v1"
+
+func (s *Store) repairLegacyUsageEventsOnce(ctx context.Context) error {
+	var completed int
+	if err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key=?`, legacyUsageEventsRepairMarker).Scan(&completed); err != nil {
+		return err
+	}
+	if completed > 0 {
+		return nil
+	}
+	if err := s.repairLegacyUsageEvents(ctx); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO NOTHING`, legacyUsageEventsRepairMarker, "1", Now())
+	return err
 }
 
 func (s *Store) migrateContextJournalTTL(ctx context.Context, now int64) error {
@@ -9675,13 +9808,19 @@ const usageCacheDiagnosticsMigrationMarker = "usage_cache_diagnostics_v3_backfil
 const openAICacheDiagnosticsMigrationMarker = "usage_cache_diagnostics_v4_openai_nested_cache_backfilled"
 
 // RunDeferredMigrations performs historical repairs after the HTTP listener is
-// available. Schema and billing-integrity migrations remain synchronous; these
-// potentially large, bounded-batch rewrites must not hold a socket-activated
+// available. Only additive schema and current-write invariants remain synchronous;
+// these potentially large, restartable rewrites must not hold a socket-activated
 // service in the pre-listener state long enough for the install health gate to
 // roll it back.
 func (s *Store) RunDeferredMigrations(ctx context.Context) error {
 	if s == nil || s.driver == "postgres" {
 		return nil
+	}
+	if err := s.repairLegacyUsageEventsOnce(ctx); err != nil {
+		return err
+	}
+	if err := s.backfillUsageHourlyRollups(ctx); err != nil {
+		return err
 	}
 	var completed int
 	if err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key=?`, usageCacheDiagnosticsMigrationMarker).Scan(&completed); err != nil {

@@ -226,13 +226,15 @@ PY
 }
 
 test_lossless_upgrade_contract() {
-  local activate_body legacy_body reauth_body systemd_body cleanup_body reaper_body schedule_body
+  local activate_body legacy_body reauth_body systemd_body cleanup_body reaper_body schedule_body wait_body capture_body
   activate_body="$(sed -n '/^activate_staged_release()/,/^}/p' scripts/install.sh)"
   legacy_body="$(sed -n '/^destroy_legacy_worker_process()/,/^}/p' scripts/install.sh)"
   reauth_body="$(sed -n '/^activate_codex_reauth_worker()/,/^}/p' scripts/install.sh)"
   systemd_body="$(sed -n '/^install_systemd_unit()/,/^}/p' scripts/install.sh)"
   cleanup_body="$(sed -n '/^deployment_exit_cleanup()/,/^}/p' scripts/install.sh)"
   schedule_body="$(sed -n '/^schedule_release_reaper()/,/^}/p' scripts/install.sh)"
+  wait_body="$(sed -n '/^wait_worker_ready()/,/^}/p' scripts/install.sh)"
+  capture_body="$(sed -n '/^capture_worker_startup_failure()/,/^}/p' scripts/install.sh)"
   reaper_body="$(cat scripts/reap-old-release.sh)"
 
   [[ "$activate_body" == *'pause_handoff_admission'* && "$activate_body" == *'resume_handoff_admission'* ]] ||
@@ -259,6 +261,12 @@ test_lossless_upgrade_contract() {
     die "background reaper can force-kill an established request"
   [[ "$cleanup_body" == *'resume_handoff_admission'* ]] ||
     die "installer failure cleanup does not automatically resume queued requests"
+  [[ "$wait_body" == *'NRestarts'* && "$wait_body" == *'WORKER_START_RESTART_LIMIT'* && "$wait_body" == *'Waiting for staged worker'* ]] ||
+    die "staged-worker health gate does not expose progress or stop a crash loop"
+  [[ "$capture_body" == *'journalctl'*'-u "$unit"'* && "$capture_body" == *'[kernel-oom]'* && "$capture_body" == *'deploy-failures'* ]] ||
+    die "staged-worker failure capture does not preserve unit journal and OOM evidence"
+  [[ "$activate_body" == *'capture_worker_startup_failure'*'systemctl stop "$new_unit"'* ]] ||
+    die "candidate cleanup runs before its startup evidence is captured"
 }
 
 test_background_reaper_contract() {
@@ -330,6 +338,19 @@ EOF
   ! grep -Fq "stop --no-block ${SERVICE_NAME}-worker@${release}.service" "$fake_log" ||
     die "background reaper stopped a release that became current during drain"
 }
+
+test_worker_failure_report_capture() {
+  WORKER_FAILURE_REPORT=""
+  capture_worker_startup_failure "release-failed" "$(date +%s)" >/dev/null 2>&1
+  [[ -n "$WORKER_FAILURE_REPORT" && -f "$WORKER_FAILURE_REPORT" ]] ||
+    die "staged-worker failure report was not persisted"
+  grep -Fq '[systemctl-show]' "$WORKER_FAILURE_REPORT" ||
+    die "failure report omitted systemd state"
+  grep -Fq '[unit-journal]' "$WORKER_FAILURE_REPORT" ||
+    die "failure report omitted the complete unit journal"
+  grep -Fq '[kernel-oom]' "$WORKER_FAILURE_REPORT" ||
+    die "failure report omitted kernel OOM evidence"
+}
 reclaim_superseded_install_resources "release-current"
 [[ ! -e "$PROC_ROOT/555" && -e "$PROC_ROOT/666/exe" ]]
 [[ -L "$PROC_ROOT/777/exe" ]]
@@ -341,5 +362,6 @@ test_release_super_instruct_permissions
 test_fresh_config_preserves_codex_client_policy
 test_lossless_upgrade_contract
 test_background_reaper_contract
+test_worker_failure_report_capture
 
 printf '%s\n' "single-worker installer lifecycle: OK"

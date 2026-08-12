@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 )
 
@@ -76,5 +77,63 @@ func TestUsageHourlyRollupCombinesExactWindowEdgesAndRepairsUpdates(t *testing.T
 	stats, err := store.UsageHourlyRollupStats(ctx)
 	if err != nil || stats.Rows != 4 {
 		t.Fatalf("rollup stats=%+v err=%v", stats, err)
+	}
+}
+
+func TestUsageHourlyRollupHistoricalBackfillWaitsForDeferredRunner(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "pool.sqlite3")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.DB().ExecContext(ctx, `
+DROP TRIGGER usage_hourly_rollup_insert;
+DROP TRIGGER usage_hourly_rollup_update;
+DROP TRIGGER usage_hourly_rollup_delete;
+DELETE FROM settings WHERE key='usage_hourly_rollup_v1';
+DELETE FROM usage_hourly_rollups;
+INSERT INTO usage_records(account_id,model,prompt_tokens,total_tokens,created_at)
+VALUES('legacy-a','gpt-test',10,10,1800000010),('legacy-b','gpt-test',20,20,1800003610)`); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := store.usageHourlyRollupReady(ctx)
+	if err != nil || ready {
+		t.Fatalf("rollup unexpectedly marked ready before deferred migration: ready=%t err=%v", ready, err)
+	}
+	stats, err := store.UsageHourlyRollupStats(ctx)
+	if err != nil || stats.Rows != 0 {
+		t.Fatalf("startup performed historical rollup: stats=%+v err=%v", stats, err)
+	}
+	rows, err := store.UsageTimeseriesWindow(ctx, 1_800_000_000, 1_800_007_200, 3600)
+	if err != nil || len(rows) != 2 || rows[0].TotalTokens != 10 || rows[1].TotalTokens != 20 {
+		t.Fatalf("raw fallback while migration is pending: rows=%+v err=%v", rows, err)
+	}
+
+	if err = store.backfillUsageHourlyRollups(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ready, err = store.usageHourlyRollupReady(ctx)
+	if err != nil || !ready {
+		t.Fatalf("deferred rollup did not commit marker: ready=%t err=%v", ready, err)
+	}
+	stats, err = store.UsageHourlyRollupStats(ctx)
+	if err != nil || stats.Rows != 2 {
+		t.Fatalf("deferred rollup stats=%+v err=%v", stats, err)
 	}
 }
