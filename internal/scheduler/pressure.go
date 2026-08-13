@@ -90,6 +90,29 @@ func (s *Scheduler) EligibleCandidateCount(ctx context.Context, route Route) (in
 	return snapshot.EligibleAccounts, err
 }
 
+// StructuralCandidateCount reports how many active accounts match the route's
+// group, provider and exact model before transient quota, recheck, egress and
+// concurrency checks are applied. A zero result is therefore safe to cache as a
+// definite "cannot execute this route" marker until RouteStructureVersion changes.
+//
+// Keeping transient state out of this result is important: a background scanner
+// must never turn a short cooldown into a stale negative mark that skips an
+// account which recovered just before the next request.
+func (s *Scheduler) StructuralCandidateCount(ctx context.Context, route Route) (int, error) {
+	if route.Group == "" {
+		route.Group = s.Config().DefaultGroup
+	}
+	selection, err := s.accountsSnapshot(ctx, route.Group)
+	if err != nil {
+		return 0, err
+	}
+	index, err := s.candidateIndexSnapshot(ctx, selection, route)
+	if err != nil {
+		return 0, err
+	}
+	return len(index.candidates), nil
+}
+
 func (s *Scheduler) providerPressureSnapshot(ctx context.Context, route Route) (ProviderPressureSnapshot, error) {
 	if route.Group == "" {
 		route.Group = s.Config().DefaultGroup

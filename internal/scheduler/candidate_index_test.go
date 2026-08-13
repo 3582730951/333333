@@ -56,6 +56,53 @@ func TestCandidateIndexFallsBackOnlyWhenBothSamplesAreUnavailable(t *testing.T) 
 	}
 }
 
+func TestStructuralCandidateCountIgnoresTransientAvailability(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	const (
+		group = "structural-count"
+		model = "gpt-5.6-sol"
+	)
+	if err := store.CreateGroup(ctx, storage.Group{Name: group}); err != nil {
+		t.Fatal(err)
+	}
+	account := storage.Account{
+		ID: "structural-cooling", GroupName: group, Provider: "codex", Status: "active",
+		QuarantineUntil: storage.Now() + 3600,
+	}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token-structural"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertCapabilities(ctx, []storage.ModelCapability{{
+		AccountID: account.ID, ModelSlug: model, AvailabilityState: "verified", Source: "test",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	s := New(store, config.Default())
+	defer s.Close()
+	route := Route{Group: group, Provider: "codex", Model: model}
+	structural, err := s.StructuralCandidateCount(ctx, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eligible, err := s.EligibleCandidateCount(ctx, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if structural != 1 || eligible != 0 {
+		t.Fatalf("structural=%d eligible=%d, want 1/0 for transient quarantine", structural, eligible)
+	}
+	before := s.RouteStructureVersion()
+	s.RefreshAccountCache()
+	if afterTransient := s.RouteStructureVersion(); afterTransient != before {
+		t.Fatalf("transient refresh advanced structural version: before=%d after=%d", before, afterTransient)
+	}
+	s.InvalidateAccountCache()
+	if after := s.RouteStructureVersion(); after <= before {
+		t.Fatalf("route state version did not advance: before=%d after=%d", before, after)
+	}
+}
+
 func TestCandidateIndexRollbackUsesFullScan(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)

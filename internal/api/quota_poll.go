@@ -324,7 +324,7 @@ func (s *Server) pollOneKiroQuota(ctx context.Context, acc storage.Account, toke
 	bearer, token, cred, err := s.kiro.Prepare(ctx, acc, cred, token, egress, false)
 	if err != nil {
 		if errors.Is(err, kirowire.ErrInvalidGrant) {
-			s.scheduler.InvalidateAccountCache()
+			s.scheduler.RefreshAccountCache()
 		}
 		return err
 	}

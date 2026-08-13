@@ -187,6 +187,9 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		if s.scheduler != nil {
+			s.scheduler.InvalidateAccountCache()
+		}
 		out, ok, err := s.store.GetCustomProvider(r.Context(), id)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -286,6 +289,9 @@ func (s *Server) adminProviderAction(w http.ResponseWriter, r *http.Request) {
 		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if s.scheduler != nil {
+		s.scheduler.InvalidateAccountCache()
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"id": id, "deleted": true})
 }

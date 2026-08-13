@@ -47,7 +47,13 @@ func (s *Server) probeAccountModels(ctx context.Context, account storage.Account
 	if err != nil {
 		return nil, err
 	}
-	return s.probeAccountModelsWithDeps(ctx, account, token, binding, egress)
+	caps, err := s.probeAccountModelsWithDeps(ctx, account, token, binding, egress)
+	if err == nil && s.scheduler != nil {
+		// Catalog changes alter structural route marks. Publish them immediately;
+		// the periodic availability scan remains only a safety net.
+		s.scheduler.InvalidateAccountCache()
+	}
+	return caps, err
 }
 
 func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage.Account, token storage.AccountToken, binding storage.AccountEgressBinding, egress storage.EgressProfile) ([]storage.ModelCapability, error) {
@@ -714,10 +720,10 @@ func (s *Server) adminProbeModels(w http.ResponseWriter, r *http.Request, accoun
 	writeJSON(w, http.StatusOK, map[string]interface{}{"account_id": accountID, "capabilities": caps})
 }
 
-// StartBackground launches the periodic model-capability probe sweep. It returns
-// immediately; the sweep runs until ctx is cancelled (on server shutdown). When
-// ModelProbeIntervalHours is 0 the background refresh is disabled (imports and the
-// manual admin probe still work).
+// StartBackground launches active-role workers, including the route-availability
+// marker and periodic model-capability probes. It returns immediately; workers run
+// until ctx is cancelled. ModelProbeIntervalHours=0 disables only model probing —
+// route markers still refresh so request routing remains current.
 func (s *Server) StartBackground(ctx context.Context) {
 	// Refresh the public Hub runtime version out of band. Request execution only
 	// reads the cache and therefore never waits for the updater manifest.
@@ -735,6 +741,9 @@ func (s *Server) StartBackground(ctx context.Context) {
 	s.startLogRetentionLoop(ctx)
 	s.startDiskGuard(ctx)
 	s.startDiagnosticJobLoop(ctx)
+	if s.routeAvailability != nil {
+		s.routeAvailability.Start(ctx)
+	}
 	interval := time.Duration(s.cfg.ModelProbeIntervalHours) * time.Hour
 	if interval <= 0 {
 		return
@@ -831,6 +840,9 @@ func (s *Server) probeAllAccounts(ctx context.Context) {
 			failed++
 		} else {
 			probed++
+			if s.scheduler != nil {
+				s.scheduler.InvalidateAccountCache()
+			}
 		}
 		select {
 		case <-ctx.Done():

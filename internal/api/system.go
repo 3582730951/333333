@@ -35,6 +35,7 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 		sysmetrics.Metrics
 		Admission          interface{}                 `json:"admission"`
 		Scheduler          interface{}                 `json:"scheduler"`
+		RouteAvailability  routeAvailabilitySnapshot   `json:"route_availability"`
 		BodyStorage        bodysource.BudgetSnapshot   `json:"body_storage"`
 		UsageJournal       map[string]interface{}      `json:"usage_journal"`
 		UsageRollup        interface{}                 `json:"usage_rollup"`
@@ -51,9 +52,15 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 		ExceptionCallbacks []supervisor.CallbackState  `json:"exception_callbacks"`
 		ExceptionJournal   interface{}                 `json:"exception_journal"`
 	}{
-		Metrics:      sysmetrics.Collect(dataDir),
-		Admission:    s.scheduler.AdmissionSnapshot(),
-		Scheduler:    s.scheduler.Metrics(),
+		Metrics:   sysmetrics.Collect(dataDir),
+		Admission: s.scheduler.AdmissionSnapshot(),
+		Scheduler: s.scheduler.Metrics(),
+		RouteAvailability: func() routeAvailabilitySnapshot {
+			if s.routeAvailability == nil {
+				return routeAvailabilitySnapshot{}
+			}
+			return s.routeAvailability.Snapshot()
+		}(),
 		BodyStorage:  s.bodyBudgetSnapshot(),
 		UsageJournal: s.usageJournalMetrics(),
 		UsageRollup: func() interface{} {

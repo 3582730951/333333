@@ -28,6 +28,10 @@ func TestAdminSystemIncludesSupervisorEvents(t *testing.T) {
 	if !ok {
 		t.Fatalf("supervisor_modules missing or wrong type: %#v", payload["supervisor_modules"])
 	}
+	availability, ok := payload["route_availability"].(map[string]interface{})
+	if !ok || availability["enabled"] == nil || availability["tracked_routes"] == nil || availability["marked_empty"] == nil || availability["scans"] == nil || availability["skips"] == nil || availability["last_scan_at"] == nil {
+		t.Fatalf("route_availability missing or incomplete: %#v", payload["route_availability"])
+	}
 	for _, event := range events {
 		row, _ := event.(map[string]interface{})
 		if row["module"] == "system-test-module" && row["panic"] == "system-test-panic" {

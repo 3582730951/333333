@@ -167,11 +167,15 @@ type Scheduler struct {
 	// changes (quarantine, enable/disable) — callers that modify accounts should call
 	// InvalidateAccountCache() afterward. TTL is short (5s) so a newly-enabled account
 	// becomes available quickly while still amortizing the DB round-trip.
-	accountCache          map[string][]storage.Account
-	accountCacheTTL       time.Time
-	accountCacheMutex     sync.RWMutex
-	selectionCache        map[string]*accountSelectionSnapshot
-	selectionVersion      atomic.Uint64
+	accountCache      map[string][]storage.Account
+	accountCacheTTL   time.Time
+	accountCacheMutex sync.RWMutex
+	selectionCache    map[string]*accountSelectionSnapshot
+	selectionVersion  atomic.Uint64
+	// routeStructureVersion changes only when group/provider/model compatibility
+	// may have changed. Transient load, quota, cooldown and egress notifications do
+	// not invalidate a structural zero-candidate marker.
+	routeStructureVersion atomic.Uint64
 	rateLimitCache        map[string]map[string][]storage.AccountRateLimit
 	rateLimitCacheGen     map[string]uint64
 	rateLimitSelectionGen map[string]uint64
@@ -300,10 +304,22 @@ const (
 	kiroBlockLogMaxEntries = 4096
 )
 
-// InvalidateAccountCache clears the account list cache so the next Select() call
-// re-reads from the DB. Call this after any operation that changes account state
-// (quarantine, enable/disable, group change, import/delete).
+// InvalidateAccountCache clears selection caches and advances structural routing
+// state. Call this after an operation that can change group/provider/model
+// compatibility (enable/disable, group/provider/model changes, import/delete).
 func (s *Scheduler) InvalidateAccountCache() {
+	s.invalidateAccountCache(true)
+}
+
+// RefreshAccountCache clears selection snapshots after a transient state change
+// without invalidating structural route markers. Cooldowns, quota, quarantine and
+// egress recovery can change immediate eligibility, but cannot create a new
+// group/provider/model-compatible account.
+func (s *Scheduler) RefreshAccountCache() {
+	s.invalidateAccountCache(false)
+}
+
+func (s *Scheduler) invalidateAccountCache(structural bool) {
 	s.accountCacheMutex.Lock()
 	s.accountCache = nil
 	s.selectionCache = nil
@@ -315,6 +331,10 @@ func (s *Scheduler) InvalidateAccountCache() {
 	s.accountCacheMutex.Unlock()
 	s.affinityCache.clear()
 	s.clearCandidateIndexes()
+	if structural {
+		s.providerCache = sync.Map{}
+		s.routeStructureVersion.Add(1)
+	}
 	s.NotifyStateChanged()
 }
 
@@ -585,6 +605,7 @@ func NewWithLeaseCoordinator(store *storage.Store, cfg config.Config, coordinato
 		s.egressEWMA[i].rows = map[string]egressEWMA{}
 	}
 	s.cfg.Store(cfg)
+	s.routeStructureVersion.Store(1)
 	if notifications := coordinator.Notifications(); notifications != nil {
 		s.coordinatorWG.Add(1)
 		go func() {
@@ -619,6 +640,7 @@ func (s *Scheduler) UpdateConfig(cfg config.Config) {
 	s.cfg.Store(cfg)
 	s.admission.SetHeadroom(cfg.ResourceHeadroomPercent)
 	s.clearCandidateIndexes()
+	s.routeStructureVersion.Add(1)
 	s.NotifyStateChanged()
 }
 
@@ -628,6 +650,16 @@ func (s *Scheduler) NotifyStateChanged() {
 	s.mu.Lock()
 	s.notifyLoadChangedLocked()
 	s.mu.Unlock()
+}
+
+// RouteStructureVersion is a monotonic process-local group/provider/model
+// compatibility generation. It is intentionally cheap enough for every
+// user-group request.
+func (s *Scheduler) RouteStructureVersion() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.routeStructureVersion.Load()
 }
 
 func (s *Scheduler) Metrics() SchedulerMetrics {
@@ -880,7 +912,7 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 	if err != nil {
 		var stale *NoAccountError
 		if (errors.As(err, &stale) && (stale.Counters.RecheckPending > 0 || stale.Counters.RateLimitCooldown > 0 || stale.Counters.EgressCooldown > 0)) || (errors.Is(err, ErrNoAccount) && len(route.Exclude) > 0) {
-			s.InvalidateAccountCache()
+			s.RefreshAccountCache()
 			lease, err = s.selectFreshIndexed(ctx, route)
 		}
 	}

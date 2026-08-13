@@ -851,6 +851,9 @@ func (s *Server) adminSetAccountStatus(w http.ResponseWriter, r *http.Request, a
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if s.scheduler != nil {
+		s.scheduler.InvalidateAccountCache()
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"account_id": accountID, "status": status})
 }
 
@@ -878,7 +881,7 @@ func (s *Server) adminSetAccountRateLimitControls(w http.ResponseWriter, r *http
 		return
 	}
 	if s.scheduler != nil {
-		s.scheduler.InvalidateAccountCache()
+		s.scheduler.RefreshAccountCache()
 		s.scheduler.NotifyStateChanged()
 	}
 	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
@@ -916,7 +919,7 @@ func (s *Server) adminClearQuarantine(w http.ResponseWriter, r *http.Request, ac
 		return
 	}
 	if s.scheduler != nil {
-		s.scheduler.InvalidateAccountCache()
+		s.scheduler.RefreshAccountCache()
 		s.scheduler.NotifyStateChanged()
 	}
 	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
@@ -943,7 +946,7 @@ func (s *Server) adminClearCooldown(w http.ResponseWriter, r *http.Request, acco
 		return
 	}
 	if s.scheduler != nil {
-		s.scheduler.InvalidateAccountCache()
+		s.scheduler.RefreshAccountCache()
 		s.scheduler.NotifyStateChanged()
 	}
 	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
@@ -969,6 +972,9 @@ func (s *Server) adminDeleteAccount(w http.ResponseWriter, r *http.Request, acco
 	if err := s.store.DeleteAccount(r.Context(), accountID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if s.scheduler != nil {
+		s.scheduler.InvalidateAccountCache()
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"account_id": accountID, "deleted": true})
 }

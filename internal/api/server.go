@@ -69,11 +69,12 @@ type Dependencies struct {
 }
 
 type Server struct {
-	cfg              config.Config
-	store            *storage.Store
-	incidentReporter *incident.Reporter
-	scheduler        *scheduler.Scheduler
-	upstream         *upstream.Client
+	cfg               config.Config
+	store             *storage.Store
+	incidentReporter  *incident.Reporter
+	scheduler         *scheduler.Scheduler
+	routeAvailability *routeAvailabilityIndex
+	upstream          *upstream.Client
 	// upstreamConfigPublishMu linearizes every persisted effectUpstream change with
 	// the DB snapshot published to the live client. Without this, an older request can
 	// resolve its snapshot, pause, and overwrite a newer request's live configuration.
@@ -303,6 +304,7 @@ func NewServer(dep Dependencies) *Server {
 	}
 	if s.scheduler != nil {
 		s.scheduler.UpdateConfig(s.effectiveSchedulerConfig(context.Background()))
+		s.routeAvailability = newRouteAvailabilityIndex(s.scheduler, s.store)
 	}
 	if s.upstream != nil && s.scheduler != nil {
 		s.upstream.SetEgressObserver(s.scheduler.ObserveEgress)
@@ -372,6 +374,12 @@ func (s *Server) StartRuntime() error {
 		s.startGoalCompactionWorkers()
 		s.startUpstreamEgressPrewarm()
 	})
+	if s.runtimeStartErr == nil && s.routeAvailability != nil {
+		// Active-role startup enables request-time synchronous markers immediately;
+		// StartBackground then adds the periodic scanner. This closes the small role
+		// handoff window between accepting active traffic and launching workers.
+		s.routeAvailability.Enable()
+	}
 	return s.runtimeStartErr
 }
 
@@ -1678,7 +1686,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		if exclude != nil {
 			delete(exclude, lease.Account.ID)
 		}
-		s.scheduler.InvalidateAccountCache()
+		s.scheduler.RefreshAccountCache()
 		return codexAttemptResult{Outcome: outcomeRetry, WaitForCapacity: true}
 	}
 	token, err := s.store.GetToken(r.Context(), lease.Account.ID)
@@ -3938,7 +3946,7 @@ func (s *Server) hasCodexFailoverCandidate(ctx context.Context, groupName, model
 	// This check runs only after an upstream failure. Imports, rechecks and quota
 	// updates may have occurred since the request's first lease, so force the same
 	// fresh snapshot Select would use on its stale-cache retry path.
-	s.scheduler.InvalidateAccountCache()
+	s.scheduler.RefreshAccountCache()
 	count, err := s.scheduler.EligibleCandidateCount(ctx, scheduler.Route{
 		Group: groupName, Provider: "codex", Model: model, Exclude: excluded,
 		AllowCodexGoalQuotaGrace: codexGoalQuotaGraceFromContext(ctx),

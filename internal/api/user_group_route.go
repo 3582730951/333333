@@ -687,6 +687,12 @@ retryUserGroupRoute:
 	replaySafe := !routing.HasServerSideState(r.URL.Path, r, resolvedRaw)
 	streamRequest := isStreamRequest(resolvedRaw)
 	units := buildUserGroupDispatchUnits(plan)
+	// Availability markers describe scheduler-backed account pools. Provider
+	// targets fail open inside the filter and retain their adapter-specific path.
+	if replaySafe && s.routeAvailability != nil {
+		model := routing.Model(resolvedRaw)
+		units = s.filterUnavailableUserGroupDispatchUnits(r, pol, model, plan, units)
+	}
 	allowBindingMigration := plan.PolicyTransfer
 	for index := 0; index < len(units); index++ {
 		unit := units[index]
@@ -906,6 +912,115 @@ type userGroupDispatchUnit struct {
 	Tier          int
 	Targets       []storage.TargetRef
 	SelectionType string
+}
+
+type userGroupAvailabilityDecision struct {
+	unavailable bool
+}
+
+// filterUnavailableUserGroupDispatchUnits removes targets carrying a current,
+// structural zero-candidate mark before any upstream request is attempted. It
+// always keeps a bound target and, if every configured target is marked empty,
+// keeps the final target so the established capacity-wait/error contract remains
+// authoritative instead of turning an optimization into a behavior change.
+func (s *Server) filterUnavailableUserGroupDispatchUnits(r *http.Request, pol downstreamPolicy, model string, plan userGroupRoutePlan, units []userGroupDispatchUnit) []userGroupDispatchUnit {
+	if s == nil || s.routeAvailability == nil || len(units) == 0 {
+		return units
+	}
+	// Custom providers are resolved ahead of built-in GPT accounts and may carry
+	// independent model mappings. Load them once, then require every concrete
+	// built-in/custom route to be empty before marking a target unavailable.
+	var customProviders []storage.CustomProvider
+	if effectiveGatewayProviderHint(r, pol) == "auto" && modelInstructionFamily(model) == storage.ModelInstructionFamilyGPT {
+		customProviders = s.customProvidersForModel(r.Context(), model)
+	}
+	decisions := make(map[string]userGroupAvailabilityDecision)
+	kept := 0
+	for _, unit := range units {
+		for _, target := range unit.Targets {
+			key := userGroupTargetChoiceKey(target)
+			if _, known := decisions[key]; known {
+				continue
+			}
+			if plan.Bound && target == plan.BoundTarget {
+				decisions[key] = userGroupAvailabilityDecision{}
+				kept++
+				continue
+			}
+			routes, ok := s.userGroupAvailabilityRoutes(r, pol, target, model, customProviders)
+			unavailable := ok && s.routeAvailability.allDefinitelyUnavailable(r.Context(), routes)
+			decisions[key] = userGroupAvailabilityDecision{unavailable: unavailable}
+			if !unavailable {
+				kept++
+			}
+		}
+	}
+	if kept == 0 {
+		// All-empty must continue through the original final target so callers get
+		// the same queue heartbeat/public terminal response as before this cache.
+		lastUnit := units[len(units)-1]
+		lastTarget := lastUnit.Targets[len(lastUnit.Targets)-1]
+		entry := decisions[userGroupTargetChoiceKey(lastTarget)]
+		entry.unavailable = false
+		decisions[userGroupTargetChoiceKey(lastTarget)] = entry
+	}
+
+	filtered := make([]userGroupDispatchUnit, 0, len(units))
+	for _, unit := range units {
+		remaining := make([]storage.TargetRef, 0, len(unit.Targets))
+		for _, target := range unit.Targets {
+			if decisions[userGroupTargetChoiceKey(target)].unavailable {
+				continue
+			}
+			remaining = append(remaining, target)
+		}
+		if len(remaining) == 0 {
+			continue
+		}
+		unit.Targets = remaining
+		if unit.SelectionType == "across" && len(remaining) == 1 {
+			unit.SelectionType = "pool"
+		}
+		filtered = append(filtered, unit)
+	}
+	s.recordUnavailableUserGroupTargets(r, model, plan, units, decisions)
+	return filtered
+}
+
+// recordUnavailableUserGroupTargets keeps the optimization visible in diagnostic
+// ZIPs. A skipped target never reaches an upstream writer, so without this row a
+// fast route would look as though the user group had never contained that tier.
+func (s *Server) recordUnavailableUserGroupTargets(r *http.Request, model string, plan userGroupRoutePlan, units []userGroupDispatchUnit, decisions map[string]userGroupAvailabilityDecision) {
+	if s == nil || r == nil {
+		return
+	}
+	requestID := requestIDFromContext(r.Context())
+	for unitIndex, unit := range units {
+		for _, target := range unit.Targets {
+			if !decisions[userGroupTargetChoiceKey(target)].unavailable {
+				continue
+			}
+			fallback := nextAvailableUserGroupTarget(units, decisions, unitIndex)
+			s.recordRouteAttempt(requestID, unit.Tier, userGroupTargetDiagnosticName(target), "availability_marker", "structurally_unavailable", fallback, diagnosticRouteDetail{
+				TerminalErrorClass:            "none",
+				SuperInstructClientChoice:     superInstructClientChoiceClass(r),
+				SuperInstructEffectiveModules: superInstructEffectiveModules(requestUserGroupPolicy(r.Context()), model),
+				UserGroupID:                   plan.UserGroupID,
+			})
+		}
+	}
+}
+
+func nextAvailableUserGroupTarget(units []userGroupDispatchUnit, decisions map[string]userGroupAvailabilityDecision, unitIndex int) string {
+	for _, unit := range units[unitIndex:] {
+		for _, target := range unit.Targets {
+			if decisions[userGroupTargetChoiceKey(target)].unavailable {
+				continue
+			}
+			return userGroupTargetDiagnosticName(target)
+		}
+	}
+	return ""
 }
 
 func buildUserGroupDispatchUnits(plan userGroupRoutePlan) []userGroupDispatchUnit {

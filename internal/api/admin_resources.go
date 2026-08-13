@@ -160,7 +160,7 @@ func (s *Server) adminEgressBinding(w http.ResponseWriter, r *http.Request, acco
 			return
 		}
 		if s.scheduler != nil {
-			s.scheduler.InvalidateAccountCache()
+			s.scheduler.RefreshAccountCache()
 		}
 		writeJSON(w, http.StatusOK, got)
 	default:

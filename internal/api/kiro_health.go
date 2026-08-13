@@ -306,7 +306,11 @@ func (s *Server) recoverKiroAfterHealthProbe(ctx context.Context, account storag
 	}
 	_ = s.store.ClearBindingRecheck(ctx, account.ID)
 	if s.scheduler != nil {
-		s.scheduler.InvalidateAccountCache()
+		if wasSuspended || account.Status == "invalid" {
+			s.scheduler.InvalidateAccountCache()
+		} else {
+			s.scheduler.RefreshAccountCache()
+		}
 		s.scheduler.NotifyStateChanged()
 	}
 	if wasSuspended {

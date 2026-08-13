@@ -52,6 +52,14 @@ func setUserGroupCapacityTestIntervals(t *testing.T, timeout, poll, heartbeat, s
 	})
 }
 
+func enableRouteAvailabilityForTest(t *testing.T, h *testHarness) {
+	t.Helper()
+	if h == nil || h.app == nil || h.app.routeAvailability == nil {
+		t.Fatal("route availability index is unavailable")
+	}
+	h.app.routeAvailability.enabled.Store(true)
+}
+
 func TestUserGroupCustomTargetSupportsDownstreamModelMappingSource(t *testing.T) {
 	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
 	provider := storage.CustomProvider{
@@ -1345,6 +1353,334 @@ func TestUserGroupSameTierSelectAcrossSkipsEmptyPool(t *testing.T) {
 	if err != nil || !found || binding.Target != healthyTarget {
 		t.Fatalf("same-tier binding=%+v found=%v err=%v", binding, found, err)
 	}
+}
+
+func TestUserGroupAvailabilityMarkerSkipsEmptyOrderedPools(t *testing.T) {
+	const (
+		model        = "gpt-5.6-sol"
+		gptTeamGroup = "marked-gpt-team"
+		claudeGroup  = "marked-claude"
+		kiroGroup    = "marked-kiro"
+		proGroup     = "marked-gpt-pro"
+		groupID      = "ug_marked_fallback_chain"
+	)
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	enableRouteAvailabilityForTest(t, h)
+	for _, group := range []string{gptTeamGroup, claudeGroup, kiroGroup, proGroup} {
+		if err := h.store.CreateGroup(t.Context(), storage.Group{Name: group}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	accountID := h.importAccount(t, "marked-pro", "upstream-marked-pro", "access-marked-pro")
+	account, err := h.store.GetAccount(t.Context(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := h.store.GetToken(t.Context(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account.GroupName = proGroup
+	if err := h.store.UpsertAccount(t.Context(), account, token); err != nil {
+		t.Fatal(err)
+	}
+	setTestCapability(t, h, accountID, model, 372000)
+	h.app.scheduler.InvalidateAccountCache()
+
+	targets := []storage.TargetRef{
+		{Kind: storage.TargetKindAccountPoolGroup, ID: gptTeamGroup},
+		{Kind: storage.TargetKindAccountPoolGroup, ID: claudeGroup},
+		{Kind: storage.TargetKindAccountPoolGroup, ID: kiroGroup},
+		{Kind: storage.TargetKindAccountPoolGroup, ID: proGroup},
+	}
+	createRouteTestGroup(t, h, groupID, targets, []storage.ModelRoutingRule{{
+		Model: model,
+		Tiers: [][]storage.TargetRef{{targets[0]}, {targets[1]}, {targets[2]}, {targets[3]}},
+	}})
+
+	raw := []byte(`{"model":"` + model + `","input":"skip empty pools"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	recorder := httptest.NewRecorder()
+	handled := h.app.dispatchUserGroupRouteCandidates(recorder, req, raw, raw, downstreamPolicy{
+		Group: gptTeamGroup, UserGroupID: groupID, ProviderHint: "auto",
+	}, h.app.handleGatewayPost)
+	if !handled || recorder.Code != http.StatusOK {
+		t.Fatalf("handled=%v status=%d body=%s", handled, recorder.Code, recorder.Body.String())
+	}
+	requests := h.requests()
+	if len(requests) != 1 || requests[0].AccountID != "upstream-marked-pro" {
+		t.Fatalf("upstream attempts=%+v, want only final healthy target", requests)
+	}
+	snapshot := h.app.routeAvailability.Snapshot()
+	if snapshot.MarkedEmpty != 3 || snapshot.Skips < 3 {
+		t.Fatalf("route availability snapshot=%+v, want three empty marks/skips", snapshot)
+	}
+	rows := h.app.diagnosticRouteAttempts()
+	skipped := 0
+	for _, row := range rows {
+		if row.SelectionType == "availability_marker" && row.StatusClass == "structurally_unavailable" {
+			skipped++
+		}
+	}
+	if skipped != 3 {
+		t.Fatalf("availability marker diagnostic rows=%+v, want three skips", rows)
+	}
+	if rows[0].FallbackTarget != "account_pool_group:"+proGroup {
+		t.Fatalf("first skip fallback=%q, want next executable target %q", rows[0].FallbackTarget, "account_pool_group:"+proGroup)
+	}
+}
+
+func TestUserGroupAvailabilityMarkerFiltersEmptyChoiceFromSameTier(t *testing.T) {
+	const (
+		emptyGroup   = "marked-same-tier-empty"
+		healthyGroup = "marked-same-tier-healthy"
+		groupID      = "ug_marked_same_tier"
+		model        = "gpt-5.6-sol"
+	)
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.completed\n"+
+			`data: {"type":"response.completed","response":{"id":"resp_marked_tier","status":"completed","output":[]}}`+"\n\n"+
+			"data: [DONE]\n\n")
+	})
+	enableRouteAvailabilityForTest(t, h)
+	for _, group := range []string{emptyGroup, healthyGroup} {
+		if err := h.store.CreateGroup(t.Context(), storage.Group{Name: group}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	accountID := h.importAccount(t, "marked-tier", "upstream-marked-tier", "access-marked-tier")
+	account, err := h.store.GetAccount(t.Context(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := h.store.GetToken(t.Context(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account.GroupName = healthyGroup
+	if err := h.store.UpsertAccount(t.Context(), account, token); err != nil {
+		t.Fatal(err)
+	}
+	setTestCapability(t, h, accountID, model, 372000)
+	h.app.scheduler.InvalidateAccountCache()
+	emptyTarget := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: emptyGroup}
+	healthyTarget := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: healthyGroup}
+	createRouteTestGroup(t, h, groupID, []storage.TargetRef{emptyTarget, healthyTarget}, []storage.ModelRoutingRule{{
+		Model: model, Tiers: [][]storage.TargetRef{{emptyTarget, healthyTarget}},
+	}})
+	raw := []byte(`{"model":"` + model + `","input":"filter same tier"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	recorder := httptest.NewRecorder()
+	if !h.app.dispatchUserGroupRouteCandidates(recorder, req, raw, raw, downstreamPolicy{
+		Group: emptyGroup, UserGroupID: groupID, ProviderHint: "auto",
+	}, h.app.handleGatewayPost) {
+		t.Fatal("route dispatch was not handled")
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if requests := h.requests(); len(requests) != 1 || requests[0].AccountID != "upstream-marked-tier" {
+		t.Fatalf("upstream attempts=%+v", requests)
+	}
+	if snapshot := h.app.routeAvailability.Snapshot(); snapshot.MarkedEmpty != 1 || snapshot.Skips < 1 {
+		t.Fatalf("route availability snapshot=%+v", snapshot)
+	}
+}
+
+func TestUserGroupAvailabilityMarkerInvalidatesAfterAccountPublication(t *testing.T) {
+	const (
+		group = "marked-late-account"
+		model = "gpt-5.6-sol"
+	)
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	enableRouteAvailabilityForTest(t, h)
+	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: group}); err != nil {
+		t.Fatal(err)
+	}
+	route := scheduler.Route{Group: group, Provider: "codex", Model: model}
+	if !h.app.routeAvailability.definitelyUnavailable(t.Context(), route) {
+		t.Fatal("empty group was not marked structurally unavailable")
+	}
+
+	accountID := h.importAccount(t, "marked-late", "upstream-marked-late", "access-marked-late")
+	account, err := h.store.GetAccount(t.Context(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := h.store.GetToken(t.Context(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account.GroupName = group
+	if err := h.store.UpsertAccount(t.Context(), account, token); err != nil {
+		t.Fatal(err)
+	}
+	setTestCapability(t, h, accountID, model, 372000)
+	h.app.scheduler.InvalidateAccountCache()
+	if h.app.routeAvailability.definitelyUnavailable(t.Context(), route) {
+		t.Fatal("stale empty mark survived account/capability publication")
+	}
+}
+
+func TestUserGroupAvailabilityMarkerSurvivesTransientSchedulerWakeup(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	enableRouteAvailabilityForTest(t, h)
+	const group = "marked-stable-empty"
+	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: group}); err != nil {
+		t.Fatal(err)
+	}
+	route := scheduler.Route{Group: group, Provider: "codex", Model: "gpt-5.6-sol"}
+	if !h.app.routeAvailability.definitelyUnavailable(t.Context(), route) {
+		t.Fatal("empty group was not marked structurally unavailable")
+	}
+	scans := h.app.routeAvailability.Snapshot().Scans
+	// Lease releases, quota wakeups and cooldown timers call this method. None can
+	// create a structurally compatible account, so they must not evict the mark.
+	h.app.scheduler.NotifyStateChanged()
+	if !h.app.routeAvailability.definitelyUnavailable(t.Context(), route) {
+		t.Fatal("transient scheduler wakeup incorrectly invalidated empty mark")
+	}
+	if after := h.app.routeAvailability.Snapshot().Scans; after != scans {
+		t.Fatalf("transient wakeup forced structural rescan: before=%d after=%d", scans, after)
+	}
+}
+
+func TestUserGroupAvailabilityMarkerExpiresAndSeesExternalAccountPublication(t *testing.T) {
+	const (
+		group = "marked-external-account"
+		model = "gpt-5.6-sol"
+	)
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	enableRouteAvailabilityForTest(t, h)
+	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: group}); err != nil {
+		t.Fatal(err)
+	}
+	route := scheduler.Route{Group: group, Provider: "codex", Model: model}
+	if !h.app.routeAvailability.definitelyUnavailable(t.Context(), route) {
+		t.Fatal("empty group was not marked structurally unavailable")
+	}
+
+	accountID := h.importAccount(t, "marked-external", "upstream-marked-external", "access-marked-external")
+	account, err := h.store.GetAccount(t.Context(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := h.store.GetToken(t.Context(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account.GroupName = group
+	if err := h.store.UpsertAccount(t.Context(), account, token); err != nil {
+		t.Fatal(err)
+	}
+	setTestCapability(t, h, accountID, model, 372000)
+	// Deliberately do not call scheduler.InvalidateAccountCache: this simulates a
+	// second process or direct database writer that cannot publish our generation.
+	key := routeAvailabilityKey(normalizeAvailabilityRoute(route))
+	h.app.routeAvailability.mu.Lock()
+	mark := h.app.routeAvailability.marks[key]
+	mark.checkedAt = time.Now().Add(-3 * routeAvailabilityRefreshInterval)
+	h.app.routeAvailability.marks[key] = mark
+	h.app.routeAvailability.mu.Unlock()
+	if h.app.routeAvailability.definitelyUnavailable(t.Context(), route) {
+		t.Fatal("expired marker hid an account published outside this process")
+	}
+}
+
+func TestUserGroupAvailabilityMarkerRequiresEveryCustomAndBuiltInRouteEmpty(t *testing.T) {
+	const (
+		group      = "marked-custom-capable"
+		model      = "gpt-5.6-sol"
+		providerID = "marked-custom-provider"
+	)
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	enableRouteAvailabilityForTest(t, h)
+	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: group}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertCustomProvider(t.Context(), storage.CustomProvider{
+		ID: providerID, Name: providerID, BaseURL: h.upstream.URL, Enabled: true, Models: []string{model},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	accountID := h.importAccount(t, "marked-custom", "upstream-marked-custom", "access-marked-custom")
+	account, err := h.store.GetAccount(t.Context(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := h.store.GetToken(t.Context(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account.GroupName = group
+	account.Provider = providerID
+	if err := h.store.UpsertAccount(t.Context(), account, token); err != nil {
+		t.Fatal(err)
+	}
+	setTestCapability(t, h, accountID, model, 372000)
+	h.app.scheduler.InvalidateAccountCache()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	routes, ok := h.app.userGroupAvailabilityRoutes(req, downstreamPolicy{ProviderHint: "auto"}, storage.TargetRef{
+		Kind: storage.TargetKindAccountPoolGroup, ID: group,
+	}, model, h.app.customProvidersForModel(t.Context(), model))
+	if !ok || len(routes) != 2 {
+		t.Fatalf("availability routes=%+v ok=%v", routes, ok)
+	}
+	if h.app.routeAvailability.allDefinitelyUnavailable(t.Context(), routes) {
+		t.Fatal("custom-capable group was incorrectly skipped because its built-in route was empty")
+	}
+}
+
+func TestUserGroupAvailabilityProviderSurfaceChangeInvalidatesMarks(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	enableRouteAvailabilityForTest(t, h)
+	h.app.routeAvailability.publishCustomProviderSurface([]routeAvailabilityProviderSurface{{
+		ID: "surface-provider", Enabled: false, Models: []string{"gpt-5.6-sol"},
+	}})
+	before := h.app.scheduler.RouteStructureVersion()
+	h.app.routeAvailability.publishCustomProviderSurface([]routeAvailabilityProviderSurface{{
+		ID: "surface-provider", Enabled: true, Models: []string{"gpt-5.6-sol"},
+	}})
+	if after := h.app.scheduler.RouteStructureVersion(); after <= before {
+		t.Fatalf("custom provider surface change did not invalidate marks: before=%d after=%d", before, after)
+	}
+	stable := h.app.scheduler.RouteStructureVersion()
+	h.app.routeAvailability.publishCustomProviderSurface([]routeAvailabilityProviderSurface{{
+		ID: "surface-provider", Enabled: true, Models: []string{"gpt-5.6-sol"},
+	}})
+	if after := h.app.scheduler.RouteStructureVersion(); after != stable {
+		t.Fatalf("unchanged provider surface invalidated marks: before=%d after=%d", stable, after)
+	}
+}
+
+func TestUserGroupAvailabilityBackgroundSeedsConfiguredModelRoutes(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	const (
+		group   = "marked-background-empty"
+		groupID = "ug_marked_background"
+		model   = "gpt-5.6-sol"
+	)
+	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: group}); err != nil {
+		t.Fatal(err)
+	}
+	target := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: group}
+	createRouteTestGroup(t, h, groupID, []storage.TargetRef{target}, []storage.ModelRoutingRule{{
+		Model: model, Tiers: [][]storage.TargetRef{{target}},
+	}})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	h.app.routeAvailability.Start(ctx)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := h.app.routeAvailability.Snapshot()
+		if snapshot.TrackedRoutes == 1 && snapshot.MarkedEmpty == 1 && snapshot.Scans >= 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("background route marker was not seeded: %+v", h.app.routeAvailability.Snapshot())
 }
 
 func TestDispatchUserGroupRouteCandidatesNeverReplaysCommittedStream(t *testing.T) {

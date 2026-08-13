@@ -714,7 +714,7 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 	bearer, token, credentials, err := s.kiro.Prepare(r.Context(), lease.Account, credentials, token, lease.Egress, false)
 	if err != nil {
 		if errors.Is(err, kirowire.ErrInvalidGrant) {
-			s.scheduler.InvalidateAccountCache()
+			s.scheduler.RefreshAccountCache()
 		}
 		s.kiroAttemptError(w, r, lease, 0, nil, []byte(err.Error()), false, nil, err)
 		return nil, endpointHash, outcomeDone

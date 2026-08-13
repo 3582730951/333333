@@ -161,7 +161,7 @@ func (s *Server) applyRuleAccountAction(ctx context.Context, account storage.Acc
 		}
 		_ = s.store.SetAccountQuarantine(ctx, account.ID, storage.Now()+seconds, "upstream error rule: "+decision.Rule.Name)
 		if s.scheduler != nil {
-			s.scheduler.InvalidateAccountCache()
+			s.scheduler.RefreshAccountCache()
 		}
 		return ban.Classify(false, status, header, body)
 	default:

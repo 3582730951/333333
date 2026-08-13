@@ -317,7 +317,7 @@ func (s *Server) handleBannedAccount(ctx context.Context, account storage.Accoun
 		_ = s.store.SetAccountQuarantine(ctx, account.ID, kiroSuspensionQuarantineUntil, kiroSuspensionQuarantineReason)
 		_ = s.store.SetBindingRecheckPending(ctx, account.ID, false)
 		if s.scheduler != nil {
-			s.scheduler.InvalidateAccountCache()
+			s.scheduler.RefreshAccountCache()
 			s.scheduler.NotifyStateChanged()
 		}
 		return
@@ -347,7 +347,7 @@ func (s *Server) handleBannedAccount(ctx context.Context, account storage.Accoun
 			return
 		}
 		if s.scheduler != nil {
-			s.scheduler.InvalidateAccountCache()
+			s.scheduler.RefreshAccountCache()
 		}
 		return
 	}
@@ -356,7 +356,7 @@ func (s *Server) handleBannedAccount(ctx context.Context, account storage.Accoun
 		until := storage.Now() + int64(s.cfg.QuarantineDurationHours*3600)
 		_ = s.store.SetAccountQuarantine(ctx, account.ID, until, "ban: "+v.Reason)
 		if s.scheduler != nil {
-			s.scheduler.InvalidateAccountCache()
+			s.scheduler.RefreshAccountCache()
 		}
 	}
 }
