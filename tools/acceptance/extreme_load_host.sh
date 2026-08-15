@@ -7,6 +7,7 @@ POOL_SERVER_BIN="${POOL_SERVER_BIN:-$BASE_DIR/bin/pool-server}"
 TIKTOKEN_CACHE_DIR="${TIKTOKEN_CACHE_DIR:-$BASE_DIR/bin}"
 FIXTURE_COUNT="${FIXTURE_COUNT:-256}"
 TARGET_TOKENS="${TARGET_TOKENS:-1000000}"
+FIXTURE_PROFILE="${FIXTURE_PROFILE:-mixed-agent}"
 TARGET_RPS="${TARGET_RPS:-100}"
 MINIMUM_ACHIEVED_RPS="${MINIMUM_ACHIEVED_RPS:-$TARGET_RPS}"
 LOAD_DURATION="${LOAD_DURATION:-10s}"
@@ -14,12 +15,23 @@ LOAD_CONCURRENCY="${LOAD_CONCURRENCY:-256}"
 FIXTURE_WORKERS="${FIXTURE_WORKERS:-16}"
 CPU_SET="${CPU_SET:-0,1}"
 MEMORY_LIMIT_KIB="${MEMORY_LIMIT_KIB:-2097152}"
+POOL_GOMAXPROCS="${POOL_GOMAXPROCS:-2}"
+BODY_MEMORY_THRESHOLD_BYTES="${BODY_MEMORY_THRESHOLD_BYTES:-8388608}"
+DEFAULT_BODY_MEMORY_BUDGET_BYTES="$((MEMORY_LIMIT_KIB * 1024 / 4))"
+if (( DEFAULT_BODY_MEMORY_BUDGET_BYTES > 536870912 )); then
+  DEFAULT_BODY_MEMORY_BUDGET_BYTES=536870912
+elif (( DEFAULT_BODY_MEMORY_BUDGET_BYTES < 67108864 )); then
+  DEFAULT_BODY_MEMORY_BUDGET_BYTES=67108864
+fi
+BODY_MEMORY_BUDGET_BYTES="${BODY_MEMORY_BUDGET_BYTES:-$DEFAULT_BODY_MEMORY_BUDGET_BYTES}"
 HEAP_PROFILE_KIB="${HEAP_PROFILE_KIB:-0}"
 MOCK_PORT="${MOCK_PORT:-29443}"
 POOL_PORT="${POOL_PORT:-28787}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-extreme-host-acceptance-admin-token-20260727}"
 RUN_ROOT="${RUN_ROOT:-$BASE_DIR/run}"
 RUN_DIR="$(mktemp -d "$RUN_ROOT/extreme.XXXXXX")"
+RUN_OWNER_UID="$(stat -c '%u' "$RUN_DIR")"
+RUN_OWNER_GID="$(stat -c '%g' "$RUN_DIR")"
 FIXTURE_DIR="${REUSE_FIXTURE_DIR:-$RUN_DIR/fixtures}"
 MOCK_PID=""
 POOL_PID=""
@@ -45,9 +57,43 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+stop_pool_gracefully() {
+  for pid in "$RUNTIME_PID" "$RESOURCE_PID"; do
+    if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; fi
+  done
+  for pid in "$RUNTIME_PID" "$RESOURCE_PID"; do
+    if [[ -n "$pid" ]]; then wait "$pid" 2>/dev/null || true; fi
+  done
+  RUNTIME_PID=""
+  RESOURCE_PID=""
+  if [[ -z "$POOL_PID" ]]; then return 0; fi
+  kill -TERM "$POOL_PID" 2>/dev/null || true
+  for _ in $(seq 1 300); do
+    if ! kill -0 "$POOL_PID" 2>/dev/null; then break; fi
+    sleep 0.1
+  done
+  if kill -0 "$POOL_PID" 2>/dev/null; then
+    echo "pool did not complete its bounded graceful drain" >&2
+	# SIGQUIT gives the retained acceptance artifact a complete Go goroutine dump,
+	# making shutdown regressions diagnosable even when the bounded drain is stuck.
+	kill -QUIT "$POOL_PID" 2>/dev/null || true
+	sleep 1
+	tail -300 "$RUN_DIR/pool.log" >&2 || true
+    return 1
+  fi
+  wait "$POOL_PID"
+  POOL_PID=""
+}
+
 for command in taskset curl openssl python3 awk find du sha256sum; do
   command -v "$command" >/dev/null || { echo "required command missing: $command" >&2; exit 1; }
 done
+POOL_LAUNCH=(taskset -c "$CPU_SET")
+if [[ "$(id -u)" != "$RUN_OWNER_UID" || "$(id -g)" != "$RUN_OWNER_GID" ]]; then
+  [[ "$(id -u)" == "0" ]] || { echo "run directory owner $RUN_OWNER_UID:$RUN_OWNER_GID does not match caller and caller cannot change identity" >&2; exit 1; }
+  command -v setpriv >/dev/null || { echo "setpriv is required to launch the pool as run directory owner $RUN_OWNER_UID:$RUN_OWNER_GID" >&2; exit 1; }
+  POOL_LAUNCH=(setpriv --reuid="$RUN_OWNER_UID" --regid="$RUN_OWNER_GID" --clear-groups taskset -c "$CPU_SET")
+fi
 [[ -x "$EXTREME_LOAD_BIN" ]] || { echo "extreme-load binary is not executable: $EXTREME_LOAD_BIN" >&2; exit 1; }
 [[ -x "$POOL_SERVER_BIN" ]] || { echo "pool-server binary is not executable: $POOL_SERVER_BIN" >&2; exit 1; }
 EXTREME_LOAD_SHA="$(sha256sum "$EXTREME_LOAD_BIN" | awk '{print $1}')"
@@ -65,7 +111,7 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
   -addext "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign" >/dev/null 2>&1
 
 if [[ -z "${REUSE_FIXTURE_DIR:-}" ]]; then
-  TIKTOKEN_CACHE_DIR="$TIKTOKEN_CACHE_DIR" "$EXTREME_LOAD_BIN" generate -dir "$FIXTURE_DIR" -count "$FIXTURE_COUNT" -tokens "$TARGET_TOKENS" -tolerance 0.005 -model gpt-5.6-sol -encoding o200k_base -workers "$FIXTURE_WORKERS"
+  TIKTOKEN_CACHE_DIR="$TIKTOKEN_CACHE_DIR" "$EXTREME_LOAD_BIN" generate -dir "$FIXTURE_DIR" -count "$FIXTURE_COUNT" -tokens "$TARGET_TOKENS" -tolerance 0.005 -model gpt-5.6-sol -encoding o200k_base -profile "$FIXTURE_PROFILE" -workers "$FIXTURE_WORKERS"
 fi
 if [[ "${SKIP_INITIAL_VERIFY:-0}" != "1" ]]; then
   TIKTOKEN_CACHE_DIR="$TIKTOKEN_CACHE_DIR" "$EXTREME_LOAD_BIN" verify -dir "$FIXTURE_DIR" -minimum "$FIXTURE_COUNT" -workers "$FIXTURE_WORKERS"
@@ -83,6 +129,7 @@ curl --silent --fail --cacert "$RUN_DIR/mock.crt" "https://127.0.0.1:$MOCK_PORT/
 cat >"$RUN_DIR/config.json" <<EOF
 {
   "listen_addr": "127.0.0.1:$POOL_PORT",
+  "data_dir": "$RUN_DIR",
   "database_path": "$RUN_DIR/pool.sqlite3",
   "storage_driver": "sqlite",
   "upstream_base_url": "https://127.0.0.1:$MOCK_PORT/backend-api/codex",
@@ -93,8 +140,8 @@ cat >"$RUN_DIR/config.json" <<EOF
   "request_timeout_seconds": 600,
   "max_body_bytes": 1073741824,
   "body_v2_enabled": true,
-  "body_memory_threshold_bytes": 8388608,
-  "body_memory_budget_bytes": 268435456,
+  "body_memory_threshold_bytes": $BODY_MEMORY_THRESHOLD_BYTES,
+  "body_memory_budget_bytes": $BODY_MEMORY_BUDGET_BYTES,
   "body_spool_max_bytes": 34359738368,
   "body_disk_reserve_bytes": 0,
   "body_spool_dir": "$RUN_DIR/spool",
@@ -110,7 +157,7 @@ cat >"$RUN_DIR/config.json" <<EOF
 }
 EOF
 
-GODEBUG="${POOL_GODEBUG:-}" GOMEMLIMIT="${POOL_GOMEMLIMIT:-off}" CODEX_POOL_HEAP_PROFILE="$RUN_DIR/heap.pprof" CODEX_POOL_CPU_PROFILE="$CPU_PROFILE_PATH" GOMAXPROCS=2 SSL_CERT_FILE="$RUN_DIR/mock.crt" taskset -c "$CPU_SET" "$POOL_SERVER_BIN" -config "$RUN_DIR/config.json" >"$RUN_DIR/pool.log" 2>&1 &
+GODEBUG="${POOL_GODEBUG:-}" GOMEMLIMIT="${POOL_GOMEMLIMIT:-off}" CODEX_POOL_HEAP_PROFILE="$RUN_DIR/heap.pprof" CODEX_POOL_CPU_PROFILE="$CPU_PROFILE_PATH" GOMAXPROCS="$POOL_GOMAXPROCS" SSL_CERT_FILE="$RUN_DIR/mock.crt" "${POOL_LAUNCH[@]}" "$POOL_SERVER_BIN" -config "$RUN_DIR/config.json" >"$RUN_DIR/pool.log" 2>&1 &
 POOL_PID="$!"
 for _ in $(seq 1 200); do
   if curl --silent --fail "http://127.0.0.1:$POOL_PORT/healthz" >/dev/null; then break; fi
@@ -178,8 +225,18 @@ summary = {
 }
 print(json.dumps(summary, separators=(",", ":")))
 PY
-  tail -200 "$RUN_DIR/pool.log" >&2
-  exit "$load_status"
+	# A performance-gate failure must still exercise the exact same bounded drain
+	# path as a passing run. This preserves the journal and a goroutine dump when
+	# shutdown itself regresses instead of silently masking it in the EXIT trap.
+	set +e
+	stop_pool_gracefully
+	shutdown_status="$?"
+	set -e
+	tail -200 "$RUN_DIR/pool.log" >&2
+	if (( shutdown_status != 0 )); then
+		exit "$shutdown_status"
+	fi
+	exit "$load_status"
 fi
 if [[ -f "$RUN_DIR/rss-limit-exceeded" ]]; then
   echo "2 GiB RSS threshold exceeded: $(cat "$RUN_DIR/rss-limit-exceeded") KiB" >&2
@@ -194,6 +251,37 @@ import json, sys
 stats = json.loads(sys.argv[1])
 if stats["requests"] <= 0 or stats["requests"] != stats["http2_requests"]:
     raise SystemExit(f"protocol gate failed: {stats}")
+PY
+
+stop_pool_gracefully
+python3 - "$RUN_DIR/load-result.json" "$RUN_DIR/pool.sqlite3" <<'PY'
+import json, sqlite3, sys
+
+result = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = int(result["succeeded"])
+db = sqlite3.connect(sys.argv[2])
+checks = {
+    "bindings": "SELECT COUNT(*) FROM codex_session_binding",
+    "aliases": "SELECT COUNT(*) FROM codex_session_alias",
+    "snapshots": "SELECT COUNT(*) FROM codex_instruction_snapshot",
+    "holds": "SELECT COUNT(*) FROM billing_holds",
+    "usage": "SELECT COUNT(*) FROM usage_events",
+    "created_audits": "SELECT COUNT(*) FROM audit_log WHERE action='codex_session_binding_created'",
+}
+counts = {name: int(db.execute(query).fetchone()[0]) for name, query in checks.items()}
+held = int(db.execute("SELECT COUNT(*) FROM billing_holds WHERE status='held'").fetchone()[0])
+attempts = int(db.execute("SELECT COUNT(*) FROM codex_upstream_attempt").fetchone()[0])
+attempt_ids = int(db.execute("SELECT COUNT(DISTINCT event_id) FROM codex_upstream_attempt").fetchone()[0])
+commit_failures = int(db.execute("SELECT COUNT(*) FROM audit_log WHERE action='codex_session_mapping_commit_failed'").fetchone()[0])
+for name in ("bindings", "snapshots", "holds", "usage", "created_audits"):
+    if counts[name] != expected:
+        raise SystemExit(f"durability gate failed: {name}={counts[name]} expected={expected}")
+if counts["aliases"] < expected or held != 0 or attempts != attempt_ids or commit_failures != 0:
+    raise SystemExit(
+        f"durability gate failed: aliases={counts['aliases']} held={held} "
+        f"attempts={attempts} distinct_attempt_ids={attempt_ids} commit_failures={commit_failures}"
+    )
+print(json.dumps({**counts, "held": held, "attempts": attempts, "distinct_attempt_ids": attempt_ids}, separators=(",", ":")))
 PY
 
 python3 - "$RUN_DIR/process-stats.jsonl" "$RUN_DIR/runtime-stats.jsonl" "$MEMORY_LIMIT_KIB" "$CPU_SET" <<'PY'

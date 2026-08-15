@@ -611,11 +611,19 @@ type Account struct {
 	// this account eligible despite its own rate-limit cooldown, recheck flag,
 	// or quarantine. It never re-enables a disabled account or an unhealthy
 	// shared egress profile.
-	IgnoreRateLimitControls bool   `json:"ignore_rate_limit_controls"`
-	QuarantineUntil         int64  `json:"quarantine_until,omitempty"`
-	QuarantineReason        string `json:"quarantine_reason,omitempty"`
-	CreatedAt               int64  `json:"created_at"`
-	UpdatedAt               int64  `json:"updated_at"`
+	IgnoreRateLimitControls bool `json:"ignore_rate_limit_controls"`
+	// RoutingWeight affects only fresh-account selection. Sticky/native sessions
+	// remain bound to their account. 100 is neutral; higher values receive a
+	// proportionally larger share under sustained equal-capacity load.
+	RoutingWeight int `json:"routing_weight"`
+	// RetryMaxAttempts is the total number of same-credential wire attempts for a
+	// replay-safe request (1 = no retry). Zero preserves the historical single
+	// attempt default. Runtime clamps the value to at most three.
+	RetryMaxAttempts int    `json:"retry_max_attempts"`
+	QuarantineUntil  int64  `json:"quarantine_until,omitempty"`
+	QuarantineReason string `json:"quarantine_reason,omitempty"`
+	CreatedAt        int64  `json:"created_at"`
+	UpdatedAt        int64  `json:"updated_at"`
 }
 
 type AccountPoolSummary struct {
@@ -2595,6 +2603,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE egress_profiles ADD COLUMN chain_proxy TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE accounts ADD COLUMN ignore_rate_limit_controls INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE accounts ADD COLUMN routing_weight INTEGER NOT NULL DEFAULT 100`,
+		`ALTER TABLE accounts ADD COLUMN retry_max_attempts INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN auth_method TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN credential_mode TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN agent_runtime_id TEXT NOT NULL DEFAULT ''`,
@@ -2824,6 +2834,10 @@ ON CONFLICT(account_id) DO NOTHING`,
 		`ALTER TABLE usage_records ADD COLUMN requested_model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN resolved_model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN model_override_source TEXT NOT NULL DEFAULT 'none'`,
+		`ALTER TABLE usage_records ADD COLUMN actual_model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN model_mismatch INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN model_mismatch_reason TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_records_model_mismatch_created ON usage_records(model_mismatch, created_at)`,
 		`ALTER TABLE billing_holds ADD COLUMN usage_expected INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE billing_holds ADD COLUMN usage_recorded_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE goal_session ADD COLUMN storage_bytes INTEGER NOT NULL DEFAULT 0`,
@@ -5327,9 +5341,18 @@ func (s *Store) upsertAccountTx(ctx context.Context, tx *sql.Tx, account Account
 	if account.GroupName == "" {
 		account.GroupName = "cyber"
 	}
+	if account.RoutingWeight <= 0 {
+		account.RoutingWeight = 100
+	}
+	if account.RoutingWeight > 1000 {
+		account.RoutingWeight = 1000
+	}
+	if account.RetryMaxAttempts < 0 || account.RetryMaxAttempts > 3 {
+		account.RetryMaxAttempts = 0
+	}
 	_, err := tx.ExecContext(ctx, `
-INSERT INTO accounts(id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO accounts(id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, routing_weight, retry_max_attempts, quarantine_until, quarantine_reason, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
  label = excluded.label,
  group_name = excluded.group_name,
@@ -5341,7 +5364,7 @@ ON CONFLICT(id) DO UPDATE SET
  status = excluded.status,
  is_fedramp = excluded.is_fedramp,
  updated_at = excluded.updated_at`,
-		account.ID, account.Label, account.GroupName, account.UpstreamAccountID, account.ChatGPTUserID, account.Email, account.PlanType, account.Provider, account.Status, boolInt(account.IsFedramp), boolInt(account.IgnoreRateLimitControls), account.QuarantineUntil, account.QuarantineReason, account.CreatedAt, account.UpdatedAt)
+		account.ID, account.Label, account.GroupName, account.UpstreamAccountID, account.ChatGPTUserID, account.Email, account.PlanType, account.Provider, account.Status, boolInt(account.IsFedramp), boolInt(account.IgnoreRateLimitControls), account.RoutingWeight, account.RetryMaxAttempts, account.QuarantineUntil, account.QuarantineReason, account.CreatedAt, account.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -5387,7 +5410,7 @@ ON CONFLICT(account_id) DO NOTHING`, account.ID, primaryEgressID, account.ID+":"
 }
 
 func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts ORDER BY created_at, id`)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, routing_weight, retry_max_attempts, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -5512,7 +5535,7 @@ func (s *Store) listAccountsPage(ctx context.Context, limit, offset int, search,
 	if err := s.rdb.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	query := "SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts" + where + " ORDER BY " + orderBy + " LIMIT ? OFFSET ?"
+	query := "SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, routing_weight, retry_max_attempts, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts" + where + " ORDER BY " + orderBy + " LIMIT ? OFFSET ?"
 	args = append(args, limit, offset)
 	rows, err := s.rdb.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -5599,7 +5622,7 @@ func (s *Store) ResolveAccountProviders(ctx context.Context, accounts []Account)
 }
 
 func (s *Store) ListActiveAccountsByGroup(ctx context.Context, group string) ([]Account, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE group_name = ? AND status = 'active' ORDER BY created_at, id`, group)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, routing_weight, retry_max_attempts, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE group_name = ? AND status = 'active' ORDER BY created_at, id`, group)
 	if err != nil {
 		return nil, err
 	}
@@ -5631,7 +5654,7 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT a.id, a.label, a.group_name, a.upstream_account_id, a.chatgpt_user_id,
 		       a.email, a.plan_type, a.provider, a.status, a.is_fedramp, a.ignore_rate_limit_controls, a.quarantine_until,
-		       a.quarantine_reason, a.created_at, a.updated_at,
+		       a.routing_weight, a.retry_max_attempts, a.quarantine_reason, a.created_at, a.updated_at,
 		       b.account_id, b.primary_egress_id, b.standby_egress_ids, b.sidecar_egress_id, b.binding_scope, b.cookie_jar_key, b.cooldown_until,
 		       b.recheck_pending, b.created_at, b.updated_at,
 		       COALESCE(e.id,''), COALESCE(e.name,''), COALESCE(e.type,''), COALESCE(e.endpoint,''),
@@ -5663,7 +5686,7 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 		err := rows.Scan(
 			&a.Account.ID, &a.Account.Label, &a.Account.GroupName, &a.Account.UpstreamAccountID,
 			&a.Account.ChatGPTUserID, &a.Account.Email, &a.Account.PlanType, &a.Account.Provider,
-			&a.Account.Status, &isFedramp, &ignoreRateLimitControls, &a.Account.QuarantineUntil, &a.Account.QuarantineReason,
+			&a.Account.Status, &isFedramp, &ignoreRateLimitControls, &a.Account.QuarantineUntil, &a.Account.RoutingWeight, &a.Account.RetryMaxAttempts, &a.Account.QuarantineReason,
 			&a.Account.CreatedAt, &a.Account.UpdatedAt,
 			&a.Binding.AccountID, &a.Binding.PrimaryEgressID, &a.Binding.StandbyEgressIDs, &a.Binding.SidecarEgressID, &a.Binding.BindingScope, &a.Binding.CookieJarKey,
 			&a.Binding.CooldownUntil, &recheck, &a.Binding.CreatedAt, &a.Binding.UpdatedAt,
@@ -5699,7 +5722,7 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 }
 
 func (s *Store) GetAccount(ctx context.Context, id string) (Account, error) {
-	row := s.rdb.QueryRowContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE id = ?`, id)
+	row := s.rdb.QueryRowContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, routing_weight, retry_max_attempts, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE id = ?`, id)
 	return scanAccount(row)
 }
 
@@ -5714,7 +5737,7 @@ func (s *Store) GetAccountByEmail(ctx context.Context, email string) (Account, e
 	}
 	row := s.rdb.QueryRowContext(ctx, `
 SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status,
-       is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at
+	   is_fedramp, ignore_rate_limit_controls, routing_weight, retry_max_attempts, quarantine_until, quarantine_reason, created_at, updated_at
 FROM accounts
 WHERE LOWER(email)=LOWER(?)
 ORDER BY updated_at DESC,id
@@ -5740,7 +5763,7 @@ func (s *Store) ListAccountsByIDs(ctx context.Context, accountIDs []string) (map
 	if len(ids) == 0 {
 		return out, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE id IN (`+sqlPlaceholders(len(ids))+`)`, stringArgs(ids)...)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, routing_weight, retry_max_attempts, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE id IN (`+sqlPlaceholders(len(ids))+`)`, stringArgs(ids)...)
 	if err != nil {
 		return nil, err
 	}
@@ -5771,6 +5794,25 @@ func (s *Store) SetAccountPlanType(ctx context.Context, id, planType string) err
 func (s *Store) SetAccountIgnoreRateLimitControls(ctx context.Context, id string, enabled bool) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET ignore_rate_limit_controls = ?, updated_at = ? WHERE id = ?`, boolInt(enabled), Now(), id)
 	return err
+}
+
+// SetAccountRoutingPolicy updates fresh-selection share and bounded same-
+// credential retry policy atomically.
+func (s *Store) SetAccountRoutingPolicy(ctx context.Context, id string, routingWeight, retryMaxAttempts int) error {
+	if routingWeight < 1 || routingWeight > 1000 {
+		return fmt.Errorf("routing weight must be between 1 and 1000")
+	}
+	if retryMaxAttempts < 0 || retryMaxAttempts > 3 {
+		return fmt.Errorf("retry max attempts must be between 0 and 3")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE accounts SET routing_weight = ?, retry_max_attempts = ?, updated_at = ? WHERE id = ?`, routingWeight, retryMaxAttempts, Now(), id)
+	if err != nil {
+		return err
+	}
+	if affected, affectedErr := result.RowsAffected(); affectedErr == nil && affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (s *Store) DeleteAccount(ctx context.Context, id string) error {
@@ -9349,6 +9391,9 @@ type UsageDiagnostics struct {
 	RequestedModel                    string
 	ResolvedModel                     string
 	ModelOverrideSource               string
+	ActualModel                       string
+	ModelMismatch                     bool
+	ModelMismatchReason               string
 }
 
 type UsageRecordWrite struct {
@@ -9585,9 +9630,9 @@ affinity_source, prompt_cache_key_present, prompt_cache_key_source, stable_prefi
 retention_effective, retention_source, claude_cache_ttl, cache_control_injected, cache_breakpoint_count,
 cache_breakpoints_json, unwritten_tail_tokens, max_possible_cache_read_tokens, cache_hit_after_prewarm, singleflight_waited_requests, diagnostics_miss_reason,
 latest_user_cache_control, latest_user_auto_context_cache_control, latest_user_tail_cache_control, latest_user_tool_result_cache_control, route_epoch,
-	kiro_credits, kiro_credits_present, billing_hold_id, requested_model, resolved_model, model_override_source,
+	kiro_credits, kiro_credits_present, billing_hold_id, requested_model, resolved_model, model_override_source, actual_model, model_mismatch, model_mismatch_reason,
 raw_usage_json, created_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(usage_event_id) WHERE usage_event_id <> '' DO UPDATE SET
 	 account_id=excluded.account_id, route_key_hash=excluded.route_key_hash, api_key_hash=excluded.api_key_hash, user_id=excluded.user_id,
 	 model=excluded.model, prompt_tokens=excluded.prompt_tokens, completion_tokens=excluded.completion_tokens, total_tokens=excluded.total_tokens,
@@ -9606,7 +9651,9 @@ ON CONFLICT(usage_event_id) WHERE usage_event_id <> '' DO UPDATE SET
 	 latest_user_auto_context_cache_control=excluded.latest_user_auto_context_cache_control, latest_user_tail_cache_control=excluded.latest_user_tail_cache_control,
 	 latest_user_tool_result_cache_control=excluded.latest_user_tool_result_cache_control, route_epoch=excluded.route_epoch, kiro_credits=excluded.kiro_credits,
 	 kiro_credits_present=excluded.kiro_credits_present, billing_hold_id=excluded.billing_hold_id, requested_model=excluded.requested_model,
-	 resolved_model=excluded.resolved_model, model_override_source=excluded.model_override_source, raw_usage_json=excluded.raw_usage_json
+	 resolved_model=excluded.resolved_model, model_override_source=excluded.model_override_source,
+	 actual_model=excluded.actual_model, model_mismatch=excluded.model_mismatch, model_mismatch_reason=excluded.model_mismatch_reason,
+	 raw_usage_json=excluded.raw_usage_json
 WHERE usage_records.estimated > 0 AND excluded.estimated = 0`,
 		diag.UsageEventID, accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, cacheRead, cacheCreation,
 		diag.UsageProvider, diag.UsageSource, boolInt(diag.CacheReadPresent), boolInt(diag.CacheCreationPresent), diag.CompatibilityLossesJSON, diag.CacheCapability,
@@ -9617,6 +9664,7 @@ WHERE usage_records.estimated > 0 AND excluded.estimated = 0`,
 		boolInt(diag.LatestUserCacheControl),
 		boolInt(diag.LatestUserAutoContextCacheControl), boolInt(diag.LatestUserTailCacheControl), boolInt(diag.LatestUserToolResultCacheControl), diag.RouteEpoch,
 		diag.KiroCredits, boolInt(diag.KiroCreditsPresent), diag.BillingHoldID, diag.RequestedModel, diag.ResolvedModel, firstNonEmptyStorage(diag.ModelOverrideSource, "none"),
+		diag.ActualModel, boolInt(diag.ModelMismatch), diag.ModelMismatchReason,
 		string(raw), now)
 	if err != nil {
 		return err
@@ -9649,6 +9697,24 @@ func firstNonEmptyStorage(values ...string) string {
 
 func finalizeUsageDiagnostics(model string, prompt, cached, cacheRead, cacheCreation int64, raw json.RawMessage, diag UsageDiagnostics) UsageDiagnostics {
 	usageMap := rawUsageMap(raw)
+	if strings.TrimSpace(diag.ActualModel) == "" {
+		diag.ActualModel = strings.TrimSpace(model)
+	}
+	expectedModel := firstNonEmptyStorage(diag.ResolvedModel, diag.RequestedModel)
+	switch {
+	case modelAuditUnavailable(diag.ActualModel):
+		diag.ModelMismatch = false
+		diag.ModelMismatchReason = "actual_model_unavailable"
+	case strings.TrimSpace(expectedModel) == "":
+		diag.ModelMismatch = false
+		diag.ModelMismatchReason = "resolved_model_unavailable"
+	case canonicalAuditModel(expectedModel) != canonicalAuditModel(diag.ActualModel):
+		diag.ModelMismatch = true
+		diag.ModelMismatchReason = "upstream_model_differs_from_resolved"
+	default:
+		diag.ModelMismatch = false
+		diag.ModelMismatchReason = ""
+	}
 	_, openAICacheReadReported := nestedUsageIntPresent(usageMap, "input_tokens_details", "cached_tokens")
 	if !openAICacheReadReported {
 		_, openAICacheReadReported = nestedUsageIntPresent(usageMap, "prompt_tokens_details", "cached_tokens")
@@ -9744,6 +9810,28 @@ func finalizeUsageDiagnostics(model string, prompt, cached, cacheRead, cacheCrea
 	}
 	_ = cached // kept in the signature so callers can pass the parsed usage shape without lossy recomputation.
 	return diag
+}
+
+func modelAuditUnavailable(model string) bool {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "", "unknown", "estimated", "unavailable":
+		return true
+	default:
+		return false
+	}
+}
+
+func canonicalAuditModel(model string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	model = strings.TrimSuffix(model, "[1m]")
+	if strings.HasPrefix(model, "claude-") {
+		model = strings.TrimSuffix(model, "-thinking")
+		model = strings.ReplaceAll(model, ".", "-")
+	}
+	if model == "gpt-5.6" {
+		return "gpt-5.6-sol"
+	}
+	return model
 }
 
 func rawUsageMap(raw json.RawMessage) map[string]interface{} {
@@ -11731,7 +11819,7 @@ func scanAccount(row scanner) (Account, error) {
 	var chatGPTUserID sql.NullString
 	var email sql.NullString
 	var planType sql.NullString
-	err := row.Scan(&acc.ID, &acc.Label, &acc.GroupName, &upstreamAccountID, &chatGPTUserID, &email, &planType, &acc.Provider, &acc.Status, &fed, &ignoreRateLimitControls, &acc.QuarantineUntil, &acc.QuarantineReason, &acc.CreatedAt, &acc.UpdatedAt)
+	err := row.Scan(&acc.ID, &acc.Label, &acc.GroupName, &upstreamAccountID, &chatGPTUserID, &email, &planType, &acc.Provider, &acc.Status, &fed, &ignoreRateLimitControls, &acc.RoutingWeight, &acc.RetryMaxAttempts, &acc.QuarantineUntil, &acc.QuarantineReason, &acc.CreatedAt, &acc.UpdatedAt)
 	if err != nil {
 		return Account{}, err
 	}
@@ -11741,6 +11829,9 @@ func scanAccount(row scanner) (Account, error) {
 	acc.PlanType = planType.String
 	acc.IsFedramp = fed != 0
 	acc.IgnoreRateLimitControls = ignoreRateLimitControls != 0
+	if acc.RoutingWeight <= 0 {
+		acc.RoutingWeight = 100
+	}
 	return acc, nil
 }
 

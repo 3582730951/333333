@@ -273,6 +273,23 @@ func TestAutoKiroGPTLowCapacityUsesFairPoolRatherThanKiroPriority(t *testing.T) 
 	}
 }
 
+func TestAutoKiroGPTCodexOnlyRouteDoesNotSelectTwice(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_codex_only","object":"response","model":"gpt-5.6-sol","status":"completed","output_text":"codex only"}`))
+	})
+	seedAutoCodexGPTAccount(t, h, "codex-only")
+	before := h.app.scheduler.Metrics().RouteSelects
+	status, header, _, body := postAutoKiroGPT(t, h, "/v1/responses", `{"model":"gpt-5.6-sol","conversation_id":"codex-only-route","input":[{"role":"user","content":"hello"}]}`, nil)
+	after := h.app.scheduler.Metrics().RouteSelects
+	if status != http.StatusOK || header.Get("X-Pool-Resolved-Provider") == "kiro" || !strings.Contains(body, "codex only") {
+		t.Fatalf("Codex-only route status=%d provider=%q body=%s", status, header.Get("X-Pool-Resolved-Provider"), body)
+	}
+	if delta := after - before; delta != 1 {
+		t.Fatalf("Codex-only request selected %d times, want exactly one", delta)
+	}
+}
+
 func TestAutoKiroGPTHighPressureAdmitsKiroToFairPool(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

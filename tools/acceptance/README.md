@@ -16,6 +16,24 @@ tools/acceptance/extreme_load.sh
 
 Use `KEEP_ARTIFACTS=1` to retain fixtures, logs, Docker samples, and JSON results. A quick developer smoke can lower `FIXTURE_COUNT`, `TARGET_TOKENS`, `TARGET_RPS`, and `LOAD_DURATION`; only the defaults constitute the hard gate.
 
+## Mixed context, provider, and multi-CLI pressure
+
+`mixed_context_pressure.sh` is the deterministic matrix for agent-style traffic. It generates and tokenizer-verifies independent `128k`, `256k`, and `1M` fixture sets. Every fixture contains a hosted web-search declaration, a paired function call/output, a paired Skill call/output, a prompt-cache key, and a downstream CLI identity. It then exercises:
+
+- context compaction while quota exhaustion forces an account switch, including tool-pair reconstruction and the case where another mapped root reaches selection only after the old account's 5xx circuit breaker has opened;
+- Kiro pressure spillover and sticky mid-conversation handoff, plus built-in and custom-provider failover;
+- 200- and 1,000-stream gateway pressure while unrelated new requests enter selection;
+- multiple downstream CLIs sharing a weak process session without crossing context;
+- root/child-agent canonical affinity: children stay on their root account even while a less-busy account exists, while independent requests continue balancing across the pool.
+
+The default uses only deterministic local mocks and writes a machine-readable `report.json`; it consumes no real account quota:
+
+```bash
+GO_BIN=/path/to/go1.25.12/bin/go tools/acceptance/mixed_context_pressure.sh
+```
+
+Set `RUN_TRANSPORT_LOAD=1` to additionally run all three tiers through the TLS/HTTP2, cgroup-limited transport gate. `FIXTURE_COUNT_PER_TIER`, `TARGET_RPS`, `LOAD_CONCURRENCY`, and `LOAD_DURATION` tune the non-release smoke profile; release evidence should keep the documented defaults. Live provider/CLI probing remains a separate opt-in because it consumes credentials and quota.
+
 `diagnostics_replay.sh` verifies the source diagnostics archive checksum and runs the focused regression matrix for every issue extracted from it:
 
 - WebSocket inner-429 account rotation and paired tool-context reconstruction;
@@ -36,6 +54,14 @@ Run:
 
 ```bash
 tools/acceptance/skills_tools_replay.sh
+```
+
+`recent_issue_regressions.sh` is the focused gate derived from a recent (2026-06-01 through 2026-08-14) sample of CLIProxyAPI, Sub2API, and `qxcnm/Codex-Manager` issues. It covers statusless SSE overload rotation, same-account Claude empty-`end_turn` continuation, upstream topology redaction, prompt-cache controls, premature stream terminals, tool-name deltas, compaction signals, reasoning round trips, and atomic batched context commits. The source-to-test matrix is in `docs/reports/production-issue-regression-2026-08-14.md`.
+
+Run:
+
+```bash
+tools/acceptance/recent_issue_regressions.sh
 ```
 
 `cluster_failover.sh` creates an isolated PostgreSQL 16 primary plus physical streaming standby and a Redis 7 AOF node. It validates SQLite migration, two application nodes settling the same usage event exactly once, PostgreSQL primary loss plus standby promotion, Redis restart durability, fencing, lease renewal, Pub/Sub-independent recovery, and lease expiry after node loss. Every container, network, and volume is uniquely named and removed on exit.

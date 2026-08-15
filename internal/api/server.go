@@ -25,12 +25,14 @@ import (
 	"codex-account-pool/internal/cf"
 	"codex-account-pool/internal/cfsolve"
 	"codex-account-pool/internal/cloak"
+	"codex-account-pool/internal/compatmanifest"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/console"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/incident"
 	"codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/leakfilter"
+	"codex-account-pool/internal/passivehealth"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/registration/teamflow"
 	"codex-account-pool/internal/reliability"
@@ -123,6 +125,7 @@ type Server struct {
 	claudeRefresh      *claudeRefreshGates
 	antigravityRefresh *antigravityRefreshFlights
 	kiro               *kiro.Manager
+	passiveHealth      *passivehealth.Monitor
 	// asyncWrites carries fire-and-forget DB writes (usage rows, virtual-ledger rows)
 	// off the request path so the response is not blocked on a write through the single
 	// SQLite write connection. A single drainer goroutine runs them FIFO (matching the
@@ -175,20 +178,22 @@ type Server struct {
 	codexSessionGatesMu  sync.Mutex
 	codexSessionGates    map[string]*codexSessionGate
 
-	codexResetMu         sync.Mutex
-	codexResetLocks      map[string]*sync.Mutex
-	compatMu             sync.Mutex
-	compatRecent         []compatIncompatibilityRecord
-	qualityMu            sync.Mutex
-	qualityRunning       bool
-	goalCompactionMu     sync.Mutex
-	goalCompactionQueued map[string]bool
-	goalCompactionQueue  chan string
-	goalCompactionCtx    context.Context
-	goalCompactionCancel context.CancelFunc
-	goalCompactionTimers sync.WaitGroup
-	contextRebuilt       uint64
-	contextDegraded      uint64
+	codexResetMu          sync.Mutex
+	codexResetLocks       map[string]*sync.Mutex
+	compatMu              sync.Mutex
+	compatRecent          []compatIncompatibilityRecord
+	compatibilityManifest *compatmanifest.Manager
+	compatibilityWake     chan struct{}
+	qualityMu             sync.Mutex
+	qualityRunning        bool
+	goalCompactionMu      sync.Mutex
+	goalCompactionQueued  map[string]bool
+	goalCompactionQueue   chan string
+	goalCompactionCtx     context.Context
+	goalCompactionCancel  context.CancelFunc
+	goalCompactionTimers  sync.WaitGroup
+	contextRebuilt        uint64
+	contextDegraded       uint64
 	// Codex CPA-v2 aggregate-only observability. Values intentionally carry no
 	// downstream/upstream ids or prompt bodies.
 	codexMappingBindingsCreated uint64
@@ -248,22 +253,25 @@ func NewServer(dep Dependencies) *Server {
 			routingAuditLogWindow,
 			routingAuditLogMaxKeys,
 		),
-		relState:            reliability.NewStore(relStateTTL, relStateMax),
-		regHandler:          NewHandler(dep.Store, dep.Upstream, dep.Config.DefaultRegisterMethod, dep.Config.RegistrationConcurrency, &dep.Config), // builds live provider Manager from provider_settings
-		claudeRefresh:       newClaudeRefreshGates(),
-		antigravityRefresh:  newAntigravityRefreshFlights(),
-		kiro:                kiro.NewManager(dep.Store, dep.Upstream, dep.Config),
-		usageDashboardCache: newUsageDashboardResponseCache(),
-		claudeCacheFlights:  map[string]chan struct{}{},
-		codexCacheFlights:   map[string]chan struct{}{},
-		claudeCacheDiagPrev: map[string]string{},
-		kiroCacheFlights:    map[string]chan struct{}{},
-		codexSessionGates:   map[string]*codexSessionGate{},
-		codexResetLocks:     map[string]*sync.Mutex{},
-		diagnosticJobWake:   make(chan struct{}, 1),
-		superMemory:         superinstruct.NewMemoryKernel(superInstructMemoryPath(dep.Config)),
-		superMonitor:        superinstruct.NewMonitorPanel(),
-		publicChatLimiter:   map[string]publicChatRateWindow{},
+		relState:              reliability.NewStore(relStateTTL, relStateMax),
+		regHandler:            NewHandler(dep.Store, dep.Upstream, dep.Config.DefaultRegisterMethod, dep.Config.RegistrationConcurrency, &dep.Config), // builds live provider Manager from provider_settings
+		claudeRefresh:         newClaudeRefreshGates(),
+		antigravityRefresh:    newAntigravityRefreshFlights(),
+		kiro:                  kiro.NewManager(dep.Store, dep.Upstream, dep.Config),
+		passiveHealth:         passivehealth.New(passivehealth.DefaultMaxSeries, passivehealth.DefaultRetention),
+		usageDashboardCache:   newUsageDashboardResponseCache(),
+		claudeCacheFlights:    map[string]chan struct{}{},
+		codexCacheFlights:     map[string]chan struct{}{},
+		claudeCacheDiagPrev:   map[string]string{},
+		kiroCacheFlights:      map[string]chan struct{}{},
+		codexSessionGates:     map[string]*codexSessionGate{},
+		codexResetLocks:       map[string]*sync.Mutex{},
+		diagnosticJobWake:     make(chan struct{}, 1),
+		superMemory:           superinstruct.NewMemoryKernel(superInstructMemoryPath(dep.Config)),
+		superMonitor:          superinstruct.NewMonitorPanel(),
+		publicChatLimiter:     map[string]publicChatRateWindow{},
+		compatibilityManifest: compatmanifest.New(dep.Config.DataDir, nil),
+		compatibilityWake:     make(chan struct{}, 1),
 	}
 	if dep.Store != nil {
 		connector := dep.TeamLifecycleConnector
@@ -294,6 +302,31 @@ func NewServer(dep Dependencies) *Server {
 	} else {
 		s.identitySecretCached = identity.ResolveSecret([]byte(dep.Config.IdentitySecret))
 	}
+	// Loading a small, checksum-verified local LKG profile is best-effort and never
+	// participates in startup readiness. Network refreshes run only in the active
+	// background role below.
+	capability.SetRemoteCodexModels(nil)
+	if s.compatibilityManifest != nil {
+		manifestCfg := compatibilityManifestBootConfig(dep.Config)
+		if dep.Store != nil {
+			// Honor a persisted disable/trust-source override before routes can
+			// receive their first request; the background worker is intentionally
+			// not responsible for closing a startup visibility window. This optional
+			// read is strictly bounded so a degraded database cannot make compatibility
+			// metadata a new startup gate.
+			manifestConfigCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			manifestCfg = s.compatibilityManifestConfig(manifestConfigCtx)
+			cancel()
+		}
+		s.compatibilityManifest.SetEnabled(manifestCfg.Enabled, manifestCfg.Source)
+		if manifestCfg.Enabled {
+			if payload, loaded, err := s.compatibilityManifest.Load(manifestCfg); err != nil {
+				log.Printf("compatibility manifest LKG load skipped: %v", err)
+			} else if loaded {
+				s.applyCompatibilityManifest(payload)
+			}
+		}
+	}
 	if !dep.DeferRuntimeStart {
 		if err := s.StartRuntime(); err != nil {
 			panic(fmt.Sprintf("start server runtime: %v", err))
@@ -322,6 +355,9 @@ func NewServer(dep Dependencies) *Server {
 	}
 	if s.upstream != nil && s.scheduler != nil {
 		s.upstream.SetEgressObserver(s.scheduler.ObserveEgress)
+	}
+	if s.upstream != nil && s.passiveHealth != nil {
+		s.upstream.SetAttemptObserver(s.passiveHealth.Observe)
 	}
 	s.routes()
 	return s
@@ -543,6 +579,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/usage/cache/reset", s.adminUsageCacheReset)
 	s.mux.HandleFunc("/admin/usage/timeseries", s.adminUsageTimeseries)
 	s.mux.HandleFunc("/admin/usage/by-model", s.adminUsageByModel)
+	s.mux.HandleFunc("/admin/usage/model-audit", s.adminUsageModelAudit)
 	s.mux.HandleFunc("/admin/compat/skills", s.adminSkillsCompatDoctor)
 	s.mux.HandleFunc("/admin/quota", s.adminQuota)
 	// Host + registration-task resource metrics (CPU/mem/disk + node/Chrome/Xvfb RSS).
@@ -1929,7 +1966,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// same turn_id; a separately issued native EOF continue allocates its own turn.
 	osHint := s.osHint(raw, lease.Egress)
 	mapping := codexSessionMappingFromContext(r.Context())
-	codexIdentity, identityErr := mapping.identitySnapshot(s.identitySecret(), lease, osHint)
+	codexIdentity, identityErr := mapping.identitySnapshot(s.identitySecret(), lease, osHint, s.identityConvergenceMode(r.Context()))
 	if identityErr != nil {
 		writePoolCodeError(w, http.StatusConflict, codexMappingErrorCode(identityErr), "Codex session identity is no longer available")
 		return codexAttemptResult{Outcome: outcomeDone}
@@ -1946,7 +1983,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// OS-hinted) identity used to build the upstream headers.
 	hdr := baseHeader.Clone()
 	if s.isolationEnabled(r.Context()) && !codexStrictCPAFromContext(r.Context()) {
-		id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
+		id := s.virtualIdentity(r.Context(), lease.Account.ID, osHint)
 		body = isolateCodexConversation(hdr, body, id)
 	}
 
@@ -3656,16 +3693,17 @@ func (s *Server) doCodexUpstream(ctx context.Context, req upstream.Request) (*up
 
 func (s *Server) doWithCFRetry(ctx context.Context, req upstream.Request, lease scheduler.Lease, strict bool) (*upstream.Response, storage.EgressProfile, error) {
 	mapping := codexSessionMappingFromContext(ctx)
-	// This canonical start is emitted at the actual transport boundary, so every
-	// auth/version/native/HTTPS retry and every selected real exit is observable.
-	// It is diagnostic-only: routing quality below uses explicit terminal success
-	// or egress_failure rows and never treats an unfinished start as a failure.
-	s.recordCodexUpstreamAttempt(ctx, mapping, lease, req.Egress, "transport_attempted", 0)
-	resp, err := s.doCodexUpstream(ctx, req)
-	if err != nil {
-		if ctx.Err() == nil {
+	resp, err, _ := s.doAccountCredentialRetry(ctx, lease.Account, !strict, func() (*upstream.Response, error) {
+		// This canonical start is emitted at the actual transport boundary, so every
+		// credential/auth/version/native retry and selected real exit is observable.
+		s.recordCodexUpstreamAttempt(ctx, mapping, lease, req.Egress, "transport_attempted", 0)
+		attemptResp, attemptErr := s.doCodexUpstream(ctx, req)
+		if attemptErr != nil && ctx.Err() == nil {
 			s.recordCodexUpstreamAttempt(ctx, mapping, lease, req.Egress, "egress_failure", 0)
 		}
+		return attemptResp, attemptErr
+	})
+	if err != nil {
 		return nil, req.Egress, err
 	}
 	if resp.StatusCode < 400 {
@@ -3990,6 +4028,10 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 		return // relay-internal (moderation) calls must not be metered against pool accounts
 	}
 	parsed := usage.ParseResponse(body)
+	actualModel := strings.TrimSpace(parsed.Model)
+	if actualModel == "" {
+		actualModel = "unknown"
+	}
 	if len(parsed.RawUsage) == 0 {
 		// Session 33: When the upstream response body does not contain countable
 		// usage (e.g. a soft rate-limit error returned as HTTP 200), fall back to
@@ -4032,6 +4074,7 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 	}
 	keyHash, userID := downstreamFromCtx(ctx)
 	diag := usageDiagnosticsFromCtx(ctx)
+	diag.ActualModel = actualModel
 	modelDiag := modelDiagnosticsFromCtx(ctx)
 	diag.BillingHoldID = holdIDFromCtx(ctx)
 	diag.RequestedModel, diag.ResolvedModel, diag.ModelOverrideSource = modelDiag.Requested, modelDiag.Resolved, modelDiag.Source
@@ -4081,6 +4124,10 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 	if isInternalCall(ctx) {
 		return // relay-internal (moderation) calls must not be metered against pool accounts
 	}
+	actualModel := strings.TrimSpace(parsed.Model)
+	if actualModel == "" {
+		actualModel = "unknown"
+	}
 	modelDiag := modelDiagnosticsFromCtx(ctx)
 	if strings.TrimSpace(parsed.Model) == "" {
 		parsed.Model = firstNonEmpty(modelDiag.Resolved, modelDiag.Requested)
@@ -4119,6 +4166,7 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 	}
 	keyHash, userID := downstreamFromCtx(ctx)
 	diag := usageDiagnosticsFromCtx(ctx)
+	diag.ActualModel = actualModel
 	diag.BillingHoldID = holdIDFromCtx(ctx)
 	diag.RequestedModel, diag.ResolvedModel, diag.ModelOverrideSource = modelDiag.Requested, modelDiag.Resolved, modelDiag.Source
 	if diag.UsageEventID == "" {

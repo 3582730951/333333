@@ -114,6 +114,32 @@ export interface UsageDashboard {
   usageWindow: UsageEnvelope;
 }
 
+export interface ModelAuditRow {
+  requested_model: string;
+  resolved_model: string;
+  actual_model: string;
+  model_override_source: string;
+  mismatch: boolean;
+  mismatch_reason: string;
+  requests: number;
+  last_seen_at: number;
+}
+
+export interface ModelAuditReport {
+  rows: ModelAuditRow[];
+  requests: number;
+  mismatches: number;
+  actual_model_unavailable: number;
+  mismatch_only: boolean;
+  window?: UsageWindow;
+  effective_start_at?: number;
+  effective_until_at?: number;
+  usage_complete_through_at?: number;
+  pending_usage_requests?: number;
+  usage_lag_seconds?: number;
+  [key: string]: unknown;
+}
+
 export function usageDimensionKey(row: UsageMetricRow): string {
   if (row.dimension_key || row.series_key || row.model_key) {
     return String(row.dimension_key || row.series_key || row.model_key);

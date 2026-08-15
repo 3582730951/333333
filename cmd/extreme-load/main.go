@@ -49,6 +49,7 @@ type fixtureManifest struct {
 	Model        string         `json:"model"`
 	Encoding     string         `json:"encoding"`
 	EncodingSHA  string         `json:"encoding_sha256"`
+	Profile      string         `json:"profile,omitempty"`
 	TargetTokens int            `json:"target_tokens"`
 	Tolerance    float64        `json:"tolerance"`
 	Fixtures     []fixtureEntry `json:"fixtures"`
@@ -79,6 +80,8 @@ type loadResult struct {
 	VerifiedFixtures   int     `json:"verified_fixtures"`
 	VerifiedMinTokens  int     `json:"verified_min_tokens"`
 	VerifiedMaxTokens  int     `json:"verified_max_tokens"`
+	FixtureProfile     string  `json:"fixture_profile"`
+	TargetTokens       int     `json:"target_tokens"`
 }
 
 func main() {
@@ -215,12 +218,17 @@ func generateCommand(args []string) error {
 	tolerance := flags.Float64("tolerance", 0.005, "allowed relative token error")
 	model := flags.String("model", "gpt-5.6-sol", "target model recorded in the manifest")
 	encodingName := flags.String("encoding", "o200k_base", "exact tokenizer encoding")
+	profileFlag := flags.String("profile", "plain", "fixture profile: plain or mixed-agent")
 	workers := flags.Int("workers", runtime.NumCPU(), "parallel fixture generators")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *dir == "" || *count < 1 || *target < 1 || *tolerance <= 0 || *tolerance > 0.1 || *workers < 1 {
 		return errors.New("dir, positive count/tokens/workers and tolerance in (0,0.1] are required")
+	}
+	profile, err := normalizeFixtureProfile(*profileFlag)
+	if err != nil {
+		return err
 	}
 	if err := ensureEmptyDirectory(*dir); err != nil {
 		return err
@@ -229,7 +237,7 @@ func generateCommand(args []string) error {
 	if err != nil {
 		return fmt.Errorf("load exact tokenizer %s: %w", *encodingName, err)
 	}
-	manifest := fixtureManifest{Version: fixtureManifestVersion, Model: *model, Encoding: *encodingName, EncodingSHA: tokenizerChecksum(*encodingName), TargetTokens: *target, Tolerance: *tolerance, Fixtures: make([]fixtureEntry, *count)}
+	manifest := fixtureManifest{Version: fixtureManifestVersion, Model: *model, Encoding: *encodingName, EncodingSHA: tokenizerChecksum(*encodingName), Profile: profile, TargetTokens: *target, Tolerance: *tolerance, Fixtures: make([]fixtureEntry, *count)}
 	type generatedFixture struct {
 		index int
 		entry fixtureEntry
@@ -253,7 +261,7 @@ func generateCommand(args []string) error {
 					if !ok {
 						return
 					}
-					entry, err := generateFixtureEntry(encoding, *dir, *model, *encodingName, index, *target, *tolerance)
+					entry, err := generateFixtureEntry(encoding, *dir, *model, *encodingName, profile, index, *target, *tolerance)
 					select {
 					case results <- generatedFixture{index: index, entry: entry, err: err}:
 					case <-ctx.Done():
@@ -312,9 +320,9 @@ func generateCommand(args []string) error {
 	return os.WriteFile(filepath.Join(*dir, "manifest.json"), append(raw, '\n'), 0o600)
 }
 
-func generateFixtureEntry(encoding *tiktoken.Tiktoken, dir, model, encodingName string, index, target int, tolerance float64) (fixtureEntry, error) {
+func generateFixtureEntry(encoding *tiktoken.Tiktoken, dir, model, encodingName, profile string, index, target int, tolerance float64) (fixtureEntry, error) {
 	key := fmt.Sprintf("extreme-%03d", index)
-	body, tokens, err := generateFixture(encoding, model, key, target, tolerance)
+	body, tokens, err := generateFixture(encoding, model, key, profile, target, tolerance)
 	if err != nil {
 		return fixtureEntry{}, err
 	}
@@ -332,11 +340,11 @@ func generateFixtureEntry(encoding *tiktoken.Tiktoken, dir, model, encodingName 
 	}
 	return fixtureEntry{
 		File: name, Bytes: int64(len(body)), Tokens: tokens, SHA256: hex.EncodeToString(sum[:]), GzipToRawRatio: ratio,
-		PromptCacheKey: key, VerificationKind: "tiktoken:" + encodingName,
+		PromptCacheKey: key, VerificationKind: fixtureVerificationKind(encodingName, profile),
 	}, nil
 }
 
-func generateFixture(encoding *tiktoken.Tiktoken, model, key string, target int, tolerance float64) ([]byte, int, error) {
+func generateFixture(encoding *tiktoken.Tiktoken, model, key, profile string, target int, tolerance float64) ([]byte, int, error) {
 	chars := max(target*3/2, 1024)
 	low, high := float64(target)*(1-tolerance), float64(target)*(1+tolerance)
 	var body []byte
@@ -346,12 +354,7 @@ func generateFixture(encoding *tiktoken.Tiktoken, model, key string, target int,
 		if err != nil {
 			return nil, 0, err
 		}
-		body, err = json.Marshal(struct {
-			Model          string `json:"model"`
-			Stream         bool   `json:"stream"`
-			PromptCacheKey string `json:"prompt_cache_key"`
-			Input          string `json:"input"`
-		}{Model: model, Stream: true, PromptCacheKey: key, Input: payload})
+		body, err = marshalFixtureBody(model, key, profile, payload)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -373,6 +376,67 @@ func generateFixture(encoding *tiktoken.Tiktoken, model, key string, target int,
 		chars = max(next, 1)
 	}
 	return nil, 0, fmt.Errorf("failed to converge: tokens=%d target=%d tolerance=%.4f", tokens, target, tolerance)
+}
+
+func normalizeFixtureProfile(profile string) (string, error) {
+	profile = strings.ToLower(strings.TrimSpace(profile))
+	if profile == "" {
+		profile = "plain"
+	}
+	if profile != "plain" && profile != "mixed-agent" {
+		return "", fmt.Errorf("unsupported fixture profile %q (want plain or mixed-agent)", profile)
+	}
+	return profile, nil
+}
+
+func fixtureVerificationKind(encodingName, profile string) string {
+	if profile == "" || profile == "plain" {
+		return "tiktoken:" + encodingName
+	}
+	return "tiktoken:" + encodingName + ":" + profile
+}
+
+func marshalFixtureBody(model, key, profile, payload string) ([]byte, error) {
+	if profile == "plain" || profile == "" {
+		return json.Marshal(struct {
+			Model          string `json:"model"`
+			Stream         bool   `json:"stream"`
+			PromptCacheKey string `json:"prompt_cache_key"`
+			Input          string `json:"input"`
+		}{Model: model, Stream: true, PromptCacheKey: key, Input: payload})
+	}
+	// The mixed profile is a protocol-real Responses history: web search is an
+	// available hosted tool, the local function and Skill calls are fully paired,
+	// and the large user payload remains high entropy so disk/memory pressure is
+	// not hidden by an unrealistically compressible fixture.
+	request := map[string]any{
+		"model":            model,
+		"stream":           true,
+		"prompt_cache_key": key,
+		"metadata": map[string]string{
+			"stress_profile": "mixed-agent",
+			"downstream_cli": key,
+			"context_policy": "preserve-quality-and-full-context",
+		},
+		"tools": []any{
+			map[string]any{"type": "web_search_preview", "search_context_size": "medium"},
+			map[string]any{
+				"type": "function", "name": "workspace_search", "description": "Search the mounted workspace without changing files.",
+				"parameters": map[string]any{"type": "object", "properties": map[string]any{"query": map[string]string{"type": "string"}}, "required": []string{"query"}, "additionalProperties": false},
+			},
+			map[string]any{"type": "custom", "name": "load_skill", "description": "Load an installed Skill instruction package.", "format": map[string]string{"type": "text"}},
+		},
+		"input": []any{
+			map[string]any{"role": "developer", "content": []any{map[string]string{"type": "input_text", "text": "Preserve the full context, tool pairing, Skill state, and parent/child account affinity across retries and compaction."}}},
+			map[string]any{"role": "user", "content": []any{map[string]string{"type": "input_text", "text": "Use web search, workspace tools, and the installed Skill before answering. Stress payload follows: " + payload}}},
+			map[string]any{"type": "function_call", "id": "fc_" + key, "call_id": "call_workspace_" + key, "name": "workspace_search", "arguments": `{"query":"account affinity"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_workspace_" + key, "output": `{"matches":["internal/routing","internal/scheduler"]}`},
+			map[string]any{"type": "custom_tool_call", "id": "ctc_" + key, "call_id": "call_skill_" + key, "name": "load_skill", "input": "coding-core"},
+			map[string]any{"type": "custom_tool_call_output", "call_id": "call_skill_" + key, "output": "Skill loaded; verification remains required."},
+			map[string]any{"role": "assistant", "content": []any{map[string]string{"type": "output_text", "text": "Web search checkpoint retained; continue with the same model quality and context window."}}},
+		},
+	}
+	return json.Marshal(request)
 }
 
 func randomURLText(length int) (string, error) {
@@ -445,6 +509,10 @@ func verifyFixtures(dir string, minimum int, loadBodies bool, workers int) (fixt
 	}
 	var manifest fixtureManifest
 	if err = json.Unmarshal(raw, &manifest); err != nil {
+		return manifest, nil, 0, 0, err
+	}
+	manifest.Profile, err = normalizeFixtureProfile(manifest.Profile)
+	if err != nil {
 		return manifest, nil, 0, 0, err
 	}
 	if manifest.Version != fixtureManifestVersion || len(manifest.Fixtures) == 0 || len(manifest.Fixtures) < minimum || manifest.TargetTokens <= 0 || manifest.Tolerance <= 0 || manifest.Tolerance > 0.1 || strings.TrimSpace(manifest.Encoding) == "" {
@@ -550,7 +618,7 @@ func verifyFixtureEntry(dir string, manifest fixtureManifest, encoding *tiktoken
 	fixture := manifest.Fixtures[index]
 	expectedFile := fmt.Sprintf("fixture-%03d.json", index)
 	expectedKey := fmt.Sprintf("extreme-%03d", index)
-	if fixture.File != expectedFile || filepath.Base(fixture.File) != fixture.File || fixture.PromptCacheKey != expectedKey || fixture.VerificationKind != "tiktoken:"+manifest.Encoding {
+	if fixture.File != expectedFile || filepath.Base(fixture.File) != fixture.File || fixture.PromptCacheKey != expectedKey || fixture.VerificationKind != fixtureVerificationKind(manifest.Encoding, manifest.Profile) {
 		return nil, 0, fmt.Errorf("fixture %d identity metadata is invalid", index)
 	}
 	body, err := os.ReadFile(filepath.Join(dir, fixture.File))
@@ -566,7 +634,57 @@ func verifyFixtureEntry(dir string, manifest fixtureManifest, encoding *tiktoken
 	if int64(len(body)) != fixture.Bytes || hex.EncodeToString(sum[:]) != fixture.SHA256 || tokens != fixture.Tokens || float64(tokens) < lower || float64(tokens) > upper || ratio < 0.70 || math.Abs(ratio-fixture.GzipToRawRatio) > 1e-12 || !json.Valid(body) {
 		return nil, 0, fmt.Errorf("fixture %d verification failed: bytes=%d tokens=%d ratio=%.4f", index, len(body), tokens, ratio)
 	}
+	if manifest.Profile == "mixed-agent" {
+		if err := verifyMixedAgentFixture(body, expectedKey); err != nil {
+			return nil, 0, fmt.Errorf("fixture %d mixed-agent contract: %w", index, err)
+		}
+	}
 	return body, tokens, nil
+}
+
+func verifyMixedAgentFixture(body []byte, expectedKey string) error {
+	var request struct {
+		PromptCacheKey string            `json:"prompt_cache_key"`
+		Metadata       map[string]string `json:"metadata"`
+		Tools          []struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		} `json:"tools"`
+		Input []struct {
+			Type   string `json:"type"`
+			Role   string `json:"role"`
+			CallID string `json:"call_id"`
+			Name   string `json:"name"`
+		} `json:"input"`
+	}
+	if err := json.Unmarshal(body, &request); err != nil {
+		return err
+	}
+	if request.PromptCacheKey != expectedKey || request.Metadata["stress_profile"] != "mixed-agent" || request.Metadata["downstream_cli"] != expectedKey {
+		return errors.New("profile, CLI, or prompt-cache metadata is missing")
+	}
+	toolContract := make(map[string]bool)
+	for _, tool := range request.Tools {
+		toolContract[tool.Type+":"+tool.Name] = true
+	}
+	for _, required := range []string{"web_search_preview:", "function:workspace_search", "custom:load_skill"} {
+		if !toolContract[required] {
+			return fmt.Errorf("required tool %s is missing", required)
+		}
+	}
+	inputTypes := make(map[string]int)
+	callOutputs := make(map[string]bool)
+	for _, item := range request.Input {
+		inputTypes[item.Type]++
+		if strings.HasSuffix(item.Type, "_output") && item.CallID != "" {
+			callOutputs[item.CallID] = true
+		}
+	}
+	if inputTypes["function_call"] != 1 || inputTypes["function_call_output"] != 1 || inputTypes["custom_tool_call"] != 1 || inputTypes["custom_tool_call_output"] != 1 ||
+		!callOutputs["call_workspace_"+expectedKey] || !callOutputs["call_skill_"+expectedKey] {
+		return errors.New("function or Skill call/output pairing is incomplete")
+	}
+	return nil
 }
 
 func tokenizerChecksum(encoding string) string {
@@ -766,6 +884,7 @@ func runCommand(args []string) error {
 		Requests: requests, Succeeded: succeeded, Failed: failed, TargetRPS: *rps, MinimumAchievedRPS: requiredRPS, AchievedRPS: float64(requests) / elapsed.Seconds(), ElapsedSeconds: elapsed.Seconds(),
 		P50Millis: percentileMillis(latencies, 0.50), P95Millis: percentileMillis(latencies, 0.95), P99Millis: percentileMillis(latencies, 0.99), BytesSent: sent,
 		VerifiedFixtures: len(manifest.Fixtures), VerifiedMinTokens: minTokens, VerifiedMaxTokens: maxTokens,
+		FixtureProfile: manifest.Profile, TargetTokens: manifest.TargetTokens,
 	}
 	raw, _ := json.MarshalIndent(result, "", "  ")
 	fmt.Println(string(raw))

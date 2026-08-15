@@ -32,7 +32,9 @@ import (
 	"time"
 
 	"codex-account-pool/internal/bodysource"
+	"codex-account-pool/internal/supervisor"
 	fhttp "github.com/bogdanfinn/fhttp"
+	fhttptrace "github.com/bogdanfinn/fhttp/httptrace"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 	utls "github.com/bogdanfinn/utls"
@@ -156,11 +158,18 @@ type Request struct {
 	Header       stdhttp.Header
 	HeaderOrder  []string
 	Body         bodysource.BodySource
-	Profile      string        // ProfileClaude => captured Bun; ""/ProfileChrome => Chrome_120
-	JA3Override  string        // explicit named profile key from profiles.MappedTLSClients ("chrome_120" etc.)
-	ProxyURL     string        // optional chain proxy (http(s)/socks5(h))
-	CookieJarKey string        // scopes a persistent cookie jar across a multi-call flow
-	Timeout      time.Duration // 0 => factory default
+	Profile      string // ProfileClaude => captured Bun; ""/ProfileChrome => Chrome_120
+	JA3Override  string // explicit named profile key from profiles.MappedTLSClients ("chrome_120" etc.)
+	ProxyURL     string // optional chain proxy (http(s)/socks5(h))
+	CookieJarKey string // scopes a persistent cookie jar across a multi-call flow
+	// Timeout is an optional absolute HTTP request deadline. Zero disables the
+	// client-wide deadline so the caller can own long-stream idle semantics. The
+	// WebSocket-only TLSDialerFor uses the factory default when this is zero.
+	Timeout time.Duration
+	// ConnectTimeout independently bounds TCP, proxy CONNECT/SOCKS, and TLS
+	// establishment. It is baked into the pooled client's dialer but does not
+	// shorten the request/stream timeout above.
+	ConnectTimeout time.Duration
 	// ForceHTTP1 restricts protocol selection to HTTP/1.1. Profiles with an ALPN
 	// extension are narrowed to ["http/1.1"]; profiles without one retain its absence.
 	//
@@ -234,7 +243,74 @@ type cookieJarEntry struct {
 	lastUsed time.Time
 }
 
-// New returns a Factory with a sane default request timeout.
+type connectionPhase struct {
+	mu       sync.Mutex
+	cancel   context.CancelFunc
+	timer    *time.Timer
+	complete bool
+	timedOut bool
+}
+
+type connectionStageTimeoutError struct{}
+
+func (connectionStageTimeoutError) Error() string   { return "upstream connection stage timed out" }
+func (connectionStageTimeoutError) Timeout() bool   { return true }
+func (connectionStageTimeoutError) Temporary() bool { return true }
+
+func newConnectionPhase(parent context.Context, timeout time.Duration) (context.Context, *connectionPhase) {
+	if timeout <= 0 {
+		return parent, nil
+	}
+	ctx, cancel := context.WithCancel(parent)
+	phase := &connectionPhase{cancel: cancel}
+	phase.timer = time.AfterFunc(timeout, func() {
+		defer supervisor.Recover("tlsclient-connection-phase-timeout")
+		phase.mu.Lock()
+		defer phase.mu.Unlock()
+		if phase.complete {
+			return
+		}
+		phase.timedOut = true
+		phase.cancel()
+	})
+	return ctx, phase
+}
+
+func (p *connectionPhase) finish() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.complete = true
+	if p.timer != nil {
+		p.timer.Stop()
+	}
+	p.mu.Unlock()
+}
+
+func (p *connectionPhase) abort() {
+	if p == nil {
+		return
+	}
+	p.finish()
+	p.cancel()
+}
+
+func (p *connectionPhase) timeoutError() error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.timedOut {
+		return connectionStageTimeoutError{}
+	}
+	return nil
+}
+
+// New returns a Factory with a bounded default for standalone WebSocket dials.
+// HTTP callers explicitly choose an absolute timeout per Request; zero leaves
+// stream lifetime to the request context.
 func New() *Factory {
 	return NewWithLimits(defaultClientMax, defaultCookieJarMax)
 }
@@ -318,7 +394,8 @@ func cacheKey(r Request) string {
 	if r.ForceHTTP1 {
 		h1 = "1"
 	}
-	return r.Profile + "\x00" + r.JA3Override + "\x00" + r.ProxyURL + "\x00" + h1
+	return r.Profile + "\x00" + r.JA3Override + "\x00" + r.ProxyURL + "\x00" + h1 + "\x00" +
+		strconv.FormatInt(r.ConnectTimeout.Milliseconds(), 10) + "\x00" + strconv.FormatInt(r.Timeout.Milliseconds(), 10)
 }
 
 func (f *Factory) clientFor(r Request) (tls_client.HttpClient, error) {
@@ -343,17 +420,12 @@ func (f *Factory) clientFor(r Request) (tls_client.HttpClient, error) {
 		return c, nil
 	}
 	f.clientMisses++
-	timeout := r.Timeout
-	if timeout <= 0 {
-		timeout = f.defaultTimeout
-	}
-	secs := int(timeout / time.Second)
-	if secs <= 0 {
-		secs = 1
-	}
 	opts := []tls_client.HttpClientOption{
 		tls_client.WithClientProfile(ResolveProfile(r.Profile, r.JA3Override)),
-		tls_client.WithTimeoutSeconds(secs),
+		// Zero deliberately disables tls-client's absolute Client.Timeout. The
+		// caller's request context and idle-read guard own inference lifetime; a
+		// fixed transport timeout would truncate a healthy long SSE stream.
+		tls_client.WithTimeoutMilliseconds(durationMilliseconds(r.Timeout)),
 		// The pool owns failover/retry semantics; the transport must not silently follow
 		// redirects (an upstream 3xx is a signal we surface, not chase).
 		tls_client.WithNotFollowRedirects(),
@@ -365,7 +437,16 @@ func (f *Factory) clientFor(r Request) (tls_client.HttpClient, error) {
 		opts = append(opts, tls_client.WithForceHttp1())
 	}
 	if r.ProxyURL != "" {
-		opts = append(opts, tls_client.WithProxyUrl(r.ProxyURL))
+		// tls-client overwrites a supplied net.Dialer timeout with its absolute
+		// request timeout and its HTTP CONNECT reader does not unblock when the
+		// context is cancelled. Use our bounded route dialer instead. The URL is
+		// captured here (rather than also setting WithProxyUrl, which tls-client
+		// rejects when a custom factory is present).
+		proxyURL := r.ProxyURL
+		connectTimeout := r.ConnectTimeout
+		opts = append(opts, tls_client.WithProxyDialerFactory(func(_ string, _ time.Duration, localAddr *net.TCPAddr, connectHeaders fhttp.Header, _ tls_client.Logger) (proxy.ContextDialer, error) {
+			return newBoundedProxyDialer(proxyURL, connectTimeout, localAddr, connectHeaders)
+		}))
 	}
 	c, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
 	if err != nil {
@@ -377,6 +458,21 @@ func (f *Factory) clientFor(r Request) (tls_client.HttpClient, error) {
 		f.evictClientLocked(f.clientLRU.Back())
 	}
 	return c, nil
+}
+
+func durationMilliseconds(value time.Duration) int {
+	if value <= 0 {
+		return 0
+	}
+	millis := value.Milliseconds()
+	if millis <= 0 {
+		millis = 1
+	}
+	maxInt := int64(^uint(0) >> 1)
+	if millis > maxInt {
+		return int(maxInt)
+	}
+	return int(millis)
 }
 
 func (f *Factory) evictClientLocked(element *list.Element) {
@@ -417,6 +513,16 @@ func (f *Factory) Do(ctx context.Context, r Request) (*Response, error) {
 	if err != nil {
 		return nil, err
 	}
+	requestCtx, phase := newConnectionPhase(ctx, r.ConnectTimeout)
+	if phase != nil {
+		// GotConn fires only after DNS/TCP, proxy CONNECT/SOCKS, and target TLS
+		// have completed (and also fires immediately for a reused connection).
+		// Stopping the phase timer here prevents connection policy from becoming
+		// a TTFT or response-stream deadline.
+		requestCtx = fhttptrace.WithClientTrace(requestCtx, &fhttptrace.ClientTrace{
+			GotConn: func(fhttptrace.GotConnInfo) { phase.finish() },
+		})
+	}
 	method := r.Method
 	if method == "" {
 		method = fhttp.MethodPost
@@ -425,11 +531,13 @@ func (f *Factory) Do(ctx context.Context, r Request) (*Response, error) {
 	if r.Body != nil && r.Body.Size() > 0 {
 		body, err = r.Body.Open()
 		if err != nil {
+			phase.abort()
 			return nil, err
 		}
 	}
-	req, err := fhttp.NewRequestWithContext(ctx, method, r.URL, body)
+	req, err := fhttp.NewRequestWithContext(requestCtx, method, r.URL, body)
 	if err != nil {
+		phase.abort()
 		if body != nil {
 			_ = body.Close()
 		}
@@ -449,8 +557,14 @@ func (f *Factory) Do(ctx context.Context, r Request) (*Response, error) {
 	f.applyCookies(r.CookieJarKey, r.URL, req.Header)
 	resp, err := client.Do(req)
 	if err != nil {
+		if timeoutErr := phase.timeoutError(); timeoutErr != nil {
+			phase.abort()
+			return nil, timeoutErr
+		}
+		phase.abort()
 		return nil, err
 	}
+	phase.finish()
 	if resp == nil {
 		return nil, errors.New("tls transport returned a nil response")
 	}
@@ -584,14 +698,70 @@ func parseDialProxy(raw string) (*url.URL, error) {
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https", "socks5", "socks5h":
+		if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
+			return nil, errors.New("proxy URL must not contain a path, query, or fragment")
+		}
 		return u, nil
 	default:
 		return nil, errors.New("unsupported proxy scheme")
 	}
 }
 
+type boundedProxyDialer struct {
+	proxyURL      *url.URL
+	timeout       time.Duration
+	localAddr     *net.TCPAddr
+	connectHeader stdhttp.Header
+}
+
+func newBoundedProxyDialer(rawURL string, timeout time.Duration, localAddr *net.TCPAddr, connectHeaders fhttp.Header) (proxy.ContextDialer, error) {
+	parsed, err := parseDialProxy(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	if parsed == nil {
+		return nil, errors.New("proxy URL is empty")
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	return &boundedProxyDialer{
+		proxyURL: parsed, timeout: timeout, localAddr: localAddr,
+		connectHeader: toStdHeader(connectHeaders),
+	}, nil
+}
+
+func (d *boundedProxyDialer) Dial(network, address string) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, address)
+}
+
+func (d *boundedProxyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if d == nil || d.proxyURL == nil {
+		return nil, errors.New("proxy dialer is unavailable")
+	}
+	if strings.ContainsAny(address, "\r\n") {
+		return nil, errors.New("invalid proxy target")
+	}
+	stageCtx, cancel := context.WithTimeout(ctx, d.timeout)
+	defer cancel()
+	direct := &net.Dialer{Timeout: d.timeout, KeepAlive: 30 * time.Second}
+	if d.localAddr != nil {
+		direct.LocalAddr = d.localAddr
+	}
+	return dialRouteWithDialer(stageCtx, network, address, d.proxyURL, direct, d.connectHeader)
+}
+
 func dialRoute(ctx context.Context, network, addr string, proxyURL *url.URL, timeout time.Duration) (net.Conn, error) {
-	direct := &net.Dialer{Timeout: timeout}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	stageCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	direct := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
+	return dialRouteWithDialer(stageCtx, network, addr, proxyURL, direct, nil)
+}
+
+func dialRouteWithDialer(ctx context.Context, network, addr string, proxyURL *url.URL, direct *net.Dialer, connectHeader stdhttp.Header) (net.Conn, error) {
 	if proxyURL == nil {
 		return direct.DialContext(ctx, network, addr)
 	}
@@ -602,7 +772,7 @@ func dialRoute(ctx context.Context, network, addr string, proxyURL *url.URL, tim
 			password, _ := proxyURL.User.Password()
 			auth = &proxy.Auth{User: proxyURL.User.Username(), Password: password}
 		}
-		dialer, err := proxy.SOCKS5("tcp", proxyURL.Host, auth, direct)
+		dialer, err := proxy.SOCKS5("tcp", proxyDialAddress(proxyURL), auth, direct)
 		if err != nil {
 			return nil, err
 		}
@@ -611,23 +781,34 @@ func dialRoute(ctx context.Context, network, addr string, proxyURL *url.URL, tim
 		}
 		return dialer.Dial(network, addr)
 	case "http", "https":
-		return dialHTTPConnect(ctx, network, addr, proxyURL, direct)
+		return dialHTTPConnect(ctx, network, addr, proxyURL, direct, connectHeader)
 	default:
 		return nil, errors.New("unsupported proxy scheme")
 	}
 }
 
-type bufferedConn struct {
-	net.Conn
-	reader *bufio.Reader
+func proxyDialAddress(proxyURL *url.URL) string {
+	if proxyURL == nil {
+		return ""
+	}
+	if proxyURL.Port() != "" {
+		return proxyURL.Host
+	}
+	port := ""
+	switch strings.ToLower(proxyURL.Scheme) {
+	case "http":
+		port = "80"
+	case "https":
+		port = "443"
+	}
+	if port == "" {
+		return proxyURL.Host
+	}
+	return net.JoinHostPort(proxyURL.Hostname(), port)
 }
 
-func (c *bufferedConn) Read(p []byte) (int, error) {
-	return c.reader.Read(p)
-}
-
-func dialHTTPConnect(ctx context.Context, network, addr string, proxyURL *url.URL, direct *net.Dialer) (net.Conn, error) {
-	conn, err := direct.DialContext(ctx, network, proxyURL.Host)
+func dialHTTPConnect(ctx context.Context, network, addr string, proxyURL *url.URL, direct *net.Dialer, connectHeader stdhttp.Header) (net.Conn, error) {
+	conn, err := direct.DialContext(ctx, network, proxyDialAddress(proxyURL))
 	if err != nil {
 		return nil, err
 	}
@@ -637,6 +818,11 @@ func dialHTTPConnect(ctx context.Context, network, addr string, proxyURL *url.UR
 			_ = conn.Close()
 		}
 	}()
+	if deadline, ok := ctx.Deadline(); ok {
+		if err = conn.SetDeadline(deadline); err != nil {
+			return nil, err
+		}
+	}
 
 	if strings.EqualFold(proxyURL.Scheme, "https") {
 		proxyHost := proxyURL.Hostname()
@@ -650,16 +836,22 @@ func dialHTTPConnect(ctx context.Context, network, addr string, proxyURL *url.UR
 		conn = tlsConn
 	}
 
-	authHeader := ""
+	headers := connectHeader.Clone()
+	if headers == nil {
+		headers = make(stdhttp.Header)
+	}
+	if headers.Get("Proxy-Connection") == "" {
+		headers.Set("Proxy-Connection", "Keep-Alive")
+	}
 	if proxyURL.User != nil {
 		password, _ := proxyURL.User.Password()
 		encoded := base64.StdEncoding.EncodeToString([]byte(proxyURL.User.Username() + ":" + password))
-		authHeader = "Proxy-Authorization: Basic " + encoded + "\r\n"
+		headers.Set("Proxy-Authorization", "Basic "+encoded)
 	}
-	if _, err = fmt.Fprintf(conn,
-		"CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n%s\r\n",
-		addr, addr, authHeader,
-	); err != nil {
+	request := (&stdhttp.Request{
+		Method: stdhttp.MethodConnect, URL: &url.URL{Host: addr}, Host: addr, Header: headers,
+	}).WithContext(ctx)
+	if err = request.Write(conn); err != nil {
 		return nil, err
 	}
 
@@ -689,8 +881,17 @@ func dialHTTPConnect(ctx context.Context, network, addr string, proxyURL *url.UR
 	if statusCode != stdhttp.StatusOK {
 		return nil, fmt.Errorf("proxy CONNECT failed with status %d", statusCode)
 	}
+	if err = conn.SetDeadline(time.Time{}); err != nil {
+		return nil, err
+	}
+	// A successful CONNECT response has no application body. Some permissive or
+	// instrumented proxies nevertheless attach bytes (often a diagnostic JSON
+	// body). The established tunnel cannot have legitimate target bytes before the
+	// client sends its first tunneled request/TLS ClientHello, so discard anything
+	// already buffered with the CONNECT headers instead of feeding it to fhttp as
+	// a forged upstream response. This matches tls-client's historical behavior.
 	closeOnError = false
-	return &bufferedConn{Conn: conn, reader: reader}, nil
+	return conn, nil
 }
 
 func readProxyLine(reader *bufio.Reader, total int) (string, int, error) {
@@ -717,6 +918,20 @@ func (f *Factory) CloseIdle() {
 	for _, c := range clients {
 		c.CloseIdleConnections()
 	}
+}
+
+// ResetClients retires every cached transport client while preserving the
+// account-scoped cookie jars. Used when a hot connection-stage timeout changes;
+// otherwise an old pooled dialer could remain active indefinitely.
+func (f *Factory) ResetClients() {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	for element := f.clientLRU.Back(); element != nil; element = f.clientLRU.Back() {
+		f.evictClientLocked(element)
+	}
+	f.mu.Unlock()
 }
 
 func lowered(in []string) []string {

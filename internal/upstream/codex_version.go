@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"codex-account-pool/internal/config"
-	"codex-account-pool/internal/identity"
 )
 
 // codexProtocolProfile is the request-shape contract for one Codex CLI release.
@@ -65,10 +64,10 @@ func codexVersionAtLeast(version, minimum string) bool {
 func (c *Client) resolveCodexClientVersion(spec Request) string {
 	identityVersion := ""
 	if spec.CodexIdentity != nil {
-		device := identity.CodexDevice(c.identitySecret, spec.Account.ID, spec.Egress.ID, spec.CodexIdentity.DeviceOSHint)
+		device := c.codexDevice(spec.Account.ID, spec.Egress.ID, spec.CodexIdentity.DeviceOSHint)
 		identityVersion = device.CodexCLIVersion
 	} else {
-		identityVersion = identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint).CodexCLIVersion
+		identityVersion = c.identityForOS(spec.Account.ID, spec.OSHint).CodexCLIVersion
 	}
 	version := c.cfgSnapshot().CodexCLIVersionOrDefault(identityVersion)
 	if downstream := codexSupportedClientVersion(spec.Headers); downstream != "" {

@@ -18,14 +18,41 @@ func TestWriteUpstreamHeadersDropsAccountScopedModelsETag(t *testing.T) {
 	source := http.Header{
 		"Content-Type":  []string{"text/event-stream"},
 		"X-Models-Etag": []string{`W/"single-account"`},
+		"Location":      []string{"https://internal-gw.example.com/v1/responses"},
 	}
 	destination := http.Header{}
 	h.app.writeUpstreamHeaders(context.Background(), destination, source)
 	if got := destination.Get("X-Models-Etag"); got != "" {
 		t.Fatalf("account-scoped models ETag leaked downstream: %q", got)
 	}
+	if got := destination.Get("Location"); got != "" {
+		t.Fatalf("upstream redirect leaked downstream: %q", got)
+	}
 	if got := destination.Get("Content-Type"); got != "text/event-stream" {
 		t.Fatalf("ordinary response header was dropped: %q", got)
+	}
+}
+
+func TestWriteFilteredErrorAlwaysRedactsUpstreamTopology(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	if err := h.store.SetSetting(context.Background(), "leak_scrub", "false"); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	h.app.writeFilteredError(context.Background(), recorder, "codex", http.StatusBadGateway, http.Header{
+		"Content-Type": {"application/json"},
+		"Location":     {"https://redirect.internal.example/v1"},
+	}, []byte(`{"error":{"message":"upstream https://internal-gw.example.com/v1 failed; dial tcp 10.0.0.5:18182"}}`), nil)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Location"); got != "" {
+		t.Fatalf("Location leaked: %q", got)
+	}
+	for _, leaked := range []string{"internal-gw.example.com", "redirect.internal.example", "10.0.0.5"} {
+		if strings.Contains(recorder.Body.String(), leaked) {
+			t.Fatalf("topology %q leaked: %s", leaked, recorder.Body.String())
+		}
 	}
 }
 
@@ -43,6 +70,34 @@ func TestProbeEarlyCodexSSEFailureDetectsFailedAfterCreated(t *testing.T) {
 	}
 	if failure.StatusCode != 429 {
 		t.Fatalf("failure=%+v", failure)
+	}
+}
+
+func TestProbeEarlyCodexSSEFailureRetriesEmptyCompletedResponse(t *testing.T) {
+	stream := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"resp_empty"}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_empty","status":"completed","output":[]}}` + "\n\n"
+	prefix, failure, retry, err := probeEarlyCodexSSEFailure(strings.NewReader(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retry || failure.StatusCode != http.StatusServiceUnavailable || failure.ErrorCode != "upstream_empty_response" || !failure.BuiltinRetryable {
+		t.Fatalf("retry=%v failure=%+v prefix=%q", retry, failure, prefix)
+	}
+}
+
+func TestProbeEarlyCodexSSEFailureKeepsUsageBearingEmptyOutput(t *testing.T) {
+	stream := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"resp_usage"}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_usage","status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}` + "\n\n"
+	_, failure, retry, err := probeEarlyCodexSSEFailure(strings.NewReader(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry || failure.StatusCode != 0 {
+		t.Fatalf("usage-bearing terminal was classified as failure: retry=%v failure=%+v", retry, failure)
 	}
 }
 

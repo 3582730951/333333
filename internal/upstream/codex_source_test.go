@@ -275,6 +275,26 @@ func TestSetRequestBodyInvalidatesMetadata(t *testing.T) {
 	}
 }
 
+func TestNormalizeCodexSourceSelectsTargetedFallbackForNestedPromptCacheBreakpoint(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.5","input":[{"role":"user","content":[{"type":"input_text","text":"keep","prompt_cache_breakpoint":{"mode":"explicit"}}]}]}`)
+	source := bodysource.Bytes(raw)
+	meta, err := bodysource.ScanJSON(context.Background(), source, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !meta.PromptCacheBreakpoint {
+		t.Fatal("test fixture did not mark nested breakpoint")
+	}
+	spec := Request{Body: source, BodyMeta: &meta}
+	normalized, err := normalizeCodexSource(&Client{}, &spec, whamBaseURL, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized {
+		t.Fatal("nested breakpoint incorrectly stayed on zero-copy top-level patch path")
+	}
+}
+
 func TestCodexSourceLiteContinuationSelectsOrderedEnvelopeFallback(t *testing.T) {
 	tests := []struct {
 		name         string

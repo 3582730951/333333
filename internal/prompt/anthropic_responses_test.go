@@ -91,6 +91,43 @@ func TestAnthropicRequestToResponsesNativeClaudeCodeShape(t *testing.T) {
 	}
 }
 
+func TestAnthropicRequestToResponsesKeepsLongToolPairStableAcrossAgentRounds(t *testing.T) {
+	longCallID := "toolu_agent_round_6_" + strings.Repeat("opaque-segment-", 12)
+	request := []byte(`{
+  "model":"gpt-5.6-sol",
+  "messages":[
+    {"role":"assistant","content":[{"type":"tool_use","id":"` + longCallID + `","name":"lookup","input":{"q":"context"}}]},
+    {"role":"user","content":[{"type":"tool_result","tool_use_id":"` + longCallID + `","content":"found"}]}
+  ],
+  "tools":[{"name":"lookup","input_schema":{"type":"object"}}]
+}`)
+
+	first, err := AnthropicRequestToResponses(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := AnthropicRequestToResponses(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := mustUnmarshal(t, first.Body)
+	input := root["input"].([]interface{})
+	if len(input) != 2 {
+		t.Fatalf("tool pair input=%v", input)
+	}
+	callID := input[0].(map[string]interface{})["call_id"].(string)
+	resultID := input[1].(map[string]interface{})["call_id"].(string)
+	if callID == "" || callID != resultID || len(callID) > codexCallIDLimit {
+		t.Fatalf("long tool id pair diverged call=%q result=%q limit=%d", callID, resultID, codexCallIDLimit)
+	}
+	secondRoot := mustUnmarshal(t, second.Body)
+	secondInput := secondRoot["input"].([]interface{})
+	if secondInput[0].(map[string]interface{})["call_id"] != callID ||
+		secondInput[1].(map[string]interface{})["call_id"] != callID {
+		t.Fatalf("tool id rewrite changed across agent rounds: first=%s second=%s", first.Body, second.Body)
+	}
+}
+
 func TestAnthropicRequestToResponsesPreservesClaudeCodeToolMatrix(t *testing.T) {
 	names := []string{
 		"Read", "Bash", "Edit", "Write", "Glob", "Grep", "NotebookEdit",

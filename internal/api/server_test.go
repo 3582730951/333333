@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -47,6 +48,30 @@ type testHarness struct {
 	store    *storage.Store
 	captured *[]capturedRequest
 	app      *Server
+}
+
+// closeRuntime mirrors the production shutdown order: stop accepting requests,
+// then drain and close every writer/replayer before the SQLite store or its temp
+// directory disappears. Tests that rebuild a server around the same store must use
+// this boundary; otherwise the retired runtime keeps replaying the same journal.
+func (h *testHarness) closeRuntime() {
+	if h == nil {
+		return
+	}
+	if h.pool != nil {
+		h.pool.Close()
+	}
+	if h.app != nil {
+		registrationCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = h.app.StopRegistrationJobs(registrationCtx)
+		cancel()
+		h.app.FlushWrites()
+	}
+}
+
+func (h *testHarness) serve(app *Server) {
+	h.app = app
+	h.pool = httptest.NewServer(app)
 }
 
 // skipLegacyCodexContextReplay marks v1 tests that asserted journal reconstruction,
@@ -112,14 +137,31 @@ func newHarness(t *testing.T, upstreamHandler http.HandlerFunc) *testHarness {
 		Upstream:  upstream.NewClient(cfg),
 		Planner:   virtual.NewPlanner(store, cfg),
 	})
-	pool := httptest.NewServer(app)
+	h := &testHarness{upstream: up, store: store, captured: &captured}
+	h.serve(app)
 	t.Cleanup(func() {
-		pool.Close()
-		app.FlushWrites()
+		h.closeRuntime()
 		up.Close()
 		_ = store.Close()
 	})
-	return &testHarness{pool: pool, upstream: up, store: store, captured: &captured, app: app}
+	return h
+}
+
+func TestEmbeddedServerFlushOwnsRegistrationRuntime(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	})
+	h.app.regHandler.mu.Lock()
+	runtimeCtx := h.app.regHandler.runtimeCtx
+	h.app.regHandler.mu.Unlock()
+	if runtimeCtx == nil || runtimeCtx.Err() != nil {
+		t.Fatalf("registration runtime was not active before flush: %v", runtimeCtx)
+	}
+	h.app.FlushWrites()
+	if err := runtimeCtx.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("registration runtime survived owning server flush: %v", err)
+	}
 }
 
 func (h *testHarness) importAccount(t *testing.T, label, upstreamAccountID, accessToken string) string {
@@ -281,6 +323,7 @@ func TestStatelessCodexRequestsRemainVisibleInAttemptDiagnostics(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
+	h.app.WaitForAsyncWrites()
 	rows, err := h.store.ListCodexUpstreamAttemptDiagnostics(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -298,7 +341,7 @@ func TestStatelessCodexRequestsRemainVisibleInAttemptDiagnostics(t *testing.T) {
 			t.Fatalf("one stateless turn used multiple diagnostic namespaces: %q != %q", row.TreeHMACPrefix, tree)
 		}
 	}
-	if tree == "" || !states["attempted"] || !states["response_headers"] {
+	if tree == "" || !states["transport_attempted"] || !states["response_headers"] {
 		t.Fatalf("stateless attempt diagnostics tree=%q states=%v rows=%+v", tree, states, rows)
 	}
 }
@@ -1164,7 +1207,7 @@ func TestRefreshTokenUpdatesAccessTokenUsedByGateway(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"resp","output_text":"ok"}`))
 	})
 	// Override config-driven OAuth URL by rebuilding the app against the same store/upstream.
-	h.pool.Close()
+	h.closeRuntime()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
 	cfg.OAuthTokenURL = oauth.URL
@@ -1176,7 +1219,7 @@ func TestRefreshTokenUpdatesAccessTokenUsedByGateway(t *testing.T) {
 		Upstream:  upstream.NewClient(cfg),
 		Planner:   virtual.NewPlanner(h.store, cfg),
 	})
-	h.pool = httptest.NewServer(app)
+	h.serve(app)
 	defer h.pool.Close()
 
 	acc := h.importAccount(t, "a", "upstream-a", "old-access")
@@ -1227,7 +1270,7 @@ func TestGatewayRefreshesCodexTokenAfterAuthExpired(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"id":"resp","output_text":"ok"}`))
 	})
-	h.pool.Close()
+	h.closeRuntime()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
 	cfg.OAuthTokenURL = oauth.URL
@@ -1239,7 +1282,7 @@ func TestGatewayRefreshesCodexTokenAfterAuthExpired(t *testing.T) {
 		Upstream:  upstream.NewClient(cfg),
 		Planner:   virtual.NewPlanner(h.store, cfg),
 	})
-	h.pool = httptest.NewServer(app)
+	h.serve(app)
 	defer h.pool.Close()
 
 	account := storage.Account{ID: "acc-expired", Label: "expired", GroupName: config.DefaultGroupName, UpstreamAccountID: "acct-expired", Status: "active"}
@@ -1294,7 +1337,7 @@ func TestGatewayQuarantinesCodexAccountOnInvalidatedRefresh(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"id":"resp","output_text":"ok"}`))
 	})
-	h.pool.Close()
+	h.closeRuntime()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
 	cfg.OAuthTokenURL = oauth.URL
@@ -1307,7 +1350,7 @@ func TestGatewayQuarantinesCodexAccountOnInvalidatedRefresh(t *testing.T) {
 		Upstream:  upstream.NewClient(cfg),
 		Planner:   virtual.NewPlanner(h.store, cfg),
 	})
-	h.pool = httptest.NewServer(app)
+	h.serve(app)
 	defer h.pool.Close()
 
 	ctx := context.Background()
@@ -1394,7 +1437,7 @@ func TestGatewayCFRayEdgeFailoversWithoutRefreshOrCFEvent(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"id":"resp","output_text":"ok"}`))
 	})
-	h.pool.Close()
+	h.closeRuntime()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
 	cfg.OAuthTokenURL = oauth.URL
@@ -1407,7 +1450,7 @@ func TestGatewayCFRayEdgeFailoversWithoutRefreshOrCFEvent(t *testing.T) {
 		Upstream:  upstream.NewClient(cfg),
 		Planner:   virtual.NewPlanner(h.store, cfg),
 	})
-	h.pool = httptest.NewServer(app)
+	h.serve(app)
 	defer h.pool.Close()
 
 	ctx := context.Background()
@@ -1460,7 +1503,7 @@ func TestGatewayHandlesMissingScopeWithoutQuarantine(t *testing.T) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(`{"error":{"message":"You have insufficient permissions for this operation. Missing scopes: api.responses.write."}}`))
 	})
-	h.pool.Close()
+	h.closeRuntime()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
 	cfg.OAuthTokenURL = oauth.URL
@@ -1473,7 +1516,7 @@ func TestGatewayHandlesMissingScopeWithoutQuarantine(t *testing.T) {
 		Upstream:  upstream.NewClient(cfg),
 		Planner:   virtual.NewPlanner(h.store, cfg),
 	})
-	h.pool = httptest.NewServer(app)
+	h.serve(app)
 	defer h.pool.Close()
 
 	ctx := context.Background()
@@ -1714,7 +1757,7 @@ func TestDownstreamResponsesWebSocketHandshakeFallbackStripsGenerate(t *testing.
 			captured <- capturedFallback{body: body, turnMetadata: r.Header.Get("X-Codex-Turn-Metadata")}
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w, "event: response.completed\n"+
-				`data: {"type":"response.completed","response":{"id":"resp_ws_https_prewarm","model":"gpt-5.5","status":"completed","output":[]}}`+
+				`data: {"type":"response.completed","response":{"id":"resp_ws_https_prewarm","model":"gpt-5.5","status":"completed","output":[],"usage":{"input_tokens":2,"output_tokens":0,"total_tokens":2}}}`+
 				"\n\ndata: [DONE]\n\n")
 		default:
 			t.Fatalf("unexpected upstream request %s %s", r.Method, r.URL.Path)
@@ -2325,7 +2368,7 @@ func TestDownstreamResponsesWebSocketNeverLeaksRepeatedOrphanedToolOutput(t *tes
 			return
 		}
 		attempts.Add(1)
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-after-orphan","object":"response","model":"gpt-5.5","status":"completed","output":[]}}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-after-orphan","object":"response","model":"gpt-5.5","status":"completed","output":[],"usage":{"input_tokens":2,"output_tokens":0,"total_tokens":2}}}`))
 	})
 	enableCodexSessionMappingForTest(h)
 	h.importAccount(t, "downstream-ws-orphan", "acct-downstream-ws-orphan", "access-downstream-ws-orphan")
@@ -2582,7 +2625,7 @@ func TestGatewayRetriesWithCurrentCodexVersionOnVersionGate(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"id":"resp","output_text":"ok"}`))
 	})
-	h.pool.Close()
+	h.closeRuntime()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
 	cfg.CodexCLIVersionOverride = "0.130.0"
@@ -2594,7 +2637,7 @@ func TestGatewayRetriesWithCurrentCodexVersionOnVersionGate(t *testing.T) {
 		Upstream:  upstream.NewClient(cfg),
 		Planner:   virtual.NewPlanner(h.store, cfg),
 	})
-	h.pool = httptest.NewServer(app)
+	h.serve(app)
 	defer h.pool.Close()
 
 	h.importAccount(t, "future", "acct-future", "access-future")
@@ -2653,7 +2696,7 @@ func TestGatewayRetriesVersionGateStreamingRequestOverWebSocket(t *testing.T) {
 		}
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_retry","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`))
 	})
-	h.pool.Close()
+	h.closeRuntime()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
 	cfg.CodexCLIVersionOverride = "0.130.0"
@@ -2665,7 +2708,7 @@ func TestGatewayRetriesVersionGateStreamingRequestOverWebSocket(t *testing.T) {
 		Upstream:  upstream.NewClient(cfg),
 		Planner:   virtual.NewPlanner(h.store, cfg),
 	})
-	h.pool = httptest.NewServer(app)
+	h.serve(app)
 	defer h.pool.Close()
 
 	h.importAccount(t, "future-ws", "acct-future-ws", "access-future-ws")
@@ -3033,7 +3076,10 @@ func TestCodexStatelessContinuationFailsOverOn429(t *testing.T) {
 	}
 	h.app.scheduler.InvalidateAccountCache()
 
-	reqBody := `{"model":"gpt","previous_response_id":"resp_from_a","prompt_cache_key":"stateless-429","input":[{"type":"custom_tool_call_output","call_id":"call_from_a","output":"keep this tool result"}]}`
+	// The retry is self-contained: the matching call travels with its output. An
+	// output whose call existed only behind previous_response_id is deliberately
+	// rejected before scheduling because moving it could fabricate tool context.
+	reqBody := `{"model":"gpt","previous_response_id":"resp_from_a","prompt_cache_key":"stateless-429","input":[{"type":"custom_tool_call","call_id":"call_from_a","name":"workspace_search","input":"{}"},{"type":"custom_tool_call_output","call_id":"call_from_a","output":"keep this tool result"}]}`
 	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
 	keyReq.Header.Set("Thread-Id", "stateless-429-thread")
 	key := routing.ExtractAffinityKey(keyReq, degradedResponsesReplay([]byte(reqBody)))
@@ -3079,9 +3125,14 @@ func TestCodexStatelessContinuationFailsOverOn429(t *testing.T) {
 			t.Fatalf("attempt %d leaked account-local state: turn_state=%q body=%s", i, request.TurnState, request.Body)
 		}
 		input, _ := root["input"].([]interface{})
-		item, _ := input[0].(map[string]interface{})
-		if item["role"] != "user" || !strings.Contains(request.Body, "keep this tool result") {
-			t.Fatalf("attempt %d did not preserve orphaned tool result as context: %s", i, request.Body)
+		if len(input) != 2 {
+			t.Fatalf("attempt %d lost paired tool context: %s", i, request.Body)
+		}
+		call, _ := input[0].(map[string]interface{})
+		output, _ := input[1].(map[string]interface{})
+		if call["type"] != "custom_tool_call" || output["type"] != "custom_tool_call_output" ||
+			call["call_id"] != output["call_id"] || !strings.Contains(request.Body, "keep this tool result") {
+			t.Fatalf("attempt %d did not preserve paired tool context: %s", i, request.Body)
 		}
 	}
 }
@@ -6238,7 +6289,7 @@ func TestProbeCodexModelsRefreshesExpiredToken(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{}`))
 	})
-	h.pool.Close()
+	h.closeRuntime()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
 	cfg.OAuthTokenURL = oauth.URL
@@ -6250,7 +6301,7 @@ func TestProbeCodexModelsRefreshesExpiredToken(t *testing.T) {
 		Upstream:  upstream.NewClient(cfg),
 		Planner:   virtual.NewPlanner(h.store, cfg),
 	})
-	h.pool = httptest.NewServer(app)
+	h.serve(app)
 	defer h.pool.Close()
 
 	account := storage.Account{ID: "acc-probe-expired", Label: "expired", GroupName: config.DefaultGroupName, UpstreamAccountID: "acct-probe", Status: "active"}

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/config"
@@ -823,9 +824,135 @@ var codexStaticModels = []codexStaticModel{
 	{slug: "gpt-5.2", window: 272000, maxWindow: 272000, minimumClientVersion: "0.0.1", preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
 }
 
+// RemoteCodexModel is the validated compatibility-manifest projection used to
+// refresh conservative fallback metadata without rebuilding the binary. It never
+// grants routability: account-scoped live capability evidence remains authoritative.
+type RemoteCodexModel struct {
+	Slug                  string
+	ContextWindow         int64
+	MaxContextWindow      int64
+	AutoCompactTokenLimit int64
+	MinimumClientVersion  string
+	RequiresCurrentClient bool
+	PreferWebSocket       bool
+	ResponsesLite         bool
+	ReasoningLevels       []string
+}
+
+var remoteCodexCatalog atomic.Value // stores []RemoteCodexModel
+
+// SetRemoteCodexModels atomically publishes a previously signature/schema-
+// validated fallback catalog. Passing nil or an empty slice restores the bundled
+// catalog. The input is defensively copied because request paths read lock-free.
+func SetRemoteCodexModels(models []RemoteCodexModel) {
+	copyModels := make([]RemoteCodexModel, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		model.Slug = strings.ToLower(strings.TrimSpace(model.Slug))
+		if model.Slug == "" {
+			continue
+		}
+		if _, duplicate := seen[model.Slug]; duplicate {
+			continue
+		}
+		seen[model.Slug] = struct{}{}
+		model.ReasoningLevels = append([]string(nil), model.ReasoningLevels...)
+		copyModels = append(copyModels, model)
+	}
+	remoteCodexCatalog.Store(copyModels)
+}
+
+func remoteCodexModels() []RemoteCodexModel {
+	value := remoteCodexCatalog.Load()
+	if value == nil {
+		return nil
+	}
+	models, _ := value.([]RemoteCodexModel)
+	return models
+}
+
+func effectiveCodexStaticModels() ([]codexStaticModel, map[string]struct{}) {
+	remote := remoteCodexModels()
+	if len(remote) == 0 {
+		return codexStaticModels, nil
+	}
+	// A signed manifest may be intentionally partial. Remote entries override a
+	// bundled slug and new entries are appended; omission never erases a safe
+	// bundled fallback model.
+	overrides := make(map[string]codexStaticModel, len(remote))
+	remoteOrder := make([]string, 0, len(remote))
+	for _, model := range remote {
+		converted := codexStaticModel{
+			slug: model.Slug, window: model.ContextWindow, maxWindow: model.MaxContextWindow,
+			autoCompactTokenLimit: model.AutoCompactTokenLimit,
+			overrideClientContext: model.ContextWindow > 0 && model.AutoCompactTokenLimit > 0,
+			minimumClientVersion:  model.MinimumClientVersion,
+			requiresCurrentClient: model.RequiresCurrentClient, preferWebSocket: model.PreferWebSocket,
+			responsesLite: model.ResponsesLite, reasoningLevels: append([]string(nil), model.ReasoningLevels...),
+		}
+		overrides[model.Slug] = converted
+		remoteOrder = append(remoteOrder, model.Slug)
+	}
+	out := make([]codexStaticModel, 0, len(codexStaticModels)+len(remote))
+	consumed := make(map[string]struct{}, len(remote))
+	for _, bundled := range codexStaticModels {
+		if replacement, ok := overrides[bundled.slug]; ok {
+			// A remote fallback may add capabilities but cannot silently shrink a
+			// bundled model's context, transports, or reasoning choices. Live
+			// account-scoped discovery remains authoritative in either direction.
+			if replacement.window < bundled.window {
+				replacement.window = bundled.window
+			}
+			if replacement.maxWindow < bundled.maxWindow {
+				replacement.maxWindow = bundled.maxWindow
+			}
+			if replacement.autoCompactTokenLimit < bundled.autoCompactTokenLimit {
+				replacement.autoCompactTokenLimit = bundled.autoCompactTokenLimit
+			}
+			replacement.overrideClientContext = replacement.overrideClientContext || bundled.overrideClientContext
+			replacement.requiresCurrentClient = replacement.requiresCurrentClient || bundled.requiresCurrentClient
+			replacement.preferWebSocket = replacement.preferWebSocket || bundled.preferWebSocket
+			replacement.responsesLite = replacement.responsesLite || bundled.responsesLite
+			replacement.reasoningLevels = mergeReasoningLevels(bundled.reasoningLevels, replacement.reasoningLevels)
+			out = append(out, replacement)
+			consumed[bundled.slug] = struct{}{}
+		} else {
+			out = append(out, bundled)
+		}
+	}
+	for _, slug := range remoteOrder {
+		if _, ok := consumed[slug]; !ok {
+			out = append(out, overrides[slug])
+			consumed[slug] = struct{}{}
+		}
+	}
+	return out, consumed
+}
+
+func mergeReasoningLevels(base, extra []string) []string {
+	out := append([]string(nil), base...)
+	seen := make(map[string]struct{}, len(base)+len(extra))
+	for _, value := range base {
+		seen[strings.ToLower(strings.TrimSpace(value))] = struct{}{}
+	}
+	for _, value := range extra {
+		key := strings.ToLower(strings.TrimSpace(value))
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
 func codexStaticModelForSlug(slug string) (codexStaticModel, bool) {
 	slug = NormalizeCodexModelAlias(slug)
-	for _, m := range codexStaticModels {
+	models, _ := effectiveCodexStaticModels()
+	for _, m := range models {
 		if strings.ToLower(m.slug) == slug {
 			return m, true
 		}
@@ -910,8 +1037,13 @@ func CodexSupportsReasoningEffort(slug, effort string) bool {
 // is tagged "codex_static" so an operator can distinguish it from a live probe.
 func StaticCodexModels(accountID string) []storage.ModelCapability {
 	now := storage.Now()
-	out := make([]storage.ModelCapability, 0, len(codexStaticModels))
-	for _, m := range codexStaticModels {
+	models, remoteSlugs := effectiveCodexStaticModels()
+	out := make([]storage.ModelCapability, 0, len(models))
+	for _, m := range models {
+		source := "codex_static"
+		if _, remote := remoteSlugs[m.slug]; remote {
+			source = "codex_compatibility_manifest"
+		}
 		cap := storage.ModelCapability{
 			AccountID:                     accountID,
 			ModelSlug:                     m.slug,
@@ -922,7 +1054,7 @@ func StaticCodexModels(accountID string) []storage.ModelCapability {
 			AvailabilityState:             AvailabilityUnverified,
 			Context1MState:                Context1MUnknown,
 			Visibility:                    "list",
-			Source:                        "codex_static",
+			Source:                        source,
 			LastProbeAt:                   now,
 		}
 		out = append(out, ApplyGPT56ContextContract(cap))

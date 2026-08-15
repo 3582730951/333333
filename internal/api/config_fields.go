@@ -184,6 +184,22 @@ func configFields() []configField {
 		{Key: "identity_os_source", Label: "身份 OS 来源", Category: catIdentity, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"vps", "downstream", "diverse"},
 			Help:    "vps=与主机一致(随出口IP多样而多样)；downstream=按请求体推断；diverse=始终跨OS池。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.IdentityOSSource, "vps") }},
+		{Key: "identity_convergence_mode", Label: "设备身份收敛", Category: catIdentity, Type: fieldSelect, Effect: effectUpstream,
+			Options: []string{"off", "full"},
+			Help:    "off(默认)=账号/出口使用独立虚拟设备；full=新建虚拟设备在本部署内完全收敛。仅影响设备指纹，不合并原生 Session/Thread；既有会话保留已持久化身份。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.IdentityConvergenceMode, "off") }},
+		{Key: "compatibility_manifest_enabled", Label: "自动兼容清单", Category: catIdentity, Type: fieldBool, Effect: effectHot,
+			Help: "后台更新客户端版本组合和可选模型元数据；失败时继续使用 A/B last-known-good，不参与启动门禁。", boot: func(c config.Config) interface{} { return c.CompatibilityManifestEnabled }},
+		{Key: "compatibility_manifest_source", Label: "兼容清单来源", Category: catIdentity, Type: fieldSelect, Effect: effectHot,
+			Options: []string{"official", "signed_custom"},
+			Help:    "official=仅访问内置 allowlist 的官方发布源并校验快照摘要；signed_custom=读取下方 HTTPS JSON 并强制 Ed25519 签名。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.CompatibilityManifestSource, "official") }},
+		{Key: "compatibility_manifest_url", Label: "签名清单 URL", Category: catIdentity, Type: fieldString, Effect: effectHot,
+			Help: "仅 signed_custom 使用；必须为 HTTPS（测试仅允许 loopback HTTP）。", boot: func(c config.Config) interface{} { return c.CompatibilityManifestURL }},
+		{Key: "compatibility_manifest_public_key", Label: "清单 Ed25519 公钥", Category: catIdentity, Type: fieldString, Effect: effectHot,
+			Help: "Base64 编码的 32 字节公钥；签名覆盖 payload 原始 JSON。", boot: func(c config.Config) interface{} { return c.CompatibilityManifestPublicKey }},
+		{Key: "compatibility_manifest_refresh_hours", Label: "兼容清单刷新周期（小时）", Category: catIdentity, Type: fieldInt, Effect: effectHot,
+			Help: "默认 6 小时，带抖动；允许 1–168。", boot: func(c config.Config) interface{} { return c.CompatibilityManifestRefreshHours }},
+		{Key: "compatibility_manifest_max_stale_days", Label: "兼容清单最长陈旧天数", Category: catIdentity, Type: fieldInt, Effect: effectHot,
+			Help: "网络故障时 last-known-good 最长可继续使用的时间；默认 30 天，允许 1–365。", boot: func(c config.Config) interface{} { return c.CompatibilityManifestMaxStaleDays }},
 		{Key: "codex_identity_scrub", Label: "Codex 身份擦除", Category: catIdentity, Type: fieldBool, Effect: effectHot,
 			Help: "开=按敏感词擦洗 Codex 请求体与响应流。", boot: func(c config.Config) interface{} { return c.CodexIdentityScrub }},
 		{Key: "codex_prefer_sidecar_ja3_over_ws", Label: "Codex 优先 sidecar JA3", Category: catIdentity, Type: fieldBool, Effect: effectHot,
@@ -307,6 +323,8 @@ func configFields() []configField {
 			Help: "同账号已有在途请求时允许叠加的估算输入 token 上限；0=关闭。", boot: func(c config.Config) interface{} { return int(c.AccountTokenBudget) }},
 		{Key: "resource_headroom_percent", Label: "资源安全余量", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "CPU、内存或 FD 达到安全线时暂停新准入；最小 10%。", boot: func(c config.Config) interface{} { return c.ResourceHeadroomPercent }},
+		{Key: "connect_timeout_seconds", Label: "连接阶段超时（秒）", Category: catLimits, Type: fieldInt, Effect: effectUpstream,
+			Help: "仅限制 DNS/TCP/HTTP CONNECT/SOCKS/TLS 建连，默认 12 秒；不缩短长推理和 SSE 读取超时。允许 1–60。", boot: func(c config.Config) interface{} { return c.ConnectTimeoutSeconds }},
 		{Key: "scheduler_index_enabled", Label: "调度索引 v2", Category: catLimits, Type: fieldBool, Effect: effectScheduler,
 			Help: "开(默认)=不可变候选索引与 power-of-two；关=逐请求全候选扫描兼容路径。", boot: func(c config.Config) interface{} { return c.SchedulerIndexEnabled }},
 		{Key: "body_v2_enabled", Label: "请求体 v2", Category: catLimits, Type: fieldBool, Effect: effectRestart,
@@ -541,6 +559,14 @@ func (s *Server) effectiveUpstreamConfig(ctx context.Context) config.Config {
 	c.ClaudeNodeVersion = s.settingString(ctx, "claude_node_version", c.ClaudeNodeVersion)
 	c.ClaudeStainlessVersion = s.settingString(ctx, "claude_stainless_version", c.ClaudeStainlessVersion)
 	c.ClaudeCCHSigning = s.flagEnabled(ctx, "claude_cch_signing", c.ClaudeCCHSigning)
+	c.IdentityConvergenceMode = s.settingString(ctx, "identity_convergence_mode", c.IdentityConvergenceMode)
+	c.ConnectTimeoutSeconds = s.settingInt(ctx, "connect_timeout_seconds", c.ConnectTimeoutSeconds)
+	if c.ConnectTimeoutSeconds < 1 || c.ConnectTimeoutSeconds > 60 {
+		c.ConnectTimeoutSeconds = config.DefaultConnectTimeoutSeconds
+	}
+	if payload, ok := s.activeCompatibilityManifest(ctx); ok {
+		c = applyCompatibilityManifestConfig(c, payload)
+	}
 	return s.effectiveThinkingConfig(ctx, c)
 }
 
@@ -695,6 +721,7 @@ func (s *Server) applySettingsPatch(ctx context.Context, body map[string]interfa
 	if changedScheduler && s.scheduler != nil {
 		s.scheduler.UpdateConfig(s.effectiveSchedulerConfig(ctx))
 	}
+	s.handleCompatibilityManifestSettings(ctx, body)
 	return changedUpstream, nil
 }
 
@@ -797,6 +824,36 @@ func validateSettingValue(f configField, v interface{}) (string, error) {
 		n, _ := strconv.Atoi(raw)
 		if n < 10 || n > 50 {
 			return "", fmt.Errorf("must be between 10 and 50")
+		}
+		return raw, nil
+	case "connect_timeout_seconds":
+		raw, err := validateIntegerSetting(v)
+		if err != nil {
+			return "", err
+		}
+		n, _ := strconv.Atoi(raw)
+		if n < 1 || n > 60 {
+			return "", fmt.Errorf("must be between 1 and 60")
+		}
+		return raw, nil
+	case "compatibility_manifest_refresh_hours":
+		raw, err := validateIntegerSetting(v)
+		if err != nil {
+			return "", err
+		}
+		n, _ := strconv.Atoi(raw)
+		if n < 1 || n > 168 {
+			return "", fmt.Errorf("must be between 1 and 168")
+		}
+		return raw, nil
+	case "compatibility_manifest_max_stale_days":
+		raw, err := validateIntegerSetting(v)
+		if err != nil {
+			return "", err
+		}
+		n, _ := strconv.Atoi(raw)
+		if n < 1 || n > 365 {
+			return "", fmt.Errorf("must be between 1 and 365")
 		}
 		return raw, nil
 	case "context_journal_ttl_seconds":

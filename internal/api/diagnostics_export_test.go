@@ -160,6 +160,7 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		"account_rate_limits.csv",
 		"affinity_bindings.csv",
 		"codex_session_mappings.csv",
+		"goal_continuity.csv",
 		"codex_instruction_snapshots.csv",
 		"codex_upstream_attempts.csv",
 		"codex_upstream_attempts_daily.csv",

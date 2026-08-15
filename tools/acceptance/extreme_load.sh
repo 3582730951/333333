@@ -2,19 +2,21 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-GO_BIN="${GO_BIN:-/tmp/codex-go1.25.12/go/bin/go}"
+GO_BIN="${GO_BIN:-go}"
 FIXTURE_COUNT="${FIXTURE_COUNT:-256}"
 TARGET_TOKENS="${TARGET_TOKENS:-1000000}"
+FIXTURE_PROFILE="${FIXTURE_PROFILE:-mixed-agent}"
 TARGET_RPS="${TARGET_RPS:-100}"
 MINIMUM_ACHIEVED_RPS="${MINIMUM_ACHIEVED_RPS:-$TARGET_RPS}"
 LOAD_DURATION="${LOAD_DURATION:-10s}"
 LOAD_CONCURRENCY="${LOAD_CONCURRENCY:-256}"
 FIXTURE_WORKERS="${FIXTURE_WORKERS:-16}"
 REQUIRE_CGROUP="${REQUIRE_CGROUP:-1}"
+MEMORY_LIMIT_KIB="${MEMORY_LIMIT_KIB:-2097152}"
 MOCK_PORT="${MOCK_PORT:-19443}"
 POOL_PORT="${POOL_PORT:-18787}"
 CONTAINER_NAME="codex-pool-extreme-$$"
-RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-pool-extreme.XXXXXX")"
+RUN_DIR="${REPORT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/codex-pool-extreme.XXXXXX")}"
 MOCK_PID=""
 STATS_PID=""
 POOL_LOG_PID=""
@@ -33,6 +35,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "$RUN_DIR/fixtures" "$RUN_DIR/spool" "$RUN_DIR/journal"
+RUN_OWNER="$(stat -c '%u:%g' "$RUN_DIR")"
 DOCKER_LIMIT_ARGS=(--cpus 2 --memory 2g --memory-swap 2g)
 POOL_COMMAND=(/accept/pool-server -config /accept/config.json)
 LIMIT_MODE="cgroup"
@@ -40,10 +43,10 @@ if ! docker run --rm "${DOCKER_LIMIT_ARGS[@]}" ubuntu:22.04 true >/dev/null 2>&1
   if [[ "$REQUIRE_CGROUP" == "1" ]]; then
     echo "host cgroup hierarchy cannot apply Docker CPU+memory limits; hard acceptance requires a domain cgroup v2 host" >&2
     exit 1
-  fi
-  DOCKER_LIMIT_ARGS=(--cpuset-cpus 0,1)
-  POOL_COMMAND=(/bin/bash -lc 'ulimit -v 2097152; exec /accept/pool-server -config /accept/config.json')
-  LIMIT_MODE="cpuset+RLIMIT_AS"
+	fi
+	DOCKER_LIMIT_ARGS=(--cpuset-cpus 0,1)
+	POOL_COMMAND=(/accept/pool-server -config /accept/config.json)
+	LIMIT_MODE="cpuset+RSS-watchdog"
 fi
 
 openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
@@ -57,7 +60,7 @@ cd "$ROOT_DIR"
 GOTOOLCHAIN=local "$GO_BIN" build -o "$RUN_DIR/extreme-load" ./cmd/extreme-load
 GOTOOLCHAIN=local "$GO_BIN" build -o "$RUN_DIR/pool-server" ./cmd/pool-server
 
-"$RUN_DIR/extreme-load" generate -dir "$RUN_DIR/fixtures" -count "$FIXTURE_COUNT" -tokens "$TARGET_TOKENS" -tolerance 0.005 -model gpt-5.6-sol -encoding o200k_base -workers "$FIXTURE_WORKERS"
+"$RUN_DIR/extreme-load" generate -dir "$RUN_DIR/fixtures" -count "$FIXTURE_COUNT" -tokens "$TARGET_TOKENS" -tolerance 0.005 -model gpt-5.6-sol -encoding o200k_base -profile "$FIXTURE_PROFILE" -workers "$FIXTURE_WORKERS"
 "$RUN_DIR/extreme-load" verify -dir "$RUN_DIR/fixtures" -minimum "$FIXTURE_COUNT" -workers "$FIXTURE_WORKERS"
 "$RUN_DIR/extreme-load" seed -database "$RUN_DIR/pool.sqlite3" -accounts 64
 
@@ -72,6 +75,7 @@ curl --silent --fail --cacert "$RUN_DIR/mock.crt" "https://127.0.0.1:$MOCK_PORT/
 cat >"$RUN_DIR/config.json" <<EOF
 {
   "listen_addr": "0.0.0.0:$POOL_PORT",
+  "data_dir": "/accept",
   "database_path": "/accept/pool.sqlite3",
   "storage_driver": "sqlite",
   "upstream_base_url": "https://127.0.0.1:$MOCK_PORT/backend-api/codex",
@@ -94,13 +98,15 @@ cat >"$RUN_DIR/config.json" <<EOF
   "codex_session_mapping_enabled": true,
   "codex_cpa_strict": true,
   "codex_cache_singleflight_enabled": true,
+  "model_probe_interval_hours": 0,
   "resource_headroom_percent": 10
 }
 EOF
 
 docker run --detach --rm --name "$CONTAINER_NAME" \
-  "${DOCKER_LIMIT_ARGS[@]}" --pids-limit 4096 --network host \
-  -e SSL_CERT_FILE=/accept/mock.crt \
+	"${DOCKER_LIMIT_ARGS[@]}" --pids-limit 4096 --network host \
+	--user "$RUN_OWNER" \
+	-e SSL_CERT_FILE=/accept/mock.crt \
   -v "$RUN_DIR:/accept" ubuntu:22.04 \
   "${POOL_COMMAND[@]}" >"$RUN_DIR/container.id"
 docker logs --follow "$CONTAINER_NAME" >"$RUN_DIR/pool.log" 2>&1 &
@@ -112,10 +118,22 @@ for _ in $(seq 1 200); do
 done
 curl --silent --fail "http://127.0.0.1:$POOL_PORT/healthz" >/dev/null
 
+POOL_HOST_PID="$(docker inspect --format '{{.State.Pid}}' "$CONTAINER_NAME")"
+
 (
-  while docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; do
-    docker stats --no-stream --format '{{json .}}' "$CONTAINER_NAME" || true
-    sleep 1
+	while docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; do
+		if [[ "$LIMIT_MODE" == "cpuset+RSS-watchdog" ]]; then
+			rss_kib="$(awk '/^VmRSS:/ {print $2}' "/proc/$POOL_HOST_PID/status" 2>/dev/null || true)"
+			rss_kib="${rss_kib:-0}"
+			printf '{"unix_nano":%s,"rss_kib":%s}\n' "$(date +%s%N)" "$rss_kib" >>"$RUN_DIR/pool-rss-watchdog.jsonl"
+			if (( rss_kib > MEMORY_LIMIT_KIB )); then
+				printf '%s\n' "$rss_kib" >"$RUN_DIR/rss-limit-exceeded"
+				docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+				break
+			fi
+		fi
+		docker stats --no-stream --format '{{json .}}' "$CONTAINER_NAME" || true
+		sleep 1
   done
 ) >"$RUN_DIR/docker-stats.jsonl" &
 STATS_PID="$!"
@@ -123,7 +141,12 @@ STATS_PID="$!"
 "$RUN_DIR/extreme-load" run -dir "$RUN_DIR/fixtures" -minimum "$FIXTURE_COUNT" \
   -endpoint "http://127.0.0.1:$POOL_PORT/v1/responses" \
   -rps "$TARGET_RPS" -minimum-achieved-rps "$MINIMUM_ACHIEVED_RPS" -duration "$LOAD_DURATION" -concurrency "$LOAD_CONCURRENCY" -fixture-workers "$FIXTURE_WORKERS" -hard \
-  | tee "$RUN_DIR/load-result.json"
+	| tee "$RUN_DIR/load-result.json"
+
+if [[ -f "$RUN_DIR/rss-limit-exceeded" ]]; then
+	echo "pool exceeded RSS limit: $(cat "$RUN_DIR/rss-limit-exceeded") KiB > $MEMORY_LIMIT_KIB KiB" >&2
+	exit 1
+fi
 
 MOCK_STATS="$(curl --silent --fail --cacert "$RUN_DIR/mock.crt" "https://127.0.0.1:$MOCK_PORT/stats")"
 printf '%s\n' "$MOCK_STATS" | tee "$RUN_DIR/mock-stats.json"
@@ -138,4 +161,4 @@ if [[ "$(docker inspect --format '{{.State.OOMKilled}}' "$CONTAINER_NAME")" != "
   echo "pool container was OOM-killed" >&2
   exit 1
 fi
-echo "extreme acceptance passed: limit_mode=$LIMIT_MODE, SQLite in-node, target=$TARGET_RPS RPS, minimum-achieved=$MINIMUM_ACHIEVED_RPS RPS, $TARGET_TOKENS tokens, TLS/HTTP2 upstream"
+echo "extreme acceptance passed: limit_mode=$LIMIT_MODE, profile=$FIXTURE_PROFILE, SQLite in-node, target=$TARGET_RPS RPS, minimum-achieved=$MINIMUM_ACHIEVED_RPS RPS, $TARGET_TOKENS tokens, TLS/HTTP2 upstream"

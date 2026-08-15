@@ -103,7 +103,7 @@ func (s *Server) adminCustomProviderModelTest(w http.ResponseWriter, r *http.Req
 	case storage.CustomProviderProtocolAnthropicMessages:
 		result.UpstreamPath = "/messages"
 		headers.Set("Anthropic-Version", "2023-06-01")
-		body, probeOSHint = s.claudeCodeMinimalProbeBody(account, token, lease.Egress, targetModel, "Reply OK", 1)
+		body, probeOSHint = s.claudeCodeMinimalProbeBody(r.Context(), account, token, lease.Egress, targetModel, "Reply OK", 1)
 	case storage.CustomProviderProtocolResponses:
 		result.UpstreamPath = "/responses"
 		body, _ = json.Marshal(map[string]interface{}{

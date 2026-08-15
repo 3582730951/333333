@@ -74,13 +74,13 @@ func TestManualCodexOAuthCompleteUpdatesOriginalAccountAndRejectsWorkspaceMismat
 	defer oauth.Close()
 
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"ok":true}`)) })
-	h.pool.Close()
+	h.closeRuntime()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
 	cfg.CodexOAuthTokenURL = oauth.URL
 	cfg.StickyWaitMillis = 1
 	app := NewServer(Dependencies{Config: cfg, Store: h.store, Scheduler: scheduler.New(h.store, cfg), Upstream: upstream.NewClient(cfg), Planner: virtual.NewPlanner(h.store, cfg)})
-	h.pool = httptest.NewServer(app)
+	h.serve(app)
 	defer h.pool.Close()
 
 	ctx := context.Background()
@@ -144,13 +144,13 @@ func TestRefreshCodexTokenQueuesAutoReauthOnInvalidRefreshAndSkipsClaude(t *test
 	}))
 	defer oauth.Close()
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"ok":true}`)) })
-	h.pool.Close()
+	h.closeRuntime()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
 	cfg.OAuthTokenURL = oauth.URL
 	cfg.StickyWaitMillis = 1
 	app := NewServer(Dependencies{Config: cfg, Store: h.store, Scheduler: scheduler.New(h.store, cfg), Upstream: upstream.NewClient(cfg), Planner: virtual.NewPlanner(h.store, cfg)})
-	h.pool = httptest.NewServer(app)
+	h.serve(app)
 	defer h.pool.Close()
 
 	ctx := context.Background()
@@ -205,13 +205,13 @@ func TestCodexReauthRunWorkerSuccessUpdatesOriginalAndWorkerFailureKeepsOldToken
 	}))
 	defer worker.Close()
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"ok":true}`)) })
-	h.pool.Close()
+	h.closeRuntime()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
 	cfg.CodexReauthWorkerURL = worker.URL
 	cfg.StickyWaitMillis = 1
 	app := NewServer(Dependencies{Config: cfg, Store: h.store, Scheduler: scheduler.New(h.store, cfg), Upstream: upstream.NewClient(cfg), Planner: virtual.NewPlanner(h.store, cfg)})
-	h.pool = httptest.NewServer(app)
+	h.serve(app)
 	defer h.pool.Close()
 
 	ctx := context.Background()
@@ -327,13 +327,13 @@ func TestCodexReauthRunWorkerWorkspaceMismatchReturnsConflict(t *testing.T) {
 	}))
 	defer worker.Close()
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"ok":true}`)) })
-	h.pool.Close()
+	h.closeRuntime()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
 	cfg.CodexReauthWorkerURL = worker.URL
 	cfg.StickyWaitMillis = 1
 	app := NewServer(Dependencies{Config: cfg, Store: h.store, Scheduler: scheduler.New(h.store, cfg), Upstream: upstream.NewClient(cfg), Planner: virtual.NewPlanner(h.store, cfg)})
-	h.pool = httptest.NewServer(app)
+	h.serve(app)
 	defer h.pool.Close()
 
 	ctx := context.Background()

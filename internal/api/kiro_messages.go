@@ -745,7 +745,7 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 	send := func(accessToken string, requestBody []byte) (*upstream.Response, error) {
 		headers := requestHeaders.Clone()
 		headers.Set("authorization", "Bearer "+accessToken)
-		return s.upstream.DoRawSource(r.Context(), lease.Egress, http.MethodPost, target, headers, bodysource.Bytes(requestBody), lease.Binding.CookieJarKey)
+		return s.upstream.DoRawSourceObserved(r.Context(), lease.Egress, http.MethodPost, target, headers, bodysource.Bytes(requestBody), lease.Binding.CookieJarKey, "kiro", converted.Model)
 	}
 	response, err := send(bearer, body)
 	if err != nil {

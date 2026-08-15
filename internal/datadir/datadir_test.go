@@ -12,7 +12,7 @@ func TestPrepareCreatesSecureLayoutAndStableKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{layout.Spool, layout.Journal, layout.Diagnostics, layout.BrowserTemporary, layout.Run, layout.Keys} {
+	for _, path := range []string{layout.Spool, layout.Journal, layout.CoreState, layout.Diagnostics, layout.BrowserTemporary, layout.Run, layout.Keys} {
 		info, statErr := os.Lstat(path)
 		if statErr != nil {
 			t.Fatalf("%s: %v", path, statErr)

@@ -237,6 +237,43 @@ func TestLegacyDiagnosticExportReturnsAsyncLocationWithoutPrematureDownload(t *t
 	}
 }
 
+func TestDiagnosticRescueExportDoesNotRequireBackgroundWorker(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	if err := h.store.InsertAuditLog(context.Background(), storage.AuditLogRow{
+		Action: "codex_context_migrated", State: "recovered",
+		Reason: "stateless_durable_replay", Detail: "goal_checkpoint_new_root",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Do not start startDiagnosticJobLoop: rescue mode exists specifically for a
+	// stopped, crashed, or stranded optional renderer.
+	request, _ := http.NewRequest(http.MethodGet, h.pool.URL+"/admin/export/logs?mode=rescue", nil)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, readErr := io.ReadAll(response.Body)
+	response.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if response.StatusCode != http.StatusOK ||
+		!strings.Contains(response.Header.Get("Content-Type"), "application/zip") ||
+		response.Header.Get("X-Codex-Diagnostic-Mode") != "rescue" {
+		t.Fatalf("rescue status=%d headers=%v body=%s", response.StatusCode, response.Header, raw)
+	}
+	files := readZipFiles(t, raw)
+	for _, name := range []string{"manifest.json", "diagnostic_summary.json", "goal_continuity.csv", "audit_log.csv"} {
+		if _, ok := files[name]; !ok {
+			t.Fatalf("rescue bundle missing %s: %v", name, zipFileNames(files))
+		}
+	}
+	if !strings.Contains(files["audit_log.csv"], "stateless_durable_replay") {
+		t.Fatalf("rescue bundle lost context recovery evidence: %s", files["audit_log.csv"])
+	}
+}
+
 func TestDiagnosticJobCreateWakesActiveWorker(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
 	request, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/admin/diagnostics/jobs", strings.NewReader(`{}`))

@@ -129,7 +129,8 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 		metadata.turnMetadataHeader = codexTurnMetadataCompatibilityHeader(metadata.turnMetadata, profile.codeModeToolNames)
 		return metadata
 	}
-	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
+	id := c.identityForOS(spec.Account.ID, spec.OSHint)
+	sessionSeed := identity.SessionSeed(id)
 	bodyMetadata := requestCodexBodyClientMetadata(spec)
 	incomingTurn := codexIncomingTurnMetadata(spec, bodyMetadata)
 
@@ -152,7 +153,7 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 		codexRunCorrelator(spec.Headers),
 		id.SessionID,
 	)
-	threadID := identity.DerivedUUIDv7(id.MachineID+"\x00thread", threadSeed)
+	threadID := identity.DerivedUUIDv7(sessionSeed+"\x00thread", threadSeed)
 	// The current Codex protocol converts ThreadId directly into SessionId, so the
 	// two UUIDv7 values are intentionally identical (as is x-client-request-id).
 	sessionID := threadID
@@ -173,10 +174,10 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 	)
 	if requestKind != "prewarm" {
 		if rawTurnID != "" {
-			turnID = identity.DerivedUUIDv7(id.MachineID+"\x00turn", rawTurnID)
+			turnID = identity.DerivedUUIDv7(sessionSeed+"\x00turn", rawTurnID)
 		} else {
 			turnSeed := fmt.Sprintf("%s:%d", threadID, startedAt)
-			turnID = identity.DerivedUUIDv7At(id.MachineID+"\x00turn", turnSeed, startedAt)
+			turnID = identity.DerivedUUIDv7At(sessionSeed+"\x00turn", turnSeed, startedAt)
 		}
 	}
 
@@ -187,7 +188,7 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 	)
 	parentThreadID := ""
 	if rawParent != "" {
-		parentThreadID = identity.DerivedUUIDv7(id.MachineID+"\x00parent", rawParent)
+		parentThreadID = identity.DerivedUUIDv7(sessionSeed+"\x00parent", rawParent)
 	}
 
 	metadata := codexRequestMetadata{

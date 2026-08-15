@@ -391,8 +391,11 @@ func (s *CodexResponsesWebSocketSession) invalidate(conn *websocket.Conn) {
 
 func (c *Client) codexWebSocketDialerForEgress(egress storage.EgressProfile) (*websocket.Dialer, error) {
 	dialer := *websocket.DefaultDialer
-	dialer.Proxy = http.ProxyFromEnvironment
-	dialer.HandshakeTimeout = 15 * time.Second
+	connectTimeout := c.cfgSnapshot().ConnectTimeout()
+	// The selected egress is authoritative; a process-wide proxy would otherwise
+	// move accounts configured as direct onto an untracked exit.
+	dialer.Proxy = nil
+	dialer.HandshakeTimeout = connectTimeout
 	dialer.EnableCompression = true
 	dialer.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 
@@ -408,6 +411,7 @@ func (c *Client) codexWebSocketDialerForEgress(egress storage.EgressProfile) (*w
 			tlsDialer, err := c.tlsFactory.TLSDialerFor(tlsclient.Request{
 				Profile:  tlsclient.ProfileChrome,
 				ProxyURL: strings.TrimSpace(egress.ChainProxy),
+				Timeout:  connectTimeout,
 			})
 			if err != nil {
 				return nil, err
@@ -430,11 +434,14 @@ func (c *Client) codexWebSocketDialerForEgress(egress storage.EgressProfile) (*w
 			return nil, errors.New("socks5 egress endpoint required")
 		}
 		addr, auth := socksAuthAndAddr(egress.Endpoint)
-		socksDialer, err := proxy.SOCKS5("tcp", addr, auth, proxy.Direct)
+		baseDialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+		socksDialer, err := proxy.SOCKS5("tcp", addr, auth, baseDialer)
 		if err != nil {
 			return nil, err
 		}
 		dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			ctx, cancel := context.WithTimeout(ctx, connectTimeout)
+			defer cancel()
 			type contextDialer interface {
 				DialContext(context.Context, string, string) (net.Conn, error)
 			}

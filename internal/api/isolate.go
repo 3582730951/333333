@@ -177,7 +177,7 @@ func (s *Server) claudeCacheTTL(ctx context.Context) string {
 // Server-state identifiers (previous_response_id, x-codex-turn-state) are left
 // untouched: they are strict-sticky and never cross accounts.
 func isolateCodexConversation(header http.Header, body []byte, id identity.Identity) []byte {
-	seed := id.MachineID
+	seed := identity.SessionSeed(id)
 	for _, h := range []string{"Conversation_id", "X-Codex-Window-Id", "X-Codex-Parent-Thread-Id", "X-Codex-Turn-Metadata"} {
 		if v := header.Get(h); v != "" {
 			header.Set(h, identity.DerivedUUID(seed, v))

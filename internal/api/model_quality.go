@@ -20,7 +20,6 @@ import (
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/config"
-	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
@@ -677,7 +676,7 @@ func (s *Server) modelQualityUpstreamRequest(ctx context.Context, combo modelQua
 		}
 		raw, _ := anthropicwire.MarshalPreservingOrder(nil, payload)
 		osHint := s.osHint(raw, lease.Egress)
-		id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
+		id := s.virtualIdentity(ctx, lease.Account.ID, osHint)
 		oauth := claudeIsOAuth(token)
 		billingVersion := s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
 		spec.SetBodyBytes(cloak.VirtualizeClaudeCode(raw, id, s.cfg.SensitiveWordsFor("claude"), oauth, billingVersion).Body)
@@ -703,6 +702,7 @@ func (s *Server) modelQualityUpstreamRequest(ctx context.Context, combo modelQua
 			spec.DownstreamPath = "/responses"
 		case storage.CustomProviderProtocolAnthropicMessages:
 			raw, osHint := s.claudeCodeMinimalProbeBody(
+				ctx,
 				lease.Account,
 				token,
 				lease.Egress,

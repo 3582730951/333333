@@ -522,6 +522,24 @@ type checkedPostgresMigration struct {
 
 var checkedPostgresMigrations = []checkedPostgresMigration{
 	{
+		version: "20260815_actual_model_audit_v1",
+		statements: []string{
+			`ALTER TABLE usage_records ADD COLUMN IF NOT EXISTS actual_model TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE usage_records ADD COLUMN IF NOT EXISTS model_mismatch INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE usage_records ADD COLUMN IF NOT EXISTS model_mismatch_reason TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX IF NOT EXISTS idx_usage_records_model_mismatch_created ON usage_records(model_mismatch, created_at)`,
+		},
+	},
+	{
+		version: "20260815_account_routing_policy_v1",
+		statements: []string{
+			`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS routing_weight INTEGER NOT NULL DEFAULT 100`,
+			`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS retry_max_attempts INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE accounts ADD CONSTRAINT accounts_routing_weight_range CHECK (routing_weight BETWEEN 1 AND 1000) NOT VALID`,
+			`ALTER TABLE accounts ADD CONSTRAINT accounts_retry_max_attempts_range CHECK (retry_max_attempts BETWEEN 0 AND 3) NOT VALID`,
+		},
+	},
+	{
 		version: "20260731_team_mailbox_policy_v1",
 		statements: []string{
 			`ALTER TABLE team_workspaces ADD COLUMN IF NOT EXISTS mailbox_provider_key TEXT NOT NULL DEFAULT ''`,

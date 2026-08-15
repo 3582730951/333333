@@ -213,6 +213,10 @@ func firstNonEmpty(a, b string) string {
 // Identity is a fully-resolved synthetic identity for one account.
 type Identity struct {
 	AccountID string
+	// SessionNamespaceSeed is local-only. It remains empty in the default mode
+	// (where MachineID is already account-scoped) and carries the original
+	// account-scoped machine seed when device fields are fully converged.
+	SessionNamespaceSeed string
 
 	OSName    string
 	OSVersion string
@@ -369,12 +373,62 @@ func ForOS(secret []byte, accountID, osName string) Identity {
 	return For(secret, accountID)
 }
 
+const fullConvergenceSubject = "codex-pool-full-device-v1"
+
+// ForOSWithConvergence derives a virtual identity according to the operator's
+// convergence policy. Full convergence intentionally ignores account, egress and
+// downstream OS hints so every newly-derived device presents one coherent host.
+// AccountID is restored on the returned value for local attribution only; none of
+// the derived wire fields depend on it in full mode.
+func ForOSWithConvergence(secret []byte, accountID, osName, mode string) Identity {
+	if !strings.EqualFold(strings.TrimSpace(mode), "full") {
+		return ForOS(secret, accountID, osName)
+	}
+	device := For(secret, fullConvergenceSubject)
+	logical := ForOS(secret, accountID, osName)
+	device.AccountID = accountID
+	// Session identity is not a device property. Keeping it account-scoped is a
+	// hard isolation boundary: convergence must never make two credentials send
+	// the same Claude session or derive the same Codex thread/cache namespace.
+	device.SessionID = logical.SessionID
+	device.ClaudeSessionID = logical.ClaudeSessionID
+	device.SessionNamespaceSeed = logical.MachineID
+	return device
+}
+
+// SessionSeed returns the account-scoped seed used for conversation, thread and
+// cache namespaces. It deliberately differs from MachineID when full device
+// convergence is enabled.
+func SessionSeed(id Identity) string {
+	if strings.TrimSpace(id.SessionNamespaceSeed) != "" {
+		return id.SessionNamespaceSeed
+	}
+	return id.MachineID
+}
+
 // CodexDevice returns the stable virtual device profile for one account/egress
 // boundary.  Codex's installation id is a device property, so a session that must
 // stay on a particular exit gets a profile stable across restarts while another exit
 // cannot accidentally present the same virtual installation.
 func CodexDevice(secret []byte, accountID, egressID, osName string) Identity {
 	return ForOS(secret, strings.TrimSpace(accountID)+"\x00codex-egress\x00"+strings.TrimSpace(egressID), osName)
+}
+
+// CodexDeviceWithConvergence is the Codex installation-id counterpart of
+// ForOSWithConvergence. Off preserves the account+egress boundary; full converges
+// new installations while durable session mappings continue to own independent
+// SessionID/ThreadID values.
+func CodexDeviceWithConvergence(secret []byte, accountID, egressID, osName, mode string) Identity {
+	if !strings.EqualFold(strings.TrimSpace(mode), "full") {
+		return CodexDevice(secret, accountID, egressID, osName)
+	}
+	device := For(secret, fullConvergenceSubject)
+	logical := CodexDevice(secret, accountID, egressID, osName)
+	device.AccountID = accountID
+	device.SessionID = logical.SessionID
+	device.ClaudeSessionID = logical.ClaudeSessionID
+	device.SessionNamespaceSeed = logical.MachineID
+	return device
 }
 
 // NewUUIDv7 creates a time-ordered UUIDv7 for a logical Codex session/thread/turn.

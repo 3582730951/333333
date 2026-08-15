@@ -62,9 +62,24 @@ type Client struct {
 	// tlsFactory is the in-process TLS/HTTP2 fingerprinting engine (bogdanfinn/tls-client).
 	// It is the switchable replacement for the external curl_cffi sidecar; a sidecar egress
 	// routes through it instead of the Python process when EgressFingerprintEngine=="inprocess".
-	tlsFactory     *tlsclient.Factory
-	observerMu     sync.RWMutex
-	egressObserver func(egressID string, latency time.Duration, success bool)
+	tlsFactory      *tlsclient.Factory
+	observerMu      sync.RWMutex
+	egressObserver  func(egressID string, latency time.Duration, success bool)
+	attemptObserver func(AttemptObservation)
+}
+
+// AttemptObservation is a bounded-label, payload-free passive health sample for
+// one real upstream wire attempt. It intentionally carries no account, request,
+// credential, endpoint, prompt, or response-body data.
+type AttemptObservation struct {
+	Provider   string        `json:"provider"`
+	Model      string        `json:"model"`
+	EgressID   string        `json:"egress_id"`
+	StatusCode int           `json:"status_code"`
+	ErrorClass string        `json:"error_class,omitempty"`
+	Latency    time.Duration `json:"-"`
+	Success    bool          `json:"success"`
+	ObservedAt time.Time     `json:"-"`
 }
 
 type transportCacheEntry struct {
@@ -110,11 +125,38 @@ func (c *Client) cfgSnapshot() *config.Config {
 	return &c.cfg
 }
 
+func (c *Client) identityForOS(accountID, osHint string) identity.Identity {
+	return identity.ForOSWithConvergence(c.identitySecret, accountID, osHint, c.cfgSnapshot().IdentityConvergenceMode)
+}
+
+func (c *Client) codexDevice(accountID, egressID, osHint string) identity.Identity {
+	return identity.CodexDeviceWithConvergence(c.identitySecret, accountID, egressID, osHint, c.cfgSnapshot().IdentityConvergenceMode)
+}
+
 // UpdateConfig atomically swaps the live config overlay. The caller (the admin
 // settings handler) passes the boot config with the current DB setting overrides
 // applied; the next upstream request reads the new fingerprint/identity values.
 func (c *Client) UpdateConfig(cfg config.Config) {
+	previousConnectTimeout := c.cfgSnapshot().ConnectTimeout()
 	c.liveCfg.Store(&cfg)
+	if previousConnectTimeout != cfg.ConnectTimeout() {
+		c.resetConnectionTransports()
+	}
+}
+
+func (c *Client) resetConnectionTransports() {
+	if c == nil {
+		return
+	}
+	c.tmu.Lock()
+	c.ensureTransportCacheLocked()
+	for element := c.transportLRU.Back(); element != nil; element = c.transportLRU.Back() {
+		c.evictTransportLocked(element)
+	}
+	c.tmu.Unlock()
+	if c.tlsFactory != nil {
+		c.tlsFactory.ResetClients()
+	}
 }
 
 // SidecarEndpoint returns the configured curl_cffi sidecar base URL ("" if none). The
@@ -501,7 +543,10 @@ func (b *firstByteObservedBody) Read(p []byte) (int, error) {
 	if n > 0 {
 		b.finish(egressStatusSuccess(b.status))
 	} else if err != nil {
-		b.finish(false)
+		// Header-only 2xx/3xx/4xx responses legitimately reach EOF before a
+		// payload byte. Their status is still a complete first-response signal;
+		// only a non-EOF read error represents a transport failure here.
+		b.finish(errors.Is(err, io.EOF) && egressStatusSuccess(b.status))
 	}
 	return n, err
 }
@@ -582,6 +627,17 @@ func (c *Client) SetEgressObserver(observer func(string, time.Duration, bool)) {
 	c.observerMu.Unlock()
 }
 
+// SetAttemptObserver installs a passive provider/model/egress health sink. The
+// callback runs synchronously and therefore must remain bounded and non-blocking.
+func (c *Client) SetAttemptObserver(observer func(AttemptObservation)) {
+	if c == nil {
+		return
+	}
+	c.observerMu.Lock()
+	c.attemptObserver = observer
+	c.observerMu.Unlock()
+}
+
 func (c *Client) observeEgress(egressID string, latency time.Duration, success bool) {
 	if c == nil || strings.TrimSpace(egressID) == "" {
 		return
@@ -591,6 +647,77 @@ func (c *Client) observeEgress(egressID string, latency time.Duration, success b
 	c.observerMu.RUnlock()
 	if observer != nil {
 		observer(egressID, latency, success)
+	}
+}
+
+func (c *Client) observeAttempt(observation AttemptObservation) {
+	if c == nil || strings.TrimSpace(observation.Provider) == "" {
+		return
+	}
+	if observation.ObservedAt.IsZero() {
+		observation.ObservedAt = time.Now()
+	}
+	c.observerMu.RLock()
+	observer := c.attemptObserver
+	c.observerMu.RUnlock()
+	if observer != nil {
+		observer(observation)
+	}
+}
+
+func passiveAttemptProvider(provider string) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return "codex"
+	}
+	return provider
+}
+
+func passiveAttemptModel(req Request) string {
+	if model := strings.TrimSpace(req.Model); model != "" {
+		return model
+	}
+	if req.BodyMeta != nil {
+		return strings.TrimSpace(req.BodyMeta.Model)
+	}
+	return ""
+}
+
+func passiveAttemptErrorClass(parent context.Context, status int, err error) string {
+	if err != nil {
+		if parent != nil && errors.Is(parent.Err(), context.DeadlineExceeded) {
+			return "client_deadline"
+		}
+		if parent != nil && errors.Is(parent.Err(), context.Canceled) {
+			return "client_canceled"
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return "upstream_timeout"
+		}
+		if errors.Is(err, context.Canceled) {
+			return "upstream_idle_timeout"
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return "connect_timeout"
+		}
+		return "transport_error"
+	}
+	switch {
+	case status == http.StatusRequestTimeout:
+		return "request_timeout"
+	case status == http.StatusTooManyRequests || status == 529:
+		return "rate_limited"
+	case status >= http.StatusInternalServerError:
+		return "upstream_5xx"
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return "authorization"
+	case status == http.StatusNotFound:
+		return "not_found"
+	case status >= http.StatusBadRequest:
+		return "request_rejected"
+	default:
+		return ""
 	}
 }
 
@@ -623,16 +750,26 @@ func (c *Client) Do(ctx context.Context, req Request) (resp *Response, err error
 	defer func() {
 		resp, err = enforceResponseContract(resp, err)
 		if err != nil {
-			c.observeEgress(req.Egress.ID, time.Since(started), false)
+			latency := time.Since(started)
+			c.observeEgress(req.Egress.ID, latency, false)
+			c.observeAttempt(AttemptObservation{
+				Provider: passiveAttemptProvider(req.Provider), Model: passiveAttemptModel(req), EgressID: req.Egress.ID,
+				StatusCode: 0, ErrorClass: passiveAttemptErrorClass(ctx, 0, err), Latency: latency, Success: false,
+			})
 			return
 		}
-		if resp != nil && resp.Body != nil && strings.TrimSpace(req.Egress.ID) != "" {
+		if resp != nil && resp.Body != nil {
+			provider, model, egressID := passiveAttemptProvider(req.Provider), passiveAttemptModel(req), req.Egress.ID
 			resp.Body = &firstByteObservedBody{
 				ReadCloser: resp.Body,
 				started:    started,
 				status:     resp.StatusCode,
 				observe: func(latency time.Duration, success bool) {
-					c.observeEgress(req.Egress.ID, latency, success)
+					c.observeEgress(egressID, latency, success)
+					c.observeAttempt(AttemptObservation{
+						Provider: provider, Model: model, EgressID: egressID, StatusCode: resp.StatusCode,
+						ErrorClass: passiveAttemptErrorClass(ctx, resp.StatusCode, nil), Latency: latency, Success: success,
+					})
 				},
 			}
 		}
@@ -882,11 +1019,16 @@ func (c *Client) transportForEgressMode(egress storage.EgressProfile, forceHTTP1
 		return t, nil
 	}
 	c.transportMisses++
+	connectTimeout := c.cfgSnapshot().ConnectTimeout()
+	baseDialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		// Egress selection is explicit. Reading process proxy variables here can
+		// silently move a "direct" account onto a different exit and also bypass
+		// the connection-stage timeout below.
+		Proxy:                 nil,
+		DialContext:           baseDialer.DialContext,
 		ForceAttemptHTTP2:     !forceHTTP1,
-		TLSHandshakeTimeout:   15 * time.Second,
+		TLSHandshakeTimeout:   connectTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
 		MaxIdleConns:          256,
 		MaxIdleConnsPerHost:   64,
@@ -924,20 +1066,27 @@ func (c *Client) transportForEgressMode(egress storage.EgressProfile, forceHTTP1
 		if err != nil {
 			return nil, err
 		}
-		// url.Parse carries any user:pass userinfo, which Go's transport turns into
-		// a Proxy-Authorization header on the CONNECT, so authenticated HTTP(S)
-		// proxies work without extra wiring.
-		transport.Proxy = http.ProxyURL(proxyURL)
+		transportProxyURL, proxyDial, err := boundedProxyDialContext(proxyURL, baseDialer, connectTimeout)
+		if err != nil {
+			return nil, err
+		}
+		// Keep standard forward-proxy semantics for cleartext targets. The wrapped
+		// connection retains its deadline through CONNECT, then clears it before
+		// target TLS/application bytes so model TTFT remains independently bounded.
+		transport.Proxy = http.ProxyURL(transportProxyURL)
+		transport.DialContext = proxyDial
 	case "socks5h_proxy", "socks5_proxy":
 		if egress.Endpoint == "" {
 			return nil, errors.New("socks5 egress endpoint required")
 		}
 		addr, auth := socksAuthAndAddr(egress.Endpoint)
-		dialer, err := proxy.SOCKS5("tcp", addr, auth, proxy.Direct)
+		dialer, err := proxy.SOCKS5("tcp", addr, auth, baseDialer)
 		if err != nil {
 			return nil, err
 		}
 		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			ctx, cancel := context.WithTimeout(ctx, connectTimeout)
+			defer cancel()
 			type contextDialer interface {
 				DialContext(context.Context, string, string) (net.Conn, error)
 			}
@@ -955,6 +1104,109 @@ func (c *Client) transportForEgressMode(egress storage.EgressProfile, forceHTTP1
 		c.evictTransportLocked(c.transportLRU.Back())
 	}
 	return transport, nil
+}
+
+type proxyStageConn struct {
+	net.Conn
+	mu                     sync.Mutex
+	deadlineActive         bool
+	connectRequest         bool
+	connectHeadersComplete bool
+}
+
+func (c *proxyStageConn) Write(p []byte) (int, error) {
+	if c == nil || c.Conn == nil {
+		return 0, io.ErrClosedPipe
+	}
+	c.mu.Lock()
+	clearDeadline := false
+	if c.deadlineActive {
+		switch {
+		case !c.connectRequest && strings.HasPrefix(string(p), http.MethodConnect+" "):
+			c.connectRequest = true
+			c.connectHeadersComplete = strings.Contains(string(p), "\r\n\r\n")
+		case c.connectRequest && !c.connectHeadersComplete:
+			c.connectHeadersComplete = strings.Contains(string(p), "\r\n\r\n")
+		case c.connectRequest && c.connectHeadersComplete:
+			// The next write after CONNECT headers is the target TLS ClientHello.
+			// TLSHandshakeTimeout now owns that stage, so the proxy deadline must
+			// not leak into inference response latency.
+			clearDeadline = true
+		default:
+			// A cleartext target uses forward-proxy absolute-form and has no
+			// CONNECT stage. TCP establishment is already complete.
+			clearDeadline = true
+		}
+	}
+	if clearDeadline {
+		if err := c.Conn.SetDeadline(time.Time{}); err != nil {
+			c.mu.Unlock()
+			return 0, err
+		}
+		c.deadlineActive = false
+	}
+	c.mu.Unlock()
+	return c.Conn.Write(p)
+}
+
+func boundedProxyDialContext(proxyURL *url.URL, baseDialer *net.Dialer, timeout time.Duration) (*url.URL, func(context.Context, string, string) (net.Conn, error), error) {
+	if proxyURL == nil || strings.TrimSpace(proxyURL.Host) == "" {
+		return nil, nil, errors.New("proxy URL requires a host")
+	}
+	scheme := strings.ToLower(strings.TrimSpace(proxyURL.Scheme))
+	if scheme != "http" && scheme != "https" {
+		return nil, nil, fmt.Errorf("unsupported HTTP proxy scheme %q", proxyURL.Scheme)
+	}
+	if proxyURL.Path != "" && proxyURL.Path != "/" || proxyURL.RawQuery != "" || proxyURL.Fragment != "" {
+		return nil, nil, errors.New("proxy URL must not contain a path, query, or fragment")
+	}
+	proxyAddr := proxyURL.Host
+	if _, _, err := net.SplitHostPort(proxyAddr); err != nil {
+		port := "80"
+		if scheme == "https" {
+			port = "443"
+		}
+		proxyAddr = net.JoinHostPort(proxyURL.Hostname(), port)
+	}
+	proxyServerName := proxyURL.Hostname()
+	transportURL := *proxyURL
+	if scheme == "https" {
+		// net/http sees a cleartext proxy because DialContext already returned an
+		// authenticated TLS channel to it. This lets proxyStageConn observe and
+		// bound plaintext CONNECT without double-wrapping proxy TLS.
+		transportURL.Scheme = "http"
+	}
+	dial := func(ctx context.Context, network, _ string) (net.Conn, error) {
+		connectCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		conn, err := baseDialer.DialContext(connectCtx, network, proxyAddr)
+		if err != nil {
+			return nil, err
+		}
+		ok := false
+		defer func() {
+			if !ok {
+				_ = conn.Close()
+			}
+		}()
+		deadline := time.Now().Add(timeout)
+		if ctxDeadline, hasDeadline := connectCtx.Deadline(); hasDeadline && ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+		if err = conn.SetDeadline(deadline); err != nil {
+			return nil, err
+		}
+		if scheme == "https" {
+			tlsConn := tls.Client(conn, &tls.Config{MinVersion: tls.VersionTLS12, ServerName: proxyServerName})
+			if err = tlsConn.HandshakeContext(connectCtx); err != nil {
+				return nil, err
+			}
+			conn = tlsConn
+		}
+		ok = true
+		return &proxyStageConn{Conn: conn, deadlineActive: true}, nil
+	}
+	return &transportURL, dial, nil
 }
 
 func (c *Client) ensureTransportCacheLocked() {
@@ -1645,13 +1897,13 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) error {
 		return nil
 	}
 
-	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
+	id := c.identityForOS(spec.Account.ID, spec.OSHint)
 	if spec.CodexIdentity != nil {
 		// A native Codex mapping binds virtual device state to the exact account
 		// and exit, including the OS-shaped profile that produces its User-Agent.
 		// The standalone fallback keeps the historical account-only profile for
 		// callers that have no durable mapping.
-		id = identity.CodexDevice(c.identitySecret, spec.Account.ID, spec.Egress.ID, spec.CodexIdentity.DeviceOSHint)
+		id = c.codexDevice(spec.Account.ID, spec.Egress.ID, spec.CodexIdentity.DeviceOSHint)
 	}
 	// Mirror the downstream client's launch entrypoint (interactive `codex` vs
 	// `codex exec`) so Originator + User-Agent agree with each other and with what

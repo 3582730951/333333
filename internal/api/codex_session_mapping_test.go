@@ -180,6 +180,7 @@ func TestCodexUpstreamAttemptPersistsAfterRequestCancellation(t *testing.T) {
 		Account:    storage.Account{ID: accountID},
 		RouteEpoch: 1,
 	}, storage.EgressProfile{ID: storage.DefaultDirectEgressID}, "transport_attempted", 0)
+	h.app.WaitForAsyncWrites()
 
 	rows, err := h.store.ListCodexUpstreamAttemptDiagnostics(context.Background())
 	if err != nil {
@@ -191,6 +192,43 @@ func TestCodexUpstreamAttemptPersistsAfterRequestCancellation(t *testing.T) {
 		}
 	}
 	t.Fatalf("cancelled request lost its upstream attempt record: %+v", rows)
+}
+
+func TestCodexUpstreamAttemptDoesNotBlockTerminalPathOnBusyWriter(t *testing.T) {
+	h := newHarness(t, nil)
+	accountID := h.importAccount(t, "queued-attempt", "upstream-queued-attempt", "access-queued-attempt")
+	tx, err := h.store.DB().BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		h.app.recordCodexUpstreamAttemptBinding(context.Background(), storage.CodexSessionBinding{
+			TreeID: "tree-queued-attempt", AccountID: accountID, EgressID: storage.DefaultDirectEgressID, ExpiresAt: storage.Now() + 60,
+		}, scheduler.Lease{Account: storage.Account{ID: accountID}}, storage.EgressProfile{ID: storage.DefaultDirectEgressID}, "response_headers", http.StatusOK)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(250 * time.Millisecond):
+		_ = tx.Rollback()
+		t.Fatal("diagnostic attempt blocked the request path behind SQLite's writer")
+	}
+	if err = tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	h.app.WaitForAsyncWrites()
+	rows, err := h.store.ListCodexUpstreamAttemptDiagnostics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.AccountID == accountID && row.State == "response_headers" {
+			return
+		}
+	}
+	t.Fatalf("queued upstream attempt was not drained: %+v", rows)
 }
 
 func TestCodexSessionMappingSeparatesConcurrentCLIThreadsWithSharedWeakSession(t *testing.T) {
@@ -438,7 +476,7 @@ func TestCodexSessionMappingUsesHTTPForPersistentHTTPChain(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\""+responseID+"\",\"object\":\"response\",\"model\":\"gpt-5.6-sol\",\"status\":\"in_progress\"}}\n\n")
-		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\""+responseID+"\",\"object\":\"response\",\"model\":\"gpt-5.6-sol\",\"status\":\"completed\",\"output\":[]}}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\""+responseID+"\",\"object\":\"response\",\"model\":\"gpt-5.6-sol\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1}}}\n\n")
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	})
 	enableCodexSessionMappingForTest(h)
@@ -603,7 +641,7 @@ func TestCodexSessionMappingPersistsTurnStateFromStreamMetadata(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w, "event: response.metadata\ndata: {\"type\":\"response.metadata\",\"headers\":{\"x-codex-turn-state\":\"opaque-metadata-state\"}}\n\n")
 			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-metadata-state\",\"object\":\"response\",\"model\":\"gpt\",\"status\":\"in_progress\"}}\n\n")
-			_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-metadata-state\",\"object\":\"response\",\"model\":\"gpt\",\"status\":\"completed\",\"output\":[]}}\n\n")
+			_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-metadata-state\",\"object\":\"response\",\"model\":\"gpt\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1}}}\n\n")
 			return
 		}
 		resumedState = r.Header.Get("X-Codex-Turn-State")
@@ -854,7 +892,7 @@ func TestCodexSessionMappingUsesOneIdentityAcrossDownstreamWebSocketTurns(t *tes
 			payloads = append(payloads, payload)
 			mu.Unlock()
 			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"`+responseID+`","object":"response","model":"gpt","status":"in_progress"}}`))
-			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"`+responseID+`","object":"response","model":"gpt","status":"completed","output":[]}}`))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"`+responseID+`","object":"response","model":"gpt","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}`))
 		}
 	})
 	enableCodexSessionMappingForTest(h)
@@ -1048,6 +1086,85 @@ func TestCodexSessionMappingRecoversOnlyAfterUpstreamContextLoss(t *testing.T) {
 	newRows, newErr := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-retired-recovered"})
 	if calls.Load() != 3 || oldErr != nil || len(oldRows) != 1 || oldRows[0].State != "retired" || newErr != nil || len(newRows) != 1 || newRows[0].State != "active" {
 		t.Fatalf("recovery calls=%d old=%+v old_err=%v new=%+v new_err=%v", calls.Load(), oldRows, oldErr, newRows, newErr)
+	}
+}
+
+func TestCodexDurableRootRecoversWhenBoundAccountIsAlreadyBenched(t *testing.T) {
+	const (
+		accountAToken = "access-bound-health-a"
+		accountBToken = "access-bound-health-b"
+	)
+	var calls atomic.Int32
+	var violationMu sync.Mutex
+	var violation string
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		w.Header().Set("Content-Type", "application/json")
+		switch calls.Add(1) {
+		case 1:
+			if auth != accountAToken || bytes.Contains(raw, []byte(`"previous_response_id"`)) {
+				violationMu.Lock()
+				violation = fmt.Sprintf("root auth=%q body=%s", auth, raw)
+				violationMu.Unlock()
+			}
+			_, _ = io.WriteString(w, `{"id":"resp-bound-health-root","object":"response","model":"gpt","status":"completed","output":[]}`)
+		case 2:
+			if auth != accountBToken || bytes.Contains(raw, []byte(`"previous_response_id"`)) || !bytes.Contains(raw, []byte("stable-bound-health-context")) {
+				violationMu.Lock()
+				violation = fmt.Sprintf("recovery auth=%q body=%s", auth, raw)
+				violationMu.Unlock()
+			}
+			_, _ = io.WriteString(w, `{"id":"resp-bound-health-recovered","object":"response","model":"gpt","status":"completed","output":[]}`)
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":"unexpected upstream call"}`)
+		}
+	})
+	enableCodexSessionMappingForTest(h)
+	accountA := h.importAccount(t, "bound-health-a", "upstream-bound-health-a", accountAToken)
+
+	post := func(body string) (*http.Response, []byte) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Session-Id", "bound-health-root")
+		req.Header.Set("Thread-Id", "bound-health-root")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, result
+	}
+
+	root, rootBody := post(`{"model":"gpt","input":"stable-bound-health-context"}`)
+	if root.StatusCode != http.StatusOK || !bytes.Contains(rootBody, []byte("resp-bound-health-root")) {
+		t.Fatalf("root status=%d body=%s", root.StatusCode, rootBody)
+	}
+	h.importAccount(t, "bound-health-b", "upstream-bound-health-b", accountBToken)
+	if err := h.store.BenchBindingForRecheck(context.Background(), accountA, storage.Now()+300); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+
+	recovered, recoveredBody := post(`{"model":"gpt","previous_response_id":"resp-bound-health-root","input":"continue"}`)
+	if recovered.StatusCode != http.StatusOK || recovered.Header.Get("X-MiCliProxy-Context-Status") != "rebuilt" ||
+		!bytes.Contains(recoveredBody, []byte("resp-bound-health-recovered")) || calls.Load() != 2 {
+		t.Fatalf("recovery status=%d context=%q calls=%d body=%s", recovered.StatusCode,
+			recovered.Header.Get("X-MiCliProxy-Context-Status"), calls.Load(), recoveredBody)
+	}
+	violationMu.Lock()
+	gotViolation := violation
+	violationMu.Unlock()
+	if gotViolation != "" {
+		t.Fatal(gotViolation)
 	}
 }
 
@@ -1264,7 +1381,7 @@ func TestCodexSessionMappingEOFUsesOneNativeContinue(t *testing.T) {
 			return
 		}
 		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-eof-final\",\"object\":\"response\",\"model\":\"gpt\",\"status\":\"in_progress\"}}\n\n")
-		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-eof-final\",\"object\":\"response\",\"model\":\"gpt\",\"status\":\"completed\",\"output\":[]}}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-eof-final\",\"object\":\"response\",\"model\":\"gpt\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1}}}\n\n")
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	})
 	enableCodexSessionMappingForTest(h)
@@ -1321,7 +1438,7 @@ func TestCodexSessionMappingQuietLongPollUsesKeepalive(t *testing.T) {
 		// Longer than the configured heartbeat interval. Strict CPA must start the
 		// relay immediately instead of holding response.created in a retry probe.
 		time.Sleep(1200 * time.Millisecond)
-		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-quiet-native\",\"object\":\"response\",\"model\":\"gpt\",\"status\":\"completed\",\"output\":[]}}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-quiet-native\",\"object\":\"response\",\"model\":\"gpt\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1}}}\n\n")
 	})
 	enableCodexSessionMappingForTest(h)
 	h.app.cfg.StreamKeepAliveSeconds = 1

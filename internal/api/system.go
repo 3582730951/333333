@@ -51,6 +51,8 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 		SupervisorModules  []supervisor.ModuleState    `json:"supervisor_modules"`
 		ExceptionCallbacks []supervisor.CallbackState  `json:"exception_callbacks"`
 		ExceptionJournal   interface{}                 `json:"exception_journal"`
+		Compatibility      interface{}                 `json:"compatibility_manifest"`
+		PassiveHealth      interface{}                 `json:"passive_provider_health"`
 	}{
 		Metrics:   sysmetrics.Collect(dataDir),
 		Admission: s.scheduler.AdmissionSnapshot(),
@@ -93,6 +95,13 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 				return map[string]interface{}{"configured": false}
 			}
 			return s.incidentReporter.Snapshot()
+		}(),
+		Compatibility: s.compatibilityManifestStatus(),
+		PassiveHealth: func() interface{} {
+			if s.passiveHealth == nil {
+				return map[string]interface{}{"series_count": 0}
+			}
+			return s.passiveHealth.Snapshot()
 		}(),
 	}
 	writeJSON(w, http.StatusOK, payload)

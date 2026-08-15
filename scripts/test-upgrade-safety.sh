@@ -221,13 +221,14 @@ test_console_prune_is_atomic() {
 }
 
 test_manifest_generation_without_git() {
-  local fixture="${TMP}/source-archive" generated="${TMP}/source-archive-manifest.txt"
-  mkdir -p "$fixture/scripts" "$fixture/cmd/app" "$fixture/internal/console/dist/assets"
+	local fixture="${TMP}/source-archive" generated="${TMP}/source-archive-manifest.txt"
+	mkdir -p "$fixture/scripts" "$fixture/cmd/app" "$fixture/internal/api" "$fixture/internal/console/dist/assets"
   cp "$ROOT/scripts/generate-managed-source-manifest.sh" "$fixture/scripts/generate-managed-source-manifest.sh"
   printf 'package main\n' >"$fixture/cmd/app/main.go"
   printf '<script src="/console/assets/index.js"></script>\n' >"$fixture/internal/console/dist/index.html"
   printf 'console.log("archive")\n' >"$fixture/internal/console/dist/assets/index.js"
-  printf '<svg/>\n' >"$fixture/internal/console/dist/assets/logo.svg"
+	printf '<svg/>\n' >"$fixture/internal/console/dist/assets/logo.svg"
+	printf 'runtime-auth-material\n' >"$fixture/internal/api/passwd.txt"
 
   bash "$fixture/scripts/generate-managed-source-manifest.sh" "$generated" >/dev/null
   for expected in \
@@ -236,8 +237,11 @@ test_manifest_generation_without_git() {
     internal/console/dist/assets/index.js \
     internal/console/dist/assets/logo.svg; do
     grep -Fqx "$expected" "$generated" ||
-      fail "source-archive manifest omitted ${expected}"
-  done
+		fail "source-archive manifest omitted ${expected}"
+	done
+	if grep -Fqx 'internal/api/passwd.txt' "$generated"; then
+		fail "source-archive manifest included ignored runtime password material"
+	fi
 }
 
 test_build_selected_duplicate_scan() {

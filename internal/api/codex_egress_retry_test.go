@@ -41,6 +41,7 @@ func TestCodexTransportFailureDoesNotRotateLegacyStandby(t *testing.T) {
 	if len(requests) != 0 {
 		t.Fatalf("legacy standby reached upstream: %+v", requests)
 	}
+	h.app.WaitForAsyncWrites()
 	rows, err := h.store.ListCodexUpstreamAttemptDiagnostics(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -120,6 +121,7 @@ func TestCodexRetryable5xxDoesNotRotateLegacyStandby(t *testing.T) {
 	if len(requests) != 0 {
 		t.Fatalf("legacy standby reached upstream: %+v", requests)
 	}
+	h.app.WaitForAsyncWrites()
 	outcomes, err := h.store.ListRecentCodexEgressOutcomes(context.Background(), storage.Now()-60)
 	if err != nil {
 		t.Fatal(err)
@@ -183,6 +185,7 @@ func TestCodexOrdinary5xxNeverReachesLegacyEdgeStandby(t *testing.T) {
 	if requests := h.requests(); len(requests) != 0 {
 		t.Fatalf("final legacy direct standby reached upstream: %+v", requests)
 	}
+	h.app.WaitForAsyncWrites()
 	outcomes, err := h.store.ListRecentCodexEgressOutcomes(context.Background(), storage.Now()-60)
 	if err != nil {
 		t.Fatal(err)

@@ -33,6 +33,51 @@ export interface SupervisorModule {
   [key: string]: unknown;
 }
 
+export interface PassiveHealthSeries {
+  provider: string;
+  model: string;
+  egress_id: string;
+  health: string;
+  observations: number;
+  health_samples: number;
+  successes: number;
+  failures: number;
+  canceled: number;
+  rate_limited: number;
+  success_ewma: number;
+  latency_ewma_ms: number;
+  last_status_code: number;
+  last_error_class?: string;
+  first_observed_at: number;
+  last_observed_at: number;
+}
+
+export interface PassiveProviderHealth {
+  generated_at?: number;
+  retention_seconds?: number;
+  max_series?: number;
+  series_count: number;
+  evictions?: number;
+  series?: PassiveHealthSeries[];
+}
+
+export interface CompatibilityManifestStatus {
+  enabled: boolean;
+  source?: string;
+  state?: string;
+  digest?: string;
+  generation?: number;
+  fetched_at?: number;
+  expires_at?: number;
+  last_attempt_at?: number;
+  last_success_at?: number;
+  last_error?: string;
+  snapshot_slot?: string;
+  signature_checked?: boolean;
+  canary?: string;
+  model_count?: number;
+}
+
 export interface SystemMetrics {
   supported: boolean;
   uptime_seconds?: number;
@@ -67,5 +112,7 @@ export interface SystemMetrics {
   go?: { goroutines?: number; sys_bytes?: number; [key: string]: unknown };
   supervisor_events?: SupervisorEvent[];
   supervisor_modules?: SupervisorModule[];
+  compatibility_manifest?: CompatibilityManifestStatus;
+  passive_provider_health?: PassiveProviderHealth;
   [key: string]: unknown;
 }

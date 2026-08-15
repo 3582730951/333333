@@ -22,7 +22,7 @@ import (
 
 func rebuildHarnessForClaudeOAuth(t *testing.T, h *testHarness, oauthURL string) {
 	t.Helper()
-	h.pool.Close()
+	h.closeRuntime()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
 	cfg.ClaudeUpstreamBaseURL = h.upstream.URL
@@ -35,9 +35,7 @@ func rebuildHarnessForClaudeOAuth(t *testing.T, h *testHarness, oauthURL string)
 		Upstream:  upstream.NewClient(cfg),
 		Planner:   virtual.NewPlanner(h.store, cfg),
 	})
-	h.app = app
-	h.pool = httptest.NewServer(app)
-	t.Cleanup(h.pool.Close)
+	h.serve(app)
 }
 
 func upsertClaudeOAuthAccount(t *testing.T, h *testHarness, access, refresh string, expiresAt int64) storage.Account {

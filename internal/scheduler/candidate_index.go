@@ -293,7 +293,18 @@ func (s *Scheduler) evaluateIndexedCandidate(indexed indexedCandidate, evaluatio
 	concurrencyLoad := float64(inflight) + normalizedLoad(egressLoad, egress.MaxConcurrency) + normalizedLoad(sidecarLoad, egress.TransportSidecarMaxConcurrency)
 	tokenLoad := normalizedTokenLoad(tokens, evaluation.cfg.AccountTokenBudget)
 	latencyPenalty := float64(maxInt64(0, egress.LatencyMillis)) / 100000.0
-	return candidate{account: account, egress: egress, binding: binding, resolvedModel: indexed.resolvedModel, bootstrap: bootstrap, score: concurrencyLoad + tokenLoad + latencyPenalty}, true
+	weight := account.RoutingWeight
+	if weight <= 0 {
+		weight = 100
+	}
+	if weight > 1000 {
+		weight = 1000
+	}
+	// The +1 baseline lets weights influence an otherwise idle pool; dividing by
+	// weight then converges active shares toward their configured ratio. This is
+	// fresh-selection-only: strict/sticky/native mappings bypass this score.
+	score := (concurrencyLoad + tokenLoad + latencyPenalty + 1) / (float64(weight) / 100)
+	return candidate{account: account, egress: egress, binding: binding, resolvedModel: indexed.resolvedModel, bootstrap: bootstrap, score: score}, true
 }
 
 func (s *Scheduler) candidateSampleIndexes(route Route, size int) ([3]int, int) {

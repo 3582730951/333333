@@ -3,12 +3,100 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func BenchmarkCommitFreshCodexSessionBatch256(b *testing.B) {
+	store := newTestStore(b)
+	store.SetTokenEncryptionKey([]byte("benchmark-codex-session-batch-key"))
+	ctx := context.Background()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		commits := make([]CodexSessionCommit, 256)
+		for index := range commits {
+			id := fmt.Sprintf("%d-%d", iteration, index)
+			commits[index] = CodexSessionCommit{
+				Namespace: "benchmark",
+				Binding: CodexSessionBinding{
+					AccountID: "account", EgressID: "direct", State: "active",
+					RootSessionID: "root-" + id, ThreadID: "root-" + id,
+				},
+				Aliases:             []CodexSessionAlias{{Type: "response", Value: "response-" + id}},
+				ExpiresAt:           time.Now().Add(time.Hour).Unix(),
+				InstructionSnapshot: &CodexInstructionSnapshot{Instructions: "stable instructions"},
+			}
+		}
+		if _, err := store.CommitFreshCodexSessionBindings(ctx, commits); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestCommitFreshCodexSessionBindingsPersistsWholeBatch(t *testing.T) {
+	store := newTestStore(t)
+	store.SetTokenEncryptionKey([]byte("test-codex-session-batch-key"))
+	const count = 128
+	commits := make([]CodexSessionCommit, count)
+	for index := range commits {
+		id := fmt.Sprintf("batch-%03d", index)
+		commits[index] = CodexSessionCommit{
+			Namespace: "batch-namespace",
+			Binding: CodexSessionBinding{
+				RootSessionID: id, ThreadID: id, AccountID: "account-" + id,
+				EgressID: "egress-" + id, Epoch: 1,
+			},
+			Aliases:             []CodexSessionAlias{{Type: "response", Value: "response-" + id}},
+			ExpiresAt:           time.Now().Add(time.Hour).Unix(),
+			InstructionSnapshot: &CodexInstructionSnapshot{Instructions: "stable instructions " + id},
+		}
+	}
+	bindings, err := store.CommitFreshCodexSessionBindings(context.Background(), commits)
+	if err != nil || len(bindings) != count {
+		t.Fatalf("batch bindings=%d err=%v", len(bindings), err)
+	}
+	for table, want := range map[string]int{
+		"codex_session_binding":      count,
+		"codex_session_alias":        count,
+		"codex_instruction_snapshot": count,
+	} {
+		var got int
+		if err := store.DB().QueryRowContext(context.Background(), "SELECT COUNT(*) FROM "+table).Scan(&got); err != nil || got != want {
+			t.Fatalf("%s rows=%d want=%d err=%v", table, got, want, err)
+		}
+	}
+}
+
+func TestCommitFreshCodexSessionBindingsRollsBackConflictingBatch(t *testing.T) {
+	store := newTestStore(t)
+	store.SetTokenEncryptionKey([]byte("test-codex-session-batch-rollback-key"))
+	commits := make([]CodexSessionCommit, 2)
+	for index := range commits {
+		id := fmt.Sprintf("conflict-%d", index)
+		commits[index] = CodexSessionCommit{
+			Namespace: "conflict-namespace",
+			Binding: CodexSessionBinding{
+				RootSessionID: id, ThreadID: id, AccountID: "account-" + id,
+				EgressID: "egress-" + id, Epoch: 1,
+			},
+			Aliases:   []CodexSessionAlias{{Type: "response", Value: "shared-response"}},
+			ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		}
+	}
+	if _, err := store.CommitFreshCodexSessionBindings(context.Background(), commits); !errors.Is(err, ErrCodexSessionMappingAmbiguous) {
+		t.Fatalf("batch conflict error=%v, want %v", err, ErrCodexSessionMappingAmbiguous)
+	}
+	for _, table := range []string{"codex_session_binding", "codex_session_alias", "codex_instruction_snapshot"} {
+		var rows int
+		if err := store.DB().QueryRowContext(context.Background(), "SELECT COUNT(*) FROM "+table).Scan(&rows); err != nil || rows != 0 {
+			t.Fatalf("%s rollback rows=%d err=%v", table, rows, err)
+		}
+	}
+}
 
 func TestCodexSessionMappingEncryptsIdentityAndRetiresWholeTree(t *testing.T) {
 	ctx := context.Background()
@@ -418,6 +506,27 @@ func TestCodexUpstreamAttemptDiagnosticsRedactTreeID(t *testing.T) {
 	row := rows[0]
 	if row.TreeHMACPrefix == "" || strings.Contains(row.TreeHMACPrefix, "tree-real") || row.AccountID != "account-a" || row.EgressID != "egress-real" || row.Epoch != 3 || row.StatusCode != 200 {
 		t.Fatalf("redacted attempt diagnostic=%+v", row)
+	}
+}
+
+func TestCodexUpstreamAttemptEventIsIdempotent(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	attempt := CodexUpstreamAttempt{
+		EventID: "attempt-idempotent", TreeID: "tree-idempotent", AccountID: "account-idempotent",
+		EgressID: DefaultDirectEgressID, State: "terminal_success", StatusCode: 200, ExpiresAt: Now() + 60,
+	}
+	for iteration := 0; iteration < 2; iteration++ {
+		if err := store.BatchWriteTelemetryAndAttempts(ctx, nil, nil, nil, nil, []CodexUpstreamAttempt{attempt}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rows int
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM codex_upstream_attempt WHERE event_id=?`, attempt.EventID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("idempotent attempt rows=%d, want 1", rows)
 	}
 }
 

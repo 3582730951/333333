@@ -12,7 +12,6 @@ import (
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cloak"
-	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/scheduler"
@@ -156,7 +155,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 		return
 	}
 	osHint := s.osHint(raw, lease.Egress)
-	id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
+	id := s.virtualIdentity(r.Context(), lease.Account.ID, osHint)
 	cacheInject := s.cacheInjectEnabled(r.Context())
 	claudeTTL := s.claudeCacheTTLForRoute(r.Context(), affinity)
 	breakpointPolicy := s.claudeCacheBreakpointPolicy(r.Context(), affinity, lease.Account.ID, routeGroup, pol.KeyHash)
@@ -209,7 +208,9 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	// the hold; an explicit settle below always wins (WHERE status='held' no longer matches).
 	defer func() { _ = s.settleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()
 	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
-	resp, err := s.upstream.Do(r.Context(), requestForToken(token))
+	resp, err, _ := s.doAccountCredentialRetry(r.Context(), lease.Account, true, func() (*upstream.Response, error) {
+		return s.upstream.Do(r.Context(), requestForToken(token))
+	})
 	releaseFlight()
 	if err != nil {
 		_ = s.settleBillingHold(r.Context(), holdID, "failed_before_response")

@@ -15,7 +15,6 @@ import (
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cloak"
-	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
@@ -422,7 +421,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 	if provider.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages && strings.Contains(strings.ToLower(upstreamPath), "messages") {
 		body = ensureClaudeCodeIdentityBody(body)
 		osHint := s.osHint(body, lease.Egress)
-		id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
+		id := s.virtualIdentity(r.Context(), lease.Account.ID, osHint)
 		billingVersion := s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
 		scrub = cloak.VirtualizeClaudeCode(body, id, s.cfg.SensitiveWordsFor(provider.ID), claudeIsOAuth(token), billingVersion)
 	} else {
@@ -444,21 +443,24 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 	// Failover may choose another account, but it may not rotate this account onto a
 	// group/provider/standby outlet and thereby change its network identity.
 	attemptBodyHash := diagnosticBodyHash(body)
-	resp, requestErr := s.upstream.Do(r.Context(), upstream.Request{
-		Method:           http.MethodPost,
-		Provider:         provider.ID,
-		BaseURL:          strings.TrimSpace(provider.BaseURL),
-		TransportProfile: provider.TransportProfile,
-		UpstreamProtocol: provider.UpstreamProtocol,
-		DownstreamPath:   upstreamPath,
-		Headers:          r.Header.Clone(),
-		Body:             bodysource.Bytes(body),
-		Model:            model,
-		Account:          lease.Account,
-		Token:            token,
-		Egress:           lease.Egress,
-		CookieJarKey:     customProviderCookieJarKey(r, lease, provider),
-		OSHint:           s.osHint(body, lease.Egress),
+	replaySafe := !routing.HasServerSideState(upstreamPath, r, body) && !routing.IsStrictSticky(upstreamPath, r, body)
+	resp, requestErr, _ := s.doAccountCredentialRetry(r.Context(), lease.Account, replaySafe, func() (*upstream.Response, error) {
+		return s.upstream.Do(r.Context(), upstream.Request{
+			Method:           http.MethodPost,
+			Provider:         provider.ID,
+			BaseURL:          strings.TrimSpace(provider.BaseURL),
+			TransportProfile: provider.TransportProfile,
+			UpstreamProtocol: provider.UpstreamProtocol,
+			DownstreamPath:   upstreamPath,
+			Headers:          r.Header.Clone(),
+			Body:             bodysource.Bytes(body),
+			Model:            model,
+			Account:          lease.Account,
+			Token:            token,
+			Egress:           lease.Egress,
+			CookieJarKey:     customProviderCookieJarKey(r, lease, provider),
+			OSHint:           s.osHint(body, lease.Egress),
+		})
 	})
 	s.recordProviderAttempt(requestIDFromContext(r.Context()), lease.Account.ID, provider.ID, "inference",
 		diagnosticResponseStatus(resp), diagnosticWireErrorClass(diagnosticResponseStatus(resp), requestErr),

@@ -30,7 +30,7 @@ func (s *Server) adminIdentity(w http.ResponseWriter, r *http.Request, accountID
 		methodNotAllowed(w)
 		return
 	}
-	id := identity.For(s.identitySecret(), accountID)
+	id := s.virtualIdentity(r.Context(), accountID, "")
 	claudeVer := s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
 	codexVer := s.cfg.CodexCLIVersionOrDefault(id.CodexCLIVersion)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -188,7 +188,7 @@ func (s *Server) adminSessions(w http.ResponseWriter, r *http.Request, accountID
 		methodNotAllowed(w)
 		return
 	}
-	id := identity.For(s.identitySecret(), accountID)
+	id := s.virtualIdentity(r.Context(), accountID, "")
 	account, err := s.store.GetAccount(r.Context(), accountID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -215,14 +215,15 @@ func (s *Server) adminSessions(w http.ResponseWriter, r *http.Request, accountID
 		UpdatedAt    int64  `json:"updated_at"`
 	}
 	sessions := make([]sessionView, 0, len(bindings))
+	sessionSeed := identity.SessionSeed(id)
 	for _, b := range bindings {
 		orig := correlatorValue(b.RouteKey)
 		ns := orig
 		if isolation && orig != "" {
 			if b.Source == "prompt_cache_key" {
-				ns = "cp_" + identity.DerivedKey(id.MachineID, orig)
+				ns = "cp_" + identity.DerivedKey(sessionSeed, orig)
 			} else {
-				ns = identity.DerivedUUID(id.MachineID, orig)
+				ns = identity.DerivedUUID(sessionSeed, orig)
 			}
 		}
 		sessions = append(sessions, sessionView{
@@ -524,7 +525,7 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 			"tools": []interface{}{},
 		})
 		osHint := s.osHint(base, egress)
-		id := identity.ForOS(s.identitySecret(), account.ID, osHint)
+		id := s.virtualIdentity(ctx, account.ID, osHint)
 		// Keep the probe byte-shaped like live traffic: cloak + (for OAuth) the
 		// x-anthropic-billing-header real Claude Code sends on count_tokens too, folded
 		// into the one virtualization pass exactly as messages.go does.
@@ -552,7 +553,7 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 			req.SetBodyBytes([]byte(`{"model":"` + model + `","input":[{"role":"user","content":"ping"}],"max_output_tokens":1,"stream":false}`))
 		case storage.CustomProviderProtocolAnthropicMessages:
 			req.DownstreamPath = "/messages"
-			body, osHint := s.claudeCodeMinimalProbeBody(account, token, egress, model, "ping", 1)
+			body, osHint := s.claudeCodeMinimalProbeBody(ctx, account, token, egress, model, "ping", 1)
 			req.SetBodyBytes(body)
 			req.OSHint = osHint
 		default:

@@ -3,8 +3,10 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2007,6 +2009,47 @@ func TestServerSideStateStrictStickyRateLimitWaitsForPinnedAccount(t *testing.T)
 	}
 }
 
+func TestRecoverableRequiredAccountCooldownReturnsWithoutStickyWait(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	if err := store.UpsertAccount(ctx, storage.Account{
+		ID: "recoverable-bound", Label: "recoverable-bound", GroupName: "cyber", Provider: "codex", Status: "active",
+	}, storage.AccountToken{AccessToken: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+		AccountID: "recoverable-bound", Provider: "codex", Model: "gpt-5", LimiterType: "tokens", Source: "tokens",
+		RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1,
+		ResetAt: storage.Now() + 300, Status: "rejected",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s := New(store, config.Default())
+	defer s.Close()
+
+	selectCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err := s.Select(selectCtx, Route{
+		Group: "cyber", Provider: "codex", Model: "gpt-5",
+		RequiredAccountID: "recoverable-bound", RequiredEgressID: storage.DefaultDirectEgressID,
+		ServerSideState: true, ImmutableAffinity: true, FailFastBoundRecovery: true,
+	})
+	if !errors.Is(err, ErrBoundAccountUnavailable) {
+		t.Fatalf("recoverable bound cooldown error=%v, want ErrBoundAccountUnavailable", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("recoverable bound cooldown waited instead of yielding to replay: %v", elapsed)
+	}
+	if !strings.Contains(err.Error(), "rate limit cooldown") {
+		t.Fatalf("recoverable bound error lost health reason: %v", err)
+	}
+	if boundHealthRecoveryReason(leaseBlockConcurrency) || boundHealthRecoveryReason(leaseBlockTokenBudget) ||
+		boundHealthRecoveryReason(leaseBlockCoordinator) {
+		t.Fatal("capacity/coordinator pressure must never rotate a durable bound context")
+	}
+}
+
 func TestCompactionSkipsLocalTokenBudget(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
@@ -2147,5 +2190,35 @@ func TestNoAccountErrorIncludesSkipCounters(t *testing.T) {
 	}
 	if noAccount.Counters.ModelUnsupported != 1 || noAccount.Counters.RateLimitCooldown != 1 || noAccount.Counters.TokenBudget != 1 {
 		t.Fatalf("skip counters = %+v, want model=1 rate-limit=1 token_budget=1", noAccount.Counters)
+	}
+}
+
+func TestConcurrentStructuralInvalidationClearsProviderCacheSafely(t *testing.T) {
+	s := New(testStore(t), config.Default())
+	defer s.Close()
+	const workers = 32
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for worker := 0; worker < workers; worker++ {
+		worker := worker
+		go func() {
+			defer wg.Done()
+			for iteration := 0; iteration < 100; iteration++ {
+				key := fmt.Sprintf("legacy-%d-%d", worker, iteration)
+				s.providerCache.Store(key, "codex")
+				_, _ = s.providerCache.Load(key)
+				s.InvalidateAccountCache()
+			}
+		}()
+	}
+	wg.Wait()
+	s.InvalidateAccountCache()
+	remaining := 0
+	s.providerCache.Range(func(_, _ any) bool {
+		remaining++
+		return true
+	})
+	if remaining != 0 {
+		t.Fatalf("provider cache retained %d entries after final structural invalidation", remaining)
 	}
 }

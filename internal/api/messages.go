@@ -16,7 +16,6 @@ import (
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cf"
 	"codex-account-pool/internal/cloak"
-	"codex-account-pool/internal/identity"
 	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
@@ -510,7 +509,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	}
 
 	osHint := s.osHint(raw, lease.Egress)
-	id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
+	id := s.virtualIdentity(r.Context(), lease.Account.ID, osHint)
 	// Virtualize the request to a consistent first-party Claude Code client and, in the
 	// SAME single JSON parse/marshal pass, stamp the x-anthropic-billing-header for
 	// native Claude Code/OAuth traffic (cc_version coherent with our UA and the
@@ -566,7 +565,9 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		}
 	}
 	if countTokens {
-		resp, requestErr := s.upstream.Do(r.Context(), requestForToken(token))
+		resp, requestErr, _ := s.doAccountCredentialRetry(r.Context(), lease.Account, movable && !strict, func() (*upstream.Response, error) {
+			return s.upstream.Do(r.Context(), requestForToken(token))
+		})
 		if requestErr != nil {
 			if allowRetry && movable {
 				return retry()
@@ -643,7 +644,9 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	defer func() { _ = s.settleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()
 	// Session 33: Carry the billing hold id in the request context for usage fallback.
 	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
-	resp, err := s.upstream.Do(r.Context(), requestForToken(token))
+	resp, err, _ := s.doAccountCredentialRetry(r.Context(), lease.Account, movable && !strict, func() (*upstream.Response, error) {
+		return s.upstream.Do(r.Context(), requestForToken(token))
+	})
 	emptyEndTurnContinued := false
 	releaseFlight()
 	if err != nil {

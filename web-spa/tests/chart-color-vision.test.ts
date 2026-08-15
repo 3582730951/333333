@@ -53,11 +53,11 @@ const tokensCss = readFileSync(TOKENS_PATH, 'utf8');
 
 const SLOTS = ['blue', 'green', 'purple', 'orange', 'teal', 'red', 'indigo', 'pink'] as const;
 
-// tokens.css declares dark under `:root, html[data-theme='dark']` and light under
-// `html[data-theme='light']`. Both blocks are read so neither theme can regress unmeasured.
+// tokens.css defaults to light under `:root, html[data-theme='light']` and keeps
+// dark explicit. Both blocks are read so neither theme can regress unmeasured.
 const THEME_SELECTORS = {
-  dark: /:root,\s*html\[data-theme='dark'\]\s*\{([\s\S]*?)\n\}/,
-  light: /html\[data-theme='light'\]\s*\{([\s\S]*?)\n\}/,
+  dark: /html\[data-theme='dark'\]\s*\{([\s\S]*?)\n\}/,
+  light: /:root,\s*html\[data-theme='light'\]\s*\{([\s\S]*?)\n\}/,
 } as const;
 
 function readTheme(theme: keyof typeof THEME_SELECTORS) {

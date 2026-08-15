@@ -428,7 +428,7 @@ func (c *Client) DoAntigravity(ctx context.Context, egress storage.EgressProfile
 		if err != nil {
 			return nil, err
 		}
-		resp, requestErr := c.DoRawHTTP1(ctx, egress, http.MethodPost, target, headers, body, cookieJarKey)
+		resp, requestErr := c.DoRawHTTP1Observed(ctx, egress, http.MethodPost, target, headers, body, cookieJarKey, "antigravity", req.Model)
 		if requestErr != nil {
 			lastErr = requestErr
 			if index+1 < len(bases) {

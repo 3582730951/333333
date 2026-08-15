@@ -10,7 +10,7 @@ import { fmtKB, fmtBytes, fmtInt, fmtDuration, fmtDateTime } from '../lib/format
 import { heatCells, hourlyBuckets } from '../lib/timeSeries.js';
 import { t } from '../lib/i18n.js';
 import { useSystemMetricsData } from '../features/observability/queries/system';
-import type { SupervisorEvent, SupervisorModule, SystemProcess } from '../features/observability/model/system';
+import type { PassiveHealthSeries, SupervisorEvent, SupervisorModule, SystemProcess } from '../features/observability/model/system';
 
 const { HeatStrip, RadialGauge, RankedBars, StackedMeter } = MicroCharts as any;
 const ErrorBanner = LoadErrorBanner as any;
@@ -20,6 +20,11 @@ const C = COLORS;
 const kindColor: Record<string, string> = { node: 'green', chrome: 'blue', xvfb: 'violet', other: 'grey' };
 const eventColor: Record<string, string> = { panic: 'red', panic_restart: 'red', failed: 'red', unexpected_exit: 'amber', event: 'blue' };
 const moduleColor: Record<string, string> = { running: 'green', restarting: 'amber', panic: 'red', failed: 'red', stopped: 'grey' };
+const passiveHealthColor: Record<string, string> = { healthy: 'green', degraded: 'amber', unhealthy: 'red', unknown: 'grey' };
+const compatibilityColor: Record<string, string> = {
+  current: 'green', unchanged: 'green', last_known_good: 'green', degraded_last_known_good: 'amber',
+  refreshing: 'blue', waiting: 'amber', disabled: 'grey', unavailable: 'red', error: 'red',
+};
 const meterColor = (percent: number) => (percent >= 90 ? C.red : percent >= 70 ? C.amber : C.green);
 
 // Chart palette for the same maps above. Tag colours are names, charts need values.
@@ -35,6 +40,7 @@ const guardColor = (level: unknown) => GUARD_COLOR[String(level || '')] || C.gre
 // Event types that mean something went wrong, as opposed to a routine lifecycle notice.
 const problemEventTypes = new Set(['panic', 'panic_restart', 'failed', 'unexpected_exit']);
 const fmtMillis = (milliseconds: unknown) => milliseconds ? fmtDuration(Math.ceil(Number(milliseconds) / 1000)) : '—';
+const fmtHealthPct = (value: unknown) => `${Math.round(Math.max(0, Math.min(1, Number(value) || 0)) * 100)}%`;
 const moduleStateLabel = (state: unknown) => {
   const value = String(state || '');
   return value ? t(`system.state.${value}`, value) : t('common.unknown');
@@ -99,6 +105,7 @@ export default function System() {
   const [modulePage, setModulePage] = React.useState(1);
   const [eventPage, setEventPage] = React.useState(1);
   const [processPage, setProcessPage] = React.useState(1);
+  const [passiveHealthPage, setPassiveHealthPage] = React.useState(1);
 
   if (error && !lastRefresh && !loading) {
     return (
@@ -135,9 +142,22 @@ export default function System() {
     key: module.name || `${module.status || 'module'}-${module.last_event_unix || 0}-${index}`,
   }));
   const processes = registration.procs || [];
+  const compatibility = system?.compatibility_manifest;
+  const passiveHealth = system?.passive_provider_health;
+  const healthRank: Record<string, number> = { unhealthy: 0, degraded: 1, unknown: 2, healthy: 3 };
+  const passiveSeries = [...(passiveHealth?.series || [])].sort((left, right) =>
+    (healthRank[left.health] ?? 2) - (healthRank[right.health] ?? 2)
+    || right.failures - left.failures
+    || right.observations - left.observations);
+  const passiveCounts = passiveSeries.reduce<Record<string, number>>((counts, row) => {
+    counts[row.health] = (counts[row.health] || 0) + 1;
+    return counts;
+  }, {});
+  const compatibilityState = compatibility?.state || (compatibility?.enabled ? 'waiting' : 'disabled');
   const modulePagination = modules.length > 8 ? { pageSize: 8, currentPage: modulePage, onPageChange: setModulePage } : false;
   const eventPagination = events.length > 8 ? { pageSize: 8, currentPage: eventPage, onPageChange: setEventPage } : false;
   const processPagination = processes.length > 12 ? { pageSize: 12, currentPage: processPage, onPageChange: setProcessPage } : false;
+  const passiveHealthPagination = passiveSeries.length > 8 ? { pageSize: 8, currentPage: passiveHealthPage, onPageChange: setPassiveHealthPage } : false;
 
   // Everything below is derived from the payload the endpoint already returns. These are plain
   // consts rather than memos because the early returns above are hooks boundaries -- a useMemo
@@ -289,6 +309,28 @@ export default function System() {
     });
   };
 
+  const openPassiveHealth = (row: PassiveHealthSeries) => {
+    const title = `${row.provider} · ${row.model}`;
+    setDetail({
+      title: `${t('system.passive_health')} · ${title}`,
+      badge: <Tag color={passiveHealthColor[row.health] || 'grey'}>{t(`system.passive_${row.health}`, row.health)}</Tag>,
+      rows: [
+        [t('system.provider'), row.provider],
+        [t('system.model'), row.model],
+        [t('system.egress'), row.egress_id],
+        [t('system.success_ewma'), fmtHealthPct(row.success_ewma)],
+        [t('system.latency_ewma'), `${fmtInt(Math.round(row.latency_ewma_ms))} ms`],
+        [t('system.observations'), fmtInt(row.observations)],
+        [t('system.failures'), fmtInt(row.failures)],
+        [t('system.rate_limited'), fmtInt(row.rate_limited)],
+        [t('system.canceled'), fmtInt(row.canceled)],
+        [t('system.last_status'), row.last_status_code || '—'],
+        [t('system.last_error_class'), row.last_error_class || '—'],
+        [t('system.last_seen'), fmtDateTime(row.last_observed_at)],
+      ],
+    });
+  };
+
   const processColumns: any[] = [
     { title: t('system.pid'), dataIndex: 'pid', width: 90, render: (value: number | string) => <span className="pool-mono">{value}</span> },
     { title: t('system.process'), dataIndex: 'comm' },
@@ -313,6 +355,19 @@ export default function System() {
     { title: t('system.backoff'), dataIndex: 'restart_backoff_millis', width: 110, align: 'right', render: fmtMillis },
     { title: t('system.next_retry'), dataIndex: 'next_restart_unix', width: 140, render: fmtDateTime },
     { title: t('system.recent_status'), dataIndex: 'last_message', render: (value: string | undefined, row: SupervisorModule) => row.last_panic ? `${value || 'panic'}: ${row.last_panic}` : (value || '—') },
+  ];
+  const passiveHealthColumns: any[] = [
+    { title: t('system.provider'), dataIndex: 'provider', width: 130, render: (value: string) => <span className="pool-mono">{value}</span> },
+    { title: t('system.model'), dataIndex: 'model', width: 190, render: (value: string) => <span className="pool-mono">{value}</span> },
+    { title: t('system.egress'), dataIndex: 'egress_id', width: 130, render: (value: string) => <span className="pool-mono">{value}</span> },
+    { title: t('system.health_state'), dataIndex: 'health', width: 110, render: (value: string) => <Tag color={passiveHealthColor[value] || 'grey'}>{t(`system.passive_${value}`, value)}</Tag> },
+    { title: t('system.success_ewma'), dataIndex: 'success_ewma', width: 110, align: 'right', sorter: (a: PassiveHealthSeries, b: PassiveHealthSeries) => a.success_ewma - b.success_ewma, render: fmtHealthPct },
+    { title: t('system.latency_ewma'), dataIndex: 'latency_ewma_ms', width: 120, align: 'right', sorter: (a: PassiveHealthSeries, b: PassiveHealthSeries) => a.latency_ewma_ms - b.latency_ewma_ms, render: (value: number) => `${fmtInt(Math.round(value))} ms` },
+    { title: t('system.observations'), dataIndex: 'observations', width: 100, align: 'right', render: fmtInt },
+    { title: t('system.failures'), dataIndex: 'failures', width: 90, align: 'right', render: fmtInt },
+    { title: t('system.rate_limited'), dataIndex: 'rate_limited', width: 100, align: 'right', render: fmtInt },
+    { title: t('system.last_error_class'), dataIndex: 'last_error_class', width: 150, render: (value: string) => value || '—' },
+    { title: t('system.last_seen'), dataIndex: 'last_observed_at', width: 170, render: fmtDateTime },
   ];
 
   return (
@@ -415,6 +470,48 @@ export default function System() {
         <div className="pool-chart-card">
           <div className="head">
             <div>
+              <div className="t">{t('system.compatibility_manifest')}</div>
+              <div className="s">{t('system.compatibility_manifest_desc')}</div>
+            </div>
+            <Tag color={compatibilityColor[compatibilityState] || 'grey'}>
+              {t(`system.compatibility_${compatibilityState}`, compatibilityState)}
+            </Tag>
+          </div>
+          <dl className="pool-system-detail__grid">
+            <div><dt>{t('system.source')}</dt><dd>{compatibility?.source || '—'}</dd></div>
+            <div><dt>{t('system.generation')}</dt><dd>{fmtInt(compatibility?.generation)}</dd></div>
+            <div><dt>{t('system.models')}</dt><dd>{fmtInt(compatibility?.model_count)}</dd></div>
+            <div><dt>{t('system.snapshot')}</dt><dd>{compatibility?.snapshot_slot || '—'}</dd></div>
+            <div><dt>{t('system.canary')}</dt><dd>{compatibility?.canary || '—'}</dd></div>
+            <div><dt>{t('system.last_success')}</dt><dd>{fmtDateTime(compatibility?.last_success_at)}</dd></div>
+          </dl>
+          {compatibility?.last_error ? <div className="pool-sys-guard__error">{compatibility.last_error}</div> : null}
+        </div>
+        <div className="pool-chart-card">
+          <div className="head">
+            <div>
+              <div className="t">{t('system.passive_health')}</div>
+              <div className="s">{t('system.passive_health_desc')}</div>
+            </div>
+            <Tag color={(passiveCounts.unhealthy || 0) > 0 ? 'red' : (passiveCounts.degraded || 0) > 0 ? 'amber' : 'green'}>
+              {fmtInt(passiveHealth?.series_count || 0)} {t('system.series')}
+            </Tag>
+          </div>
+          <dl className="pool-system-detail__grid">
+            <div><dt>{t('system.passive_healthy')}</dt><dd>{fmtInt(passiveCounts.healthy || 0)}</dd></div>
+            <div><dt>{t('system.passive_degraded')}</dt><dd>{fmtInt(passiveCounts.degraded || 0)}</dd></div>
+            <div><dt>{t('system.passive_unhealthy')}</dt><dd>{fmtInt(passiveCounts.unhealthy || 0)}</dd></div>
+            <div><dt>{t('system.passive_unknown')}</dt><dd>{fmtInt(passiveCounts.unknown || 0)}</dd></div>
+            <div><dt>{t('system.evictions')}</dt><dd>{fmtInt(passiveHealth?.evictions || 0)}</dd></div>
+            <div><dt>{t('system.retention')}</dt><dd>{fmtDuration(passiveHealth?.retention_seconds)}</dd></div>
+          </dl>
+        </div>
+      </section>
+
+      <section className="pool-sys-modules">
+        <div className="pool-chart-card">
+          <div className="head">
+            <div>
               <div className="t">{t('system.module_composition')}</div>
               <div className="s">{t('system.modules_running').replace('{running}', fmtInt(runningModules)).replace('{total}', fmtInt(modules.length))}</div>
             </div>
@@ -482,6 +579,42 @@ export default function System() {
           />
         </section>
       ) : null}
+
+      <Section title={t('system.passive_health')} extra={<Typography.Text type="tertiary" size="small">{t('system.passive_health_table_desc')}</Typography.Text>}>
+        <DataTable
+          loading={loading}
+          lastRefresh={lastRefresh}
+          dataSource={passiveSeries}
+          columns={passiveHealthColumns}
+          rowKey={(row: PassiveHealthSeries) => `${row.provider}:${row.model}:${row.egress_id}`}
+          size="small"
+          pagination={passiveHealthPagination}
+          emptyTitle={t('system.no_passive_health')}
+          emptyDesc={t('system.no_passive_health_desc')}
+          skeletonRows={5}
+          skeletonCols={11}
+          density="compact"
+          minScrollX={1390}
+          mobileListLabel={t('system.passive_health')}
+          mobileRenderer={(row: PassiveHealthSeries) => (
+            <CompactSystemRecord
+              title={<span className="pool-mono">{row.provider} · {row.model}</span>}
+              titleLabel={`${row.provider} ${row.model} ${row.egress_id}`}
+              badge={<Tag color={passiveHealthColor[row.health] || 'grey'}>{t(`system.passive_${row.health}`, row.health)}</Tag>}
+              subtitle={row.egress_id}
+              stats={[
+                [t('system.success_ewma'), fmtHealthPct(row.success_ewma)],
+                [t('system.latency_ewma'), `${fmtInt(Math.round(row.latency_ewma_ms))} ms`],
+                [t('system.failures'), fmtInt(row.failures)],
+              ]}
+              note={`${t('system.last_seen')} ${fmtDateTime(row.last_observed_at)}`}
+              onOpen={() => openPassiveHealth(row)}
+            />
+          )}
+        />
+      </Section>
+
+      <div style={{ height: 18 }} />
 
       <Section title={t('system.module_health')} extra={<Typography.Text type="tertiary" size="small">{t('system.module_health_desc')}</Typography.Text>}>
         <DataTable

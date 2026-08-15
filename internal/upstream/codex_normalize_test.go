@@ -212,6 +212,24 @@ func TestNormalizeCodexClassicParallelToolCallsRequireTools(t *testing.T) {
 	}
 }
 
+func TestStripCodexUnsupportedPromptCacheControlsIsNarrowAndExact(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.5","prompt_cache_key":"keep-cache-key","prompt_cache_options":{"mode":"explicit"},"future":{"n":900719925474099312345},"input":[{"role":"system","content":[{"type":"input_text","text":"base","prompt_cache_breakpoint":{"mode":"explicit"},"future_block":true}]},{"role":"user","content":[{"type":"input_text","text":"the string prompt_cache_breakpoint must stay"}]}]}`)
+	got := stripCodexUnsupportedPromptCacheControls(raw)
+	for _, forbidden := range []string{`"prompt_cache_options"`, `"prompt_cache_breakpoint":`} {
+		if bytes.Contains(got, []byte(forbidden)) {
+			t.Fatalf("unsupported cache control %s survived: %s", forbidden, got)
+		}
+	}
+	for _, preserved := range []string{`"prompt_cache_key":"keep-cache-key"`, `900719925474099312345`, `"future_block":true`, `the string prompt_cache_breakpoint must stay`} {
+		if !bytes.Contains(got, []byte(preserved)) {
+			t.Fatalf("sanitizer lost %q: %s", preserved, got)
+		}
+	}
+	if second := stripCodexUnsupportedPromptCacheControls(got); !bytes.Equal(second, got) {
+		t.Fatalf("sanitizer is not idempotent: first=%s second=%s", got, second)
+	}
+}
+
 func TestNormalizeCodexResponsesLitePreservesReasoningFields(t *testing.T) {
 	input := []byte(`{"model":"gpt-5.6-sol","store":false,"parallel_tool_calls":false,"reasoning":{"effort":"xhigh","summary":"auto","context":"current_turn"},"input":[{"type":"additional_tools","role":"developer","tools":[]},{"type":"message","role":"user","content":[{"type":"input_text","text":"keep exact context"}]}]}`)
 	got := normalizeCodexResponsesBody(input, whamBaseURL, true)

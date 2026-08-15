@@ -50,6 +50,31 @@ func TestJournalReplayAckAndSegmentCleanup(t *testing.T) {
 	}
 }
 
+func TestJournalReplayHonorsLimitBeforeScanningRemainder(t *testing.T) {
+	dir := t.TempDir()
+	journal, err := Open(dir, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	for index := 0; index < 20; index++ {
+		if _, err = journal.Append(Record{Hold: &storage.BillingHoldWrite{ID: "limited-" + string(rune('a'+index)), Create: true}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	replayed, err := journal.Replay(7)
+	if err != nil || len(replayed) != 7 || replayed[0].Sequence != 1 || replayed[6].Sequence != 7 {
+		t.Fatalf("limited replay=%+v err=%v", replayed, err)
+	}
+	if err = journal.Ack(7); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err = journal.Replay(7)
+	if err != nil || len(replayed) != 7 || replayed[0].Sequence != 8 || replayed[6].Sequence != 14 {
+		t.Fatalf("second limited replay=%+v err=%v", replayed, err)
+	}
+}
+
 func TestJournalPreservesUsagePayloadAndRecoversTornTail(t *testing.T) {
 	dir := t.TempDir()
 	journal, err := Open(dir, 1<<20)

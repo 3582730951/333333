@@ -41,6 +41,51 @@ const moduleSchema = z.object({
   last_panic: z.string().optional(),
 }).passthrough();
 
+const passiveHealthSeriesSchema = z.object({
+  provider: z.string(),
+  model: z.string(),
+  egress_id: z.string(),
+  health: z.string(),
+  observations: z.coerce.number(),
+  health_samples: z.coerce.number(),
+  successes: z.coerce.number(),
+  failures: z.coerce.number(),
+  canceled: z.coerce.number(),
+  rate_limited: z.coerce.number(),
+  success_ewma: z.coerce.number(),
+  latency_ewma_ms: z.coerce.number(),
+  last_status_code: z.coerce.number(),
+  last_error_class: z.string().optional(),
+  first_observed_at: z.coerce.number(),
+  last_observed_at: z.coerce.number(),
+}).passthrough();
+
+const passiveProviderHealthSchema = z.object({
+  generated_at: z.coerce.number().optional(),
+  retention_seconds: z.coerce.number().optional(),
+  max_series: z.coerce.number().optional(),
+  series_count: z.coerce.number().default(0),
+  evictions: z.coerce.number().optional(),
+  series: z.array(passiveHealthSeriesSchema).nullish().transform((value) => value ?? []),
+}).passthrough();
+
+const compatibilityManifestSchema = z.object({
+  enabled: z.boolean().default(false),
+  source: z.string().optional(),
+  state: z.string().optional(),
+  digest: z.string().optional(),
+  generation: z.coerce.number().optional(),
+  fetched_at: z.coerce.number().optional(),
+  expires_at: z.coerce.number().optional(),
+  last_attempt_at: z.coerce.number().optional(),
+  last_success_at: z.coerce.number().optional(),
+  last_error: z.string().optional(),
+  snapshot_slot: z.string().optional(),
+  signature_checked: z.boolean().optional(),
+  canary: z.string().optional(),
+  model_count: z.coerce.number().optional(),
+}).passthrough();
+
 export const systemMetricsSchema = z.object({
   supported: z.boolean().default(true),
   uptime_seconds: z.coerce.number().optional(),
@@ -81,6 +126,8 @@ export const systemMetricsSchema = z.object({
   go: z.object({ goroutines: z.coerce.number().optional(), sys_bytes: z.coerce.number().optional() }).passthrough().optional(),
   supervisor_events: z.array(eventSchema).nullish().transform((value) => value ?? []),
   supervisor_modules: z.array(moduleSchema).nullish().transform((value) => value ?? []),
+  compatibility_manifest: compatibilityManifestSchema.optional(),
+  passive_provider_health: passiveProviderHealthSchema.optional(),
 }).passthrough();
 
 export async function fetchSystemMetrics(signal?: AbortSignal): Promise<SystemMetrics> {

@@ -54,16 +54,17 @@ func (c *Client) postInProcessOrdered(ctx context.Context, spec Request, target 
 
 	ctx, guard := newRequestGuard(ctx, timeout)
 	resp, err := c.tlsFactory.Do(ctx, tlsclient.Request{
-		Method:       firstNonEmpty(spec.Method, http.MethodPost),
-		URL:          target,
-		Header:       headers,
-		HeaderOrder:  headerOrder,
-		Body:         spec.Body,
-		Profile:      profileName,
-		JA3Override:  inProcessNamedProfile(jaProfileOverride),
-		ForceHTTP1:   forceHTTP1ForClaudeImpersonation(target, headers),
-		ProxyURL:     egressProxyURL(spec.Egress),
-		CookieJarKey: sidecarCookieKey(spec.Account.ID, spec.Egress.ID, target, spec.CookieJarKey),
+		Method:         firstNonEmpty(spec.Method, http.MethodPost),
+		URL:            target,
+		Header:         headers,
+		HeaderOrder:    headerOrder,
+		Body:           spec.Body,
+		Profile:        profileName,
+		JA3Override:    inProcessNamedProfile(jaProfileOverride),
+		ForceHTTP1:     forceHTTP1ForClaudeImpersonation(target, headers),
+		ProxyURL:       egressProxyURL(spec.Egress),
+		CookieJarKey:   sidecarCookieKey(spec.Account.ID, spec.Egress.ID, target, spec.CookieJarKey),
+		ConnectTimeout: c.cfgSnapshot().ConnectTimeout(),
 		// Timeout intentionally left 0: the requestGuard context bounds the call with the
 		// pool's idle-timeout semantics, not an absolute deadline.
 	})
@@ -207,15 +208,16 @@ func (c *Client) doRawInProcessSource(ctx context.Context, egress storage.Egress
 
 	ctx, guard := newRequestGuard(ctx, c.cfg.RequestTimeout())
 	resp, err := c.tlsFactory.Do(ctx, tlsclient.Request{
-		Method:       firstNonEmpty(method, http.MethodGet),
-		URL:          rawURL,
-		Header:       built,
-		HeaderOrder:  headerOrder,
-		Body:         body,
-		Profile:      profileName,
-		ForceHTTP1:   forceHTTP1ForClaudeImpersonation(rawURL, built),
-		ProxyURL:     egressProxyURL(egress),
-		CookieJarKey: cookieJarKey,
+		Method:         firstNonEmpty(method, http.MethodGet),
+		URL:            rawURL,
+		Header:         built,
+		HeaderOrder:    headerOrder,
+		Body:           body,
+		Profile:        profileName,
+		ForceHTTP1:     forceHTTP1ForClaudeImpersonation(rawURL, built),
+		ProxyURL:       egressProxyURL(egress),
+		CookieJarKey:   cookieJarKey,
+		ConnectTimeout: c.cfgSnapshot().ConnectTimeout(),
 	})
 	if err != nil {
 		guard.Fail()

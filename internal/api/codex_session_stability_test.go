@@ -650,7 +650,7 @@ func TestCodexMappedDownstreamWebSocketQuotaRotatesAccountAndRestoresToolContext
 				mu.Lock()
 				recoveredPayloadValid = valid
 				mu.Unlock()
-				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-websocket-quota-recovered","object":"response","model":"gpt-5.6-sol","status":"completed","output":[]}}`))
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-websocket-quota-recovered","object":"response","model":"gpt-5.6-sol","status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}`))
 				return
 			default:
 				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","status_code":401,"error":{"message":"unexpected account"}}`))
@@ -853,7 +853,7 @@ func TestCodexMappedDownstreamWebSocketSurvivesTruncatedUpstreamTurn(t *testing.
 			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-websocket-truncated","object":"response","model":"gpt-5.6-sol","status":"in_progress"}}`))
 			return
 		}
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-websocket-after-truncation","object":"response","model":"gpt-5.6-sol","status":"completed","output":[]}}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-websocket-after-truncation","object":"response","model":"gpt-5.6-sol","status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}`))
 	})
 	enableCodexSessionMappingForTest(h)
 	h.importAccount(t, "websocket-truncated", "upstream-websocket-truncated", "access-websocket-truncated")

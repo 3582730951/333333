@@ -41,13 +41,17 @@ const (
 	DefaultAccountFailureStreakThreshold       = 5
 	DefaultAccountFailureStreakCooldownSeconds = 300
 	DefaultRequestTimeoutSec                   = 600
-	DefaultShutdownDrainSec                    = 30
-	DefaultMaxBodyBytes                        = 1 << 30
-	DefaultBodyMemoryThresholdBytes            = 8 << 20
-	DefaultBodyMemoryBudgetMaxBytes            = 256 << 20
-	DefaultBodySpoolMaxBytes                   = 32 << 30
-	DefaultBodyDiskReserveBytes                = 0
-	DefaultUsageJournalSegmentBytes            = 8 << 20
+	// DefaultConnectTimeoutSeconds bounds only connection establishment (DNS,
+	// TCP/proxy and TLS). Long inference and streaming reads continue to use the
+	// independent request idle timeout below.
+	DefaultConnectTimeoutSeconds    = 12
+	DefaultShutdownDrainSec         = 30
+	DefaultMaxBodyBytes             = 1 << 30
+	DefaultBodyMemoryThresholdBytes = 8 << 20
+	DefaultBodyMemoryBudgetMaxBytes = 256 << 20
+	DefaultBodySpoolMaxBytes        = 32 << 30
+	DefaultBodyDiskReserveBytes     = 0
+	DefaultUsageJournalSegmentBytes = 8 << 20
 	// Goal continuity keeps a seven-day sliding window. The original 256 MiB
 	// bootstrap default was exhausted by sustained Codex tool traffic while the
 	// server still had ample disk. One GiB provides fourfold admission headroom;
@@ -97,7 +101,9 @@ const (
 	DefaultClaudeNodeVersion = "v26.3.0"
 	// DefaultModelProbeIntervalHours refreshes each account's last-good model
 	// catalog every six hours. The worker adds per-account jitter.
-	DefaultModelProbeIntervalHours = 6
+	DefaultModelProbeIntervalHours           = 6
+	DefaultCompatibilityManifestRefreshHours = 6
+	DefaultCompatibilityManifestMaxStaleDays = 30
 	// Model-quality monitoring is group×model (never per account). One compact
 	// primary probe runs per interval; confirmations are anomaly-only.
 	DefaultModelQualityIntervalMinutes   = 60
@@ -194,33 +200,45 @@ func DefaultClaudeGatewayBlockedHostPatterns() []string {
 }
 
 type Config struct {
-	ListenAddr                     string `json:"listen_addr"`
-	DataDir                        string `json:"data_dir"`
-	MasterKeyFile                  string `json:"master_key_file,omitempty"`
-	IdentityKeyFile                string `json:"identity_key_file,omitempty"`
-	DiagnosticAliasKeyFile         string `json:"diagnostic_alias_key_file,omitempty"`
-	DiagnosticsDir                 string `json:"diagnostics_dir,omitempty"`
-	RuntimeIdentityKey             []byte `json:"-"`
-	RuntimeDiagnosticAliasKey      []byte `json:"-"`
-	DatabasePath                   string `json:"database_path"`
-	StorageDriver                  string `json:"storage_driver"`
-	PostgresDSN                    string `json:"postgres_dsn,omitempty"`
-	RedisURL                       string `json:"redis_url,omitempty"`
-	NodeID                         string `json:"node_id"`
-	UpstreamBaseURL                string `json:"upstream_base_url"`
-	OpenAIAPIUpstreamBaseURL       string `json:"openai_api_upstream_base_url"`
-	OAuthTokenURL                  string `json:"oauth_token_url"`
-	ClientVersion                  string `json:"client_version"`
-	DefaultGroup                   string `json:"default_group"`
-	Virtual2MEnabled               bool   `json:"-"`
-	VirtualContextWindow           int64  `json:"-"`
-	VirtualContextLedgerTTLSeconds int64  `json:"-"`
-	StickyWaitMillis               int    `json:"sticky_wait_millis"`
+	ListenAddr                string `json:"listen_addr"`
+	DataDir                   string `json:"data_dir"`
+	MasterKeyFile             string `json:"master_key_file,omitempty"`
+	IdentityKeyFile           string `json:"identity_key_file,omitempty"`
+	DiagnosticAliasKeyFile    string `json:"diagnostic_alias_key_file,omitempty"`
+	DiagnosticsDir            string `json:"diagnostics_dir,omitempty"`
+	RuntimeIdentityKey        []byte `json:"-"`
+	RuntimeDiagnosticAliasKey []byte `json:"-"`
+	DatabasePath              string `json:"database_path"`
+	StorageDriver             string `json:"storage_driver"`
+	PostgresDSN               string `json:"postgres_dsn,omitempty"`
+	RedisURL                  string `json:"redis_url,omitempty"`
+	NodeID                    string `json:"node_id"`
+	UpstreamBaseURL           string `json:"upstream_base_url"`
+	OpenAIAPIUpstreamBaseURL  string `json:"openai_api_upstream_base_url"`
+	OAuthTokenURL             string `json:"oauth_token_url"`
+	ClientVersion             string `json:"client_version"`
+	// CompatibilityManifest keeps the client identity tuple and optional fallback
+	// model metadata current without making network availability a startup gate.
+	// "official" reads allowlisted upstream release metadata and protects its A/B
+	// snapshots with a digest; "signed_custom" additionally requires an Ed25519
+	// signature from CompatibilityManifestPublicKey.
+	CompatibilityManifestEnabled      bool   `json:"compatibility_manifest_enabled"`
+	CompatibilityManifestSource       string `json:"compatibility_manifest_source"`
+	CompatibilityManifestURL          string `json:"compatibility_manifest_url,omitempty"`
+	CompatibilityManifestPublicKey    string `json:"compatibility_manifest_public_key,omitempty"`
+	CompatibilityManifestRefreshHours int    `json:"compatibility_manifest_refresh_hours"`
+	CompatibilityManifestMaxStaleDays int    `json:"compatibility_manifest_max_stale_days"`
+	DefaultGroup                      string `json:"default_group"`
+	Virtual2MEnabled                  bool   `json:"-"`
+	VirtualContextWindow              int64  `json:"-"`
+	VirtualContextLedgerTTLSeconds    int64  `json:"-"`
+	StickyWaitMillis                  int    `json:"sticky_wait_millis"`
 	// AdmissionWaitMillis bounds the per-account concurrency/token-budget backpressure
 	// wait. It is retained for one-version config compatibility; the scheduler now
 	// uses the cancellation-aware request deadline instead of a shorter queue timer.
 	AdmissionWaitMillis   int   `json:"admission_wait_millis"`
 	RequestTimeoutSeconds int   `json:"request_timeout_seconds"`
+	ConnectTimeoutSeconds int   `json:"connect_timeout_seconds"`
 	ShutdownDrainSeconds  int   `json:"shutdown_drain_seconds"`
 	MaxBodyBytes          int64 `json:"max_body_bytes"`
 	// BodyV2Enabled switches the bounded replayable body pipeline. Disable for one
@@ -316,6 +334,11 @@ type Config struct {
 	// per deployment so profiles are not predictable across installs. When empty
 	// a built-in default is used (still deterministic and per-account unique).
 	IdentitySecret string `json:"identity_secret"`
+	// IdentityConvergenceMode controls only the virtual device fingerprint. "off"
+	// (default) preserves per-account/per-egress derivation; "full" deliberately
+	// converges new virtual devices deployment-wide. Durable native session/thread
+	// mappings remain separate, and existing mappings retain their stored device.
+	IdentityConvergenceMode string `json:"identity_convergence_mode"`
 	// WebSearchEnabled makes the gateway ensure a web_search tool is present on
 	// /v1/responses requests (the "联网搜索" AT path). WebSearchToolType overrides
 	// the injected tool type (default "web_search").
@@ -877,79 +900,85 @@ type ThinkingOverride struct {
 
 func Default() Config {
 	return Config{
-		ListenAddr:                       DefaultListenAddr,
-		DataDir:                          "data",
-		DatabasePath:                     DefaultDatabasePath,
-		StorageDriver:                    DefaultStorageDriver,
-		UpstreamBaseURL:                  DefaultUpstreamBaseURL,
-		OpenAIAPIUpstreamBaseURL:         DefaultOpenAIAPIUpstreamBaseURL,
-		ClientVersion:                    DefaultClientVersion,
-		CodexOAuthAuthURL:                DefaultCodexOAuthAuthURL,
-		CodexOAuthTokenURL:               DefaultCodexOAuthTokenURL,
-		CodexOAuthClientID:               DefaultCodexOAuthClientID,
-		CodexOAuthRedirectURI:            DefaultCodexOAuthRedirectURI,
-		CodexOAuthScope:                  DefaultCodexOAuthScope,
-		ClaudeOAuthAuthURL:               DefaultClaudeOAuthAuthURL,
-		ClaudeOAuthTokenURL:              DefaultClaudeOAuthTokenURL,
-		ClaudeOAuthClientID:              DefaultClaudeOAuthClientID,
-		ClaudeOAuthRedirectURI:           DefaultClaudeOAuthRedirectURI,
-		ClaudeOAuthScope:                 DefaultClaudeOAuthScope,
-		AntigravityOAuthAuthURL:          DefaultAntigravityOAuthAuthURL,
-		AntigravityOAuthTokenURL:         DefaultAntigravityOAuthTokenURL,
-		AntigravityOAuthClientID:         DefaultAntigravityOAuthClientID,
-		AntigravityOAuthClientSecret:     DefaultAntigravityOAuthClientSecret,
-		AntigravityOAuthRedirectURI:      DefaultAntigravityOAuthRedirectURI,
-		AntigravityOAuthScope:            DefaultAntigravityOAuthScope,
-		DefaultGroup:                     DefaultGroupName,
-		Virtual2MEnabled:                 false,
-		VirtualContextWindow:             DefaultVirtualWindow,
-		VirtualContextLedgerTTLSeconds:   DefaultVirtualContextLedgerTTLSeconds,
-		StickyWaitMillis:                 DefaultStickyWaitMillis,
-		AdmissionWaitMillis:              DefaultAdmissionWaitMillis,
-		RequestTimeoutSeconds:            DefaultRequestTimeoutSec,
-		ShutdownDrainSeconds:             DefaultShutdownDrainSec,
-		MaxBodyBytes:                     DefaultMaxBodyBytes,
-		BodyV2Enabled:                    true,
-		BodyMemoryThresholdBytes:         DefaultBodyMemoryThresholdBytes,
-		BodySpoolMaxBytes:                DefaultBodySpoolMaxBytes,
-		BodyDiskReserveBytes:             DefaultBodyDiskReserveBytes,
-		UsageJournalEnabled:              true,
-		UsageJournalSegmentBytes:         DefaultUsageJournalSegmentBytes,
-		AccountTokenBudget:               DefaultAccountTokenBudget,
-		SchedulerIndexEnabled:            true,
-		ResourceHeadroomPercent:          10,
-		ContextJournalTTLSeconds:         3600,
-		ContextJournalMaxRows:            50000,
-		ContextJournalMaxMB:              200,
-		GoalContinuityEnabled:            true,
-		GoalLegacyJournalDualWrite:       false,
-		GoalRetentionDays:                7,
-		GoalStorageMaxMB:                 DefaultGoalStorageMaxMB,
-		GoalCompressionChunkRatio:        0.70,
-		GoalCompressionMaxStages:         16,
-		GoalLeaseSeconds:                 90,
-		GoalHeartbeatSeconds:             15,
-		GoalCompressionConcurrency:       1,
-		CodexSessionMappingEnabled:       true,
-		CodexSessionMappingRetentionDays: 7,
-		CodexCPAStrict:                   true,
-		CodexStatelessPassthrough:        false,
-		TrustedProxyCIDRs:                []string{"127.0.0.0/8", "::1/128"},
-		SidecarTimeoutSeconds:            120,
-		EgressFingerprintEngine:          "inprocess",
-		KiroVersion:                      "0.11.107",
-		KiroNodeVersion:                  "22.22.0",
-		KiroDefaultAuthRegion:            "us-east-1",
-		KiroDefaultAPIRegion:             "us-east-1",
-		KiroDefaultThinking:              true,
-		KiroCacheMode:                    "auto",
-		KiroCacheUnreportedThreshold:     DefaultKiroCacheUnreportedThreshold,
-		SchedulerHeartbeatSeconds:        15,
-		StreamKeepAliveSeconds:           15,
-		StreamStallRecoverySeconds:       360,
-		StreamContinueText:               "Please continue from exactly where you left off, without repeating anything.",
-		StreamAutoContinueMaxAttempts:    1,
-		ConversationIsolation:            true,
+		ListenAddr:                        DefaultListenAddr,
+		DataDir:                           "data",
+		DatabasePath:                      DefaultDatabasePath,
+		StorageDriver:                     DefaultStorageDriver,
+		UpstreamBaseURL:                   DefaultUpstreamBaseURL,
+		OpenAIAPIUpstreamBaseURL:          DefaultOpenAIAPIUpstreamBaseURL,
+		ClientVersion:                     DefaultClientVersion,
+		CompatibilityManifestEnabled:      true,
+		CompatibilityManifestSource:       "official",
+		CompatibilityManifestRefreshHours: DefaultCompatibilityManifestRefreshHours,
+		CompatibilityManifestMaxStaleDays: DefaultCompatibilityManifestMaxStaleDays,
+		CodexOAuthAuthURL:                 DefaultCodexOAuthAuthURL,
+		CodexOAuthTokenURL:                DefaultCodexOAuthTokenURL,
+		CodexOAuthClientID:                DefaultCodexOAuthClientID,
+		CodexOAuthRedirectURI:             DefaultCodexOAuthRedirectURI,
+		CodexOAuthScope:                   DefaultCodexOAuthScope,
+		ClaudeOAuthAuthURL:                DefaultClaudeOAuthAuthURL,
+		ClaudeOAuthTokenURL:               DefaultClaudeOAuthTokenURL,
+		ClaudeOAuthClientID:               DefaultClaudeOAuthClientID,
+		ClaudeOAuthRedirectURI:            DefaultClaudeOAuthRedirectURI,
+		ClaudeOAuthScope:                  DefaultClaudeOAuthScope,
+		AntigravityOAuthAuthURL:           DefaultAntigravityOAuthAuthURL,
+		AntigravityOAuthTokenURL:          DefaultAntigravityOAuthTokenURL,
+		AntigravityOAuthClientID:          DefaultAntigravityOAuthClientID,
+		AntigravityOAuthClientSecret:      DefaultAntigravityOAuthClientSecret,
+		AntigravityOAuthRedirectURI:       DefaultAntigravityOAuthRedirectURI,
+		AntigravityOAuthScope:             DefaultAntigravityOAuthScope,
+		DefaultGroup:                      DefaultGroupName,
+		Virtual2MEnabled:                  false,
+		VirtualContextWindow:              DefaultVirtualWindow,
+		VirtualContextLedgerTTLSeconds:    DefaultVirtualContextLedgerTTLSeconds,
+		StickyWaitMillis:                  DefaultStickyWaitMillis,
+		AdmissionWaitMillis:               DefaultAdmissionWaitMillis,
+		RequestTimeoutSeconds:             DefaultRequestTimeoutSec,
+		ConnectTimeoutSeconds:             DefaultConnectTimeoutSeconds,
+		ShutdownDrainSeconds:              DefaultShutdownDrainSec,
+		MaxBodyBytes:                      DefaultMaxBodyBytes,
+		BodyV2Enabled:                     true,
+		BodyMemoryThresholdBytes:          DefaultBodyMemoryThresholdBytes,
+		BodySpoolMaxBytes:                 DefaultBodySpoolMaxBytes,
+		BodyDiskReserveBytes:              DefaultBodyDiskReserveBytes,
+		UsageJournalEnabled:               true,
+		UsageJournalSegmentBytes:          DefaultUsageJournalSegmentBytes,
+		AccountTokenBudget:                DefaultAccountTokenBudget,
+		SchedulerIndexEnabled:             true,
+		ResourceHeadroomPercent:           10,
+		ContextJournalTTLSeconds:          3600,
+		ContextJournalMaxRows:             50000,
+		ContextJournalMaxMB:               200,
+		GoalContinuityEnabled:             true,
+		GoalLegacyJournalDualWrite:        false,
+		GoalRetentionDays:                 7,
+		GoalStorageMaxMB:                  DefaultGoalStorageMaxMB,
+		GoalCompressionChunkRatio:         0.70,
+		GoalCompressionMaxStages:          16,
+		GoalLeaseSeconds:                  90,
+		GoalHeartbeatSeconds:              15,
+		GoalCompressionConcurrency:        1,
+		CodexSessionMappingEnabled:        true,
+		CodexSessionMappingRetentionDays:  7,
+		CodexCPAStrict:                    true,
+		CodexStatelessPassthrough:         false,
+		TrustedProxyCIDRs:                 []string{"127.0.0.0/8", "::1/128"},
+		SidecarTimeoutSeconds:             120,
+		EgressFingerprintEngine:           "inprocess",
+		IdentityConvergenceMode:           "off",
+		KiroVersion:                       "0.11.107",
+		KiroNodeVersion:                   "22.22.0",
+		KiroDefaultAuthRegion:             "us-east-1",
+		KiroDefaultAPIRegion:              "us-east-1",
+		KiroDefaultThinking:               true,
+		KiroCacheMode:                     "auto",
+		KiroCacheUnreportedThreshold:      DefaultKiroCacheUnreportedThreshold,
+		SchedulerHeartbeatSeconds:         15,
+		StreamKeepAliveSeconds:            15,
+		StreamStallRecoverySeconds:        360,
+		StreamContinueText:                "Please continue from exactly where you left off, without repeating anything.",
+		StreamAutoContinueMaxAttempts:     1,
+		ConversationIsolation:             true,
 		// Auto-inject Claude cache_control on the OpenAI-compat path by default so
 		// that path benefits from prompt caching like native Claude Code does.
 		ClaudeCacheControlInject:          true,
@@ -1107,6 +1136,19 @@ func (c *Config) AdmissionWait() time.Duration {
 
 func (c *Config) RequestTimeout() time.Duration {
 	return time.Duration(c.RequestTimeoutSeconds) * time.Second
+}
+
+// ConnectTimeout bounds connection establishment independently from the much
+// longer inference/stream idle timeout.
+func (c *Config) ConnectTimeout() time.Duration {
+	seconds := c.ConnectTimeoutSeconds
+	if seconds <= 0 {
+		seconds = DefaultConnectTimeoutSeconds
+	}
+	if seconds > 60 {
+		seconds = 60
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func (c Config) EffectiveBodyMemoryBudgetBytes() int64 {
@@ -1370,6 +1412,38 @@ func (c *Config) applyEnv() error {
 	if v := os.Getenv("CODEX_POOL_CLIENT_VERSION"); v != "" {
 		c.ClientVersion = v
 	}
+	if v := os.Getenv("CODEX_POOL_CONNECT_TIMEOUT_SECONDS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			c.ConnectTimeoutSeconds = parsed
+		}
+	}
+	if v := os.Getenv("CODEX_POOL_IDENTITY_CONVERGENCE_MODE"); v != "" {
+		c.IdentityConvergenceMode = v
+	}
+	if v := os.Getenv("CODEX_POOL_COMPATIBILITY_MANIFEST_ENABLED"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			c.CompatibilityManifestEnabled = parsed
+		}
+	}
+	if v := os.Getenv("CODEX_POOL_COMPATIBILITY_MANIFEST_SOURCE"); v != "" {
+		c.CompatibilityManifestSource = v
+	}
+	if v := os.Getenv("CODEX_POOL_COMPATIBILITY_MANIFEST_URL"); v != "" {
+		c.CompatibilityManifestURL = v
+	}
+	if v := os.Getenv("CODEX_POOL_COMPATIBILITY_MANIFEST_PUBLIC_KEY"); v != "" {
+		c.CompatibilityManifestPublicKey = v
+	}
+	if v := os.Getenv("CODEX_POOL_COMPATIBILITY_MANIFEST_REFRESH_HOURS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			c.CompatibilityManifestRefreshHours = parsed
+		}
+	}
+	if v := os.Getenv("CODEX_POOL_COMPATIBILITY_MANIFEST_MAX_STALE_DAYS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			c.CompatibilityManifestMaxStaleDays = parsed
+		}
+	}
 	if v := os.Getenv("CODEX_POOL_CODEX_JA3"); v != "" {
 		c.CodexJA3Override = v
 	}
@@ -1589,6 +1663,26 @@ func (c *Config) normalize() {
 	if c.ClientVersion == "" || dottedVersionLess(c.ClientVersion, DefaultClientVersion) {
 		c.ClientVersion = DefaultClientVersion
 	}
+	switch strings.ToLower(strings.TrimSpace(c.CompatibilityManifestSource)) {
+	case "official", "signed_custom":
+		c.CompatibilityManifestSource = strings.ToLower(strings.TrimSpace(c.CompatibilityManifestSource))
+	default:
+		c.CompatibilityManifestSource = "official"
+	}
+	c.CompatibilityManifestURL = strings.TrimSpace(c.CompatibilityManifestURL)
+	c.CompatibilityManifestPublicKey = strings.TrimSpace(c.CompatibilityManifestPublicKey)
+	if c.CompatibilityManifestRefreshHours <= 0 {
+		c.CompatibilityManifestRefreshHours = DefaultCompatibilityManifestRefreshHours
+	}
+	if c.CompatibilityManifestRefreshHours > 168 {
+		c.CompatibilityManifestRefreshHours = 168
+	}
+	if c.CompatibilityManifestMaxStaleDays <= 0 {
+		c.CompatibilityManifestMaxStaleDays = DefaultCompatibilityManifestMaxStaleDays
+	}
+	if c.CompatibilityManifestMaxStaleDays > 365 {
+		c.CompatibilityManifestMaxStaleDays = 365
+	}
 	if c.CodexCLIVersionOverride != "" &&
 		dottedVersionLess(c.CodexCLIVersionOverride, DefaultClientVersion) &&
 		!IsSupportedCodexCLIVersion(c.CodexCLIVersionOverride) {
@@ -1611,6 +1705,18 @@ func (c *Config) normalize() {
 	}
 	if c.RequestTimeoutSeconds <= 0 {
 		c.RequestTimeoutSeconds = DefaultRequestTimeoutSec
+	}
+	if c.ConnectTimeoutSeconds <= 0 {
+		c.ConnectTimeoutSeconds = DefaultConnectTimeoutSeconds
+	}
+	if c.ConnectTimeoutSeconds > 60 {
+		c.ConnectTimeoutSeconds = 60
+	}
+	switch strings.ToLower(strings.TrimSpace(c.IdentityConvergenceMode)) {
+	case "full":
+		c.IdentityConvergenceMode = "full"
+	default:
+		c.IdentityConvergenceMode = "off"
 	}
 	if c.StatefulStickyWaitSeconds < 0 {
 		c.StatefulStickyWaitSeconds = 0

@@ -690,6 +690,8 @@ func (s *Server) adminAccountAction(w http.ResponseWriter, r *http.Request) {
 		s.adminClearCooldown(w, r, accountID)
 	case "rate-limit-controls":
 		s.adminSetAccountRateLimitControls(w, r, accountID)
+	case "routing-policy":
+		s.adminSetAccountRoutingPolicy(w, r, accountID)
 	case "group":
 		s.adminSetAccountGroup(w, r, accountID)
 	case "delete":
@@ -889,6 +891,53 @@ func (s *Server) adminSetAccountRateLimitControls(w http.ResponseWriter, r *http
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"account_id":                 accountID,
 		"ignore_rate_limit_controls": req.IgnoreRateLimitControls,
+	})
+}
+
+// adminSetAccountRoutingPolicy updates only fresh-selection share and the
+// replay-safe same-credential attempt cap. It cannot move an existing sticky or
+// native session and cannot enable retries for unsafe/stateful request classes.
+func (s *Server) adminSetAccountRoutingPolicy(w http.ResponseWriter, r *http.Request, accountID string) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPatch {
+		methodNotAllowed(w)
+		return
+	}
+	var req struct {
+		RoutingWeight    int `json:"routing_weight"`
+		RetryMaxAttempts int `json:"retry_max_attempts"`
+	}
+	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	account, err := s.store.GetAccount(r.Context(), accountID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if req.RoutingWeight < 1 || req.RoutingWeight > 1000 {
+		writeError(w, http.StatusBadRequest, errors.New("routing_weight must be between 1 and 1000"))
+		return
+	}
+	if req.RetryMaxAttempts < 0 || req.RetryMaxAttempts > 3 {
+		writeError(w, http.StatusBadRequest, errors.New("retry_max_attempts must be between 0 and 3"))
+		return
+	}
+	if err := s.store.SetAccountRoutingPolicy(r.Context(), accountID, req.RoutingWeight, req.RetryMaxAttempts); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if s.scheduler != nil {
+		s.scheduler.RefreshAccountCache()
+		s.scheduler.NotifyStateChanged()
+	}
+	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+		AccountID: accountID, AccountLabel: firstNonEmpty(account.Label, account.Email, account.ID),
+		Action: "set_routing_policy", State: "manual",
+		Detail: fmt.Sprintf("routing_weight=%d retry_max_attempts=%d", req.RoutingWeight, req.RetryMaxAttempts),
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"account_id": accountID, "routing_weight": req.RoutingWeight, "retry_max_attempts": req.RetryMaxAttempts,
 	})
 }
 

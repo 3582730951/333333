@@ -180,8 +180,8 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 	}
 	agentTaskRecovered := false
 	for attempt := 0; attempt < 2; attempt++ {
-		probePath := capability.ProbePath(s.cfg.ClientVersion)
-		clientVersion := s.cfg.ClientVersion
+		clientVersion := s.effectiveCodexClientVersion(ctx)
+		probePath := capability.ProbePath(clientVersion)
 		if accountprovider.UsesAPIKey("codex", token) {
 			probePath = "/v1/models"
 			clientVersion = ""
@@ -666,7 +666,7 @@ func (s *Server) probeCustomAnthropicModelCandidate(
 	provider storage.CustomProvider,
 	model string,
 ) (bool, bool) {
-	body, osHint := s.claudeCodeMinimalProbeBody(account, token, egress, model, "Reply OK", 1)
+	body, osHint := s.claudeCodeMinimalProbeBody(ctx, account, token, egress, model, "Reply OK", 1)
 	headers := http.Header{}
 	headers.Set("Anthropic-Version", "2023-06-01")
 	req := upstream.Request{
@@ -728,6 +728,7 @@ func (s *Server) StartBackground(ctx context.Context) {
 	// Refresh the public Hub runtime version out of band. Request execution only
 	// reads the cache and therefore never waits for the updater manifest.
 	antigravityidentity.StartVersionUpdater(ctx)
+	s.startCompatibilityManifest(ctx)
 	if s.regHandler != nil {
 		s.regHandler.StartRuntime(ctx)
 	}

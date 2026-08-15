@@ -23,7 +23,13 @@ func (c *Client) DoRaw(ctx context.Context, egress storage.EgressProfile, method
 // DoRawSource is the replayable-body counterpart to DoRaw. The source is borrowed for
 // the duration of the call and remains owned by the caller.
 func (c *Client) DoRawSource(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body bodysource.BodySource, cookieJarKey string) (*Response, error) {
-	return c.doRawSource(ctx, egress, method, rawURL, headers, body, cookieJarKey, false)
+	return c.doRawSource(ctx, egress, method, rawURL, headers, body, cookieJarKey, false, "", "")
+}
+
+// DoRawSourceObserved is the provider-labelled counterpart used by native
+// adapters. Labels are diagnostic metadata only and never alter wire behavior.
+func (c *Client) DoRawSourceObserved(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body bodysource.BodySource, cookieJarKey, provider, model string) (*Response, error) {
+	return c.doRawSource(ctx, egress, method, rawURL, headers, body, cookieJarKey, false, provider, model)
 }
 
 // DoRawHTTP1 is the HTTP/1.1-only counterpart to DoRaw. It is used by native
@@ -37,20 +43,38 @@ func (c *Client) DoRawHTTP1(ctx context.Context, egress storage.EgressProfile, m
 
 // DoRawHTTP1Source is the replayable-body counterpart to DoRawHTTP1.
 func (c *Client) DoRawHTTP1Source(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body bodysource.BodySource, cookieJarKey string) (*Response, error) {
-	return c.doRawSource(ctx, http1TransparentEgress(egress), method, rawURL, headers, body, cookieJarKey, true)
+	return c.doRawSource(ctx, http1TransparentEgress(egress), method, rawURL, headers, body, cookieJarKey, true, "", "")
 }
 
-func (c *Client) doRawSource(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body bodysource.BodySource, cookieJarKey string, forceHTTP1 bool) (result *Response, resultErr error) {
+// DoRawHTTP1Observed retains the native HTTP/1.1 profile while emitting a
+// provider-labelled passive health sample.
+func (c *Client) DoRawHTTP1Observed(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body []byte, cookieJarKey, provider, model string) (*Response, error) {
+	return c.doRawSource(ctx, http1TransparentEgress(egress), method, rawURL, headers, bodysource.Bytes(body), cookieJarKey, true, provider, model)
+}
+
+func (c *Client) doRawSource(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body bodysource.BodySource, cookieJarKey string, forceHTTP1 bool, provider, model string) (result *Response, resultErr error) {
 	started := time.Now()
 	defer func() {
 		if resultErr != nil {
-			c.observeEgress(egress.ID, time.Since(started), false)
+			latency := time.Since(started)
+			c.observeEgress(egress.ID, latency, false)
+			if strings.TrimSpace(provider) != "" {
+				c.observeAttempt(AttemptObservation{Provider: passiveAttemptProvider(provider), Model: model, EgressID: egress.ID,
+					ErrorClass: passiveAttemptErrorClass(ctx, 0, resultErr), Latency: latency})
+			}
 			return
 		}
-		if result != nil && result.Body != nil && strings.TrimSpace(egress.ID) != "" {
+		if result != nil && result.Body != nil {
+			status := result.StatusCode
 			result.Body = &firstByteObservedBody{
-				ReadCloser: result.Body, started: started, status: result.StatusCode,
-				observe: func(latency time.Duration, success bool) { c.observeEgress(egress.ID, latency, success) },
+				ReadCloser: result.Body, started: started, status: status,
+				observe: func(latency time.Duration, success bool) {
+					c.observeEgress(egress.ID, latency, success)
+					if strings.TrimSpace(provider) != "" {
+						c.observeAttempt(AttemptObservation{Provider: passiveAttemptProvider(provider), Model: model, EgressID: egress.ID,
+							StatusCode: status, ErrorClass: passiveAttemptErrorClass(ctx, status, nil), Latency: latency, Success: success})
+					}
+				},
 			}
 		}
 	}()

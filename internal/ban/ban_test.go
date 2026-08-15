@@ -24,6 +24,7 @@ func TestClassify(t *testing.T) {
 		{"usage limit", false, 429, `{"error":"You've hit your usage limit. Try again later."}`, RateLimited},
 		{"bare 429", false, 429, `slow down`, RateLimited},
 		{"payment required", false, 402, `{"error":"balance exhausted"}`, RateLimited},
+		{"statusless overload body on 400", false, 400, `{"error":{"message":"Our servers are currently overloaded. Please try again later."}}`, RateLimited},
 		{"bare 401", false, 401, `unauthorized`, AuthExpired},
 		{"unrelated 400", false, 400, `{"error":{"code":"model_not_found"}}`, Unknown},
 	}

@@ -36,6 +36,7 @@ func TestResponsesStreamToChatSSERecognizesStableToolKinds(t *testing.T) {
 
 	names := map[int]string{}
 	arguments := map[int]string{}
+	emptyToolNameDeltas := 0
 	finish := ""
 	for _, line := range strings.Split(recorder.Body.String(), "\n") {
 		line = strings.TrimSpace(line)
@@ -61,6 +62,9 @@ func TestResponsesStreamToChatSSERecognizesStableToolKinds(t *testing.T) {
 			index := int(call["index"].(float64))
 			function, _ := call["function"].(map[string]interface{})
 			if name, ok := function["name"].(string); ok {
+				if name == "" {
+					emptyToolNameDeltas++
+				}
 				names[index] = name
 			}
 			if part, ok := function["arguments"].(string); ok {
@@ -70,6 +74,9 @@ func TestResponsesStreamToChatSSERecognizesStableToolKinds(t *testing.T) {
 	}
 	if finish != "tool_calls" {
 		t.Fatalf("finish_reason = %q\n%s", finish, recorder.Body.String())
+	}
+	if emptyToolNameDeltas != 0 {
+		t.Fatalf("argument deltas repeated an empty tool name %d times: %s", emptyToolNameDeltas, recorder.Body.String())
 	}
 	if names[0] != "apply_patch" || arguments[0] != `{"input":"hello"}` {
 		t.Fatalf("custom tool = name %q args %q", names[0], arguments[0])

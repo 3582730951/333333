@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { ConfirmDialog, Drawer, Modal, Tag, Button, Typography, Spin, Select, Switch, Toast } from './pool/index.jsx';
+import { ConfirmDialog, Drawer, Modal, Tag, Button, Typography, Spin, Select, Switch, Toast, InputNumber } from './pool/index.jsx';
 import { get, post, put } from '../api.js';
 import LoadErrorBanner from './LoadErrorBanner.jsx';
 import { Panel } from './PageHeader.jsx';
@@ -43,6 +43,8 @@ export default function AccountDrawer({
   const [selectedSidecar, setSelectedSidecar] = useState('');
   const [selectedGroup, setSelectedGroup] = useState('');
   const [ignoreRateLimitControls, setIgnoreRateLimitControls] = useState(false);
+  const [routingWeight, setRoutingWeight] = useState(100);
+  const [retryMaxAttempts, setRetryMaxAttempts] = useState(0);
   const [reauthForm, setReauthForm] = useState({ login_email: '', password: '', otp_url: '', target_workspace_id: '', auto_enabled: false });
   const [oauthModal, setOauthModal] = useState({ open: false, session_id: '', auth_url: '', redirected: '', target_workspace_id: '' });
 
@@ -90,6 +92,11 @@ export default function AccountDrawer({
   useEffect(() => {
     setIgnoreRateLimitControls(Boolean(account?.ignore_rate_limit_controls));
   }, [account?.id, account?.ignore_rate_limit_controls]);
+
+  useEffect(() => {
+    setRoutingWeight(Number(account?.routing_weight) > 0 ? Number(account.routing_weight) : 100);
+    setRetryMaxAttempts(Math.max(0, Math.min(3, Number(account?.retry_max_attempts) || 0)));
+  }, [account?.id, account?.routing_weight, account?.retry_max_attempts]);
 
   useEffect(() => {
     const cfg = details.codexReauth?.config || {};
@@ -152,6 +159,26 @@ export default function AccountDrawer({
       void onUpdated?.(account.id, saved);
     } catch (err) {
       setIgnoreRateLimitControls(previous);
+      showErrorToast(err);
+    }
+  });
+
+  const { run: saveRoutingPolicy, running: savingRoutingPolicy } = useAsyncAction(async () => {
+    if (!account) return;
+    const weight = Number(routingWeight);
+    const attempts = Number(retryMaxAttempts);
+    if (!Number.isInteger(weight) || weight < 1 || weight > 1000 || !Number.isInteger(attempts) || attempts < 0 || attempts > 3) {
+      Toast.error('权重需为 1–1000 的整数，尝试上限需为 0–3 的整数');
+      return;
+    }
+    try {
+      const saved = await post(`/admin/accounts/${encodeURIComponent(account.id)}/routing-policy`, {
+        routing_weight: weight,
+        retry_max_attempts: attempts,
+      });
+      Toast.success('账号分压与安全重试策略已保存');
+      void onUpdated?.(account.id, saved);
+    } catch (err) {
       showErrorToast(err);
     }
   });
@@ -329,6 +356,35 @@ export default function AccountDrawer({
         <Typography.Text size="small" type="tertiary" as="p" style={{ marginTop: 8, display: 'block' }}>
           手动停用、出口不可用及并发上限仍然有效；关闭后，已有冷却和隔离记录会立即重新生效。
         </Typography.Text>
+      </Panel>
+
+      <Panel title="分压与凭证内重试" style={{ marginBottom: 14 }}>
+        <div className="pool-grid pool-grid-2">
+          <InputNumber
+            label="新请求软权重"
+            help="100 为中性；仅影响新会话选择，不迁移主 CLI、子 Agent 或既有 sticky 上下文。"
+            min={1}
+            max={1000}
+            step={1}
+            value={routingWeight}
+            onChange={setRoutingWeight}
+            disabled={savingRoutingPolicy}
+          />
+          <InputNumber
+            label="同凭证总尝试上限"
+            help="0/1 = 单次；2/3 = 最多两/三次。仅限尚未向下游返回字节且可完整重放的请求；上游断连时仍可能重复执行。"
+            min={0}
+            max={3}
+            step={1}
+            value={retryMaxAttempts}
+            onChange={setRetryMaxAttempts}
+            disabled={savingRoutingPolicy}
+          />
+        </div>
+        <Typography.Text size="small" type="tertiary" as="p" style={{ marginTop: 8, display: 'block' }}>
+          不会重试 400/401/403/429、Kiro、strict sticky、previous_response_id 或已开始流式输出的请求。
+        </Typography.Text>
+        <Button size="small" theme="solid" loading={savingRoutingPolicy} onClick={saveRoutingPolicy}>保存分压策略</Button>
       </Panel>
 
       <Panel title="模型与上下文能力" style={{ marginBottom: 14 }}>

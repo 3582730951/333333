@@ -204,7 +204,7 @@ func (s *Server) runProviderAPIKeyInferenceProbe(ctx context.Context, account st
 	req := upstream.Request{Method: http.MethodPost, Provider: provider, Account: account, Token: token, Egress: egress, CookieJarKey: account.ID + ":" + egress.ID, MinimalProbe: true}
 	if provider == "claude" {
 		req.DownstreamPath = "/v1/messages"
-		body, osHint := s.claudeCodeMinimalProbeBody(account, token, egress, model, "Reply exactly OK", 8)
+		body, osHint := s.claudeCodeMinimalProbeBody(ctx, account, token, egress, model, "Reply exactly OK", 8)
 		req.SetBodyBytes(body)
 		req.OSHint = osHint
 	} else {

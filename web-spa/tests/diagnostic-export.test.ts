@@ -67,17 +67,26 @@ describe('diagnostic archive export', () => {
     await expect(fetchAuditArchive('cache-hits')).rejects.toThrow('did not return');
   });
 
-  it('stops without downloading when generation fails', async () => {
+  it('uses the same-origin rescue stream when generation fails', async () => {
     vi.mocked(api.post).mockResolvedValue({
       data: { job: { id: 'diagjob_failed', status: 'queued' } },
     });
-    vi.mocked(api.get).mockResolvedValue({
-      data: { id: 'diagjob_failed', status: 'failed', error_code: 'dlp_validation_failed' },
-    });
+    vi.mocked(api.get)
+      .mockResolvedValueOnce({
+        data: { id: 'diagjob_failed', status: 'failed', error_code: 'dlp_validation_failed' },
+      })
+      .mockResolvedValueOnce({
+        data: zipPayload(),
+        headers: { 'content-type': 'application/zip' },
+      });
 
-    await expect(fetchAuditArchive('diagnostics', { pollIntervalMs: 0 }))
-      .rejects.toThrow('dlp_validation_failed');
-    expect(api.get).toHaveBeenCalledTimes(1);
+    const archive = await fetchAuditArchive('diagnostics', { pollIntervalMs: 0 });
+
+    expect(archive.blob.size).toBeGreaterThan(0);
+    expect(api.get).toHaveBeenNthCalledWith(2, '/admin/export/logs?mode=rescue', {
+      responseType: 'blob',
+      timeout: 5 * 60 * 1_000,
+    });
   });
 
   it('cancels a job when the client-side deadline expires', async () => {
@@ -93,7 +102,10 @@ describe('diagnostic archive export', () => {
       queueTimeoutMs: 1,
       now: () => ++clock,
     })).rejects.toThrow('timed out');
-    expect(api.get).not.toHaveBeenCalled();
+    expect(api.get).toHaveBeenCalledWith('/admin/export/logs?mode=rescue', {
+      responseType: 'blob',
+      timeout: 60_000,
+    });
     expect(api.delete).toHaveBeenCalledWith('/admin/diagnostics/jobs/diagjob_slow');
   });
 
@@ -117,8 +129,12 @@ describe('diagnostic archive export', () => {
       },
     })).rejects.toThrow('did not claim');
 
-    expect(api.get).toHaveBeenCalledTimes(2);
+    expect(api.get).toHaveBeenCalledTimes(3);
     expect(api.get).toHaveBeenNthCalledWith(2, '/admin/diagnostics/jobs');
+    expect(api.get).toHaveBeenNthCalledWith(3, '/admin/export/logs?mode=rescue', {
+      responseType: 'blob',
+      timeout: 30 * 60 * 1_000,
+    });
     expect(api.delete).toHaveBeenCalledWith('/admin/diagnostics/jobs/diagjob_stranded');
   });
 
@@ -213,7 +229,7 @@ describe('diagnostic archive export', () => {
     );
   });
 
-  it('rejects cross-origin download URLs and cleans up the job', async () => {
+  it('rejects a cross-origin job URL, cleans it up, and uses rescue mode', async () => {
     vi.mocked(api.post).mockResolvedValue({
       data: {
         job: {
@@ -224,10 +240,18 @@ describe('diagnostic archive export', () => {
       },
     });
     vi.mocked(api.delete).mockResolvedValue({ data: undefined });
+    vi.mocked(api.get).mockResolvedValue({
+      data: zipPayload(),
+      headers: { 'content-type': 'application/zip' },
+    });
 
-    await expect(fetchAuditArchive('diagnostics', { pollIntervalMs: 0 }))
-      .rejects.toThrow('invalid diagnostic download URL');
-    expect(api.get).not.toHaveBeenCalled();
+    const archive = await fetchAuditArchive('diagnostics', { pollIntervalMs: 0 });
+
+    expect(archive.blob.size).toBeGreaterThan(0);
+    expect(api.get).toHaveBeenCalledWith('/admin/export/logs?mode=rescue', {
+      responseType: 'blob',
+      timeout: 5 * 60 * 1_000,
+    });
     expect(api.delete).toHaveBeenCalledWith('/admin/diagnostics/jobs/diagjob_redirect');
   });
 
@@ -309,7 +333,10 @@ describe('diagnostic archive export', () => {
       now: () => times.shift() ?? 5 * 60 * 1_000 + 2,
     })).rejects.toThrow('timed out');
 
-    expect(api.get).not.toHaveBeenCalled();
+    expect(api.get).toHaveBeenCalledWith('/admin/export/logs?mode=rescue', {
+      responseType: 'blob',
+      timeout: 5 * 60 * 1_000,
+    });
     expect(api.delete).toHaveBeenCalledWith('/admin/diagnostics/jobs/diagjob_running_timeout');
   });
 });

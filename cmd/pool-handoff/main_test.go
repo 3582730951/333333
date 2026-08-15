@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"codex-account-pool/internal/corestate"
 	"github.com/gorilla/websocket"
 )
 
@@ -86,6 +87,53 @@ func TestAtomicSwitchKeepsOldRequestAndRoutesNewRequest(t *testing.T) {
 	close(release)
 	if got := <-oldResult; got != "old" {
 		t.Fatalf("old request body = %q", got)
+	}
+}
+
+func TestMissingActiveLinkFallsBackToAuthenticatedCoreSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	workerSocket := filepath.Join(dir, "worker-snapshot.sock")
+	missingLink := filepath.Join(dir, "active-missing.sock")
+	unixServer(t, workerSocket, "snapshot", nil, nil)
+	key := make([]byte, 32)
+	writer, err := corestate.OpenWriter(filepath.Join(dir, "state"), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = writer.Commit("activate", func(state *corestate.Snapshot) error {
+		state.ActiveWorker = workerSocket
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := corestate.NewReader(filepath.Join(dir, "state"), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newHandoff(missingLink)
+	h.setCoreStateReader(reader)
+	front := httptest.NewServer(h)
+	defer front.Close()
+
+	resp, err := http.Get(front.URL + "/v1/responses")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if readErr != nil || resp.StatusCode != http.StatusOK || string(body) != "snapshot" {
+		t.Fatalf("snapshot response status=%d body=%q err=%v", resp.StatusCode, body, readErr)
+	}
+
+	status, err := http.Get(front.URL + "/handoffz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusBody, _ := io.ReadAll(status.Body)
+	_ = status.Body.Close()
+	if !strings.Contains(string(statusBody), `"route_source":"core-snapshot"`) ||
+		!strings.Contains(string(statusBody), `"snapshot_generation":1`) {
+		t.Fatalf("handoff status did not report snapshot route: %s", statusBody)
 	}
 }
 

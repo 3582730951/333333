@@ -104,6 +104,21 @@ func TestCodexGoalSignalUsesNewestExplicitState(t *testing.T) {
 	}
 }
 
+func TestObserveGoalTurnFastGatePreservesGoalTransitions(t *testing.T) {
+	mapping := &codexSessionMapping{enabled: true, identity: codexDownstreamIdentity{RootID: "root", ThreadID: "root"}}
+	ordinary := []byte(`{"model":"gpt","input":[{"role":"user","content":"ordinary"}]}`)
+	if mapping.observeGoalTurn(nil, ordinary) || mapping.goalModeActive {
+		t.Fatal("ordinary fresh root activated Goal mode")
+	}
+	active := []byte(`{"client_metadata":{"turn_id":"turn-1"},"input":[{"type":"function_call_output","call_id":"goal-call","output":"{\"goal\":{\"status\":\"active\"}}"}]}`)
+	if !mapping.observeGoalTurn(nil, active) || !mapping.goalModeActive || mapping.goalTurnID != "turn-1" {
+		t.Fatalf("Goal result did not activate mapping: active=%v turn=%q", mapping.goalModeActive, mapping.goalTurnID)
+	}
+	if mapping.observeGoalTurn(nil, ordinary) || mapping.goalModeActive {
+		t.Fatal("ordinary turn did not clear active Goal mode")
+	}
+}
+
 func TestCodexGoalQuotaPredicateAndTerminal(t *testing.T) {
 	ctx := withCodexGoalQuotaGrace(context.Background(), true)
 	generic := []byte(`{"error":{"type":"rate_limit_exceeded","message":"retry later"}}`)

@@ -9,7 +9,7 @@ import (
 )
 
 func TestScanJSONMetadataAndSpans(t *testing.T) {
-	body := []byte(` {"model":"gpt-5.6-sol","stream":true,"prompt_cache_key":"cache-1","previous_response_id":"resp-1","input":[{"role":"user","content":"hello"}]} `)
+	body := []byte(` {"model":"gpt-5.6-sol","stream":true,"prompt_cache_key":"cache-1","previous_response_id":"resp-1","input":[{"role":"user","content":"goal status"}]} `)
 	meta, err := ScanJSON(context.Background(), Bytes(body), []byte("secret"))
 	if err != nil {
 		t.Fatal(err)
@@ -20,7 +20,10 @@ func TestScanJSONMetadataAndSpans(t *testing.T) {
 	if meta.Size != int64(len(body)) || meta.StablePrefixHMAC == "" || meta.EstimatedTokens <= 0 {
 		t.Fatalf("scan counters=%+v", meta)
 	}
-	for key, want := range map[string]string{"model": `"gpt-5.6-sol"`, "stream": "true", "input": `[{"role":"user","content":"hello"}]`} {
+	if meta.InputItemCount != 1 || meta.LastInputRole != "user" || !meta.GoalSignalCandidate || !meta.GoalSignalQualified {
+		t.Fatalf("input identity metadata=%+v", meta)
+	}
+	for key, want := range map[string]string{"model": `"gpt-5.6-sol"`, "stream": "true", "input": `[{"role":"user","content":"goal status"}]`} {
 		span, ok := meta.Fields[key]
 		if !ok || string(body[span.Offset:span.Offset+span.Length]) != want {
 			t.Fatalf("span %s=%+v value=%q", key, span, body[span.Offset:span.Offset+span.Length])
@@ -28,15 +31,47 @@ func TestScanJSONMetadataAndSpans(t *testing.T) {
 	}
 }
 
+func TestScanJSONGoalCandidateCrossesReaderSegments(t *testing.T) {
+	padding := strings.Repeat("x", DefaultChunkSize-2)
+	body := []byte(`{"input":"` + padding + `goal"}`)
+	meta, err := ScanJSON(context.Background(), Bytes(body), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !meta.GoalSignalCandidate {
+		t.Fatal("goal marker crossing a buffered read boundary was missed")
+	}
+	if meta.GoalSignalQualified {
+		t.Fatal("an unqualified random goal token became a Goal state signal")
+	}
+	ordinary, err := ScanJSON(context.Background(), Bytes([]byte(`{"input":"ordinary"}`)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ordinary.GoalSignalCandidate {
+		t.Fatal("ordinary request became a Goal candidate")
+	}
+	qualified, err := ScanJSON(context.Background(), Bytes([]byte(`{"input":[{"type":"function_call_output","call_id":"goal-call","output":"{\"goal\":{\"status\":\"active\"}}"}]}`)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !qualified.GoalSignalCandidate || !qualified.GoalSignalQualified {
+		t.Fatalf("Goal output qualification metadata=%+v", qualified)
+	}
+}
+
 func TestScanJSONTracksFirstInputItemAndMembers(t *testing.T) {
-	body := []byte(` {"input" : [ {"type":"message","content":"first"}, {"type":"message","content":"second"}], "store":true } `)
+	body := []byte(` {"input" : [ {"type":"message","role":"user","content":"first"}, {"type":"agent_message","role":"assistant","content":"second"}], "store":true } `)
 	meta, err := ScanJSON(context.Background(), Bytes(body), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	first := body[meta.FirstInputItem.Offset : meta.FirstInputItem.Offset+meta.FirstInputItem.Length]
-	if string(first) != `{"type":"message","content":"first"}` {
+	if string(first) != `{"type":"message","role":"user","content":"first"}` {
 		t.Fatalf("first input item=%q", first)
+	}
+	if meta.InputItemCount != 2 || meta.LastInputRole != "assistant" || meta.LastInputType != "agent_message" {
+		t.Fatalf("last input identity=%+v", meta)
 	}
 	if meta.ObjectEnd <= 0 || meta.MemberCount != 2 || meta.Members["input"].Length == 0 || meta.Kinds["store"] != 't' || string(meta.Scalars["store"]) != "true" {
 		t.Fatalf("metadata=%+v", meta)
@@ -79,6 +114,20 @@ func TestScanJSONDoesNotCaptureLargeStrings(t *testing.T) {
 	}
 	if meta.Model != "gpt-5.6-sol" || !meta.StreamPresent || meta.Stream || meta.Fields["input"].Length != int64(len(large)+2) {
 		t.Fatalf("metadata=%+v", meta)
+	}
+}
+
+func TestScanJSONMarksNestedPromptCacheBreakpointWithoutCapturingPayload(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.5","prompt_cache_options":{"mode":"explicit"},"input":[{"role":"system","content":[{"type":"input_text","text":"keep","prompt_cache_breakpoint":{"mode":"explicit"}}]},{"role":"user","content":[{"type":"input_text","text":"prompt_cache_breakpoint is harmless text"}]}]}`)
+	meta, err := ScanJSON(context.Background(), Bytes(raw), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !meta.PromptCacheBreakpoint {
+		t.Fatal("nested prompt_cache_breakpoint was not marked")
+	}
+	if _, ok := meta.Fields["prompt_cache_options"]; !ok {
+		t.Fatal("top-level prompt_cache_options was not tracked for source patching")
 	}
 }
 

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -100,6 +101,7 @@ func TestClaudeCodeMinimalProbeBodyMatchesNativeIdentityAndJSONWire(t *testing.T
 	h := newHarness(t, nil)
 	account := storage.Account{ID: "claude-probe-wire", Provider: "claude"}
 	body, _ := h.app.claudeCodeMinimalProbeBody(
+		context.Background(),
 		account,
 		storage.AccountToken{OpenAIAPIKey: "sk-ant-api03-probe"},
 		storage.EgressProfile{ID: "probe-direct", Type: "direct"},

@@ -100,7 +100,11 @@ func TestCustomProvidersWithSameModelProduceDistinctProviderModelRows(t *testing
 	for _, key := range []string{"attribution-a::" + model, "attribution-b::" + model} {
 		if got[key] != 1 {
 			raw, _ := json.Marshal(rows)
-			t.Fatalf("provider_model row %q requests=%d; rows=%s", key, got[key], raw)
+			var usageRecords, holds, events string
+			_ = h.store.DB().QueryRow(`SELECT COALESCE(group_concat(usage_event_id || ':' || usage_provider || ':' || account_id, '|'),'') FROM usage_records`).Scan(&usageRecords)
+			_ = h.store.DB().QueryRow(`SELECT COALESCE(group_concat(id || ':' || event_id || ':' || account_id || ':' || status, '|'),'') FROM billing_holds`).Scan(&holds)
+			_ = h.store.DB().QueryRow(`SELECT COALESCE(group_concat(event_id || ':' || hold_id || ':' || account_id || ':' || usage_state, '|'),'') FROM usage_events`).Scan(&events)
+			t.Fatalf("provider_model row %q requests=%d; rows=%s usage_records=%s holds=%s events=%s", key, got[key], raw, usageRecords, holds, events)
 		}
 	}
 }

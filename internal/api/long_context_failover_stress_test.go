@@ -35,7 +35,10 @@ func runLongContextRequests(concurrency int, build func(int) (*http.Request, err
 	start := make(chan struct{})
 	results := make(chan longContextHTTPResult, concurrency)
 	var workers sync.WaitGroup
-	client := &http.Client{Timeout: 3 * time.Minute}
+	// A full-package race run retains a much larger instrumented heap than this
+	// fixture in isolation. Keep a hard deadline, but leave enough headroom for
+	// eight concurrent 1 MiB rebuilds to survive race/GC pressure on two-core CI.
+	client := &http.Client{Timeout: 6 * time.Minute}
 	for index := 0; index < concurrency; index++ {
 		workers.Add(1)
 		go func(index int) {

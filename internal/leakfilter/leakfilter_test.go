@@ -150,6 +150,35 @@ func TestNeutralizeErrorBodyClaudeOverloaded(t *testing.T) {
 	}
 }
 
+func TestParseCodexFailureFrameRetriesStatuslessOverloadVariants(t *testing.T) {
+	for _, event := range []string{
+		"event: error\n" + `data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}` + "\n\n",
+		"event: error\n" + `data: {"type":"error","error":{"type":"service_unavailable_error","message":"Our servers are currently overloaded. Please try again later."}}` + "\n\n",
+	} {
+		failure, ok := ParseRetryableCodexFailureFrame([]byte(event))
+		if !ok || failure.StatusCode != http.StatusServiceUnavailable || !failure.BuiltinRetryable {
+			t.Fatalf("statusless overload was not retryable: ok=%v failure=%+v", ok, failure)
+		}
+	}
+}
+
+func TestRedactUpstreamTopology(t *testing.T) {
+	body := []byte(`{"error":{"message":"upstream https://internal-gw.example.com/v1/responses?token=secret failed; dial tcp 10.0.0.5:18182; dial tcp relay.internal:9443"}}`)
+	out, changed := RedactUpstreamTopology(body)
+	if !changed {
+		t.Fatal("expected topology redaction")
+	}
+	got := string(out)
+	for _, leaked := range []string{"internal-gw.example.com", "10.0.0.5", "relay.internal", "token=secret"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("topology %q leaked: %s", leaked, got)
+		}
+	}
+	if !json.Valid(out) || !strings.Contains(got, "<upstream>") {
+		t.Fatalf("redacted error is invalid: %s", got)
+	}
+}
+
 func TestNeutralizeErrorBodyGenericClientErrorUnchanged(t *testing.T) {
 	body := []byte(`{"error":{"type":"invalid_request_error","message":"messages: field required"}}`)
 	_, out, changed := NeutralizeErrorBody("codex", 400, body)
@@ -221,6 +250,35 @@ func TestSSEFilterNeutralizesResponseFailedLimit(t *testing.T) {
 		if strings.Contains(strings.ToLower(got), leak) {
 			t.Fatalf("neutralized terminal leaked %q: %s", leak, got)
 		}
+	}
+}
+
+func TestSSEFilterRejectsOnlySemanticallyEmptyCompletedResponse(t *testing.T) {
+	empty := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"resp_empty"}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_empty","status":"completed","output":[]}}` + "\n\n"
+	for _, step := range []int{1, 7, 4096} {
+		got := runSSE(t, "codex", empty, step)
+		if !strings.Contains(got, `"type":"response.failed"`) || !strings.Contains(got, `"code":"server_error"`) || strings.Contains(got, `"type":"response.completed"`) {
+			t.Fatalf("step=%d empty completion was accepted: %s", step, got)
+		}
+	}
+
+	withTool := "event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_keep","name":"lookup","arguments":"{}"}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_tool","status":"completed","output":[]}}` + "\n\n"
+	if got := runSSE(t, "codex", withTool, 5); !strings.Contains(got, `"type":"response.completed"`) || strings.Contains(got, `"type":"response.failed"`) {
+		t.Fatalf("tool completion was incorrectly rejected: %s", got)
+	}
+
+	withUsage := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"resp_usage"}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_usage","status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}` + "\n\n"
+	if got := runSSE(t, "codex", withUsage, 11); !strings.Contains(got, `"type":"response.completed"`) || strings.Contains(got, `"type":"response.failed"`) {
+		t.Fatalf("usage-bearing completion was incorrectly rejected: %s", got)
 	}
 }
 

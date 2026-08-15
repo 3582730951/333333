@@ -30,6 +30,8 @@ export interface AccountRow {
   billing_mode?: 'subscription' | 'pay_as_you_go' | string;
   api_key_present?: boolean;
   ignore_rate_limit_controls?: boolean;
+	 routing_weight?: number;
+	 retry_max_attempts?: number;
   quarantine_until?: number;
   quarantine_reason?: string;
   capabilities?: AccountModelCapability[];

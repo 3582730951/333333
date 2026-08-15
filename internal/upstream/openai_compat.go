@@ -133,15 +133,15 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 	claudeShaped := !spec.PassThrough && claudeShapedCustomCall(spec)
 	if claudeShaped {
 		// Narrow the cookie jar to the conversation before either transport reads it.
-		spec.CookieJarKey = customClaudeCookieJarKey(spec, identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint))
+		spec.CookieJarKey = customClaudeCookieJarKey(spec, c.identityForOS(spec.Account.ID, spec.OSHint))
 	}
 	switch {
 	case claudeShaped:
-		id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
+		id := c.identityForOS(spec.Account.ID, spec.OSHint)
 		c.applyClaudeCodeCustomHeaders(built, spec, id, stream)
 	case spec.PassThrough && spec.TransportProfile == storage.CustomProviderTransportClaudeCode:
 		// Opaque Files/Skills/Agents proxy: endpoint semantics, not the messages shape.
-		id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
+		id := c.identityForOS(spec.Account.ID, spec.OSHint)
 		c.applyClaudePassthroughHeaders(built, spec, id, stream)
 		copyOpenAICompatPassthroughHeaders(built, spec, []string{
 			"Content-Range",
@@ -252,7 +252,7 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 }
 
 func (c *Client) applyOpenAICompatCodexIdentity(dst http.Header, spec Request) {
-	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
+	id := c.identityForOS(spec.Account.ID, spec.OSHint)
 	threadOriginator := codexThreadOriginator(spec.Headers)
 	processOriginator := codexProcessOriginator(spec.Headers, threadOriginator)
 	version := c.codexClientVersionForRequest(spec)

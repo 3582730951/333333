@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { get, post } from '../../../api.js';
 import { parseApiResponse } from '../../../api/contracts';
 import type {
-  UsageBucket, UsageCacheReport, UsageDashboard, UsageEnvelope, UsageMetricRow,
+  ModelAuditReport, UsageBucket, UsageCacheReport, UsageDashboard, UsageEnvelope, UsageMetricRow,
   UsageRange, UsageSeriesDescriptor,
 } from '../model/usage';
 
@@ -123,6 +123,31 @@ export const usageDashboardSchema = z.object({
   effective_until_at: z.coerce.number().optional(),
 }).passthrough();
 
+const modelAuditRowSchema = z.object({
+  requested_model: z.string(),
+  resolved_model: z.string(),
+  actual_model: z.string(),
+  model_override_source: z.string(),
+  mismatch: z.boolean(),
+  mismatch_reason: z.string(),
+  requests: z.coerce.number(),
+  last_seen_at: z.coerce.number(),
+});
+
+export const modelAuditSchema = z.object({
+  rows: z.array(modelAuditRowSchema).nullish().transform((value) => value ?? []),
+  requests: z.coerce.number(),
+  mismatches: z.coerce.number(),
+  actual_model_unavailable: z.coerce.number(),
+  mismatch_only: z.boolean(),
+  window: windowSchema.optional(),
+  effective_start_at: z.coerce.number().optional(),
+  effective_until_at: z.coerce.number().optional(),
+  usage_complete_through_at: z.coerce.number().optional(),
+  pending_usage_requests: z.coerce.number().optional(),
+  usage_lag_seconds: z.coerce.number().optional(),
+}).passthrough();
+
 const ranges = {
   today: { bucket: 3600 },
   604800: { bucket: 86400 },
@@ -166,6 +191,12 @@ export async function fetchUsageCacheDiagnostic(
   const definition = ranges[range];
   const response = await get('/admin/usage/cache', { bucket: definition.bucket, fields: field }, { signal });
   return parseApiResponse(usageCacheSchema, response) as UsageCacheReport;
+}
+
+export async function fetchModelAudit(range: UsageRange, signal?: AbortSignal): Promise<ModelAuditReport> {
+  const now = Math.floor(Date.now() / 1000);
+  const params = range === 'today' ? { limit: 200 } : { since: now - Number(range), limit: 200 };
+  return parseApiResponse(modelAuditSchema, await get('/admin/usage/model-audit', params, { signal })) as ModelAuditReport;
 }
 
 export async function resetUsageCacheStats() {

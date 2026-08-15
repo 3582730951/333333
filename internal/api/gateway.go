@@ -85,7 +85,7 @@ func (s *Server) handleGatewayIdentity(w http.ResponseWriter, r *http.Request) {
 
 	// 生成虚拟身份模板（不绑定具体账号）
 	// 使用 downstream_key 作为种子，确保同一 key 获得稳定的虚拟身份
-	id := identity.For(s.identitySecret(), downstreamKey)
+	id := s.virtualIdentity(r.Context(), downstreamKey, "")
 
 	// 生成虚拟网络环境
 	dnsServers := s.gatewayDNSServers(r.Context(), id)

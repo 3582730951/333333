@@ -1561,7 +1561,7 @@ func (m *codexSessionMapping) upstreamAttemptBinding() (storage.CodexSessionBind
 	return *binding, true
 }
 
-func (m *codexSessionMapping) identitySnapshot(secret []byte, lease scheduler.Lease, osHint string) (*upstream.CodexIdentitySnapshot, error) {
+func (m *codexSessionMapping) identitySnapshot(secret []byte, lease scheduler.Lease, osHint string, convergenceMode ...string) (*upstream.CodexIdentitySnapshot, error) {
 	if m == nil || !m.enabled {
 		return nil, nil
 	}
@@ -1625,7 +1625,11 @@ func (m *codexSessionMapping) identitySnapshot(secret []byte, lease scheduler.Le
 		binding.DeviceOSHintSet = true
 	}
 	if strings.TrimSpace(binding.InstallationID) == "" {
-		binding.InstallationID = identity.CodexDevice(secret, lease.Account.ID, lease.Egress.ID, binding.DeviceOSHint).MachineID
+		mode := "off"
+		if len(convergenceMode) > 0 {
+			mode = convergenceMode[0]
+		}
+		binding.InstallationID = identity.CodexDeviceWithConvergence(secret, lease.Account.ID, lease.Egress.ID, binding.DeviceOSHint, mode).MachineID
 	}
 	if m.logicalTurnID == "" {
 		m.logicalTurnID = identity.NewUUIDv7()

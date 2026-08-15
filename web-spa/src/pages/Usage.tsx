@@ -1,5 +1,5 @@
 import React, { useState, type ReactNode } from 'react';
-import { Button, ConfirmDialog, Select, Toast } from '../components/pool/index.jsx';
+import { Button, ConfirmDialog, Select, Tag, Toast } from '../components/pool/index.jsx';
 import { IconDownload, IconRefresh } from '../components/pool/icons.jsx';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
@@ -11,12 +11,12 @@ import { fmtTokens, fmtInt } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
 import {
-  useResetUsageCacheMutation, useUsageCacheDiagnosticData, useUsageDashboardData,
+  useModelAuditData, useResetUsageCacheMutation, useUsageCacheDiagnosticData, useUsageDashboardData,
 } from '../features/observability/queries/usage';
 import type { UsageCacheDiagnosticField } from '../features/observability/api/usage';
 import {
   reportedCacheMetric, usageDimensionKey, usageDisplayLabel,
-  type UsageMetricRow, type UsageRange,
+  type ModelAuditRow, type UsageMetricRow, type UsageRange,
 } from '../features/observability/model/usage';
 
 const DataTable = ResourceTable as any;
@@ -134,6 +134,13 @@ export default function Usage() {
   const [activeDiagnostic, setActiveDiagnostic] = useState('providerModel');
 
   const { data, loading, error, lastRefresh, reload: load } = useUsageDashboardData(range);
+  const {
+    data: modelAudit,
+    loading: modelAuditLoading,
+    error: modelAuditError,
+    lastRefresh: modelAuditLastRefresh,
+    reload: reloadModelAudit,
+  } = useModelAuditData(range);
   const diagnosticField = DIAGNOSTIC_FIELDS[activeDiagnostic] || null;
   const {
     data: diagnosticCache = {},
@@ -281,6 +288,21 @@ export default function Usage() {
     { title: t('usage.cache_read'), dataIndex: 'cache_read_tokens', render: (v) => fmtTokens(v || 0) },
     { title: t('usage.cache_write'), dataIndex: 'cache_creation_tokens', render: fmtTokens },
     { title: t('usage.total'), dataIndex: 'total_tokens', sorter: (a, b) => (a.total_tokens || 0) - (b.total_tokens || 0), defaultSortOrder: 'descend', render: (v) => <b>{fmtTokens(v)}</b> },
+  ];
+
+  const modelAuditColumns: any[] = [
+    { title: t('usage.requested_model'), dataIndex: 'requested_model', width: 180, render: textOrDash },
+    { title: t('usage.resolved_model'), dataIndex: 'resolved_model', width: 180, render: textOrDash },
+    { title: t('usage.actual_model'), dataIndex: 'actual_model', width: 180, render: (value: unknown) => value === 'unknown' ? <Tag color="grey">{t('usage.actual_unavailable')}</Tag> : textOrDash(value) },
+    { title: t('usage.override_source'), dataIndex: 'model_override_source', width: 150, render: textOrDash },
+    {
+      title: t('usage.model_match'), dataIndex: 'mismatch', width: 130,
+      render: (value: boolean, row: ModelAuditRow) => value
+        ? <Tag color="red">{row.mismatch_reason || t('usage.model_mismatch')}</Tag>
+        : <Tag color="green">{t('usage.model_match_ok')}</Tag>,
+    },
+    { title: t('usage.request_unit'), dataIndex: 'requests', width: 90, align: 'right', render: fmtInt },
+    { title: t('usage.last_seen'), dataIndex: 'last_seen_at', width: 180, render: unixDateTime },
   ];
 
   const cacheKeyCols: UsageColumn[] = [
@@ -554,6 +576,49 @@ export default function Usage() {
           ) : null}
         </div>
       ) : null}
+
+      <Section
+        title={t('usage.model_audit')}
+        extra={(
+          <span className="pool-text-tertiary">
+            {t('usage.audit_summary')
+              .replace('{requests}', fmtInt(modelAudit?.requests || 0))
+              .replace('{mismatches}', fmtInt(modelAudit?.mismatches || 0))
+              .replace('{unknown}', fmtInt(modelAudit?.actual_model_unavailable || 0))}
+          </span>
+        )}
+      >
+        <DataTable
+          error={modelAuditError}
+          onRetry={reloadModelAudit}
+          loading={modelAuditLoading}
+          lastRefresh={modelAuditLastRefresh}
+          dataSource={modelAudit?.rows || []}
+          columns={modelAuditColumns}
+          rowKey={(row: ModelAuditRow) => [row.requested_model, row.resolved_model, row.actual_model, row.model_override_source, row.mismatch_reason].join(':')}
+          pagination={{ pageSize: 8 }}
+          emptyTitle={t('usage.no_model_audit')}
+          emptyDesc={t('usage.no_model_audit_desc')}
+          skeletonRows={5}
+          skeletonCols={7}
+          density="compact"
+          minScrollX={1090}
+          mobileListLabel={t('usage.model_audit')}
+          mobileRenderer={(row: ModelAuditRow) => (
+            <div className="pool-diagnostic-card">
+              <div className="pool-diagnostic-card__title">{row.requested_model || t('usage.unknown_model')}</div>
+              <div className="pool-diagnostic-card__grid">
+                <div className="pool-diagnostic-card__item"><span className="pool-diagnostic-card__label">{t('usage.resolved_model')}</span><span className="pool-diagnostic-card__value">{textOrDash(row.resolved_model)}</span></div>
+                <div className="pool-diagnostic-card__item"><span className="pool-diagnostic-card__label">{t('usage.actual_model')}</span><span className="pool-diagnostic-card__value">{textOrDash(row.actual_model)}</span></div>
+                <div className="pool-diagnostic-card__item"><span className="pool-diagnostic-card__label">{t('usage.model_match')}</span><span className="pool-diagnostic-card__value">{row.mismatch ? (row.mismatch_reason || t('usage.model_mismatch')) : t('usage.model_match_ok')}</span></div>
+                <div className="pool-diagnostic-card__item"><span className="pool-diagnostic-card__label">{t('usage.request_unit')}</span><span className="pool-diagnostic-card__value">{fmtInt(row.requests)}</span></div>
+              </div>
+            </div>
+          )}
+        />
+      </Section>
+
+      <div style={{ height: 18 }} />
 
       <section className="pool-usage-diagnostics" style={{ marginBottom: 18 }}>
         <div className="pool-usage-diagnostics__head">

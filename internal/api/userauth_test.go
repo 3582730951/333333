@@ -319,7 +319,7 @@ func TestAuthAdminSessionMutationRequiresCSRF(t *testing.T) {
 
 func TestAuthAdminTokenBackCompat(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
-	h.pool.Close()
+	h.closeRuntime()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
 	cfg.AdminToken = "cap_secret-token"
@@ -331,7 +331,7 @@ func TestAuthAdminTokenBackCompat(t *testing.T) {
 		Upstream:  upstream.NewClient(cfg),
 		Planner:   virtual.NewPlanner(h.store, cfg),
 	})
-	h.pool = httptest.NewServer(app)
+	h.serve(app)
 	defer h.pool.Close()
 	c := jarClient(t)
 

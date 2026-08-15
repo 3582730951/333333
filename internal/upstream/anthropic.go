@@ -111,7 +111,7 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 		spec = c.normalizeClaudeMessagesSpec(spec)
 	}
 
-	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
+	id := c.identityForOS(spec.Account.ID, spec.OSHint)
 
 	applyHeaders := c.applyClaudeHeaders
 	if spec.PassThrough {
@@ -946,7 +946,7 @@ func (c *Client) normalizeClaudeMessagesMetadata(root map[string]interface{}, sp
 	if metadata == nil {
 		metadata = map[string]interface{}{}
 	}
-	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
+	id := c.identityForOS(spec.Account.ID, spec.OSHint)
 	userID := id.UserID
 	if claudeCode {
 		sessionID := claudeSessionID(spec.Headers, requestBody(spec), id)
@@ -1316,15 +1316,17 @@ func removeOutputConfigEffort(root map[string]interface{}) bool {
 //     work, an obvious anomaly.
 //   - neither available: fall back to the account's stable id.
 //
-// Seeding with id.MachineID keeps it per-account isolated and never leaks the real value.
+// SessionSeed stays per-account even when the optional device fingerprint is
+// converged, and never leaks the real value.
 func claudeSessionID(downstream http.Header, body []byte, id identity.Identity) string {
+	seed := identity.SessionSeed(id)
 	if downstream != nil {
 		if v := strings.TrimSpace(downstream.Get("X-Claude-Code-Session-Id")); v != "" {
-			return identity.DerivedUUID(id.MachineID, v)
+			return identity.DerivedUUID(seed, v)
 		}
 	}
 	if anchor := routing.ConversationAnchor(body); anchor != "" {
-		return identity.DerivedUUID(id.MachineID, "claude-session-anchor\x00"+anchor)
+		return identity.DerivedUUID(seed, "claude-session-anchor\x00"+anchor)
 	}
 	return id.ClaudeSessionID
 }

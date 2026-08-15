@@ -83,6 +83,35 @@ func TestGatewayIdentity(t *testing.T) {
 	}
 }
 
+func TestGatewayFullDeviceConvergencePreservesDownstreamSessions(t *testing.T) {
+	srv := newGatewayIdentityTestServer(t)
+	if err := srv.store.SetSetting(context.Background(), "identity_convergence_mode", "full"); err != nil {
+		t.Fatal(err)
+	}
+	call := func(key string) GatewayIdentityResponse {
+		req := httptest.NewRequest(http.MethodGet, "/v1/gateway/identity", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		w := httptest.NewRecorder()
+		srv.handleGatewayIdentity(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		var response GatewayIdentityResponse
+		if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	left, right := call("converged-left"), call("converged-right")
+	if left.MachineID != right.MachineID || left.UserID != right.UserID || left.Hostname != right.Hostname ||
+		left.GatewayIP != right.GatewayIP || left.LocalIP != right.LocalIP || left.ProcessInfo.PID != right.ProcessInfo.PID {
+		t.Fatalf("gateway device fields did not converge: left=%+v right=%+v", left, right)
+	}
+	if left.SessionID == right.SessionID {
+		t.Fatal("full device convergence merged downstream logical sessions")
+	}
+}
+
 func TestGatewayIdentityIncludesEditablePolicyAndDNSOverride(t *testing.T) {
 	srv := newGatewayIdentityTestServer(t)
 	ctx := context.Background()
@@ -264,5 +293,8 @@ func newGatewayIdentityTestServer(t *testing.T) *Server {
 		Store:     store,
 		Scheduler: scheduler.New(store, cfg),
 	})
+	// Registered after the store cleanup so LIFO cleanup drains the journal and
+	// stops its replayer before closing SQLite and deleting the temp directory.
+	t.Cleanup(srv.FlushWrites)
 	return srv
 }

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/config"
@@ -234,6 +235,53 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	additional := items[0].(map[string]interface{})["tools"].([]interface{})
 	if len(additional) != 7 {
 		t.Fatalf("stable/future Responses tools were not transparent over WS: %+v", additional)
+	}
+}
+
+func TestCodexResponsesWebSocketSilentBeforeFirstEventIsBounded(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		if _, _, err = conn.ReadMessage(); err != nil {
+			return
+		}
+		// Never send response.created or any other event. The request guard must
+		// close this otherwise healthy-looking socket after its bounded idle window.
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamBaseURL = server.URL + "/backend-api/codex"
+	cfg.RequestTimeoutSeconds = 1
+	client := NewClient(cfg)
+	response, err := client.Do(context.Background(), Request{
+		DownstreamPath:          "/v1/responses",
+		Body:                    testBody([]byte(`{"model":"gpt-5.6-sol","input":"wait for first event","stream":true}`)),
+		Account:                 storage.Account{ID: "acc-silent", UpstreamAccountID: "upstream-silent"},
+		Token:                   storage.AccountToken{AccessToken: "access-silent"},
+		Egress:                  storage.EgressProfile{Type: "direct", Health: "healthy"},
+		CodexClientVersion:      config.DefaultClientVersion,
+		CodexResponsesWebSocket: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	started := time.Now()
+	body, _ := io.ReadAll(response.Body)
+	elapsed := time.Since(started)
+	if elapsed < 750*time.Millisecond || elapsed > 3*time.Second {
+		t.Fatalf("silent pre-first-event wait=%s, want bounded ~1s", elapsed)
+	}
+	if bytes.Contains(body, []byte("response.completed")) {
+		t.Fatalf("silent upstream manufactured completion: %s", body)
 	}
 }
 

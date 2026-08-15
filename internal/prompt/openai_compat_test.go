@@ -337,6 +337,49 @@ func TestResponsesLiteToolSearchAddsDiscoveredTools(t *testing.T) {
 	}
 }
 
+func TestResponsesToolOutputImageRemainsAnthropicContentBlock(t *testing.T) {
+	dataURL := "data:image/png;base64," + strings.Repeat("QUJD", 64)
+	request := []byte(`{
+	  "model":"claude-sonnet-4-5",
+	  "input":[
+	    {"type":"custom_tool_call","call_id":"call_screenshot","name":"inspect","input":"{}"},
+	    {"type":"custom_tool_call_output","call_id":"call_screenshot","output":[
+	      {"type":"input_text","text":"captured"},
+	      {"type":"input_image","image_url":"` + dataURL + `"}
+	    ]}
+	  ]
+	}`)
+	bridge, err := ResponsesRequestToChatCompletionBridge(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bridge.CompatibilityLosses) != 0 {
+		t.Fatalf("lossless tool image reported compatibility losses: %v", bridge.CompatibilityLosses)
+	}
+	anthropic, err := ChatCompletionToAnthropic(bridge.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := mustUnmarshal(t, anthropic)
+	messages := root["messages"].([]interface{})
+	if len(messages) != 2 {
+		t.Fatalf("messages = %v, want tool use followed by tool result", messages)
+	}
+	result := messages[1].(map[string]interface{})["content"].([]interface{})[0].(map[string]interface{})
+	blocks, ok := result["content"].([]interface{})
+	if !ok || len(blocks) != 2 {
+		t.Fatalf("tool result content was flattened: %v", result["content"])
+	}
+	image := blocks[1].(map[string]interface{})
+	source := image["source"].(map[string]interface{})
+	if image["type"] != "image" || source["type"] != "base64" || source["media_type"] != "image/png" || source["data"] != strings.Repeat("QUJD", 64) {
+		t.Fatalf("tool image conversion = %v", image)
+	}
+	if strings.Contains(string(anthropic), dataURL) {
+		t.Fatalf("data URL leaked into Anthropic prompt text: %s", anthropic)
+	}
+}
+
 func TestResponsesLiteAdditionalToolsSurviveEarlierInjectedSystemItem(t *testing.T) {
 	converted, err := ResponsesRequestToChatCompletionBridge([]byte(`{
 	  "model":"chat-model",
