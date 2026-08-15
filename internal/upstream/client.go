@@ -709,6 +709,7 @@ func (c *Client) Do(ctx context.Context, req Request) (resp *Response, err error
 		// HTTP or Responses-over-WebSocket. Keep prompt_cache_key (the supported
 		// cache-affinity control), but strip this obsolete extension consistently.
 		setRequestBody(&req, stripCodexResponsesPromptCacheRetentionWithFields(req.bodyBytes, codexFields))
+		setRequestBody(&req, stripCodexUnsupportedPromptCacheControls(req.bodyBytes))
 		if !usesAPIKey {
 			// The ChatGPT Codex/WHAM contract does not accept the public Responses API's
 			// max_output_tokens field. Claude Code always sends Anthropic max_tokens;

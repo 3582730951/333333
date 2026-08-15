@@ -2987,6 +2987,8 @@ ON CONFLICT(account_id) DO NOTHING`,
 		// a checksum mismatch.  state leads because the moving-window query uses a
 		// small IN set, followed by the time range and all remaining referenced
 		// columns so both SQLite and PostgreSQL can answer it from the index.
+		`ALTER TABLE codex_upstream_attempt ADD COLUMN event_id TEXT NOT NULL DEFAULT ''`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_codex_upstream_attempt_event ON codex_upstream_attempt(event_id) WHERE event_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_codex_upstream_attempt_recent_egress ON codex_upstream_attempt(state, created_at, expires_at, egress_id)`,
 		`CREATE TABLE IF NOT EXISTS codex_reset_credit_consumptions(
   account_id TEXT NOT NULL,
@@ -9377,7 +9379,23 @@ func (s *Store) BatchInsertUsageRecords(ctx context.Context, writes []UsageRecor
 }
 
 func (s *Store) BatchWriteTelemetry(ctx context.Context, writes []UsageRecordWrite, apiKeyUsed map[string]int64, holds []BillingHoldWrite, audits []AuditLogRow) error {
-	if len(writes) == 0 && len(apiKeyUsed) == 0 && len(holds) == 0 && len(audits) == 0 {
+	return s.BatchWriteTelemetryAndAttempts(ctx, writes, apiKeyUsed, holds, audits, nil)
+}
+
+// BatchWriteTelemetryAndAttempts commits metering and metadata-only upstream
+// observations in one writer transaction. Codex emits several transport lifecycle
+// observations per request; batching them keeps those diagnostic writes from
+// queueing ahead of the terminal context-pointer commit on SQLite's sole writer.
+func (s *Store) BatchWriteTelemetryAndAttempts(ctx context.Context, writes []UsageRecordWrite, apiKeyUsed map[string]int64, holds []BillingHoldWrite, audits []AuditLogRow, attempts []CodexUpstreamAttempt) error {
+	normalizedAttempts := make([]CodexUpstreamAttempt, 0, len(attempts))
+	for _, attempt := range attempts {
+		normalized, err := normalizeCodexUpstreamAttempt(attempt)
+		if err != nil {
+			return err
+		}
+		normalizedAttempts = append(normalizedAttempts, normalized)
+	}
+	if len(writes) == 0 && len(apiKeyUsed) == 0 && len(holds) == 0 && len(audits) == 0 && len(normalizedAttempts) == 0 {
 		return nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -9426,6 +9444,12 @@ func (s *Store) BatchWriteTelemetry(ctx context.Context, writes []UsageRecordWri
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO audit_log(account_id, account_label, action, state, reason, detail, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)`,
 			row.AccountID, row.AccountLabel, row.Action, row.State, row.Reason, row.Detail, row.CreatedAt); err != nil {
+			return err
+		}
+	}
+	for _, attempt := range normalizedAttempts {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO codex_upstream_attempt(event_id,tree_id,account_id,egress_id,epoch,state,status_code,created_at,expires_at)
+VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, attempt.EventID, attempt.TreeID, attempt.AccountID, attempt.EgressID, attempt.Epoch, attempt.State, attempt.StatusCode, attempt.CreatedAt, attempt.ExpiresAt); err != nil {
 			return err
 		}
 	}

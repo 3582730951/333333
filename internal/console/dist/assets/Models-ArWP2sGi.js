@@ -1,1 +1,0 @@
-import{g as e,v as t}from"./browserStorage-CerBgVfO.js";import{t as n}from"./ModelNameList-CQGboYk2.js";t();var r=e();function i(){return(0,r.jsx)(n,{endpoint:`/admin/models`,title:`模型列表`,subtitle:`当前账号池能力快照中的模型名称`})}export{i as default};

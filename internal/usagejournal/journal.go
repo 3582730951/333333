@@ -27,11 +27,13 @@ const (
 )
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
+var errReplayLimit = errors.New("usage journal replay limit reached")
 
 type Record struct {
-	Sequence uint64                    `json:"sequence"`
-	Usage    *storage.UsageRecordWrite `json:"usage,omitempty"`
-	Hold     *storage.BillingHoldWrite `json:"hold,omitempty"`
+	Sequence        uint64                        `json:"sequence"`
+	Usage           *storage.UsageRecordWrite     `json:"usage,omitempty"`
+	Hold            *storage.BillingHoldWrite     `json:"hold,omitempty"`
+	UpstreamAttempt *storage.CodexUpstreamAttempt `json:"upstream_attempt,omitempty"`
 }
 
 type Snapshot struct {
@@ -158,16 +160,19 @@ func (j *Journal) Replay(limit int) ([]Record, error) {
 	out := make([]Record, 0, limit)
 	for index, segment := range segments {
 		_, _, err = scanSegment(segment.path, index == len(segments)-1, false, func(record Record) error {
-			if record.Sequence > j.acked && len(out) < limit {
+			if record.Sequence > j.acked {
 				out = append(out, record)
+				if len(out) >= limit {
+					return errReplayLimit
+				}
 			}
 			return nil
 		})
+		if errors.Is(err, errReplayLimit) {
+			return out, nil
+		}
 		if err != nil {
 			return nil, err
-		}
-		if len(out) >= limit {
-			break
 		}
 	}
 	return out, nil
@@ -358,7 +363,7 @@ func scanSegment(path string, last, repairTail bool, visit func(Record) error) (
 		if err = json.Unmarshal(payload, &record); err != nil {
 			return 0, offset, fmt.Errorf("decode usage journal %s at %d: %w", path, offset, err)
 		}
-		if record.Sequence == 0 || record.Sequence <= lastSequence || (record.Usage == nil && record.Hold == nil) {
+		if record.Sequence == 0 || record.Sequence <= lastSequence || (record.Usage == nil && record.Hold == nil && record.UpstreamAttempt == nil) {
 			return 0, offset, fmt.Errorf("invalid usage journal sequence %d in %s", record.Sequence, path)
 		}
 		lastSequence = record.Sequence

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import * as AlertDialogPrimitive from '@radix-ui/react-alert-dialog';
 
@@ -40,6 +40,7 @@ export function Modal({
   okText = '确定',
   cancelText = '取消',
   title,
+  description,
   children,
   footer,
   width,
@@ -50,22 +51,28 @@ export function Modal({
   const [isOpen, setOpen] = useOpenProps({ open, visible, onOpenChange, onCancel });
   const cssVars = useMemo(() => ({ '--pool-modal-width': typeof width === 'number' ? `${width}px` : width }), [width]);
   useBodyScrollLock(isOpen, 'modal');
+  const changeOpen = (next) => {
+    if (!next && confirmLoading) return;
+    setOpen(next);
+  };
   return (
-    <DialogPrimitive.Root open={isOpen} onOpenChange={setOpen}>
+    <DialogPrimitive.Root open={isOpen} onOpenChange={changeOpen}>
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="pool-modal-overlay" />
         <DialogPrimitive.Content
           className={cx('pool-modal-content', className)}
           style={cssVars}
-          onInteractOutside={maskClosable ? undefined : (event) => event.preventDefault()}
+          onEscapeKeyDown={confirmLoading ? (event) => event.preventDefault() : undefined}
+          onInteractOutside={maskClosable && !confirmLoading ? undefined : (event) => event.preventDefault()}
           {...props}
         >
           <div className="pool-modal-header">
             <DialogPrimitive.Title className="pool-modal-title">{title}</DialogPrimitive.Title>
             <DialogPrimitive.Close asChild>
-              <Button theme="borderless" icon={<X />} aria-label="关闭" />
+              <Button theme="borderless" icon={<X />} aria-label="关闭" disabled={confirmLoading} />
             </DialogPrimitive.Close>
           </div>
+          {description ? <DialogPrimitive.Description className="pool-sr-only">{description}</DialogPrimitive.Description> : null}
           <div className="pool-modal-body">{children}</div>
           {footer !== null ? (
             <div className="pool-modal-footer">
@@ -106,21 +113,32 @@ export function Drawer({ open, visible, onOpenChange, onCancel, onClose, title, 
   );
 }
 
-export function ConfirmDialog({ open, title, description, confirmText = '确认', cancelText = '取消', destructive, onConfirm, onCancel, children }) {
+export function ConfirmDialog({ open, title, description, confirmText = '确认', cancelText = '取消', destructive, busy = false, onConfirm, onCancel, children }) {
   const controlled = open !== undefined;
   const [internalOpen, setInternalOpen] = useState(false);
   const isOpen = controlled ? Boolean(open) : internalOpen;
+  const cancelRef = useRef(null);
   const trigger = children ? <AlertDialogPrimitive.Trigger asChild>{children}</AlertDialogPrimitive.Trigger> : null;
   useBodyScrollLock(isOpen, 'confirm');
   return (
     <AlertDialogPrimitive.Root open={isOpen} onOpenChange={(next) => {
+      if (!next && busy) return;
       if (!controlled) setInternalOpen(next);
       if (!next) onCancel?.();
     }}>
       {trigger}
       <AlertDialogPrimitive.Portal>
         <AlertDialogPrimitive.Overlay className="pool-modal-overlay" />
-        <AlertDialogPrimitive.Content className="pool-modal-content">
+        <AlertDialogPrimitive.Content
+          className="pool-modal-content"
+          aria-busy={busy || undefined}
+          onEscapeKeyDown={busy ? (event) => event.preventDefault() : undefined}
+          onPointerDownOutside={busy ? (event) => event.preventDefault() : undefined}
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            cancelRef.current?.focus();
+          }}
+        >
           <div className="pool-modal-header">
             <AlertDialogPrimitive.Title className="pool-modal-title">{title}</AlertDialogPrimitive.Title>
           </div>
@@ -129,10 +147,10 @@ export function ConfirmDialog({ open, title, description, confirmText = '确认'
           </AlertDialogPrimitive.Description>
           <div className="pool-modal-footer">
             <AlertDialogPrimitive.Cancel asChild>
-              <Button onClick={onCancel}>{cancelText}</Button>
+              <Button ref={cancelRef} onClick={onCancel} disabled={busy}>{cancelText}</Button>
             </AlertDialogPrimitive.Cancel>
             <AlertDialogPrimitive.Action asChild>
-              <Button theme={destructive ? undefined : 'solid'} type={destructive ? 'danger' : undefined} onClick={onConfirm}>{confirmText}</Button>
+              <Button theme={destructive ? undefined : 'solid'} type={destructive ? 'danger' : undefined} loading={busy} onClick={onConfirm}>{confirmText}</Button>
             </AlertDialogPrimitive.Action>
           </div>
         </AlertDialogPrimitive.Content>

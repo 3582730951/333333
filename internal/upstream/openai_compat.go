@@ -66,6 +66,7 @@ func (c *Client) prepareOpenAICompatCodexRequest(spec *Request) error {
 	_ = json.Unmarshal(spec.bodyBytes, &fields)
 	setRequestBody(spec, normalizeCodexReasoningEffortForWireWithFields(spec.bodyBytes, fields))
 	setRequestBody(spec, stripCodexResponsesPromptCacheRetentionWithFields(spec.bodyBytes, fields))
+	setRequestBody(spec, stripCodexUnsupportedPromptCacheControls(spec.bodyBytes))
 	metadata := c.newCodexRequestMetadataWithResponsesLite(*spec, responsesLite)
 	spec.codexMetadata = &metadata
 	setRequestBody(spec, normalizeCodexPromptCacheKeyForProfileWithFields(spec.bodyBytes, fields, metadata))

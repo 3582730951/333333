@@ -205,6 +205,43 @@ func applyCustomProviderModelMapping(provider storage.CustomProvider, raw []byte
 	return setForcedModel(raw, target), target, true
 }
 
+// ensureDeepSeekV4ReasoningContent repairs the OpenAI-compatible replay contract
+// used by DeepSeek V4 (including OpenRouter routes). Some upstreams return the
+// assistant's thinking text as `reasoning`, while DeepSeek requires the same value
+// under `reasoning_content` when that assistant tool-call message is submitted on
+// the next turn. The client is replaying text it already received; this narrow
+// last-mile alias neither exposes new reasoning nor changes any other model.
+func ensureDeepSeekV4ReasoningContent(body []byte, model string) ([]byte, error) {
+	lowerModel := strings.ToLower(strings.TrimSpace(model))
+	if !strings.Contains(lowerModel, "deepseek-v4") {
+		return body, nil
+	}
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body, nil
+	}
+	out := body
+	for index, message := range messages.Array() {
+		if !strings.EqualFold(strings.TrimSpace(message.Get("role").String()), "assistant") {
+			continue
+		}
+		existing := message.Get("reasoning_content")
+		if existing.Exists() && (existing.Type != gjson.String || strings.TrimSpace(existing.String()) != "") {
+			continue
+		}
+		reasoning := message.Get("reasoning")
+		if !reasoning.Exists() || reasoning.Type != gjson.String || strings.TrimSpace(reasoning.String()) == "" {
+			continue
+		}
+		var err error
+		out, err = sjson.SetBytes(out, fmt.Sprintf("messages.%d.reasoning_content", index), reasoning.String())
+		if err != nil {
+			return body, fmt.Errorf("deepseek v4 reasoning replay: %w", err)
+		}
+	}
+	return out, nil
+}
+
 func (s *Server) customProviderByID(ctx context.Context, id string) (storage.CustomProvider, bool) {
 	p, ok, err := s.store.GetCustomProvider(ctx, id)
 	if err != nil || !ok || !p.Enabled {
@@ -343,10 +380,19 @@ func (s *Server) callCustom(w http.ResponseWriter, r *http.Request, provider sto
 }
 
 func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provider storage.CustomProvider, body []byte, model, routeGroup, proto, upstreamPath string, exclude map[string]bool, attemptsRemaining int) (customCall, bool) {
-	retryBody := body
 	if strings.TrimSpace(upstreamPath) == "" {
 		upstreamPath = "/chat/completions"
 	}
+	if provider.UpstreamProtocol == storage.CustomProviderProtocolChatCompletions &&
+		strings.Trim(strings.TrimSpace(upstreamPath), "/") == "chat/completions" {
+		var normalizeErr error
+		body, normalizeErr = ensureDeepSeekV4ReasoningContent(body, model)
+		if normalizeErr != nil {
+			writeError(w, http.StatusBadRequest, normalizeErr)
+			return customCall{}, false
+		}
+	}
+	retryBody := body
 	affinity := customProviderScopedAffinity(r, provider, routing.ExtractAffinityKey(r, body))
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
 		Group:           routeGroup,

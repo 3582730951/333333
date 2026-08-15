@@ -1051,5 +1051,19 @@ func (s *Server) adminDiagnosticsExport(w http.ResponseWriter, r *http.Request) 
 		methodNotAllowed(w)
 		return
 	}
+	// The normal path remains the bounded asynchronous renderer. A diagnostic
+	// export is also the recovery tool for a failed optional worker, so a stranded
+	// queue must not make the evidence unobtainable. The UI invokes this same-origin
+	// rescue mode only after the job path fails or times out; it snapshots and
+	// streams directly on the requesting worker without relying on the background
+	// diagnostic loop. Physical storage/database failure can still make any export
+	// impossible, but a context-loss incident or dead renderer cannot.
+	if r.Method == http.MethodGet && r.URL.Query().Get("mode") == "rescue" {
+		w.Header().Set("X-Codex-Diagnostic-Mode", "rescue")
+		if err := s.streamDiagnosticsExport(r.Context(), w); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
 	s.createDiagnosticJob(w, r)
 }

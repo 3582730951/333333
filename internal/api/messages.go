@@ -644,6 +644,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	// Session 33: Carry the billing hold id in the request context for usage fallback.
 	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
 	resp, err := s.upstream.Do(r.Context(), requestForToken(token))
+	emptyEndTurnContinued := false
 	releaseFlight()
 	if err != nil {
 		_ = s.settleBillingHold(r.Context(), holdID, "failed_before_response")
@@ -755,7 +756,7 @@ claudeSuccess:
 	s.captureQuota(r.Context(), lease.Account.ID, "claude", model, resp.Header)
 
 	if isEventStream(resp.Header) {
-		prefix, retryableStream, probeErr := probeEarlyClaudeSSEFailure(resp.Body)
+		prefix, relayBody, earlyOutcome, probeErr := probeEarlyClaudeSSEWithIdleRelease(resp.Body, earlySSEIdleRelease)
 		if probeErr != nil {
 			_ = s.settleBillingHold(r.Context(), holdID, "stream_probe_failed")
 			if allowRetry && movable {
@@ -767,7 +768,7 @@ claudeSuccess:
 			writePublicUnavailable(w, http.StatusServiceUnavailable)
 			return outcomeDone
 		}
-		if retryableStream {
+		if earlyOutcome == claudeEarlySSERetryableError {
 			s.benchOnLimitForAccount(r.Context(), lease.Account, 200, resp.Header, prefix)
 			_ = s.settleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
 			if allowRetry && movable {
@@ -779,7 +780,46 @@ claudeSuccess:
 			writePublicUnavailable(w, http.StatusServiceUnavailable)
 			return outcomeDone
 		}
-		streamBody := io.MultiReader(bytes.NewReader(prefix), resp.Body)
+		if earlyOutcome == claudeEarlySSEEmptyEndTurn {
+			_ = resp.Body.Close()
+			if !emptyEndTurnContinued {
+				if continuationBody, ok := buildClaudeContinueBody(body, "", s.autoContinueText(r.Context())); ok {
+					body = continuationBody
+					emptyEndTurnContinued = true
+					resp, err = s.upstream.Do(r.Context(), requestForToken(token))
+					if err != nil {
+						_ = s.settleBillingHold(r.Context(), holdID, "empty_end_turn_continuation_failed")
+						if allowRetry && movable {
+							return retry()
+						}
+						if writeClaudeWaitError(r.Context(), refreshHeartbeat, err) {
+							return outcomeDone
+						}
+						writePublicUnavailable(w, http.StatusServiceUnavailable)
+						return outcomeDone
+					}
+					defer resp.Body.Close()
+					if resp.StatusCode < http.StatusBadRequest {
+						goto claudeSuccess
+					}
+					errorBody := readUpstreamErrorBody(resp.Body)
+					verdict := s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
+					_ = s.settleBillingHold(r.Context(), holdID, "empty_end_turn_continuation_upstream_error")
+					if allowRetry && movable && retryableForFailover(verdict, resp.StatusCode) {
+						return retry()
+					}
+					s.writeFilteredError(r.Context(), w, "claude", resp.StatusCode, resp.Header, errorBody, result.Scrubber)
+					return outcomeDone
+				}
+			}
+			_ = s.settleBillingHold(r.Context(), holdID, "empty_end_turn_continuation_exhausted")
+			if allowRetry && movable {
+				return retry()
+			}
+			writePublicUnavailable(w, http.StatusServiceUnavailable)
+			return outcomeDone
+		}
+		streamBody := io.MultiReader(bytes.NewReader(prefix), relayBody)
 		aliasCapture := &claudeAliasCapture{}
 		captureWriter := io.Writer(aliasCapture)
 		var goalCapture *bodysource.SpoolBuffer

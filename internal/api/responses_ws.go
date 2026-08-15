@@ -30,6 +30,13 @@ type codexResponsesWebSocketHTTPSRecoveryTurnKey struct{}
 const (
 	responsesWebSocketHeartbeatInterval = 30 * time.Second
 	responseInProgressPayload           = `{"type":"response.in_progress"}`
+	// The Codex upstream can reject one oversized WebSocket message with close
+	// code 1009 even though the same Responses request is valid over HTTP/SSE.
+	// Keep the first turn below the production-safe bridge threshold used by the
+	// compatible gateways we regression-test against. Later stateful appends stay
+	// on their existing transport because a connection-scoped response id is not
+	// portable without durable replay.
+	codexResponsesWebSocketHTTPBridgeThreshold = 15 << 20
 )
 
 type webSocketMessageWriter interface {

@@ -209,6 +209,14 @@ func run() int {
 		reportStartupFailure("validate_credentials", err)
 		return 1
 	}
+	coreStateWriter, coreStateErr := openCoreStateWriter(layout)
+	if coreStateErr != nil {
+		// The relay can keep using either previously committed A/B snapshot. A
+		// state-writer outage reduces future failover freshness but must not make
+		// the worker or its existing contexts unavailable.
+		log.Printf("core state writer unavailable: %v", coreStateErr)
+		supervisor.ReportError("core-state-writer", "open", coreStateErr)
+	}
 	up := upstream.NewClient(cfg)
 	// WARP CF-fallback manager. The prober wraps ProbeEgress so the manager can refresh
 	// an exit's IP after a re-registration without importing the upstream package.
@@ -261,6 +269,10 @@ func run() int {
 	}
 	deferredMigrations := newDeferredMigrationTask(store.RunDeferredMigrations, log.Printf)
 	startActive := func(activeCtx context.Context, fencingToken int64) error {
+		if err := commitActiveWorker(coreStateWriter, releaseID, unixSocket, fencingToken); err != nil {
+			log.Printf("core state commit unavailable release=%s fencing_token=%d: %v", releaseID, fencingToken, err)
+			supervisor.ReportError("core-state-writer", "commit_active_worker", err)
+		}
 		if err := app.StartRuntime(); err != nil {
 			return fmt.Errorf("start active runtime: %w", err)
 		}

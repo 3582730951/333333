@@ -18,11 +18,11 @@ import './styles/layout.css';
 import './styles/components.css';
 import './styles/dataviz.css';
 import './styles/portal.css';
+import './styles/pages.css';
 import './styles/utilities.css';
-import './styles/apple-ui.css';
 
 try {
-  const preference = getLocalItem('pool_theme', 'auto') || 'auto';
+  const preference = getLocalItem('pool_theme', 'light') || 'light';
   const resolved = preference === 'auto'
     ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
     : preference;

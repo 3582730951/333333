@@ -417,9 +417,12 @@ func responsesHistoryItemAsChatMessage(item map[string]interface{}) map[string]i
 	return map[string]interface{}{"role": "user", "content": string(raw)}
 }
 
-func responsesToolOutputChatContent(item map[string]interface{}) (string, bool) {
+func responsesToolOutputChatContent(item map[string]interface{}) (interface{}, bool) {
 	if output, ok := item["output"].(string); ok && responsesToolOutputIsPlainText(item) {
 		return output, false
+	}
+	if content, ok := responsesToolOutputChatBlocks(item); ok {
+		return content, false
 	}
 	envelope := map[string]interface{}{
 		"version": 1,
@@ -431,6 +434,71 @@ func responsesToolOutputChatContent(item map[string]interface{}) (string, bool) 
 		return responsesOutputToText(item["output"]), false
 	}
 	return string(raw), true
+}
+
+// responsesToolOutputChatBlocks preserves the small Responses content subset that
+// ChatCompletionToAnthropic can represent without flattening it to prompt text.
+// In particular, screenshots returned by a custom tool must remain image blocks:
+// treating their data URLs as JSON text can consume the entire context window.
+// Unknown fields deliberately fall back to the loss-marked JSON envelope above.
+func responsesToolOutputChatBlocks(item map[string]interface{}) ([]interface{}, bool) {
+	for key := range item {
+		switch key {
+		case "type", "id", "call_id", "name", "output":
+		default:
+			return nil, false
+		}
+	}
+	output, ok := item["output"].([]interface{})
+	if !ok || len(output) == 0 {
+		return nil, false
+	}
+	content := make([]interface{}, 0, len(output))
+	for _, rawPart := range output {
+		part, ok := rawPart.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		switch stringOr(part["type"], "") {
+		case "text", "input_text", "output_text":
+			if !hasOnlyKeys(part, "type", "text") {
+				return nil, false
+			}
+			text, ok := part["text"].(string)
+			if !ok {
+				return nil, false
+			}
+			content = append(content, map[string]interface{}{"type": "text", "text": text})
+		case "input_image":
+			if !hasOnlyKeys(part, "type", "image_url") {
+				return nil, false
+			}
+			url, ok := part["image_url"].(string)
+			if !ok || strings.TrimSpace(url) == "" {
+				return nil, false
+			}
+			content = append(content, map[string]interface{}{
+				"type":      "image_url",
+				"image_url": map[string]interface{}{"url": url},
+			})
+		default:
+			return nil, false
+		}
+	}
+	return content, true
+}
+
+func hasOnlyKeys(value map[string]interface{}, allowed ...string) bool {
+	set := make(map[string]struct{}, len(allowed))
+	for _, key := range allowed {
+		set[key] = struct{}{}
+	}
+	for key := range value {
+		if _, ok := set[key]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func responsesToolOutputIsPlainText(item map[string]interface{}) bool {

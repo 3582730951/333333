@@ -9,7 +9,6 @@ import (
 	authparse "codex-account-pool/internal/auth"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/storage"
-	"codex-account-pool/internal/supervisor"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -508,12 +507,9 @@ func (s *Server) seedImportedAccountCapabilities(ctx context.Context, account st
 // import response. Detached context keeps the probe alive after the HTTP handler
 // returns, while the timeout bounds cleanup on shutdown/network failure.
 func (s *Server) probeImportedAccountAsync(account storage.Account) {
-	go func(acc storage.Account) {
-		defer supervisor.Recover("account-import-probe")
-		cctx, cancel := context.WithTimeout(context.Background(), s.cfg.RequestTimeout())
-		defer cancel()
-		_, _ = s.probeAccountModels(cctx, acc)
-	}(account)
+	s.launchRuntimeTask("account-import-probe", s.cfg.RequestTimeout(), func(ctx context.Context) {
+		_, _ = s.probeAccountModels(ctx, account)
+	})
 }
 
 // adminImportToken imports a ChatGPT account from a bare access token ("AT"

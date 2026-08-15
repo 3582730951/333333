@@ -127,37 +127,42 @@ type Server struct {
 	// off the request path so the response is not blocked on a write through the single
 	// SQLite write connection. A single drainer goroutine runs them FIFO (matching the
 	// 1-writer pool); see asyncwrite.go. FlushWrites drains it on shutdown.
-	asyncWrites           chan func()
-	usageWrites           chan telemetryWrite
-	usageJournal          *usagejournal.Journal
-	usageJournalStop      chan struct{}
-	usageJournalWake      chan struct{}
-	diagnosticJobWake     chan struct{}
-	usageJournalCommitMu  sync.Mutex
-	usageEnqueueMu        sync.Mutex
-	usageJournalAcked     atomic.Uint64
-	usagePending          sync.WaitGroup
-	usageDashboardCache   *usageDashboardResponseCache
-	asyncWG               sync.WaitGroup
-	asyncMu               sync.RWMutex
-	asyncClosed           bool
-	asyncWriteCtx         context.Context
-	asyncWriteCancel      context.CancelFunc
-	runtimeStartOnce      sync.Once
-	runtimeStartErr       error
-	asyncFlushOnce        sync.Once
-	asyncFlushDone        chan struct{}
-	asyncBytes            int64
-	billingEstimates      sync.Map
-	missingLimitAudit     sync.Map // account/provider -> last emitted unix hour
-	upstreamRulesMu       sync.RWMutex
-	upstreamRulesCache    []storage.UpstreamErrorRule
-	upstreamRulesCachedAt time.Time
-	superMemory           *superinstruct.MemoryKernel
-	superMonitor          *superinstruct.MonitorPanel
-	publicChatLimiterMu   sync.Mutex
-	publicChatLimiter     map[string]publicChatRateWindow
-	publicChatLastMinute  int64
+	asyncWrites            chan func()
+	usageWrites            chan telemetryWrite
+	codexStateCommits      chan codexStateCommitRequest
+	usageJournal           *usagejournal.Journal
+	usageJournalStop       chan struct{}
+	usageJournalWake       chan struct{}
+	diagnosticJobWake      chan struct{}
+	usageJournalCommitMu   sync.Mutex
+	usageEnqueueMu         sync.Mutex
+	usageJournalAcked      atomic.Uint64
+	usageJournalLastAppend atomic.Int64
+	usagePending           sync.WaitGroup
+	usageDashboardCache    *usageDashboardResponseCache
+	asyncWG                sync.WaitGroup
+	asyncMu                sync.RWMutex
+	asyncClosed            bool
+	asyncWriteCtx          context.Context
+	asyncWriteCancel       context.CancelFunc
+	runtimeTaskCtx         context.Context
+	runtimeTaskCancel      context.CancelFunc
+	runtimeTaskWG          sync.WaitGroup
+	runtimeStartOnce       sync.Once
+	runtimeStartErr        error
+	asyncFlushOnce         sync.Once
+	asyncFlushDone         chan struct{}
+	asyncBytes             int64
+	billingEstimates       sync.Map
+	missingLimitAudit      sync.Map // account/provider -> last emitted unix hour
+	upstreamRulesMu        sync.RWMutex
+	upstreamRulesCache     []storage.UpstreamErrorRule
+	upstreamRulesCachedAt  time.Time
+	superMemory            *superinstruct.MemoryKernel
+	superMonitor           *superinstruct.MonitorPanel
+	publicChatLimiterMu    sync.Mutex
+	publicChatLimiter      map[string]publicChatRateWindow
+	publicChatLastMinute   int64
 
 	claudeCacheFlightsMu sync.Mutex
 	claudeCacheFlights   map[string]chan struct{}
@@ -293,7 +298,16 @@ func NewServer(dep Dependencies) *Server {
 		if err := s.StartRuntime(); err != nil {
 			panic(fmt.Sprintf("start server runtime: %v", err))
 		}
-		s.regHandler.StartRuntime(context.Background())
+		// Registration is optional, but its scanner and any admitted child jobs must
+		// still belong to this Server instance. A Background parent leaked one
+		// scanner for every embedded/test server and let retired runtimes access a
+		// closed store. The async runtime context is cancelled by FlushWrites, while
+		// production additionally calls StopRegistrationJobs to join child work.
+		registrationCtx := s.runtimeTaskCtx
+		if registrationCtx == nil {
+			registrationCtx = context.Background()
+		}
+		s.regHandler.StartRuntime(registrationCtx)
 	}
 	// Apply any persisted runtime overrides for the upstream-consumed fingerprint /
 	// identity fields to the upstream client at boot, so admin settings survive a
@@ -1043,7 +1057,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// relayed to the Anthropic upstream (format-converted both ways) instead of
 	// Codex; everything else continues down the Codex/Responses path.
 	if !selectedCustomOK && isChat && (userGroupProvider == "claude" || (userGroupProvider == "" && isClaudeModel(model))) {
-		raw, err = s.applyModelInstructionsForEntrypoint(r.Context(), requestUserGroupPolicy(r.Context()), model, path, raw)
+		raw, err = s.applyModelInstructionsForEntrypoint(r.Context(), requestUserGroupPolicy(r.Context()), model, path, raw, bodyMetaForView(capturedMeta, originalRaw, raw))
 		if err != nil {
 			writeCodexInstructionConfigurationError(w, err)
 			return
@@ -1065,7 +1079,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-Pool-Resolved-Model", targetModel)
 			w.Header().Set("X-Pool-Model-Override-Source", "custom_provider_mapping:"+prov.ID)
 		}
-		raw, err = s.applyModelInstructionsForEntrypoint(r.Context(), requestUserGroupPolicy(r.Context()), model, path, raw)
+		raw, err = s.applyModelInstructionsForEntrypoint(r.Context(), requestUserGroupPolicy(r.Context()), model, path, raw, bodyMetaForView(capturedMeta, originalRaw, raw))
 		if err != nil {
 			writeCodexInstructionConfigurationError(w, err)
 			return
@@ -1096,14 +1110,15 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// previous_response_id/session state.
 	kiroRaw := raw
 	if !serverSideStateWithMeta(path, r, raw, bodyMetaForView(capturedMeta, originalRaw, raw)) {
-		kiroRaw, err = s.applyModelInstructionsForEntrypoint(r.Context(), requestUserGroupPolicy(r.Context()), model, path, raw)
+		kiroRaw, err = s.applyModelInstructionsForEntrypoint(r.Context(), requestUserGroupPolicy(r.Context()), model, path, raw, bodyMetaForView(capturedMeta, originalRaw, raw))
 		if err != nil {
 			writeCodexInstructionConfigurationError(w, err)
 			return
 		}
 	}
-	if codexGoalSignal(kiroRaw) != codexGoalTurnActive &&
-		s.tryServeAutoKiroGPT(w, r, kiroRaw, bodyMetaForView(capturedMeta, originalRaw, kiroRaw), model, affinityGroup, isChat, isCompact, pol) {
+	kiroMeta := bodyMetaForView(capturedMeta, originalRaw, kiroRaw)
+	if (!codexBodyMayContainGoalSignalWithMeta(kiroRaw, kiroMeta) || codexGoalSignal(kiroRaw) != codexGoalTurnActive) &&
+		s.tryServeAutoKiroGPT(w, r, kiroRaw, kiroMeta, model, affinityGroup, isChat, isCompact, pol) {
 		return
 	}
 	// Explicit CPA-style stateless compatibility mode. Make native Codex turns
@@ -1151,22 +1166,60 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 				Detail: "stateless_http_replay",
 			})
 		} else {
-			// This opt-in mode may discard previous_response_id for ordinary text,
-			// but it must not relabel a detached tool result as user input. Without
-			// its matching call, an output like {} is semantically meaningless and
-			// can provoke a false upstream answer about the script returning no data.
-			if responsesHasUnpairedToolOutput(raw, leakfilter.ResponsesContextErrorPreviousResponseNotFound) {
-				code := codexMappingErrorCode(errCodexToolContextUnrecoverable)
-				s.auditCodexMappingFailure(r.Context(), code)
-				s.writeCodexSessionMappingError(w, isStreamRequest(raw), code)
-				return
+			// A normal downstream WebSocket can lose its account-local upstream
+			// context at any turn even though the durable goal checkpoint is intact.
+			// Rebuild that checkpoint before considering the legacy stateless
+			// degradation path. In particular, an output whose matching call lived
+			// behind previous_response_id becomes a valid paired exchange after this
+			// reconstruction instead of producing a false fresh-root answer or a
+			// repeated codex_tool_context_unrecoverable loop.
+			originalContinuation := append([]byte(nil), raw...)
+			identityAliases := goalAliases(r, originalContinuation, "codex")
+			replay := s.goalReplayBody(r.Context(), r, "codex", raw)
+			if replay.Kind == goalResumeFound {
+				retry := codexRetryRequest{
+					Raw:    replay.Body,
+					Header: stripCodexServerStateHeaders(r.Header),
+				}
+				if code := codexHTTPSFallbackRecoveryErrorCode(
+					raw, retry, "rebuilt", true,
+					leakfilter.ResponsesContextErrorPreviousResponseNotFound,
+				); code != "" {
+					s.auditCodexMappingFailure(r.Context(), code)
+					s.writeCodexSessionMappingError(w, isStreamRequest(raw), code)
+					return
+				}
+				raw = retry.Raw
+				replayContext := withGoalIdentityAliases(r.Context(), identityAliases)
+				replayContext = withGoalOriginalBody(replayContext, originalContinuation)
+				r = r.Clone(replayContext)
+				r.Header = retry.Header
+				w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt")
+				w.Header().Set("X-MiCliProxy-Codex-Passthrough", "stateless-rebuilt")
+				atomic.AddUint64(&s.contextRebuilt, 1)
+				_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+					Action: "codex_context_migrated", State: "recovered",
+					Reason: "stateless_durable_replay", Detail: "goal_checkpoint_new_root",
+				})
+			} else {
+				// This opt-in compatibility mode may discard previous_response_id for
+				// ordinary text when no checkpoint exists, but it must never relabel a
+				// detached tool result as user input. Without its matching call, an
+				// output like {} is semantically meaningless and can provoke a false
+				// upstream answer about the script returning no data.
+				if responsesHasUnpairedToolOutput(raw, leakfilter.ResponsesContextErrorPreviousResponseNotFound) {
+					code := codexMappingErrorCode(errCodexToolContextUnrecoverable)
+					s.auditCodexMappingFailure(r.Context(), code)
+					s.writeCodexSessionMappingError(w, isStreamRequest(raw), code)
+					return
+				}
+				raw = degradedResponsesReplay(raw)
+				if r.Header.Get("X-Codex-Turn-State") != "" {
+					r = r.Clone(r.Context())
+					r.Header.Del("X-Codex-Turn-State")
+				}
+				w.Header().Set("X-MiCliProxy-Codex-Passthrough", "stateless")
 			}
-			raw = degradedResponsesReplay(raw)
-			if r.Header.Get("X-Codex-Turn-State") != "" {
-				r = r.Clone(r.Context())
-				r.Header.Del("X-Codex-Turn-State")
-			}
-			w.Header().Set("X-MiCliProxy-Codex-Passthrough", "stateless")
 		}
 	}
 	// Native Codex context is owned by the upstream Responses session during normal
@@ -1244,6 +1297,55 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		// A completed upstream response and its encrypted Goal checkpoint are
+		// committed independently from the CPA alias metadata. If the process dies,
+		// SQLite is interrupted, or an alias conflict occurs between those commits,
+		// the next WebSocket append is stateful but appears "unidentified" to CPA.
+		// The downstream audit incident repeatedly reached exactly this branch with a
+		// tool output even though goal checkpoints were present. Prefer an exact Goal
+		// replay and install a fresh epoch before exposing an unrecoverable error.
+		if mappingErr != nil && errors.Is(mappingErr, storage.ErrCodexSessionMappingNotFound) &&
+			codexDownstreamSessionIdentityForRequest(r, raw).stateful() {
+			originalContinuation := append([]byte(nil), raw...)
+			identityAliases := goalAliases(r, originalContinuation, "codex")
+			contextError := leakfilter.ResponsesContextErrorPreviousResponseNotFound
+			if responsesHasEncryptedToolOutput(raw) {
+				contextError = leakfilter.ResponsesContextErrorEncryptedFunctionOutput
+			}
+			migration, recovered, recoveryErr := s.recoverCodexSessionMapping(
+				r.Context(), r, raw, r.Header, pol, codexMapping, contextError,
+				codexRecoveryReasonUnidentifiedMapping,
+			)
+			if errors.Is(recoveryErr, errCodexToolContextUnrecoverable) {
+				code := codexMappingErrorCode(recoveryErr)
+				s.auditCodexMappingFailure(r.Context(), code)
+				s.writeCodexSessionMappingError(w, isStreamRequest(raw), code)
+				return
+			}
+			if recoveryErr != nil {
+				log.Printf("[CODEX-SESSION-MAPPING] unidentified context migration request_id=%s: %v", requestIDFromContext(r.Context()), recoveryErr)
+			}
+			if recovered {
+				replayContext := withGoalIdentityAliases(r.Context(), identityAliases)
+				replayContext = withGoalOriginalBody(replayContext, originalContinuation)
+				raw = migration.Retry.Raw
+				r = r.Clone(replayContext)
+				r.Header = migration.Retry.Header
+				codexMapping, mappingErr = migration.Mapping, nil
+				freshRootAfterContextLoss = true
+				contextRecoveryStatus = migration.Mode
+				if migration.Mode == "rebuilt" {
+					atomic.AddUint64(&s.contextRebuilt, 1)
+				} else {
+					atomic.AddUint64(&s.contextDegraded, 1)
+				}
+				atomic.AddUint64(&s.codexMappingFreshRoots, 1)
+				_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+					Action: "codex_context_migrated", State: "recovered",
+					Reason: codexRecoveryReasonUnidentifiedMapping, Detail: "durable_goal_replay_new_epoch",
+				})
+			}
+		}
 		if mappingErr != nil {
 			code := codexMappingErrorCode(mappingErr)
 			if code == "codex_session_mapping_unidentified" && bodyHasClientToolResult(raw) {
@@ -1261,7 +1363,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		if freshRootAfterContextLoss {
 			w.Header().Set("X-MiCliProxy-Context-Status", firstNonEmpty(contextRecoveryStatus, "new_root_after_context_loss"))
 		}
-		goalQuotaGrace := codexMapping.observeGoalTurn(r.Header, raw)
+		goalQuotaGrace := codexMapping.observeGoalTurnWithMeta(r.Header, raw, bodyMetaForView(capturedMeta, originalRaw, raw))
 		r = r.WithContext(withCodexSessionMapping(r.Context(), codexMapping))
 		r = r.WithContext(withCodexGoalQuotaGrace(r.Context(), goalQuotaGrace))
 		if s.codexCPAStrict(r.Context()) {
@@ -1325,7 +1427,8 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		raw = instructionPlan.apply(raw)
 	}
 
-	affinity := codexSelectionAffinity(r, raw, affinityWithMeta(r, raw, bodyMetaForView(capturedMeta, originalRaw, raw)), affinityGroup)
+	affinityMeta := bodyMetaForView(capturedMeta, originalRaw, raw)
+	affinity := codexSelectionAffinityWithMeta(r, raw, affinityMeta, affinityWithMeta(r, raw, affinityMeta), affinityGroup)
 	currentHeader := r.Header.Clone()
 	// movable: the request carries its full input and so can be re-sent to a fresh
 	// account losslessly. This is the failover gate. It is broader than !strict: a
@@ -1383,7 +1486,10 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		if currentModel == "" {
 			currentModel = model
 		}
-		currentAffinity := codexSelectionAffinity(headerReq, current.Raw, affinityWithMeta(headerReq, current.Raw, attemptMeta), affinityGroup)
+		currentAffinity := affinity
+		if outerAttempts > 1 || current.Prepared {
+			currentAffinity = codexSelectionAffinityWithMeta(headerReq, current.Raw, attemptMeta, affinityWithMeta(headerReq, current.Raw, attemptMeta), affinityGroup)
+		}
 		if currentAffinity.Hash == "" {
 			currentAffinity = affinity
 		}
@@ -1802,7 +1908,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	}
 	if strictNativeCPA {
 		if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil {
-			if sanitized, removed := mapping.sanitizePendingRootAgentEncryptedContent(body, baseHeader); removed > 0 {
+			if sanitized, removed := mapping.sanitizePendingRootAgentEncryptedContent(body, baseHeader, currentMeta); removed > 0 {
 				body = sanitized
 				_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
 					AccountID: lease.Account.ID, AccountLabel: lease.Account.Label,
@@ -1871,6 +1977,22 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// below and still reuses its matching upstream connection across turns.
 	if strictNativeCPA && webSocketSession == nil {
 		codexUseWebSocket = false
+	}
+	// A large fresh root is semantically transport-independent and is safer over
+	// HTTP/SSE: the upstream WebSocket has a per-message ceiling and closes with
+	// 1009 before it can create any recoverable response state. This check must run
+	// before every WebSocket mode-specific return so a forced downstream WS cannot
+	// accidentally bypass it. Stateful continuations are deliberately excluded;
+	// their connection-local pointer is handled by the established recovery path.
+	if codexUseWebSocket && forceCodexResponsesWebSocket(r.Context()) && webSocketSession != nil && !isCompact &&
+		len(body) > codexResponsesWebSocketHTTPBridgeThreshold &&
+		strings.TrimSpace(topLevelStringWithMeta(body, usageMeta, "previous_response_id")) == "" {
+		codexUseWebSocket = false
+		_ = s.store.InsertAuditLog(context.WithoutCancel(r.Context()), storage.AuditLogRow{
+			AccountID: lease.Account.ID, AccountLabel: lease.Account.Label,
+			Action: "codex_upstream_websocket_http_bridge", State: "selected", Reason: "oversized_first_message",
+			Detail: "bytes=" + strconv.Itoa(len(body)) + " threshold=" + strconv.Itoa(codexResponsesWebSocketHTTPBridgeThreshold),
+		})
 	}
 	// A sidecar-bound account presents the real Codex JA3 only on the HTTP/SSE path
 	// (postViaSidecar replays it); the WS dialer cannot, so it would dial with Go-stdlib
@@ -1959,7 +2081,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	}
 
 	logicalUsageDiag.RouteEpoch = lease.RouteEpoch
-	releaseCacheFlight, waitedForCacheFlight := s.enterCodexCacheSingleflight(r.Context(), s.codexCacheSingleflightEnabled(r.Context()), lease.Account.ID, resolvedModel, body, affinity)
+	releaseCacheFlight, waitedForCacheFlight := s.enterCodexCacheSingleflight(r.Context(), s.codexCacheSingleflightEnabled(r.Context()), lease.Account.ID, resolvedModel, body, affinity, forwardMeta)
 	if waitedForCacheFlight {
 		logicalUsageDiag.SingleflightWaitedRequests = 1
 	}
@@ -2028,7 +2150,6 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		return fallbackResponse, fallbackEgress, nil
 	}
 	attemptedWebSocket := codexUseWebSocket
-	s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "attempted", 0)
 	resp, finalEgress, err := s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
 	releaseCacheFlight()
 	if err != nil && attemptedWebSocket {

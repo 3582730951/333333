@@ -123,11 +123,16 @@ type scrubbingFrameWriter struct {
 	leak     bool
 	words    *streamrewrite.Matcher
 	provider string
+	filter   *leakfilter.SSEFilter
 	buf      []byte
 }
 
 func newScrubbingFrameWriter(dst io.Writer, leak bool, words *streamrewrite.Matcher, provider string) *scrubbingFrameWriter {
-	return &scrubbingFrameWriter{dst: dst, leak: leak, words: words, provider: provider}
+	w := &scrubbingFrameWriter{dst: dst, leak: leak, words: words, provider: provider}
+	if leak {
+		w.filter = leakfilter.NewSSEFilter(provider, words)
+	}
+	return w
 }
 
 func (s *scrubbingFrameWriter) Write(p []byte) (int, error) {
@@ -173,7 +178,7 @@ func (s *scrubbingFrameWriter) Write(p []byte) (int, error) {
 func (s *scrubbingFrameWriter) relay(frame []byte) error {
 	out := frame
 	if s.leak {
-		out = leakfilter.NewSSEFilter(s.provider, s.words).ProcessFrameForRelay(out)
+		out = s.filter.ProcessFrameForRelay(out)
 	} else {
 		if s.provider == "codex" {
 			out, _ = leakfilter.NeutralizeResponsesContextErrorSSEFrame(out)

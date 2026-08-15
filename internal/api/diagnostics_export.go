@@ -172,6 +172,7 @@ func diagnosticFileOrder() []string {
 		"account_rate_limits.csv",
 		"affinity_bindings.csv",
 		"codex_session_mappings.csv",
+		"goal_continuity.csv",
 		"codex_instruction_snapshots.csv",
 		"codex_upstream_attempts.csv",
 		"codex_upstream_attempts_daily.csv",
@@ -198,6 +199,71 @@ type diagnosticExportStat struct {
 	SourceRows int64
 	Min        int64
 	Max        int64
+}
+
+// diagnosticGoalContinuityRows exports only aggregate, HMAC-aliased continuity
+// metadata. Checkpoint/segment payloads, response ids, thread ids, hashes and
+// working state never enter a support bundle. These counts are sufficient to
+// distinguish "context was never checkpointed" from "checkpoint existed but the
+// resume path failed before using it", which an audit CSV alone cannot prove.
+func diagnosticGoalContinuityRows(ctx context.Context, db storage.ReadQuerier, aliasKey []byte) ([][]string, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT s.id,s.parent_goal_id,s.protocol,
+       CASE WHEN s.branch_hash<>'' THEN 1 ELSE 0 END,
+       CASE WHEN s.downstream_key_hash<>'' THEN 1 ELSE 0 END,
+       CASE WHEN s.workspace_hash<>'' THEN 1 ELSE 0 END,
+       CASE WHEN s.initial_goal_hash<>'' THEN 1 ELSE 0 END,
+       CASE WHEN s.last_response_hash<>'' THEN 1 ELSE 0 END,
+       s.state,s.current_checkpoint_id,s.storage_bytes,
+       (SELECT COUNT(*) FROM goal_checkpoint c WHERE c.goal_id=s.id),
+       (SELECT COUNT(*) FROM goal_segment g WHERE g.goal_id=s.id),
+       COALESCE((SELECT MAX(g.sequence) FROM goal_segment g WHERE g.goal_id=s.id),0),
+       (SELECT COUNT(*) FROM goal_alias a WHERE a.goal_id=s.id),
+       (SELECT COUNT(*) FROM goal_run r WHERE r.goal_id=s.id AND r.state='active'),
+       (SELECT COUNT(*) FROM goal_run r WHERE r.goal_id=s.id AND r.state='failed'),
+       s.expires_at,s.created_at,s.updated_at
+FROM goal_session s ORDER BY s.updated_at DESC,s.id DESC LIMIT ?`, diagnosticExportRowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([][]string, 0)
+	for rows.Next() {
+		var id, parentID, protocol, state, checkpointID string
+		var branchPresent, downstreamPresent, workspacePresent, initialPresent, responsePresent int64
+		var storageBytes, checkpoints, segments, lastSegment, aliases, activeRuns, failedRuns int64
+		var expiresAt, createdAt, updatedAt int64
+		if err := rows.Scan(
+			&id, &parentID, &protocol,
+			&branchPresent, &downstreamPresent, &workspacePresent, &initialPresent, &responsePresent,
+			&state, &checkpointID, &storageBytes,
+			&checkpoints, &segments, &lastSegment, &aliases, &activeRuns, &failedRuns,
+			&expiresAt, &createdAt, &updatedAt,
+		); err != nil {
+			return nil, err
+		}
+		goalCode := diagnosticAlias(aliasKey, "GOAL", "goal-session", id)
+		parentCode := ""
+		if strings.TrimSpace(parentID) != "" {
+			parentCode = diagnosticAlias(aliasKey, "GOAL", "goal-session", parentID)
+		}
+		checkpointCode := ""
+		if strings.TrimSpace(checkpointID) != "" {
+			checkpointCode = diagnosticAlias(aliasKey, "GCP", "goal-checkpoint", checkpointID)
+		}
+		out = append(out, []string{
+			goalCode, parentCode, protocol,
+			strconv.FormatBool(branchPresent != 0), strconv.FormatBool(downstreamPresent != 0),
+			strconv.FormatBool(workspacePresent != 0), strconv.FormatBool(initialPresent != 0),
+			strconv.FormatBool(responsePresent != 0), state, checkpointCode,
+			strconv.FormatInt(storageBytes, 10), strconv.FormatInt(checkpoints, 10),
+			strconv.FormatInt(segments, 10), strconv.FormatInt(lastSegment, 10),
+			strconv.FormatInt(aliases, 10), strconv.FormatInt(activeRuns, 10),
+			strconv.FormatInt(failedRuns, 10), strconv.FormatInt(expiresAt, 10),
+			strconv.FormatInt(createdAt, 10), strconv.FormatInt(updatedAt, 10),
+		})
+	}
+	return out, rows.Err()
 }
 
 // A diagnostics bundle is a support snapshot, not a second full database
@@ -294,6 +360,10 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 	if err != nil {
 		return err
 	}
+	goalContinuity, err := diagnosticGoalContinuityRows(ctx, snapshotStore.ReadDB(), s.cfg.RuntimeDiagnosticAliasKey)
+	if err != nil {
+		return err
+	}
 	codexInstructionSnapshots, err := snapshotStore.ListCodexInstructionSnapshotDiagnostics(ctx)
 	if err != nil {
 		return err
@@ -382,6 +452,7 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 	addCSV("kiro_runtime_capabilities.csv", []string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "unknown_cache_schema_json", "updated_at", "cache_point_state", "cache_reuse_state", "cache_reuse_evidence", "cache_reuse_credit_reduction_percent", "cache_reuse_probed_at"}, kiroRuntimeCapabilityRows(kiroCapabilities, codebook))
 	addCSV("account_rate_limits.csv", []string{"account_code", "provider", "model", "limiter_type", "source", "used_percent", "limit_tokens", "remaining_tokens", "limit_requests", "remaining_requests", "reset_at", "status", "raw_json", "updated_at"}, accountRateLimitRows(rateLimits, codebook))
 	addCSV("codex_session_mappings.csv", []string{"tree_hmac_prefix", "namespace_hmac_prefix", "account_code", "egress_id", "epoch", "state", "instruction_snapshot_present", "created_at", "updated_at", "expires_at"}, codexSessionMappingDiagnosticRows(codexMappings, codebook))
+	addCSV("goal_continuity.csv", []string{"goal_code", "parent_goal_code", "protocol", "branch_present", "downstream_scope_present", "workspace_fingerprint_present", "initial_fingerprint_present", "last_response_present", "state", "checkpoint_code", "storage_bytes", "checkpoint_count", "segment_count", "last_segment_sequence", "alias_count", "active_run_count", "failed_run_count", "expires_at", "created_at", "updated_at"}, goalContinuity)
 	addCSV("codex_instruction_snapshots.csv", []string{"tree_hmac_prefix", "revision_hmac_prefix", "created_at", "updated_at", "expires_at"}, codexInstructionSnapshotDiagnosticRows(codexInstructionSnapshots))
 	addCSV("codex_group_policy_revisions.csv", []string{"group_name", "instructions_enabled", "instruction_file_count", "policy_revision_hmac_prefix", "updated_at"}, codexGroupPolicyRevisionRows(groups, s))
 	sidecarAdaptive := []upstream.SidecarAdaptiveStatus(nil)
@@ -1297,6 +1368,7 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	// present with headers so callers see the same bundle schema; the streaming
 	// admin export above fills them from encrypted mapping tables.
 	addCSV("codex_session_mappings.csv", []string{"tree_hmac_prefix", "namespace_hmac_prefix", "account_code", "egress_id", "epoch", "state", "instruction_snapshot_present", "created_at", "updated_at", "expires_at"}, nil)
+	addCSV("goal_continuity.csv", []string{"goal_code", "parent_goal_code", "protocol", "branch_present", "downstream_scope_present", "workspace_fingerprint_present", "initial_fingerprint_present", "last_response_present", "state", "checkpoint_code", "storage_bytes", "checkpoint_count", "segment_count", "last_segment_sequence", "alias_count", "active_run_count", "failed_run_count", "expires_at", "created_at", "updated_at"}, nil)
 	addCSV("codex_instruction_snapshots.csv", []string{"tree_hmac_prefix", "revision_hmac_prefix", "created_at", "updated_at", "expires_at"}, nil)
 	addCSV("codex_upstream_attempts.csv", []string{"tree_hmac_prefix", "account_code", "egress_id", "epoch", "state", "status_code", "created_at"}, nil)
 	addCSV("codex_upstream_attempts_daily.csv", []string{"day_start", "account_code", "egress_id", "state", "status_code", "attempt_count", "first_created_at", "last_created_at"}, nil)

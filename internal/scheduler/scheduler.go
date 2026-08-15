@@ -332,7 +332,10 @@ func (s *Scheduler) invalidateAccountCache(structural bool) {
 	s.affinityCache.clear()
 	s.clearCandidateIndexes()
 	if structural {
-		s.providerCache = sync.Map{}
+		// A sync.Map must not be copied after first use. Clear is safe alongside
+		// concurrent Load/Store calls from route selection and concurrent catalog
+		// probes, and publishes the same structural invalidation without racing.
+		s.providerCache.Clear()
 		s.routeStructureVersion.Add(1)
 	}
 	s.NotifyStateChanged()
@@ -425,6 +428,13 @@ type Route struct {
 	// session. RequiredEgressID completes that same identity boundary.
 	RequiredAccountID string
 	RequiredEgressID  string
+	// FailFastBoundRecovery is set only when the caller owns a durable replay for
+	// an exact RequiredAccountID binding. Health/quota cooldowns then return
+	// ErrBoundAccountUnavailable immediately so the caller can rotate the durable
+	// epoch instead of waiting behind a multi-minute account circuit breaker.
+	// Concurrency, token-budget, and coordinator pressure still wait normally: they
+	// do not prove that the bound upstream state is unavailable.
+	FailFastBoundRecovery bool
 	// AllowCodexGoalQuotaGrace lets an observed, active Codex Goal turn probe an
 	// account despite local quota snapshots. It never bypasses inactive/quarantined
 	// accounts, recheck-pending upstream failures, unhealthy egress, concurrency, or
@@ -789,7 +799,8 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 		if ok {
 			return s.leaseWithAffinityEpoch(ctx, route, lease), nil
 		}
-		if route.ServerSideState && statefulStickyWaitReason(reason) {
+		if route.ServerSideState && statefulStickyWaitReason(reason) &&
+			!(route.FailFastBoundRecovery && boundHealthRecoveryReason(reason)) {
 			if lease, err := s.waitForStatefulStickyLease(ctx, route.RequiredAccountID, route, reason); err == nil {
 				return s.leaseWithAffinityEpoch(ctx, route, lease), nil
 			}
@@ -2061,6 +2072,19 @@ func statefulStickyWaitReason(reason leaseBlockReason) bool {
 	return reason == leaseBlockTokenBudget || reason == leaseBlockConcurrency ||
 		reason == leaseBlockRateLimitCooldown || reason == leaseBlockRecheckPending ||
 		reason == leaseBlockEgressCooldown || reason == leaseBlockCoordinator
+}
+
+// boundHealthRecoveryReason identifies account/egress health states where a
+// durable CPA root can safely stop waiting and ask its owner to rebuild on a new
+// epoch. Capacity pressure is intentionally excluded so ordinary concurrent turns
+// keep their exact account and context rather than rotating under load.
+func boundHealthRecoveryReason(reason leaseBlockReason) bool {
+	switch baseBlockReason(reason) {
+	case leaseBlockRateLimitCooldown, leaseBlockRecheckPending, leaseBlockEgressCooldown:
+		return true
+	default:
+		return false
+	}
 }
 
 func (reason leaseBlockReason) humanString() string {

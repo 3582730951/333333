@@ -24,6 +24,7 @@ list_candidates() {
 }
 
 list_candidates | awk '
+  /(^|\/)passwd\.txt$/ { next }
   /^super-instruct\/LICENSE$/ { print; next }
   /^internal\/console\/dist\// { print; next }
   /^(cmd|internal|services|sidecar|scripts|deploy|web-spa\/src|web-spa\/scripts|workers\/node-registrar\/src|super-instruct)\// &&

@@ -22,14 +22,46 @@ const asyncWriteBudgetBytes = 64 << 20
 // response path on a database write.
 const asyncWriteQueueDepth = 2048
 
+// telemetryBatchMax amortizes SQLite transactions and journal replay scans under
+// burst load. Records are metadata-sized and the channel remains independently
+// bounded, so a larger drain batch improves throughput without making admission
+// memory unbounded.
+const telemetryBatchMax = 1024
+
+// usageJournalReplayBatchMax avoids repeatedly rescanning and decoding a large
+// acknowledged prefix when a pressure backlog is materialized. The deferred journal
+// itself is capped at 32 MiB/65k records, so 8k metadata records keep replay memory
+// bounded even on the 512 MiB profile while cutting shutdown scan amplification.
+const usageJournalReplayBatchMax = 8192
+
+// The live replayer deliberately commits one small batch per pass. A shutdown replay
+// can drain aggressively because request-critical SQLite writes have stopped, whereas
+// an 8k live transaction can hold SQLite long enough to create a multi-second latency
+// cliff for context-pointer commits.
+const usageJournalOnlineReplayBatchMax = 512
+
+// Telemetry is already durable once appended to the journal. Under request pressure,
+// postpone its optional SQLite materialization so terminal context-pointer commits are
+// not queued behind diagnostic rows on SQLite's single writer. The byte/record ceilings
+// bound the deferred backlog; crossing either ceiling resumes replay even while busy.
+const (
+	telemetryReplayActiveThreshold = int64(8)
+	telemetryReplayDeferMaxBytes   = int64(32 << 20)
+	telemetryReplayDeferMaxRecords = uint64(65_536)
+	telemetryReplayDeferInterval   = 250 * time.Millisecond
+	telemetryReplayQuietPeriod     = 2 * time.Second
+)
+
 type telemetryWrite struct {
-	usage      *storage.UsageRecordWrite
-	hold       *storage.BillingHoldWrite
-	apiKeyHash string
-	usedAt     int64
-	audit      *storage.AuditLogRow
-	journalSeq uint64
-	barrier    chan error
+	usage           *storage.UsageRecordWrite
+	hold            *storage.BillingHoldWrite
+	upstreamAttempt *storage.CodexUpstreamAttempt
+	apiKeyHash      string
+	usedAt          int64
+	audit           *storage.AuditLogRow
+	journalSeq      uint64
+	barrier         chan error
+	barrierContext  context.Context
 }
 
 // startAsyncWriter launches the single FIFO drainer. Called once from NewServer so the
@@ -37,9 +69,11 @@ type telemetryWrite struct {
 // the channel during shutdown (after in-flight requests have drained), then exits.
 func (s *Server) startAsyncWriter() {
 	s.asyncWriteCtx, s.asyncWriteCancel = context.WithCancel(context.Background())
+	s.runtimeTaskCtx, s.runtimeTaskCancel = context.WithCancel(context.Background())
 	s.asyncFlushDone = make(chan struct{})
 	s.asyncWrites = make(chan func(), asyncWriteQueueDepth)
 	s.usageWrites = make(chan telemetryWrite, asyncWriteQueueDepth)
+	s.startCodexStateWriter()
 	s.asyncWG.Add(1)
 	supervisor.GoOnce("async-write-drainer", func() {
 		defer s.asyncWG.Done()
@@ -51,7 +85,7 @@ func (s *Server) startAsyncWriter() {
 			batch := []func(){fn}
 			timer := time.NewTimer(5 * time.Millisecond)
 		collect:
-			for len(batch) < 64 {
+			for len(batch) < telemetryBatchMax {
 				select {
 				case next, open := <-s.asyncWrites:
 					if !open {
@@ -82,15 +116,16 @@ func (s *Server) startAsyncWriter() {
 		defer s.asyncWG.Done()
 		for first := range s.usageWrites {
 			if first.barrier != nil {
-				first.barrier <- s.replayUsageJournal(context.Background())
+				first.barrier <- s.replayUsageJournal(telemetryBarrierContext(first.barrierContext))
 				s.usagePending.Done()
 				continue
 			}
 			batch := []telemetryWrite{first}
 			var barrier chan error
+			var barrierCtx context.Context
 			timer := time.NewTimer(5 * time.Millisecond)
 		collect:
-			for len(batch) < 64 {
+			for len(batch) < telemetryBatchMax {
 				select {
 				case next, ok := <-s.usageWrites:
 					if !ok {
@@ -98,6 +133,7 @@ func (s *Server) startAsyncWriter() {
 					}
 					if next.barrier != nil {
 						barrier = next.barrier
+						barrierCtx = next.barrierContext
 						break collect
 					}
 					batch = append(batch, next)
@@ -111,6 +147,19 @@ func (s *Server) startAsyncWriter() {
 				default:
 				}
 			}
+			if barrier == nil && s.shouldDeferUsageJournalReplay(false) {
+				immediate, deferred := splitDeferredJournalWrites(batch)
+				for index := 0; index < deferred; index++ {
+					s.usagePending.Done()
+				}
+				if deferred > 0 {
+					s.signalUsageJournalReplay()
+				}
+				if len(immediate) == 0 {
+					continue
+				}
+				batch = immediate
+			}
 			err := s.persistTelemetryBatch(batch)
 			if err != nil {
 				log.Printf("[USAGE-ERROR] batch insert count=%d: %v", len(batch), err)
@@ -119,6 +168,12 @@ func (s *Server) startAsyncWriter() {
 				s.usagePending.Done()
 			}
 			if barrier != nil {
+				// A pressure-deferred FIFO prefix may exist only in the journal while
+				// this in-memory batch is already materialized. A barrier collected at
+				// the tail of the batch must fill that gap exactly like a barrier read as
+				// the first item; otherwise dashboards and tests can observe only the
+				// newest provider/account row even though earlier telemetry is durable.
+				err = errors.Join(err, s.replayUsageJournal(telemetryBarrierContext(barrierCtx)))
 				barrier <- err
 				s.usagePending.Done()
 			}
@@ -128,6 +183,10 @@ func (s *Server) startAsyncWriter() {
 		s.asyncWG.Add(1)
 		supervisor.GoOnce("usage-journal-replayer", func() {
 			defer s.asyncWG.Done()
+			replayCtx := s.runtimeTaskCtx
+			if replayCtx == nil {
+				replayCtx = context.Background()
+			}
 			delay := time.Second
 			for {
 				timer := time.NewTimer(delay)
@@ -144,7 +203,25 @@ func (s *Server) startAsyncWriter() {
 					}
 				case <-timer.C:
 				}
-				if err := s.replayUsageJournal(context.Background()); err != nil {
+				if s.shouldDeferUsageJournalReplay(true) {
+					// Ignore wake notifications during this bounded pause. A producer can
+					// otherwise keep the one-slot wake channel permanently readable and
+					// turn durable deferral into a busy loop.
+					timer = time.NewTimer(telemetryReplayDeferInterval)
+					select {
+					case <-s.usageJournalStop:
+						timer.Stop()
+						return
+					case <-timer.C:
+					}
+					if s.shouldDeferUsageJournalReplay(true) {
+						continue
+					}
+				}
+				if err := s.replayUsageJournalOnce(replayCtx); err != nil {
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						continue
+					}
 					log.Printf("[USAGE-JOURNAL] replay failed: %v", err)
 					delay *= 2
 					if delay > 30*time.Second {
@@ -156,6 +233,89 @@ func (s *Server) startAsyncWriter() {
 			}
 		})
 	}
+}
+
+// launchRuntimeTask starts a bounded optional task whose lifetime is owned by the
+// active Server. Admission is serialized with FlushWrites: once shutdown begins no
+// new task can be added, and every admitted task is cancelled and joined before the
+// backing store may be closed.
+func (s *Server) launchRuntimeTask(name string, timeout time.Duration, run func(context.Context)) bool {
+	if s == nil || run == nil {
+		return false
+	}
+	s.asyncMu.RLock()
+	if s.asyncClosed || s.runtimeTaskCtx == nil {
+		s.asyncMu.RUnlock()
+		return false
+	}
+	base := s.runtimeTaskCtx
+	s.runtimeTaskWG.Add(1)
+	s.asyncMu.RUnlock()
+	supervisor.GoOnce(name, func() {
+		defer s.runtimeTaskWG.Done()
+		ctx := base
+		cancel := func() {}
+		if timeout > 0 {
+			ctx, cancel = context.WithTimeout(base, timeout)
+		}
+		defer cancel()
+		run(ctx)
+	})
+	return true
+}
+
+func splitDeferredJournalWrites(batch []telemetryWrite) (immediate []telemetryWrite, deferred int) {
+	immediate = make([]telemetryWrite, 0, len(batch))
+	for _, write := range batch {
+		// The journal record covers usage, hold, and upstreamAttempt only. Never
+		// defer a composite or non-journaled write whose API-key/audit effect would
+		// otherwise be lost when the in-memory copy is released.
+		if write.journalSeq > 0 && write.apiKeyHash == "" && write.audit == nil {
+			deferred++
+			continue
+		}
+		immediate = append(immediate, write)
+	}
+	return immediate, deferred
+}
+
+func shouldDeferTelemetryReplay(active int64, recentlyAppended bool, snapshot usagejournal.Snapshot) bool {
+	return (active > telemetryReplayActiveThreshold || recentlyAppended) &&
+		snapshot.Pending > 0 &&
+		snapshot.Bytes < telemetryReplayDeferMaxBytes &&
+		snapshot.Pending < telemetryReplayDeferMaxRecords
+}
+
+func (s *Server) usageJournalRecentlyActive(now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	last := s.usageJournalLastAppend.Load()
+	if last <= 0 {
+		return false
+	}
+	delta := now.UnixNano() - last
+	return delta < 0 || delta < int64(telemetryReplayQuietPeriod)
+}
+
+func (s *Server) shouldDeferUsageJournalReplay(protectRecentActivity bool) bool {
+	if s == nil || s.scheduler == nil || s.usageJournal == nil {
+		return false
+	}
+	snapshot, err := s.usageJournal.Snapshot()
+	if err != nil {
+		// A journal inspection failure must never suppress its recovery path.
+		return false
+	}
+	recentlyAppended := protectRecentActivity && s.usageJournalRecentlyActive(time.Now())
+	return shouldDeferTelemetryReplay(s.scheduler.Metrics().Active, recentlyAppended, snapshot)
+}
+
+func telemetryBarrierContext(ctx context.Context) context.Context {
+	if ctx != nil {
+		return ctx
+	}
+	return context.Background()
 }
 
 func (s *Server) persistTelemetryBatch(batch []telemetryWrite) error {
@@ -175,8 +335,16 @@ func (s *Server) persistTelemetryBatchContext(ctx context.Context, batch []telem
 	holds := make([]storage.BillingHoldWrite, 0, len(batch))
 	apiKeys := make(map[string]int64)
 	audits := make([]storage.AuditLogRow, 0, len(batch))
+	attempts := make([]storage.CodexUpstreamAttempt, 0, len(batch))
 	journalSequences := make([]uint64, 0, len(batch))
+	acked := s.usageJournalAcked.Load()
 	for _, write := range batch {
+		// The journal overflow replayer may commit and acknowledge an item while its
+		// original in-memory copy is still waiting in this queue. Skip that stale copy;
+		// every journaled record is already durable and all DB effects are idempotent.
+		if write.journalSeq > 0 && write.journalSeq <= acked {
+			continue
+		}
 		if write.usage != nil {
 			usageBatch = append(usageBatch, *write.usage)
 		}
@@ -192,11 +360,14 @@ func (s *Server) persistTelemetryBatchContext(ctx context.Context, batch []telem
 		if write.audit != nil {
 			audits = append(audits, *write.audit)
 		}
+		if write.upstreamAttempt != nil {
+			attempts = append(attempts, *write.upstreamAttempt)
+		}
 	}
-	if len(usageBatch) == 0 && len(holds) == 0 && len(apiKeys) == 0 && len(audits) == 0 {
+	if len(usageBatch) == 0 && len(holds) == 0 && len(apiKeys) == 0 && len(audits) == 0 && len(attempts) == 0 {
 		return nil
 	}
-	directErr := s.store.BatchWriteTelemetry(ctx, usageBatch, apiKeys, holds, audits)
+	directErr := s.store.BatchWriteTelemetryAndAttempts(ctx, usageBatch, apiKeys, holds, audits, attempts)
 	if directErr != nil || len(journalSequences) == 0 {
 		return directErr
 	}
@@ -216,7 +387,12 @@ func (s *Server) persistTelemetryBatchContext(ctx context.Context, batch []telem
 		contiguous = journalSequences[index] == journalSequences[index-1]+1
 	}
 	if !contiguous {
-		return s.replayUsageJournalLocked(ctx)
+		// Earlier durable records were deliberately deferred under request pressure.
+		// This batch is already idempotently materialized, but ACK cannot skip the
+		// gap. Let the dedicated/final replayer fill it in FIFO order; doing a full
+		// replay on the batch-writer goroutine stalls shutdown and fresh telemetry.
+		s.signalUsageJournalReplay()
+		return nil
 	}
 	last := journalSequences[len(journalSequences)-1]
 	if err := s.usageJournal.Ack(last); err != nil {
@@ -236,6 +412,19 @@ func (s *Server) replayUsageJournal(ctx context.Context) error {
 }
 
 func (s *Server) replayUsageJournalLocked(ctx context.Context) error {
+	return s.replayUsageJournalLockedMode(ctx, usageJournalReplayBatchMax, true)
+}
+
+func (s *Server) replayUsageJournalOnce(ctx context.Context) error {
+	if s.usageJournal == nil {
+		return nil
+	}
+	s.usageJournalCommitMu.Lock()
+	defer s.usageJournalCommitMu.Unlock()
+	return s.replayUsageJournalLockedMode(ctx, usageJournalOnlineReplayBatchMax, false)
+}
+
+func (s *Server) replayUsageJournalLockedMode(ctx context.Context, batchMax int, drain bool) error {
 	snapshot, err := s.usageJournal.Snapshot()
 	if err != nil || snapshot.Pending == 0 {
 		if err == nil {
@@ -247,8 +436,11 @@ func (s *Server) replayUsageJournalLocked(ctx context.Context) error {
 	if err = s.usageJournal.Sync(); err != nil {
 		return err
 	}
+	if batchMax <= 0 {
+		batchMax = usageJournalOnlineReplayBatchMax
+	}
 	for {
-		records, err := s.usageJournal.Replay(64)
+		records, err := s.usageJournal.Replay(batchMax)
 		if err != nil || len(records) == 0 {
 			return err
 		}
@@ -262,6 +454,7 @@ func (s *Server) replayUsageJournalLocked(ctx context.Context) error {
 		records = records[:end]
 		usageBatch := make([]storage.UsageRecordWrite, 0, len(records))
 		holds := make([]storage.BillingHoldWrite, 0, len(records))
+		attempts := make([]storage.CodexUpstreamAttempt, 0, len(records))
 		for _, record := range records {
 			if record.Usage != nil {
 				usageBatch = append(usageBatch, *record.Usage)
@@ -269,9 +462,15 @@ func (s *Server) replayUsageJournalLocked(ctx context.Context) error {
 			if record.Hold != nil {
 				holds = append(holds, *record.Hold)
 			}
+			if record.UpstreamAttempt != nil {
+				attempts = append(attempts, *record.UpstreamAttempt)
+			}
 		}
-		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		err = s.store.BatchWriteTelemetry(writeCtx, usageBatch, nil, holds, nil)
+		// The caller chooses whether replay is detached (Background) or bounded
+		// (shutdown/runtime task context). A cancelled batch is safe to retry because
+		// every telemetry effect and journal acknowledgement is idempotent.
+		writeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err = s.store.BatchWriteTelemetryAndAttempts(writeCtx, usageBatch, nil, holds, nil, attempts)
 		cancel()
 		if err != nil {
 			return err
@@ -280,7 +479,7 @@ func (s *Server) replayUsageJournalLocked(ctx context.Context) error {
 			return err
 		}
 		s.usageJournalAcked.Store(records[len(records)-1].Sequence)
-		if records[len(records)-1].Sequence >= target {
+		if !drain || records[len(records)-1].Sequence >= target {
 			return nil
 		}
 	}
@@ -301,6 +500,11 @@ func (s *Server) usageJournalMetrics() map[string]interface{} {
 	out["pending_records"] = snapshot.Pending
 	out["bytes"] = snapshot.Bytes
 	out["segments"] = snapshot.Segments
+	active := int64(0)
+	if s.scheduler != nil {
+		active = s.scheduler.Metrics().Active
+	}
+	out["replay_deferred"] = shouldDeferTelemetryReplay(active, s.usageJournalRecentlyActive(time.Now()), snapshot)
 	return out
 }
 
@@ -316,7 +520,7 @@ func (s *Server) flushTelemetry(ctx context.Context) (timedOut bool, err error) 
 	}
 	s.usagePending.Add(1)
 	select {
-	case s.usageWrites <- telemetryWrite{barrier: done}:
+	case s.usageWrites <- telemetryWrite{barrier: done, barrierContext: ctx}:
 		s.asyncMu.RUnlock()
 	case <-ctx.Done():
 		s.asyncMu.RUnlock()
@@ -347,6 +551,10 @@ func (s *Server) enqueueAudit(row storage.AuditLogRow) {
 	s.enqueueTelemetry(telemetryWrite{audit: &row})
 }
 
+func (s *Server) enqueueCodexUpstreamAttempt(attempt storage.CodexUpstreamAttempt) {
+	s.enqueueTelemetry(telemetryWrite{upstreamAttempt: &attempt})
+}
+
 func (s *Server) enqueueTelemetry(write telemetryWrite) {
 	if s.usageDirectWrites.Load() && (write.usage != nil || write.hold != nil) {
 		if err := s.persistTelemetryBatch([]telemetryWrite{write}); err == nil {
@@ -366,10 +574,10 @@ func (s *Server) enqueueTelemetry(write telemetryWrite) {
 	s.usagePending.Add(1)
 	journalLocked := false
 	journaled := false
-	if s.usageJournal != nil && (write.usage != nil || write.hold != nil) {
+	if s.usageJournal != nil && (write.usage != nil || write.hold != nil || write.upstreamAttempt != nil) {
 		s.usageEnqueueMu.Lock()
 		journalLocked = true
-		sequence, err := s.usageJournal.Append(usagejournal.Record{Usage: write.usage, Hold: write.hold})
+		sequence, err := s.usageJournal.Append(usagejournal.Record{Usage: write.usage, Hold: write.hold, UpstreamAttempt: write.upstreamAttempt})
 		if err != nil {
 			s.usageEnqueueMu.Unlock()
 			s.asyncMu.RUnlock()
@@ -381,6 +589,7 @@ func (s *Server) enqueueTelemetry(write telemetryWrite) {
 			return
 		}
 		write.journalSeq = sequence
+		s.usageJournalLastAppend.Store(time.Now().UnixNano())
 		journaled = true
 	}
 	select {
@@ -480,6 +689,9 @@ func (s *Server) FlushWritesContext(ctx context.Context) error {
 	s.asyncFlushOnce.Do(func() {
 		s.asyncMu.Lock()
 		s.asyncClosed = true
+		if s.runtimeTaskCancel != nil {
+			s.runtimeTaskCancel()
+		}
 		if s.usageJournalStop != nil {
 			close(s.usageJournalStop)
 		}
@@ -489,26 +701,37 @@ func (s *Server) FlushWritesContext(ctx context.Context) error {
 		if s.usageWrites != nil {
 			close(s.usageWrites)
 		}
+		if s.codexStateCommits != nil {
+			close(s.codexStateCommits)
+		}
 		s.asyncMu.Unlock()
 		s.stopGoalCompactionWorkers()
 		go func() {
 			defer supervisor.Recover("bounded-async-flush")
+			log.Printf("[SHUTDOWN] async flush stage=runtime_tasks")
+			s.runtimeTaskWG.Wait()
+			log.Printf("[SHUTDOWN] async flush stage=writers")
 			s.asyncWG.Wait()
+			log.Printf("[SHUTDOWN] async flush stage=telemetry_pending")
 			s.usagePending.Wait()
 			if s.usageJournal != nil {
+				log.Printf("[SHUTDOWN] async flush stage=journal_replay")
 				if err := s.replayUsageJournal(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					log.Printf("[USAGE-JOURNAL] final replay failed; records remain durable: %v", err)
 				}
+				log.Printf("[SHUTDOWN] async flush stage=journal_close")
 				if err := s.usageJournal.Close(); err != nil {
 					log.Printf("[USAGE-JOURNAL] close failed: %v", err)
 				}
 			}
 			if s.scheduler != nil {
+				log.Printf("[SHUTDOWN] async flush stage=scheduler")
 				s.scheduler.Close()
 			}
 			if s.asyncWriteCancel != nil {
 				s.asyncWriteCancel()
 			}
+			log.Printf("[SHUTDOWN] async flush stage=complete")
 			close(s.asyncFlushDone)
 		}()
 	})

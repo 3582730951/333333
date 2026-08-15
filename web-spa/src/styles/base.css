@@ -94,8 +94,9 @@ p {
 }
 
 :focus-visible {
-  outline: none;
-  box-shadow: var(--pool-focus);
+  outline: 3px solid var(--pool-focus-color);
+  outline-offset: 2px;
+  box-shadow: none;
 }
 
 ::-webkit-scrollbar {
@@ -173,9 +174,9 @@ p {
   transform: translateY(0);
   opacity: 1;
   pointer-events: auto;
-  outline: 2px solid var(--pool-accent);
+  outline: 3px solid var(--pool-focus-color);
   outline-offset: 2px;
-  box-shadow: var(--pool-shadow-md), var(--pool-focus);
+  box-shadow: var(--pool-shadow-md);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -186,7 +187,7 @@ p {
 
 @media (forced-colors: active) {
   :focus-visible {
-    outline: 2px solid Highlight;
+    outline: 3px solid Highlight;
     outline-offset: 2px;
     box-shadow: none;
   }
@@ -202,7 +203,15 @@ p {
 
   .pool-skip-link:focus,
   .pool-skip-link:focus-visible {
-    outline: 2px solid Highlight;
+    outline: 3px solid Highlight;
     outline-offset: 2px;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .pool-skip-link {
+    background: var(--pool-bg-elevated);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
   }
 }

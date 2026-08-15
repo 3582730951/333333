@@ -1,4 +1,5 @@
 import React from 'react';
+import { Tooltip as PoolTooltip } from './Feedback.jsx';
 
 export { Button, IconButton } from './Button.jsx';
 export { Card, DataCard, MetricCard } from './Card.jsx';
@@ -62,9 +63,11 @@ function NavItem({ item, selected, collapsed, onClick }) {
     return (
       <section className="pool-nav-section" aria-labelledby={groupLabelId}>
         {collapsed ? (
-          <button id={groupLabelId} type="button" className="pool-nav-group-label" title={item.text} onClick={() => onClick?.({ itemKey: item.itemKey, group: true })}>
-            {label}
-          </button>
+          <PoolTooltip content={item.text}>
+            <button id={groupLabelId} type="button" className="pool-nav-group-label" aria-label={item.text} onClick={() => onClick?.({ itemKey: item.itemKey, group: true })}>
+              {label}
+            </button>
+          </PoolTooltip>
         ) : <h2 id={groupLabelId} className="pool-nav-group-label pool-nav-group-label--static">{label}</h2>}
         <div className="pool-nav-children" role="group" aria-labelledby={groupLabelId}>
           {item.items.map((child) => (
@@ -75,18 +78,19 @@ function NavItem({ item, selected, collapsed, onClick }) {
     );
   }
   const current = selected.includes(item.itemKey);
-  return (
+  const button = (
     <button
       type="button"
       className="pool-nav-item"
       aria-current={current ? 'page' : undefined}
-      title={collapsed ? item.text : undefined}
+      aria-label={collapsed ? item.text : undefined}
       onClick={() => onClick?.({ itemKey: item.itemKey })}
     >
       {item.icon}
       <span className="pool-nav-text">{item.text}</span>
     </button>
   );
+  return collapsed ? <PoolTooltip content={item.text}>{button}</PoolTooltip> : button;
 }
 
 export function Nav({ items = [], selectedKeys = [], isCollapsed, onClick, className, style }) {

@@ -282,6 +282,9 @@ func (s *Server) writeUpstreamHeaders(ctx context.Context, dst, src http.Header)
 		if lower == "authorization" ||
 			lower == "chatgpt-account-id" ||
 			lower == "x-openai-fedramp" ||
+			// A provider redirect is an upstream routing instruction, not a safe
+			// downstream redirect. Reflecting it exposes custom provider topology.
+			lower == "location" ||
 			// An upstream account's catalog ETag is not the ETag of the pool's
 			// route-scoped aggregate. Reflecting it makes stock Codex repeatedly
 			// refresh otherwise-current model metadata.
@@ -576,13 +579,20 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 		}
 		return nil
 	}
+	var streamLeakFilter *leakfilter.SSEFilter
+	if leak {
+		streamLeakFilter = leakfilter.NewSSEFilter(provider, words)
+	}
 	emitFrame := func(frame []byte) (bool, error) {
+		if streamLeakFilter != nil {
+			streamLeakFilter.ObserveFrameForRelay(frame)
+		}
 		out := filterRuleSSEFrame(frame, rf)
 		if len(out) == 0 {
 			return false, nil
 		}
 		if leak {
-			out = leakfilter.NewSSEFilter(provider, words).ProcessFrameForRelay(out)
+			out = streamLeakFilter.ProcessFrameForRelay(out)
 		} else {
 			if provider == "codex" {
 				out, _ = leakfilter.NeutralizeResponsesContextErrorSSEFrame(out)
@@ -771,6 +781,7 @@ const (
 func probeEarlyCodexSSEFailure(body io.Reader) ([]byte, leakfilter.CodexFailureFrame, bool, error) {
 	var failure leakfilter.CodexFailureFrame
 	sawContent := false
+	sawLifecycle := false
 	prefix, terminal, err := probeEarlySSEFailure(body, func(frame []byte) bool {
 		parsed, ok := leakfilter.ParseCodexFailureFrame(frame)
 		if ok {
@@ -781,9 +792,17 @@ func probeEarlyCodexSSEFailure(body io.Reader) ([]byte, leakfilter.CodexFailureF
 			if sawContent && parsed.ContextError != leakfilter.ResponsesContextErrorNone {
 				return false
 			}
+			return true
 		}
-		return ok
+		if sawLifecycle && !sawContent && leakfilter.IsEmptyCodexCompletionFrame(frame) {
+			failure = emptyCodexCompletionFailure()
+			return true
+		}
+		return false
 	}, func(frame []byte) bool {
+		if codexSSEFrameStartsResponse(frame) {
+			sawLifecycle = true
+		}
 		commits := codexSSEFrameCommitsContent(frame)
 		if commits {
 			sawContent = true
@@ -913,6 +932,8 @@ func (r *earlySSEReadAhead) readWithIdle(p []byte, idle time.Duration) (int, err
 func probeEarlyCodexSSEFailureWithIdleRelease(body io.Reader, idle time.Duration) ([]byte, io.Reader, leakfilter.CodexFailureFrame, bool, error) {
 	reader := newEarlySSEReadAhead(body)
 	var failure leakfilter.CodexFailureFrame
+	sawContent := false
+	sawLifecycle := false
 	buf := make([]byte, 0, 4096)
 	tmp := make([]byte, 4096)
 	processed := 0
@@ -927,6 +948,9 @@ func probeEarlyCodexSSEFailureWithIdleRelease(body io.Reader, idle time.Duration
 			end := processed + boundary + separatorLen
 			frame := buf[processed:end]
 			frames++
+			if codexSSEFrameStartsResponse(frame) {
+				sawLifecycle = true
+			}
 			if parsed, ok := leakfilter.ParseCodexFailureFrame(frame); ok {
 				failure = parsed
 				if committedInBatch && parsed.ContextError != leakfilter.ResponsesContextErrorNone {
@@ -935,8 +959,13 @@ func probeEarlyCodexSSEFailureWithIdleRelease(body io.Reader, idle time.Duration
 				}
 				return buf, reader, failure, true, nil
 			}
+			if sawLifecycle && !sawContent && leakfilter.IsEmptyCodexCompletionFrame(frame) {
+				failure = emptyCodexCompletionFailure()
+				return buf, reader, failure, true, nil
+			}
 			if codexSSEFrameCommitsContent(frame) {
 				committedInBatch = true
+				sawContent = true
 			}
 			processed = end
 			if frames >= earlySSEMaxFrames {
@@ -964,6 +993,119 @@ func probeEarlyCodexSSEFailureWithIdleRelease(body io.Reader, idle time.Duration
 		}
 	}
 	return buf, reader, failure, false, nil
+}
+
+func emptyCodexCompletionFailure() leakfilter.CodexFailureFrame {
+	return leakfilter.CodexFailureFrame{
+		EventType:        "response.failed",
+		ErrorCode:        "upstream_empty_response",
+		StatusCode:       http.StatusServiceUnavailable,
+		BuiltinRetryable: true,
+		Header:           http.Header{"Content-Type": []string{"application/json"}},
+		Body:             []byte(`{"error":{"type":"upstream_empty_response","message":"upstream completed without output or usage"}}`),
+	}
+}
+
+type claudeEarlySSEOutcome uint8
+
+const (
+	claudeEarlySSENormal claudeEarlySSEOutcome = iota
+	claudeEarlySSERetryableError
+	claudeEarlySSEEmptyEndTurn
+)
+
+// probeEarlyClaudeSSEWithIdleRelease keeps the non-semantic message_start in a
+// tiny pre-commit window. Most streams immediately produce a content block and
+// are released; an empty end_turn arriving in that same window can instead be
+// continued on the same credential, as Anthropic requires. The read-ahead reader
+// prevents a slow first content block from delaying downstream streaming.
+func probeEarlyClaudeSSEWithIdleRelease(body io.Reader, idle time.Duration) ([]byte, io.Reader, claudeEarlySSEOutcome, error) {
+	reader := newEarlySSEReadAhead(body)
+	buf := make([]byte, 0, 4096)
+	tmp := make([]byte, 4096)
+	processed := 0
+	frames := 0
+	stopReason := ""
+	for len(buf) < earlySSEMaxBytes && frames < earlySSEMaxFrames {
+		for {
+			boundary, separatorLen := sseFrameBoundary(buf[processed:])
+			if boundary < 0 {
+				break
+			}
+			end := processed + boundary + separatorLen
+			frame := buf[processed:end]
+			processed = end
+			frames++
+			if leakfilter.IsRetryableClaudeErrorFrame(frame) {
+				return buf, reader, claudeEarlySSERetryableError, nil
+			}
+			semantic, reason, stopped := claudeEarlySSEFrameState(frame)
+			if reason != "" {
+				stopReason = reason
+			}
+			if semantic {
+				return buf, reader, claudeEarlySSENormal, nil
+			}
+			if stopped {
+				if strings.EqualFold(stopReason, "end_turn") {
+					return buf, reader, claudeEarlySSEEmptyEndTurn, nil
+				}
+				return buf, reader, claudeEarlySSENormal, nil
+			}
+			if frames >= earlySSEMaxFrames {
+				return buf, reader, claudeEarlySSENormal, nil
+			}
+		}
+		n, err := reader.readWithIdle(tmp, idle)
+		if errors.Is(err, errEarlySSEProbeIdle) {
+			return buf, reader, claudeEarlySSENormal, nil
+		}
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+		if err != nil {
+			if err == io.EOF {
+				if n > 0 {
+					continue
+				}
+				return buf, reader, claudeEarlySSENormal, nil
+			}
+			return buf, reader, claudeEarlySSENormal, err
+		}
+	}
+	return buf, reader, claudeEarlySSENormal, nil
+}
+
+func claudeEarlySSEFrameState(frame []byte) (semantic bool, stopReason string, stopped bool) {
+	eventType, data := sseFrameEventData(frame)
+	if len(data) == 0 {
+		return false, "", false
+	}
+	var event map[string]interface{}
+	if json.Unmarshal(data, &event) != nil {
+		return false, "", false
+	}
+	typ := streamString(event["type"])
+	if typ == "" {
+		typ = eventType
+	}
+	switch typ {
+	case "content_block_start", "content_block_delta":
+		return true, "", false
+	case "message_start":
+		if message, ok := event["message"].(map[string]interface{}); ok {
+			if content, ok := message["content"].([]interface{}); ok && len(content) > 0 {
+				return true, "", false
+			}
+		}
+	case "message_delta":
+		if delta, ok := event["delta"].(map[string]interface{}); ok {
+			return false, streamString(delta["stop_reason"]), false
+		}
+	case "message_stop":
+		return false, "", true
+	}
+	return false, "", false
 }
 
 func probeEarlyClaudeSSEFailure(body io.Reader) ([]byte, bool, error) {
@@ -1050,6 +1192,11 @@ func codexSSEFrameCommitsContent(frame []byte) bool {
 	return false
 }
 
+func codexSSEFrameStartsResponse(frame []byte) bool {
+	lower := strings.ToLower(string(frame))
+	return strings.Contains(lower, "response.created")
+}
+
 func claudeSSEFrameCommitsContent(frame []byte) bool {
 	lower := strings.ToLower(string(frame))
 	for _, marker := range []string{
@@ -1073,6 +1220,9 @@ func claudeSSEFrameCommitsContent(frame []byte) bool {
 func (s *Server) writeFilteredError(ctx context.Context, w http.ResponseWriter, provider string, status int, header http.Header, body []byte, words *streamrewrite.Matcher) {
 	out := body
 	filteredHeader := header
+	if redacted, changed := leakfilter.RedactUpstreamTopology(out); changed {
+		out = redacted
+	}
 	if !strings.EqualFold(provider, "claude") {
 		if ns, nb, changed := leakfilter.NeutralizeResponsesContextErrorBody(status, body); changed {
 			status = ns

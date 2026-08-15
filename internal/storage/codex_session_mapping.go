@@ -151,6 +151,14 @@ type CodexSessionCommit struct {
 	Aliases             []CodexSessionAlias
 	ExpiresAt           int64
 	InstructionSnapshot *CodexInstructionSnapshot
+	// DropConflictingHierarchyAliases contains legacy/concurrent damage without
+	// weakening terminal state pointers. When a commit also owns a response alias,
+	// root/session/branch aliases already held by another active binding are skipped
+	// atomically; response and turn-state collisions remain hard failures.
+	DropConflictingHierarchyAliases bool
+	// DroppedHierarchyAliases receives the number skipped after a successful
+	// transaction. It is optional and used only for aggregate audit telemetry.
+	DroppedHierarchyAliases *int
 }
 
 // CodexInstructionSnapshot is the tree-scoped, encrypted base-instructions
@@ -171,6 +179,7 @@ type CodexInstructionSnapshot struct {
 // bundle correlate transport/account/real-exit outcomes without retaining input,
 // output, aliases, or upstream ids.
 type CodexUpstreamAttempt struct {
+	EventID    string
 	TreeID     string
 	AccountID  string
 	EgressID   string
@@ -499,7 +508,7 @@ FROM codex_instruction_snapshot WHERE tree_id=? AND expires_at>?`, treeID, Now()
 // by lazy migration and terminal mapping commits. The first writer determines a
 // tree's instruction text forever (until expiry); concurrent branches receive
 // that exact stored value instead of racing current group files into the tree.
-func (s *Store) ensureCodexInstructionSnapshotTx(ctx context.Context, tx *sql.Tx, candidate CodexInstructionSnapshot) (CodexInstructionSnapshot, error) {
+func (s *Store) ensureCodexInstructionSnapshotTx(ctx context.Context, tx *sql.Tx, candidate CodexInstructionSnapshot, freshTree bool) (CodexInstructionSnapshot, error) {
 	candidate.TreeID = strings.TrimSpace(candidate.TreeID)
 	if candidate.TreeID == "" {
 		return CodexInstructionSnapshot{}, ErrCodexInstructionSnapshotNotFound
@@ -520,6 +529,16 @@ func (s *Store) ensureCodexInstructionSnapshotTx(ctx context.Context, tx *sql.Tx
 		candidate.CreatedAt = now
 	}
 	candidate.UpdatedAt = now
+	if freshTree {
+		// A fresh root/fork receives a cryptographically random tree id in the same
+		// transaction as its first binding. No previous snapshot can own that id, so
+		// the general conflict/read-back/TTL-refresh path is redundant. A collision
+		// remains a hard transaction error instead of silently changing policy.
+		_, err = tx.ExecContext(ctx, `INSERT INTO codex_instruction_snapshot(`+codexInstructionSnapshotColumns+`)
+VALUES(?,?,?,?,?,?)`, candidate.TreeID, encrypted, candidate.Revision,
+			candidate.CreatedAt, candidate.UpdatedAt, candidate.ExpiresAt)
+		return candidate, err
+	}
 	// The conflict update intentionally fires only for an expired snapshot. This
 	// is a CAS, not a configuration refresh: active trees must never observe file
 	// edits made after their root turn began.
@@ -564,7 +583,7 @@ func (s *Store) EnsureCodexInstructionSnapshot(ctx context.Context, candidate Co
 		return CodexInstructionSnapshot{}, err
 	}
 	defer tx.Rollback()
-	stored, err := s.ensureCodexInstructionSnapshotTx(ctx, tx, candidate)
+	stored, err := s.ensureCodexInstructionSnapshotTx(ctx, tx, candidate, false)
 	if err != nil {
 		return CodexInstructionSnapshot{}, err
 	}
@@ -582,7 +601,16 @@ func (s *Store) CommitCodexSessionBinding(ctx context.Context, commit CodexSessi
 		return CodexSessionBinding{}, ErrCodexSessionMappingNotFound
 	}
 	aliases := normalizedCodexSessionAliases(commit.Aliases)
+	hasResponseAlias := false
+	for _, alias := range aliases {
+		if alias.Type == "response" && strings.TrimSpace(alias.Value) != "" {
+			hasResponseAlias = true
+			break
+		}
+	}
 	binding := commit.Binding
+	freshBindingID := binding.ID == ""
+	freshTreeID := binding.TreeID == ""
 	if binding.ID == "" {
 		binding.ID = newCodexSessionMappingID("csm")
 	}
@@ -617,80 +645,95 @@ func (s *Store) CommitCodexSessionBinding(ctx context.Context, commit CodexSessi
 	}
 	defer tx.Rollback()
 
-	var existingEpoch int64
-	var existingState string
-	err = tx.QueryRowContext(ctx, `SELECT epoch,state FROM codex_session_binding WHERE id=?`, binding.ID).Scan(&existingEpoch, &existingState)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
+	bindingInserted := false
+	if freshBindingID {
 		if _, err = tx.ExecContext(ctx, `INSERT INTO codex_session_binding(`+codexSessionBindingColumns+`)
 VALUES(?,?,?,?,?,?,?,?,?,?,?)`, binding.ID, binding.TreeID, namespaceHash, binding.AccountID, binding.EgressID,
 			binding.Epoch, binding.State, encrypted, binding.CreatedAt, binding.UpdatedAt, binding.ExpiresAt); err != nil {
 			return CodexSessionBinding{}, err
 		}
-	case err != nil:
-		return CodexSessionBinding{}, err
-	case existingState != "active":
-		return CodexSessionBinding{}, ErrCodexSessionEpochRetired
-	case existingEpoch != binding.Epoch:
-		return CodexSessionBinding{}, ErrCodexSessionEpochConflict
-	default:
-		result, updateErr := tx.ExecContext(ctx, `UPDATE codex_session_binding
+		bindingInserted = true
+	} else {
+		var existingEpoch int64
+		var existingState string
+		err = tx.QueryRowContext(ctx, `SELECT epoch,state FROM codex_session_binding WHERE id=?`, binding.ID).Scan(&existingEpoch, &existingState)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			if _, err = tx.ExecContext(ctx, `INSERT INTO codex_session_binding(`+codexSessionBindingColumns+`)
+VALUES(?,?,?,?,?,?,?,?,?,?,?)`, binding.ID, binding.TreeID, namespaceHash, binding.AccountID, binding.EgressID,
+				binding.Epoch, binding.State, encrypted, binding.CreatedAt, binding.UpdatedAt, binding.ExpiresAt); err != nil {
+				return CodexSessionBinding{}, err
+			}
+			bindingInserted = true
+		case err != nil:
+			return CodexSessionBinding{}, err
+		case existingState != "active":
+			return CodexSessionBinding{}, ErrCodexSessionEpochRetired
+		case existingEpoch != binding.Epoch:
+			return CodexSessionBinding{}, ErrCodexSessionEpochConflict
+		default:
+			result, updateErr := tx.ExecContext(ctx, `UPDATE codex_session_binding
 SET namespace_hash=?,account_id=?,egress_id=?,state=?,encrypted_identity=?,updated_at=?,expires_at=?
 WHERE id=? AND epoch=? AND state='active'`, namespaceHash, binding.AccountID, binding.EgressID, binding.State,
-			encrypted, binding.UpdatedAt, binding.ExpiresAt, binding.ID, binding.Epoch)
-		if updateErr != nil {
-			return CodexSessionBinding{}, updateErr
-		}
-		changed, _ := result.RowsAffected()
-		if changed != 1 {
-			return CodexSessionBinding{}, ErrCodexSessionEpochConflict
+				encrypted, binding.UpdatedAt, binding.ExpiresAt, binding.ID, binding.Epoch)
+			if updateErr != nil {
+				return CodexSessionBinding{}, updateErr
+			}
+			changed, _ := result.RowsAffected()
+			if changed != 1 {
+				return CodexSessionBinding{}, ErrCodexSessionEpochConflict
+			}
 		}
 	}
 	if commit.InstructionSnapshot != nil {
 		snapshot := *commit.InstructionSnapshot
 		snapshot.TreeID = binding.TreeID
 		snapshot.ExpiresAt = binding.ExpiresAt
-		if _, err := s.ensureCodexInstructionSnapshotTx(ctx, tx, snapshot); err != nil {
+		if _, err := s.ensureCodexInstructionSnapshotTx(ctx, tx, snapshot, freshTreeID); err != nil {
 			return CodexSessionBinding{}, err
 		}
 	}
 
+	droppedHierarchyAliases := 0
 	for _, alias := range aliases {
 		hash := s.codexSessionAliasHash(commit.Namespace, alias.Type, alias.Value)
-		rows, queryErr := tx.QueryContext(ctx, `SELECT b.id FROM codex_session_alias a
-JOIN codex_session_binding b ON b.id=a.binding_id
-WHERE a.alias_hash=? AND a.expires_at>? AND b.expires_at>? AND b.state='active'`, hash, now, now)
-		if queryErr != nil {
-			return CodexSessionBinding{}, queryErr
+		result, insertErr := tx.ExecContext(ctx, `INSERT INTO codex_session_alias(alias_hash,alias_type,binding_id,created_at,updated_at,expires_at)
+SELECT ?,?,?,?,?,?
+WHERE ?='turn_state' OR NOT EXISTS (
+ SELECT 1 FROM codex_session_alias a
+ JOIN codex_session_binding b ON b.id=a.binding_id
+ WHERE a.alias_hash=? AND a.expires_at>? AND b.expires_at>? AND b.state='active' AND b.id<>?
+)
+ON CONFLICT(alias_hash,binding_id) DO UPDATE SET updated_at=excluded.updated_at,expires_at=excluded.expires_at`,
+			hash, alias.Type, binding.ID, now, now, binding.ExpiresAt,
+			alias.Type, hash, now, now, binding.ID)
+		if insertErr != nil {
+			return CodexSessionBinding{}, insertErr
 		}
-		owners := make([]string, 0, 1)
-		for rows.Next() {
-			var owner string
-			if scanErr := rows.Scan(&owner); scanErr != nil {
-				rows.Close()
-				return CodexSessionBinding{}, scanErr
+		if changed, rowsErr := result.RowsAffected(); rowsErr != nil {
+			return CodexSessionBinding{}, rowsErr
+		} else if alias.Type != "turn_state" && changed == 0 {
+			droppableHierarchy := commit.DropConflictingHierarchyAliases && hasResponseAlias &&
+				(alias.Type == "root" || alias.Type == "session" || alias.Type == "branch")
+			if droppableHierarchy {
+				droppedHierarchyAliases++
+				continue
 			}
-			owners = append(owners, owner)
-		}
-		rows.Close()
-		if alias.Type != "turn_state" && (len(owners) > 1 || (len(owners) == 1 && owners[0] != binding.ID)) {
 			return CodexSessionBinding{}, ErrCodexSessionMappingAmbiguous
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO codex_session_alias(alias_hash,alias_type,binding_id,created_at,updated_at,expires_at)
-VALUES(?,?,?,?,?,?) ON CONFLICT(alias_hash,binding_id) DO UPDATE SET updated_at=excluded.updated_at,expires_at=excluded.expires_at`,
-			hash, alias.Type, binding.ID, now, now, binding.ExpiresAt); err != nil {
+	}
+	// Newly inserted aliases already carry the terminal expiry. Existing bindings
+	// still need a sliding refresh for aliases omitted by this particular turn.
+	if !bindingInserted {
+		if _, err := tx.ExecContext(ctx, `UPDATE codex_session_alias SET updated_at=?,expires_at=? WHERE binding_id=?`, now, binding.ExpiresAt, binding.ID); err != nil {
 			return CodexSessionBinding{}, err
 		}
 	}
-	// A successful terminal refreshes the complete mapping, not merely the aliases
-	// that happened to be present on this particular request. A root-only alias may
-	// otherwise expire while a client has been continuously resuming through newer
-	// previous_response_id values, defeating the documented sliding retention window.
-	if _, err := tx.ExecContext(ctx, `UPDATE codex_session_alias SET updated_at=?,expires_at=? WHERE binding_id=?`, now, binding.ExpiresAt, binding.ID); err != nil {
-		return CodexSessionBinding{}, err
-	}
 	if err := tx.Commit(); err != nil {
 		return CodexSessionBinding{}, err
+	}
+	if commit.DroppedHierarchyAliases != nil {
+		*commit.DroppedHierarchyAliases = droppedHierarchyAliases
 	}
 	return binding, nil
 }
@@ -973,12 +1016,26 @@ func (s *Store) ListCodexInstructionSnapshotDiagnostics(ctx context.Context) ([]
 // InsertCodexUpstreamAttempt persists one safe Codex transport observation. TreeID
 // is either a durable CPA tree or a server-owned stateless request namespace.
 func (s *Store) InsertCodexUpstreamAttempt(ctx context.Context, attempt CodexUpstreamAttempt) error {
+	normalized, err := normalizeCodexUpstreamAttempt(attempt)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO codex_upstream_attempt(event_id,tree_id,account_id,egress_id,epoch,state,status_code,created_at,expires_at)
+VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, normalized.EventID, normalized.TreeID, normalized.AccountID, normalized.EgressID, normalized.Epoch, normalized.State, normalized.StatusCode, normalized.CreatedAt, normalized.ExpiresAt)
+	return err
+}
+
+func normalizeCodexUpstreamAttempt(attempt CodexUpstreamAttempt) (CodexUpstreamAttempt, error) {
+	attempt.EventID = strings.TrimSpace(attempt.EventID)
 	attempt.TreeID = strings.TrimSpace(attempt.TreeID)
 	attempt.AccountID = strings.TrimSpace(attempt.AccountID)
 	attempt.EgressID = strings.TrimSpace(attempt.EgressID)
 	attempt.State = strings.TrimSpace(attempt.State)
 	if attempt.TreeID == "" || attempt.AccountID == "" || attempt.EgressID == "" || attempt.State == "" {
-		return errors.New("codex upstream attempt metadata incomplete")
+		return CodexUpstreamAttempt{}, errors.New("codex upstream attempt metadata incomplete")
+	}
+	if attempt.EventID == "" {
+		attempt.EventID = newCodexSessionMappingID("attempt")
 	}
 	if attempt.CreatedAt <= 0 {
 		attempt.CreatedAt = Now()
@@ -986,9 +1043,7 @@ func (s *Store) InsertCodexUpstreamAttempt(ctx context.Context, attempt CodexUps
 	if attempt.ExpiresAt <= attempt.CreatedAt {
 		attempt.ExpiresAt = attempt.CreatedAt + int64((7 * 24 * time.Hour).Seconds())
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO codex_upstream_attempt(tree_id,account_id,egress_id,epoch,state,status_code,created_at,expires_at)
-VALUES(?,?,?,?,?,?,?,?)`, attempt.TreeID, attempt.AccountID, attempt.EgressID, attempt.Epoch, attempt.State, attempt.StatusCode, attempt.CreatedAt, attempt.ExpiresAt)
-	return err
+	return attempt, nil
 }
 
 // ListRecentCodexEgressOutcomes aggregates raw recent observations. Daily rows

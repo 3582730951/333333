@@ -5,14 +5,19 @@ import (
 	"strings"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/routing"
 )
 
-func (s *Server) enterCodexCacheSingleflight(ctx context.Context, enabled bool, accountID, model string, body []byte, affinity routing.AffinityKey) (func(), bool) {
+func (s *Server) enterCodexCacheSingleflight(ctx context.Context, enabled bool, accountID, model string, body []byte, affinity routing.AffinityKey, metadata ...*bodysource.BodyMeta) (func(), bool) {
 	if !enabled {
 		return func() {}, false
 	}
-	promptCacheKey := strings.TrimSpace(routing.PromptCacheKey(body))
+	var meta *bodysource.BodyMeta
+	if len(metadata) > 0 {
+		meta = metadata[0]
+	}
+	promptCacheKey := strings.TrimSpace(promptCacheKeyWithMeta(body, meta))
 	if promptCacheKey == "" {
 		return func() {}, false
 	}

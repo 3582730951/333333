@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
@@ -453,23 +454,32 @@ func (s *Server) compileGroupSuperInstructForModel(ctx context.Context, group st
 	return compiled, hex.EncodeToString(sum[:]), nil
 }
 
-func (s *Server) applyModelInstructionsForEntrypoint(ctx context.Context, group storage.Group, model, path string, raw []byte) ([]byte, error) {
+func (s *Server) applyModelInstructionsForEntrypoint(ctx context.Context, group storage.Group, model, path string, raw []byte, metadata ...*bodysource.BodyMeta) ([]byte, error) {
 	components, err := s.compileGroupInstructionComponentsForModel(ctx, group, model)
 	if err != nil {
 		return raw, err
 	}
 	groupPrompt := ""
-	if prompt.ShouldRewrite(group.SystemPrompt, routing.IsCompaction(path, raw), group.SystemPromptApplyToCompaction) {
-		groupPrompt = strings.TrimSpace(group.SystemPrompt)
+	// Most groups have no prompt override. Avoid classifying (and therefore scanning)
+	// a potentially million-token body until there is an instruction to apply.
+	if configuredPrompt := strings.TrimSpace(group.SystemPrompt); configuredPrompt != "" &&
+		prompt.ShouldRewrite(configuredPrompt, routing.IsCompaction(path, raw), group.SystemPromptApplyToCompaction) {
+		groupPrompt = configuredPrompt
 	}
 	superPolicy, _ := superInstructPolicyForModel(group, model)
 	if !superPolicy.Enabled {
 		// M1 replaces complete system carriers while it is active.  A carrier with
 		// our exact bundle marker is therefore stale gateway state, not a client
 		// fragment to retain after the group/client gate has closed.
-		raw, err = stripLegacySuperInstructCarriers(raw)
-		if err != nil {
-			return raw, err
+		var meta *bodysource.BodyMeta
+		if len(metadata) > 0 {
+			meta = metadata[0]
+		}
+		if meta == nil || meta.Size != int64(len(raw)) || meta.LegacyInstructionMark {
+			raw, err = stripLegacySuperInstructCarriers(raw)
+			if err != nil {
+				return raw, err
+			}
 		}
 	}
 	if superPolicy.Enabled {

@@ -17,6 +17,9 @@ fi
 if [ -f "${secret_dir}/codex_pool_diagnostic_alias_key" ] && [ -z "${CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE:-}" ]; then
   export CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE="${secret_dir}/codex_pool_diagnostic_alias_key"
 fi
+if [ -f "${secret_dir}/codex_pool_core_state_key" ] && [ -z "${CODEX_POOL_CORE_STATE_KEY_FILE:-}" ]; then
+  export CODEX_POOL_CORE_STATE_KEY_FILE="${secret_dir}/codex_pool_core_state_key"
+fi
 if [ -f "${secret_dir}/codex_pool_admin_token" ] && [ -z "${CODEX_POOL_ADMIN_TOKEN_FILE:-}" ]; then
   export CODEX_POOL_ADMIN_TOKEN_FILE="${secret_dir}/codex_pool_admin_token"
 fi

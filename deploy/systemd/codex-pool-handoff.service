@@ -10,6 +10,8 @@ Sockets=codex-pool.socket
 User=codex-pool
 Group=codex-pool
 WorkingDirectory=/var/lib/codex-pool
+Environment=CODEX_POOL_DATA_DIR=/var/lib/codex-pool/data
+LoadCredential=core-state.key:/var/lib/codex-pool/data/keys/core-state.key
 ExecStart=/usr/local/bin/codex-pool-handoff --listen 0.0.0.0:8787 --backend-link /var/lib/codex-pool/run/active-worker.sock --control-socket /var/lib/codex-pool/run/handoff-control.sock --pause-state /var/lib/codex-pool/run/admission-paused.json
 Restart=always
 RestartSec=3

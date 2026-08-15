@@ -330,6 +330,7 @@ func copyDownstreamHeaders(dst http.Header, src http.Header) {
 		if lower == "authorization" ||
 			lower == "chatgpt-account-id" ||
 			lower == "x-openai-fedramp" ||
+			lower == "location" ||
 			strings.HasPrefix(lower, "x-pool-") ||
 			strings.HasPrefix(lower, "x-sidecar-") ||
 			lower == "content-length" ||
@@ -711,7 +712,17 @@ func hasHistoricalUserTurn(raw []byte) bool {
 }
 
 func codexSelectionAffinity(r *http.Request, raw []byte, base routing.AffinityKey, group string) routing.AffinityKey {
+	return codexSelectionAffinityWithMeta(r, raw, nil, base, group)
+}
+
+func codexSelectionAffinityWithMeta(r *http.Request, raw []byte, meta *bodysource.BodyMeta, base routing.AffinityKey, group string) routing.AffinityKey {
 	if isTrueConversationAffinity(base.Source) {
+		return base
+	}
+	if meta != nil && meta.Size == int64(len(raw)) && meta.InputItemCount > 0 && meta.LastInputRole != "user" {
+		// StablePromptPrefixFingerprint requires the final input item to be a user
+		// turn. The streaming scanner already observed the top-level item role, so
+		// avoid materializing a 128K-1M tool/assistant-ended history only to reject it.
 		return base
 	}
 	prefixHash := automaticPromptCachePrefixHash(raw)
@@ -724,7 +735,7 @@ func codexSelectionAffinity(r *http.Request, raw []byte, base routing.AffinityKe
 
 func codexRequestUsageDiagnostics(body []byte, meta *bodysource.BodyMeta, affinity routing.AffinityKey, promptCacheKeySource, retentionEffective, retentionSource string) storage.UsageDiagnostics {
 	stableSource, stableReason, stableBytes := "", "", 0
-	if meta != nil && meta.Size == int64(len(body)) && len(body) > 256<<10 && meta.StablePrefixHMAC != "" {
+	if meta != nil && meta.Size == int64(len(body)) && len(body) > 128<<10 && meta.StablePrefixHMAC != "" {
 		stableSource, stableReason, stableBytes = "body_meta_hmac", "bounded_large_body", int(meta.StablePrefixBytes)
 	} else {
 		fp := routing.StablePromptPrefixFingerprint(body)

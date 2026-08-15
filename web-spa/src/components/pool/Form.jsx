@@ -49,14 +49,16 @@ function validateField(value, rules = []) {
 function FieldShell({ field, label, help, rules, controlId, children }) {
   const form = useContext(FormContext);
   const error = form?.errors?.[field] || '';
+  const errorId = controlId ? `${controlId}-error` : undefined;
+  const helpId = controlId ? `${controlId}-help` : undefined;
   return (
-    <div className={cx('pool-field', form?.labelPosition === 'left' ? 'pool-field--left' : '')}>
+    <div className={cx('pool-field', form?.labelPosition === 'left' ? 'pool-field--left' : '')} data-pool-field={field || undefined} data-error={error ? 'true' : undefined}>
       {label ? controlId
         ? <label className="pool-field__label" htmlFor={controlId}>{label}</label>
         : <span className="pool-field__label">{label}</span> : null}
       <span>
         {children}
-        {error ? <div className="pool-field__error">{error}</div> : help ? <div className="pool-field__help">{help}</div> : null}
+        {error ? <div id={errorId} className="pool-field__error" role="alert">{error}</div> : help ? <div id={helpId} className="pool-field__help">{help}</div> : null}
       </span>
     </div>
   );
@@ -104,6 +106,8 @@ export function TextInput({
 }) {
   const generatedId = useId();
   const controlId = props.id || (field ? `pool-field-${field}-${generatedId}` : generatedId);
+  const fieldError = useContext(FormContext)?.errors?.[field] || '';
+  const describedBy = [props['aria-describedby'], fieldError ? `${controlId}-error` : help ? `${controlId}-help` : ''].filter(Boolean).join(' ') || undefined;
   const [current, setCurrent] = useField(field, rules, value, onChange, initValue);
   const [revealed, setRevealed] = useState(false);
   const inputType = mode === 'password' && !revealed ? 'password' : 'text';
@@ -119,6 +123,9 @@ export function TextInput({
       }}
       style={!prefix && !showClear ? style : undefined}
       {...props}
+      name={props.name || field}
+      aria-invalid={props['aria-invalid'] ?? (fieldError ? true : undefined)}
+      aria-describedby={describedBy}
     />
   );
   const control = prefix || showClear || allowReveal ? (
@@ -145,6 +152,8 @@ export function TextInput({
 export function NumberInput({ field, label, help, rules, value, onChange, min, max, className, initValue, ...props }) {
   const generatedId = useId();
   const controlId = props.id || (field ? `pool-field-${field}-${generatedId}` : generatedId);
+  const fieldError = useContext(FormContext)?.errors?.[field] || '';
+  const describedBy = [props['aria-describedby'], fieldError ? `${controlId}-error` : help ? `${controlId}-help` : ''].filter(Boolean).join(' ') || undefined;
   const [current, setCurrent] = useField(field, rules, value, onChange, initValue);
   return (
     <FieldShell field={field} label={label} help={help} rules={rules} controlId={controlId}>
@@ -160,6 +169,9 @@ export function NumberInput({ field, label, help, rules, value, onChange, min, m
           setCurrent(raw === '' ? '' : Number(raw));
         }}
         {...props}
+        name={props.name || field}
+        aria-invalid={props['aria-invalid'] ?? (fieldError ? true : undefined)}
+        aria-describedby={describedBy}
       />
     </FieldShell>
   );
@@ -168,6 +180,8 @@ export function NumberInput({ field, label, help, rules, value, onChange, min, m
 export function Textarea({ field, label, help, rules, value, onChange, autosize, className, initValue, ...props }) {
   const generatedId = useId();
   const controlId = props.id || (field ? `pool-field-${field}-${generatedId}` : generatedId);
+  const fieldError = useContext(FormContext)?.errors?.[field] || '';
+  const describedBy = [props['aria-describedby'], fieldError ? `${controlId}-error` : help ? `${controlId}-help` : ''].filter(Boolean).join(' ') || undefined;
   const [current, setCurrent] = useField(field, rules, value, onChange, initValue);
   return (
     <FieldShell field={field} label={label} help={help} rules={rules} controlId={controlId}>
@@ -178,6 +192,9 @@ export function Textarea({ field, label, help, rules, value, onChange, autosize,
         onChange={(event) => setCurrent(event.target.value)}
         rows={autosize ? 4 : props.rows}
         {...props}
+        name={props.name || field}
+        aria-invalid={props['aria-invalid'] ?? (fieldError ? true : undefined)}
+        aria-describedby={describedBy}
       />
     </FieldShell>
   );
@@ -669,6 +686,7 @@ export function Form({
   const [values, setValues] = useState(() => getInitialValues(initValues));
   const [errors, setErrors] = useState({});
   const fieldsRef = useRef(new Map());
+  const formRef = useRef(null);
   const initKey = initialValuesKey(initValues);
 
   useEffect(() => {
@@ -702,7 +720,16 @@ export function Form({
         if (message) nextErrors[field] = message;
       }
       setErrors(nextErrors);
-      if (Object.keys(nextErrors).length === 0) onSubmit?.({ ...values });
+      const firstError = Object.keys(nextErrors)[0];
+      if (!firstError) {
+        onSubmit?.({ ...values });
+        return;
+      }
+      requestBrowserAnimationFrame(() => {
+        const field = Array.from(formRef.current?.querySelectorAll('[data-pool-field]') || [])
+          .find((node) => node.dataset.poolField === firstError);
+        field?.querySelector('input, textarea, button, [tabindex]:not([tabindex="-1"])')?.focus();
+      });
     },
     validate: async () => {
       const nextErrors = {};
@@ -751,6 +778,7 @@ export function Form({
   return (
     <FormContext.Provider value={context}>
       <form
+        ref={formRef}
         className={cx('pool-form', className)}
         style={{ '--pool-form-label-width': typeof labelWidth === 'number' ? `${labelWidth}px` : labelWidth, ...(style || {}) }}
         onSubmit={(event) => {

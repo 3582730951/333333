@@ -28,8 +28,8 @@ func (s *Server) createBillingHold(ctx context.Context, routeKeyHash, accountID 
 
 func (s *Server) settleBillingHold(_ context.Context, id, status string) error {
 	if id != "" {
-		s.enqueueBillingHold(storage.BillingHoldWrite{ID: id, Status: status, CreatedAt: storage.Now()})
 		s.billingEstimates.Delete(id)
+		s.enqueueBillingHold(storage.BillingHoldWrite{ID: id, Status: status, CreatedAt: storage.Now()})
 	}
 	return nil
 }
@@ -43,8 +43,12 @@ func (s *Server) billingHoldEstimate(id string) int64 {
 
 func (s *Server) settleBillingHoldIfHeld(_ context.Context, id, status string) error {
 	if id != "" {
-		s.enqueueBillingHold(storage.BillingHoldWrite{ID: id, Status: status, CreatedAt: storage.Now(), IfHeld: true})
-		s.billingEstimates.Delete(id)
+		// Explicit settlement deletes the in-flight marker first. The deferred
+		// abandoned backstop therefore emits only when it is the operation that
+		// actually claims an otherwise-unsettled request.
+		if _, held := s.billingEstimates.LoadAndDelete(id); held {
+			s.enqueueBillingHold(storage.BillingHoldWrite{ID: id, Status: status, CreatedAt: storage.Now(), IfHeld: true})
+		}
 	}
 	return nil
 }

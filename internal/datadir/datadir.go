@@ -24,6 +24,7 @@ type Layout struct {
 	Root             string
 	Spool            string
 	Journal          string
+	CoreState        string
 	Diagnostics      string
 	BrowserTemporary string
 	Run              string
@@ -45,6 +46,7 @@ func Prepare(root, explicitSpool, explicitJournal string) (Layout, error) {
 		Root:             absolute,
 		Spool:            filepath.Join(absolute, "spool"),
 		Journal:          filepath.Join(absolute, "journal"),
+		CoreState:        filepath.Join(absolute, "core-state"),
 		Diagnostics:      filepath.Join(absolute, "diagnostics"),
 		BrowserTemporary: filepath.Join(absolute, "tmp", "browser"),
 		Run:              filepath.Join(absolute, "run"),
@@ -67,6 +69,7 @@ func Prepare(root, explicitSpool, explicitJournal string) (Layout, error) {
 		layout.Root,
 		layout.Spool,
 		layout.Journal,
+		layout.CoreState,
 		layout.Diagnostics,
 		filepath.Dir(layout.BrowserTemporary),
 		layout.BrowserTemporary,

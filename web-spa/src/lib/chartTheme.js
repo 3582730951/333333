@@ -56,6 +56,7 @@ export const PALETTE = [
 // these were aliases like `cyan: PALETTE[4]`, which tied the semantic name to a slot
 // position: reordering the palette silently moved every MetricCard's colour.
 export const COLORS = {
+  primary: 'var(--chart-primary)',
   blue: 'var(--chart-blue)',
   green: 'var(--chart-green)',
   violet: 'var(--chart-purple)',

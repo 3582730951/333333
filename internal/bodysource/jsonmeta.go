@@ -2,6 +2,7 @@ package bodysource
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -30,39 +31,51 @@ type Span struct {
 }
 
 type BodyMeta struct {
-	Size               int64             `json:"size"`
-	Type               string            `json:"type,omitempty"`
-	ID                 string            `json:"id,omitempty"`
-	Model              string            `json:"model,omitempty"`
-	Status             string            `json:"status,omitempty"`
-	ResponseID         string            `json:"response_id,omitempty"`
-	ResponseModel      string            `json:"response_model,omitempty"`
-	Stream             bool              `json:"stream"`
-	StreamPresent      bool              `json:"stream_present"`
-	PromptCacheKey     string            `json:"prompt_cache_key,omitempty"`
-	PreviousResponseID string            `json:"previous_response_id,omitempty"`
-	ConversationID     string            `json:"conversation_id,omitempty"`
-	SessionID          string            `json:"session_id,omitempty"`
-	ThreadID           string            `json:"thread_id,omitempty"`
-	Fields             map[string]Span   `json:"fields,omitempty"`
-	StablePrefixHMAC   string            `json:"stable_prefix_hmac,omitempty"`
-	StablePrefixBytes  int64             `json:"stable_prefix_bytes"`
-	EstimatedTokens    int64             `json:"estimated_tokens"`
-	CompactionTrigger  bool              `json:"compaction_trigger,omitempty"`
-	ClientToolResult   bool              `json:"client_tool_result,omitempty"`
-	ToolContext        bool              `json:"tool_context,omitempty"`
-	ObjectEnd          int64             `json:"-"`
-	MemberCount        int               `json:"-"`
-	Members            map[string]Span   `json:"-"`
-	Kinds              map[string]byte   `json:"-"`
-	Scalars            map[string][]byte `json:"-"`
-	FirstInputItem     Span              `json:"-"`
+	Size               int64           `json:"size"`
+	Type               string          `json:"type,omitempty"`
+	ID                 string          `json:"id,omitempty"`
+	Model              string          `json:"model,omitempty"`
+	Status             string          `json:"status,omitempty"`
+	ResponseID         string          `json:"response_id,omitempty"`
+	ResponseModel      string          `json:"response_model,omitempty"`
+	Stream             bool            `json:"stream"`
+	StreamPresent      bool            `json:"stream_present"`
+	PromptCacheKey     string          `json:"prompt_cache_key,omitempty"`
+	PreviousResponseID string          `json:"previous_response_id,omitempty"`
+	ConversationID     string          `json:"conversation_id,omitempty"`
+	SessionID          string          `json:"session_id,omitempty"`
+	ThreadID           string          `json:"thread_id,omitempty"`
+	Fields             map[string]Span `json:"fields,omitempty"`
+	StablePrefixHMAC   string          `json:"stable_prefix_hmac,omitempty"`
+	StablePrefixBytes  int64           `json:"stable_prefix_bytes"`
+	EstimatedTokens    int64           `json:"estimated_tokens"`
+	CompactionTrigger  bool            `json:"compaction_trigger,omitempty"`
+	ClientToolResult   bool            `json:"client_tool_result,omitempty"`
+	ToolContext        bool            `json:"tool_context,omitempty"`
+	// PromptCacheBreakpoint marks the unsupported client-only cache control found
+	// anywhere below the request root. The Codex upstream sanitizer uses this bit
+	// to select its targeted materialized fallback without rescanning every large
+	// request body on the normal path.
+	PromptCacheBreakpoint bool              `json:"prompt_cache_breakpoint,omitempty"`
+	ObjectEnd             int64             `json:"-"`
+	MemberCount           int               `json:"-"`
+	InputItemCount        int               `json:"-"`
+	LastInputRole         string            `json:"-"`
+	LastInputType         string            `json:"-"`
+	GoalSignalCandidate   bool              `json:"-"`
+	GoalSignalQualified   bool              `json:"-"`
+	EncryptedContentKey   bool              `json:"-"`
+	LegacyInstructionMark bool              `json:"-"`
+	Members               map[string]Span   `json:"-"`
+	Kinds                 map[string]byte   `json:"-"`
+	Scalars               map[string][]byte `json:"-"`
+	FirstInputItem        Span              `json:"-"`
 }
 
 var trackedJSONFields = map[string]struct{}{
 	"type": {}, "id": {}, "model": {}, "status": {}, "response": {}, "stream": {}, "prompt_cache_key": {}, "previous_response_id": {}, "conversation_id": {}, "session_id": {}, "thread_id": {},
 	"instructions": {}, "system": {}, "tools": {}, "input": {}, "messages": {}, "max_output_tokens": {}, "max_tokens": {}, "reasoning": {}, "thinking": {},
-	"store": {}, "tool_choice": {}, "parallel_tool_calls": {}, "prompt_cache_retention": {}, "client_metadata": {}, "generate": {}, "include": {},
+	"store": {}, "tool_choice": {}, "parallel_tool_calls": {}, "prompt_cache_retention": {}, "prompt_cache_options": {}, "client_metadata": {}, "generate": {}, "include": {},
 	"object": {}, "output": {}, "output_text": {}, "delta": {}, "item": {}, "usage": {}, "headers": {},
 	"window_id": {}, "parent_thread_id": {}, "forked_from_thread_id": {}, "turn_metadata": {}, "turn_state": {},
 	"compaction_trigger": {},
@@ -164,19 +177,26 @@ func scanJSONReader(ctx context.Context, r io.Reader, expectedSize int64, hmacKe
 	if expectedSize >= 0 && expectedSize != s.offset {
 		return BodyMeta{}, fmt.Errorf("body size changed during JSON scan: got %d want %d", s.offset, expectedSize)
 	}
+	meta.GoalSignalQualified = meta.GoalSignalCandidate && (meta.GoalSignalQualified || s.goalStatusKey)
 	return meta, nil
 }
 
 type jsonMetaScanner struct {
-	ctx         context.Context
-	reader      *bufio.Reader
-	offset      int64
-	runes       int64
-	prefix      hash.Hash
-	prefixBytes int64
-	prefixBuf   [4096]byte
-	prefixN     int
-	meta        *BodyMeta
+	ctx           context.Context
+	reader        *bufio.Reader
+	offset        int64
+	runes         int64
+	prefix        hash.Hash
+	prefixBytes   int64
+	prefixBuf     [4096]byte
+	prefixN       int
+	meta          *BodyMeta
+	inputDepth    int
+	inputRole     string
+	inputType     string
+	goalTail      [3]byte
+	goalTailN     int
+	goalStatusKey bool
 }
 
 type scannedValue struct {
@@ -231,6 +251,15 @@ func (s *jsonMetaScanner) scanTopObject() error {
 			return err
 		}
 		key, _ := decodeJSONString(keyValue.raw)
+		if key == "prompt_cache_breakpoint" {
+			s.meta.PromptCacheBreakpoint = true
+		}
+		if key == "status" {
+			s.goalStatusKey = true
+		}
+		if key == "encrypted_content" {
+			s.meta.EncryptedContentKey = true
+		}
 		if err = s.skipSpace(); err != nil {
 			return err
 		}
@@ -322,9 +351,15 @@ func (s *jsonMetaScanner) scanInputArray(depth int) error {
 	first := true
 	for {
 		start := s.offset
+		s.inputDepth = depth + 1
+		s.inputRole, s.inputType = "", ""
 		if _, err := s.scanValue(depth, false); err != nil {
 			return err
 		}
+		s.meta.InputItemCount++
+		s.meta.LastInputRole = s.inputRole
+		s.meta.LastInputType = s.inputType
+		s.inputDepth = 0
 		if first {
 			s.meta.FirstInputItem = Span{Offset: start, Length: s.offset - start}
 			first = false
@@ -443,6 +478,15 @@ func (s *jsonMetaScanner) scanObject(depth int) error {
 			return err
 		}
 		key, _ := decodeJSONString(keyValue.raw)
+		if key == "prompt_cache_breakpoint" {
+			s.meta.PromptCacheBreakpoint = true
+		}
+		if key == "status" {
+			s.goalStatusKey = true
+		}
+		if key == "encrypted_content" {
+			s.meta.EncryptedContentKey = true
+		}
 		if err := s.skipSpace(); err != nil {
 			return err
 		}
@@ -452,13 +496,25 @@ func (s *jsonMetaScanner) scanObject(depth int) error {
 		if err := s.skipSpace(); err != nil {
 			return err
 		}
-		value, err := s.scanValue(depth, key == "type")
+		captureInputIdentity := depth == s.inputDepth && (key == "role" || key == "type")
+		value, err := s.scanValue(depth, key == "type" || key == "name" || captureInputIdentity)
 		if err != nil {
 			return err
 		}
 		if key == "type" {
 			if decoded, ok := decodeJSONString(value.raw); ok {
 				s.applySemanticType(decoded)
+				if depth == s.inputDepth {
+					s.inputType = decoded
+				}
+			}
+		} else if key == "name" {
+			if decoded, ok := decodeJSONString(value.raw); ok && (decoded == "create_goal" || decoded == "update_goal") {
+				s.meta.GoalSignalQualified = true
+			}
+		} else if key == "role" && depth == s.inputDepth {
+			if decoded, ok := decodeJSONString(value.raw); ok {
+				s.inputRole = decoded
 			}
 		}
 		if err := s.skipSpace(); err != nil {
@@ -589,10 +645,29 @@ func (s *jsonMetaScanner) scanString(captureLimit int) (scannedValue, error) {
 	}
 	escaped := false
 	unicodeDigits := 0
+	s.goalTailN = 0
+	stringGoal := false
 	for {
 		segment, readErr := s.reader.ReadSlice('"')
+		goalInSegment := s.observeGoalSignalSegment(segment)
+		if goalInSegment {
+			stringGoal = true
+			if bytes.Contains(segment, []byte("create_goal")) || bytes.Contains(segment, []byte("update_goal")) ||
+				bytes.Contains(segment, []byte("Continue working toward the active thread goal.")) {
+				s.meta.GoalSignalQualified = true
+			}
+		}
+		// Goal tool output is JSON encoded inside one JSON string. Once its stable
+		// goal token appears, look for the status envelope only in the remainder of
+		// that same string instead of rescanning every million-token body.
+		if stringGoal && bytes.Contains(segment, []byte("status")) {
+			s.meta.GoalSignalQualified = true
+		}
 		runes := int64(0)
 		for i, b := range segment {
+			if b == '#' {
+				s.meta.LegacyInstructionMark = true
+			}
 			if b&0xc0 != 0x80 {
 				runes++
 			}
@@ -669,6 +744,34 @@ func (s *jsonMetaScanner) consumeScannedBytes(p []byte, runes int64) error {
 		_, _ = s.prefix.Write(p[:n])
 	}
 	return s.ctx.Err()
+}
+
+func (s *jsonMetaScanner) observeGoalSignalSegment(segment []byte) bool {
+	marker := []byte("goal")
+	if bytes.Contains(segment, marker) {
+		s.meta.GoalSignalCandidate = true
+		return true
+	}
+	if s.goalTailN > 0 && len(segment) > 0 {
+		var boundary [6]byte
+		n := copy(boundary[:], s.goalTail[:s.goalTailN])
+		prefixN := len(segment)
+		if prefixN > len(marker)-1 {
+			prefixN = len(marker) - 1
+		}
+		n += copy(boundary[n:], segment[:prefixN])
+		if bytes.Contains(boundary[:n], marker) {
+			s.meta.GoalSignalCandidate = true
+			return true
+		}
+	}
+	tailN := len(segment)
+	if tailN > len(s.goalTail) {
+		tailN = len(s.goalTail)
+	}
+	copy(s.goalTail[:], segment[len(segment)-tailN:])
+	s.goalTailN = tailN
+	return false
 }
 
 func (s *jsonMetaScanner) scanLiteral(literal string, capture bool) (scannedValue, error) {

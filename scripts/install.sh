@@ -1294,10 +1294,11 @@ prepare_runtime_layout() {
   run_root install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
     "${persistent_root}/spool" "${persistent_root}/journal" "${persistent_root}/diagnostics" \
     "${persistent_root}/tmp" "${persistent_root}/tmp/browser" "${persistent_root}/run" \
-    "${persistent_root}/keys" "${DATA_DIR}/run"
+    "${persistent_root}/keys" "${persistent_root}/core-state" "${DATA_DIR}/run"
   ensure_persistent_key "${persistent_root}/keys/master.key"
   ensure_persistent_key "${persistent_root}/keys/identity.key"
   ensure_persistent_key "${persistent_root}/keys/diagnostic-alias.key"
+  ensure_persistent_key "${persistent_root}/keys/core-state.key"
   run_root install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$database_parent"
   if bool_enabled "$WITH_SIDECAR"; then
     run_root install -d -m 0755 "$SIDECAR_INSTALL_DIR"
@@ -2303,6 +2304,8 @@ Sockets=${SERVICE_NAME}.socket
 User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 WorkingDirectory=${DATA_DIR}
+Environment="CODEX_POOL_DATA_DIR=${DATA_DIR%/}/data"
+LoadCredential=core-state.key:${DATA_DIR%/}/data/keys/core-state.key
 ExecStart=${BIN_DIR}/${HANDOFF_NAME} --listen ${LISTEN_ADDR} --backend-link ${DATA_DIR%/}/run/active-worker.sock --control-socket ${HANDOFF_CONTROL_SOCKET} --pause-state ${HANDOFF_PAUSE_STATE} --instance-id ${RELEASE_ID}
 Restart=always
 RestartSec=3
@@ -2366,6 +2369,7 @@ Environment="CODEX_POOL_SUPER_INSTRUCT_BRIDGE_FILE=${APP_DIR%/}/releases/%i/supe
 LoadCredential=master.key:${DATA_DIR%/}/data/keys/master.key
 LoadCredential=identity.key:${DATA_DIR%/}/data/keys/identity.key
 LoadCredential=diagnostic-alias.key:${DATA_DIR%/}/data/keys/diagnostic-alias.key
+LoadCredential=core-state.key:${DATA_DIR%/}/data/keys/core-state.key
 Environment="CODEX_POOL_RELEASE_ID=%i"
 Environment="CODEX_POOL_INSTANCE_ID=%i"${admin_env}${extra_env}
 ExecStart=${APP_DIR%/}/releases/%i/${APP_NAME} --config ${CONFIG_FILE} --release-id %i --deployment-role auto --unix-socket ${DATA_DIR%/}/run/worker-%i.sock

@@ -49,6 +49,18 @@ func (s *Server) tryServeAutoKiroGPT(w http.ResponseWriter, r *http.Request, raw
 	if isCompact || (!isChat && r.URL.Path != "/v1/responses") || serverSideStateWithMeta(r.URL.Path, r, raw, meta) {
 		return false
 	}
+	kiroCfg := s.effectiveKiroConfig(r.Context())
+	kiroRoute := scheduler.Route{
+		Group: group, Provider: "kiro", Model: kiroModel,
+		KiroEndpointAllowlist: kiroCfg.KiroEndpointAllowlist,
+		KiroDefaultRegion:     kiroCfg.KiroDefaultAPIRegion,
+	}
+	// When the group has no structurally compatible Kiro account, a fair-pool
+	// selection can only choose Codex and is pure duplicate scheduling. This cheap
+	// cached gate leaves real Kiro pressure/failover behavior unchanged.
+	if candidates, countErr := s.scheduler.StructuralCandidateCount(r.Context(), kiroRoute); countErr != nil || candidates == 0 {
+		return false
+	}
 
 	pressure, err := s.scheduler.ProviderPressureSnapshot(r.Context(), group, "codex", model)
 	if err != nil {
@@ -62,9 +74,7 @@ func (s *Server) tryServeAutoKiroGPT(w http.ResponseWriter, r *http.Request, raw
 		return false
 	}
 
-	affinity := codexSelectionAffinity(r, raw, affinityWithMeta(r, raw, meta), group)
-	kiroCfg := s.effectiveKiroConfig(r.Context())
-
+	affinity := codexSelectionAffinityWithMeta(r, raw, meta, affinityWithMeta(r, raw, meta), group)
 	// Fair scheduling is only for the first unbound request. Once an affinity
 	// binding exists for this conversation and it targets a Kiro account, honor
 	// the sticky binding so context is preserved across turns. Without this,

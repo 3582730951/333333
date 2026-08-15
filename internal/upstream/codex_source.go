@@ -21,6 +21,13 @@ func normalizeCodexSource(client *Client, spec *Request, upstreamBaseURL string,
 		return false, nil
 	}
 	usesAPIKey := AccountUsesAPIKey(spec.Token)
+	// The nested client-only cache breakpoint cannot be expressed as a top-level
+	// composite patch. Select the targeted RawMessage sanitizer only for bodies the
+	// single-pass metadata scanner positively marked; all ordinary large requests
+	// keep the zero-copy/spooled source path.
+	if meta.PromptCacheBreakpoint {
+		return false, nil
+	}
 	responsesLite, liteEnvelope := false, false
 	if !usesAPIKey {
 		var supported bool
@@ -183,6 +190,9 @@ func normalizeCodexSource(client *Client, spec *Request, upstreamBaseURL string,
 	}
 	if kind, present := meta.Kinds["prompt_cache_retention"]; present && kind != 'n' {
 		patches = append(patches, bodysource.JSONFieldPatch{Name: "prompt_cache_retention", Delete: true})
+	}
+	if _, present := meta.Fields["prompt_cache_options"]; present {
+		patches = append(patches, bodysource.JSONFieldPatch{Name: "prompt_cache_options", Delete: true})
 	}
 	if !usesAPIKey {
 		if kind, present := meta.Kinds["max_output_tokens"]; present && kind != 'n' {

@@ -4,13 +4,15 @@ import { useIsFetching } from '@tanstack/react-query';
 import { Avatar, Button, Layout, Nav, Toast } from './components/pool/index.jsx';
 import {
   IconChevronDown, IconClose, IconExit, IconGlobe, IconHistogram, IconHome, IconKey, IconLanguage,
-  IconList, IconMoon, IconPulse, IconSetting, IconSun, IconUser, IconUserGroup,
+  IconList, IconMoon, IconPulse, IconSearch, IconSetting, IconSun, IconUser, IconUserGroup,
 } from './components/pool/icons.jsx';
+import CommandPalette, { type CommandPaletteItem } from './components/CommandPalette';
 import AppErrorBoundary, { isChunkLoadError, notifyChunkUpdateAvailable, reportClientError } from './components/AppErrorBoundary.jsx';
 import LoadErrorBanner from './components/LoadErrorBanner.jsx';
 import { useAuth } from './app/AuthProvider';
 import { adminRoutes, legacyRedirects, portalRoutes, settingsSections } from './app/routeDefinitions';
 import { useTheme } from './app/useTheme';
+import { useAdminDensity } from './app/useAdminDensity';
 import useResponsiveLayout from './hooks/useResponsiveLayout.js';
 import { getLocale, setLocale, t } from './lib/i18n.js';
 import { addDocumentListener, addWindowListener, cancelBrowserIdleCallback, requestBrowserIdleCallback } from './lib/browserLifecycle.js';
@@ -234,12 +236,14 @@ export default function App() {
   const auth = useAuth();
   const theme = useTheme();
   const responsive = useResponsiveLayout();
+  const density = useAdminDensity(responsive.isMobile);
   const navigate = useNavigate();
   const location = useLocation();
   const [locale, setLocaleState] = useState(() => getLocale());
   const [collapsed, setCollapsed] = useState(responsive.collapsedByWidth);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [commandOpen, setCommandOpen] = useState(false);
   const [aiSettingsDirty, setAISettingsDirty] = useState(false);
   const [routeAnnouncement, setRouteAnnouncement] = useState('');
   const accountMenuRef = useRef<HTMLDivElement | null>(null);
@@ -247,6 +251,16 @@ export default function App() {
   const mobileMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const wasMobileRef = useRef(responsive.isMobile);
   const isAdmin = auth.role === 'admin';
+
+  useEffect(() => {
+    if (!auth.authed || !isAdmin) return undefined;
+    return addDocumentListener('keydown', (event: KeyboardEvent) => {
+      if (event.key.toLocaleLowerCase() !== 'k' || (!event.metaKey && !event.ctrlKey) || event.altKey) return;
+      event.preventDefault();
+      setAccountMenuOpen(false);
+      setCommandOpen((value) => !value);
+    });
+  }, [auth.authed, isAdmin]);
 
   const closeMobileMenu = useCallback(() => {
     setMobileOpen(false);
@@ -450,6 +464,7 @@ export default function App() {
   }, [auth.authed, isAdmin, mobileOpen, responsive.isMobile, shellViewIdentity]);
   const ident = auth.user?.email || auth.user?.name || (isAdmin ? 'admin' : 'user');
   const identInitial = String(ident).trim().charAt(0).toUpperCase();
+  const commandShortcut = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘K' : 'Ctrl K';
   const navCollapsed = isAdmin && !responsive.isMobile ? collapsed : false;
   const sidebarWidth = !isAdmin ? 0 : responsive.isMobile ? SIDEBAR_EXPANDED_WIDTH : navCollapsed ? SIDEBAR_COLLAPSED_WIDTH : SIDEBAR_EXPANDED_WIDTH;
   const navigateFromShell = (target: string) => {
@@ -459,6 +474,26 @@ export default function App() {
     navigate(target);
     if (responsive.isMobile && isAdmin) setMobileOpen(false);
   };
+  const commandItems = useMemo<CommandPaletteItem[]>(() => {
+    if (!isAdmin) return [];
+    const pages = adminRoutes
+      .filter((route) => !('navHidden' in route && route.navHidden))
+      .map((route) => ({
+        key: `page:${route.path}`,
+        label: t(route.titleKey),
+        group: t('command.pages'),
+        keywords: `${route.path} ${t(route.descriptionKey)}`,
+        onSelect: () => navigateFromShell(route.path),
+      }));
+    const settings = settingsSections.map((section) => ({
+      key: `setting:${section.key}`,
+      label: t(section.labelKey),
+      group: t('command.settings'),
+      keywords: `/settings-v2?tab=${section.key}`,
+      onSelect: () => navigateFromShell(`/settings-v2?tab=${section.key}`),
+    }));
+    return [...pages, ...settings];
+  }, [isAdmin, locale, aiSettingsDirty, location.pathname, location.search, responsive.isMobile]);
 
   if (!auth.ready) return <BootScreen portal={location.pathname.startsWith('/portal')} />;
   if (auth.error) {
@@ -504,6 +539,7 @@ export default function App() {
           <div className="pool-account-menu-divider" />
           <button type="button" className="pool-account-menu-item" role="menuitem" tabIndex={-1} onClick={() => { switchLocale(); closeAccountMenuAndRestoreFocus(); }}><IconLanguage /><span>{locale === 'en' ? '切换到中文' : 'Switch to English'}</span></button>
           <button type="button" className="pool-account-menu-item" role="menuitem" tabIndex={-1} onClick={() => { theme.cycle(); closeAccountMenuAndRestoreFocus(); }}>{theme.resolved === 'dark' ? <IconMoon /> : <IconSun />}<span>{t(`theme.${theme.preference}`)}</span></button>
+          {isAdmin && !responsive.isMobile ? <button type="button" className="pool-account-menu-item" role="menuitem" tabIndex={-1} onClick={() => { density.toggle(); closeAccountMenuAndRestoreFocus(); }}><IconList /><span>{t(`density.${density.preference}`)}</span></button> : null}
           <div className="pool-account-menu-divider" />
           <button type="button" className="pool-account-menu-item" role="menuitem" tabIndex={-1} onClick={async () => { setAccountMenuOpen(false); await auth.logout(); navigate('/'); Toast.success(t('app.logged_out')); }}><IconExit /><span>{t('app.logout')}</span></button>
         </div>
@@ -517,7 +553,7 @@ export default function App() {
   // decoration that read as intent. Their styled counterparts (pool-app-mobile, pool-portal-header)
   // are kept.
   return (
-    <Layout className={`pool-app-layout ${responsive.isMobile ? 'pool-app-mobile' : ''} ${isAdmin ? 'pool-admin-shell' : 'pool-portal-shell'} ${navCollapsed ? 'pool-sidebar-is-collapsed' : ''}`} style={layoutStyle}>
+    <Layout className={`pool-app-layout ${responsive.isMobile ? 'pool-app-mobile' : ''} ${isAdmin ? 'pool-admin-shell' : 'pool-portal-shell'} ${navCollapsed ? 'pool-sidebar-is-collapsed' : ''}`} style={layoutStyle} data-density={isAdmin ? density.resolved : undefined}>
       <a
         href="#main-content"
         className="pool-skip-link"
@@ -578,6 +614,7 @@ export default function App() {
             </nav> : <div className="pool-portal-mobile-title">{activeRoute ? t(activeRoute.titleKey) : t('app.portal')}</div>}
           </>}
           <div className="pool-topbar-actions">
+            {isAdmin && !responsive.isMobile ? <Button className="pool-command-trigger" onClick={() => setCommandOpen(true)} icon={<IconSearch />} aria-label={t('command.open')}><span>{t('command.search')}</span><kbd>{commandShortcut}</kbd></Button> : null}
             <Button className="pool-topbar-icon-button pool-desktop-only" theme="borderless" icon={<IconLanguage />} onClick={switchLocale} aria-label={t('app.language')} />
             <Button className="pool-topbar-icon-button pool-desktop-only" theme="borderless" icon={theme.resolved === 'dark' ? <IconMoon /> : <IconSun />} onClick={theme.cycle} aria-label={`${t('app.theme')}: ${t(`theme.${theme.preference}`)}`} title={`${t('app.theme')}: ${t(`theme.${theme.preference}`)}`} />
             {accountMenu}
@@ -588,6 +625,14 @@ export default function App() {
           {navigation.map((item) => <button type="button" key={item.itemKey} className="pool-portal-tabbar__item" aria-label={item.text} aria-current={currentNavKey === item.itemKey ? 'page' : undefined} onClick={() => navigateFromShell(item.itemKey)}>{item.icon}<span>{item.text}</span></button>)}
         </nav> : null}
       </Layout>
+      {isAdmin ? <CommandPalette
+        open={commandOpen}
+        onOpenChange={setCommandOpen}
+        items={commandItems}
+        title={t('command.title')}
+        placeholder={t('command.placeholder')}
+        emptyText={t('command.empty')}
+      /> : null}
     </Layout>
   );
 }

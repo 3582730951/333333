@@ -166,6 +166,11 @@ func degradedResponsesReplay(body []byte) []byte {
 // only the selected fragments, preserving the byte representation of unrelated
 // history (including large JSON numbers) instead of re-marshalling a large turn.
 func stripAgentMessageEncryptedContent(body []byte) ([]byte, int) {
+	// Most root turns contain no subagent ciphertext. Avoid making gjson traverse a
+	// 128K-1M request merely to prove the relevant key is absent.
+	if !bytes.Contains(body, []byte(`"encrypted_content"`)) {
+		return body, 0
+	}
 	input := gjson.GetBytes(body, "input")
 	if !input.IsArray() {
 		return body, 0

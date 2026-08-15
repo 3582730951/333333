@@ -26,6 +26,8 @@ import (
 	"syscall"
 	"time"
 
+	"codex-account-pool/internal/corestate"
+	"codex-account-pool/internal/datadir"
 	"codex-account-pool/internal/supervisor"
 )
 
@@ -192,7 +194,16 @@ type handoff struct {
 	startedAt   time.Time
 	inflight    atomic.Int64
 	gate        *admissionGate
+	coreState   *corestate.Reader
+	routeSource atomic.Value
+	snapshotGen atomic.Uint64
 	proxy       *httputil.ReverseProxy
+}
+
+type backendCandidate struct {
+	path       string
+	source     string
+	generation uint64
 }
 
 func newHandoff(backendLink string) *handoff {
@@ -213,11 +224,8 @@ func newHandoffWithState(backendLink, pauseStateFile, instanceID string) *handof
 		// request after a deployment switch.
 		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			resolved, err := filepath.EvalSymlinks(h.backendLink)
-			if err != nil {
-				return nil, fmt.Errorf("resolve active worker: %w", err)
-			}
-			return (&net.Dialer{}).DialContext(ctx, "unix", resolved)
+			conn, _, err := h.dialBackend(ctx)
+			return conn, err
 		},
 	}
 	h.proxy = httputil.NewSingleHostReverseProxy(target)
@@ -229,6 +237,69 @@ func newHandoffWithState(backendLink, pauseStateFile, instanceID string) *handof
 		writeHandoffUnavailable(w, requestID)
 	}
 	return h
+}
+
+func (h *handoff) setCoreStateReader(reader *corestate.Reader) {
+	h.coreState = reader
+}
+
+// dialBackend prefers the atomic active-worker symlink. If the link is missing or
+// points at a failed generation during a worker crash, it tries only authenticated
+// A/B snapshot routes. Optional-module, database, migration and SPA failures never
+// participate in this decision.
+func (h *handoff) dialBackend(ctx context.Context) (net.Conn, backendCandidate, error) {
+	candidates, resolveErr := h.backendCandidates()
+	var failures []error
+	if resolveErr != nil {
+		failures = append(failures, resolveErr)
+	}
+	for _, candidate := range candidates {
+		conn, err := (&net.Dialer{}).DialContext(ctx, "unix", candidate.path)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("dial %s route %s: %w", candidate.source, candidate.path, err))
+			continue
+		}
+		h.routeSource.Store(candidate.source)
+		h.snapshotGen.Store(candidate.generation)
+		return conn, candidate, nil
+	}
+	if len(failures) == 0 {
+		failures = append(failures, errors.New("no relay backend route is available"))
+	}
+	return nil, backendCandidate{}, errors.Join(failures...)
+}
+
+func (h *handoff) backendCandidates() ([]backendCandidate, error) {
+	seen := make(map[string]struct{}, 3)
+	candidates := make([]backendCandidate, 0, 3)
+	add := func(candidate backendCandidate) {
+		candidate.path = filepath.Clean(strings.TrimSpace(candidate.path))
+		if candidate.path == "." || candidate.path == "" || !filepath.IsAbs(candidate.path) {
+			return
+		}
+		if _, exists := seen[candidate.path]; exists {
+			return
+		}
+		seen[candidate.path] = struct{}{}
+		candidates = append(candidates, candidate)
+	}
+	var failures []error
+	resolved, err := filepath.EvalSymlinks(h.backendLink)
+	if err == nil {
+		add(backendCandidate{path: resolved, source: "active-link"})
+	} else {
+		failures = append(failures, fmt.Errorf("resolve active worker: %w", err))
+	}
+	if h.coreState != nil {
+		snapshot, snapshotErr := h.coreState.Load()
+		if snapshotErr != nil {
+			failures = append(failures, fmt.Errorf("load core state: %w", snapshotErr))
+		} else {
+			add(backendCandidate{path: snapshot.ActiveWorker, source: "core-snapshot", generation: snapshot.Generation})
+			add(backendCandidate{path: snapshot.PreviousWorker, source: "core-snapshot-previous", generation: snapshot.Generation})
+		}
+	}
+	return candidates, errors.Join(failures...)
 }
 
 func newHandoffRequestID() string {
@@ -333,13 +404,11 @@ func formatOptionalTime(t time.Time) interface{} {
 }
 
 func (h *handoff) serveStatus(w http.ResponseWriter, trusted bool) {
-	resolved, err := filepath.EvalSymlinks(h.backendLink)
+	probeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	conn, candidate, err := h.dialBackend(probeCtx)
+	cancel()
 	if err == nil {
-		var conn net.Conn
-		conn, err = net.DialTimeout("unix", resolved, time.Second)
-		if err == nil {
-			_ = conn.Close()
-		}
+		_ = conn.Close()
 	}
 	ready := err == nil
 	status := http.StatusOK
@@ -351,20 +420,22 @@ func (h *handoff) serveStatus(w http.ResponseWriter, trusted bool) {
 	w.WriteHeader(status)
 	paused, queued, pausedAt, reason, release := h.gate.snapshot()
 	body := map[string]interface{}{
-		"ok":               ready,
-		"ready":            ready,
-		"deployment_state": "handoff",
-		"instance_id":      h.instanceID,
-		"inflight":         h.inflight.Load(),
-		"admission_paused": paused,
-		"queued":           queued,
-		"paused_at":        formatOptionalTime(pausedAt),
-		"pause_reason":     reason,
-		"pause_release":    release,
-		"started_at":       h.startedAt.Format(time.RFC3339Nano),
+		"ok":                  ready,
+		"ready":               ready,
+		"deployment_state":    "handoff",
+		"instance_id":         h.instanceID,
+		"inflight":            h.inflight.Load(),
+		"admission_paused":    paused,
+		"queued":              queued,
+		"paused_at":           formatOptionalTime(pausedAt),
+		"pause_reason":        reason,
+		"pause_release":       release,
+		"started_at":          h.startedAt.Format(time.RFC3339Nano),
+		"route_source":        candidate.source,
+		"snapshot_generation": candidate.generation,
 	}
 	if trusted {
-		body["active_backend"] = resolved
+		body["active_backend"] = candidate.path
 		if err != nil {
 			body["error"] = err.Error()
 		}
@@ -375,6 +446,29 @@ func (h *handoff) serveStatus(w http.ResponseWriter, trusted bool) {
 		}
 	}
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+func coreStateReaderFromEnvironment() (*corestate.Reader, error) {
+	dataDir := strings.TrimSpace(os.Getenv("CODEX_POOL_DATA_DIR"))
+	stateDir := strings.TrimSpace(os.Getenv("CODEX_POOL_CORE_STATE_DIR"))
+	keyPath := strings.TrimSpace(os.Getenv("CODEX_POOL_CORE_STATE_KEY_FILE"))
+	if credentialDirectory := strings.TrimSpace(os.Getenv("CREDENTIALS_DIRECTORY")); keyPath == "" && credentialDirectory != "" {
+		keyPath = filepath.Join(credentialDirectory, "core-state.key")
+	}
+	if stateDir == "" && dataDir != "" {
+		stateDir = filepath.Join(dataDir, "core-state")
+	}
+	if keyPath == "" && dataDir != "" {
+		keyPath = filepath.Join(dataDir, "keys", "core-state.key")
+	}
+	if stateDir == "" || keyPath == "" {
+		return nil, nil
+	}
+	key, err := datadir.LoadCredentialKey(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	return corestate.NewReader(stateDir, key)
 }
 
 func main() {
@@ -393,6 +487,13 @@ func main() {
 	}
 
 	h := newHandoffWithState(backendLink, pauseStateFile, instanceID)
+	if reader, readerErr := coreStateReaderFromEnvironment(); readerErr != nil {
+		// A missing/corrupt snapshot must never gate the survival kernel. The
+		// active symlink remains the primary route and status exposes any failure.
+		log.Printf("core state fallback unavailable: %v", readerErr)
+	} else {
+		h.setCoreStateReader(reader)
+	}
 	srv := &http.Server{Handler: h, ReadHeaderTimeout: 15 * time.Second}
 	ln, err := activatedListener()
 	if err != nil {

@@ -22,6 +22,7 @@ Environment=CODEX_REG_V3_SCRIPT=/usr/local/lib/codex-pool/releases/%i/registrar-
 LoadCredential=master.key:/var/lib/codex-pool/data/keys/master.key
 LoadCredential=identity.key:/var/lib/codex-pool/data/keys/identity.key
 LoadCredential=diagnostic-alias.key:/var/lib/codex-pool/data/keys/diagnostic-alias.key
+LoadCredential=core-state.key:/var/lib/codex-pool/data/keys/core-state.key
 ExecStart=/usr/local/lib/codex-pool/releases/%i/codex-pool-server --config /etc/codex-pool/config.json --release-id %i --deployment-role auto --unix-socket /var/lib/codex-pool/run/worker-%i.sock
 Restart=on-failure
 RestartSec=3

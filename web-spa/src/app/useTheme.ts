@@ -8,8 +8,8 @@ export type ResolvedTheme = 'light' | 'dark';
 const THEME_KEY = 'pool_theme';
 
 function storedPreference(): ThemePreference {
-  const value = getLocalItem(THEME_KEY, 'auto');
-  return value === 'light' || value === 'dark' ? value : 'auto';
+  const value = getLocalItem(THEME_KEY, 'light');
+  return value === 'auto' || value === 'dark' ? value : 'light';
 }
 
 function systemTheme(): ResolvedTheme {

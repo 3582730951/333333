@@ -120,10 +120,9 @@ function rowKeyOf(row, rowKey, index) {
 }
 
 const densityRowHeights = {
-  compact: 56,
-  default: 64,
-  regular: 64,
-  account: 72,
+  compact: 36,
+  regular: 44,
+  account: 52,
 };
 
 export default function ResourceTable({
@@ -213,9 +212,13 @@ export default function ResourceTable({
     isMobile && activeScroll === false ? 'pool-table-wrapper--mobile-cards' : '',
     className,
   ].filter(Boolean).join(' ');
-  const resolvedRowHeight = rowHeight || densityRowHeights[density] || densityRowHeights.regular;
+  const resolvedRowHeight = rowHeight
+    ? `${rowHeight}px`
+    : density === 'default'
+      ? 'var(--pool-row-height, 44px)'
+      : `${densityRowHeights[density] || densityRowHeights.regular}px`;
   const tableStyle = {
-    '--pool-table-row-height': `${resolvedRowHeight}px`,
+    '--pool-table-row-height': resolvedRowHeight,
     '--pool-table-fit-width': `${fitWidth}px`,
     ...(style || {}),
   };

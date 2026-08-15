@@ -7,13 +7,13 @@ package api
 // the upstream confirms previous_response_id loss; steady-state turns remain native.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -173,6 +173,8 @@ type codexContextMigration struct {
 }
 
 var errCodexToolContextUnrecoverable = errors.New("codex tool context cannot be recovered without a paired durable checkpoint")
+
+const codexRecoveryReasonUnidentifiedMapping = "unidentified_session_mapping"
 
 func withCodexSessionMapping(ctx context.Context, mapping *codexSessionMapping) context.Context {
 	if mapping == nil {
@@ -347,14 +349,47 @@ func codexGoalSignal(body []byte) codexGoalTurnSignal {
 }
 
 func (m *codexSessionMapping) observeGoalTurn(headers http.Header, body []byte) bool {
+	return m.observeGoalTurnWithMeta(headers, body, nil)
+}
+
+func (m *codexSessionMapping) observeGoalTurnWithMeta(headers http.Header, body []byte, meta *bodysource.BodyMeta) bool {
 	if m == nil || !m.enabled {
 		return false
 	}
-	turnID := codexDownstreamTurnID(headers, body)
+	// Goal parsing intentionally understands full tool history, but decoding every
+	// 128K-1M ordinary root turn is unnecessary. A non-goal mapping can activate
+	// only through the stable continuation wrapper or a Goal tool/result marker.
+	m.mu.Lock()
+	binding := m.binding
+	if binding == nil {
+		binding = m.prospective
+	}
+	active := m.goalModeActive
+	if binding != nil {
+		active = binding.GoalModeActive
+	}
+	rootOwner := strings.TrimSpace(m.identity.ParentID) == "" && strings.TrimSpace(m.identity.ForkedFromID) == "" &&
+		(strings.TrimSpace(m.identity.ThreadID) == "" || strings.TrimSpace(m.identity.RootID) == "" || m.identity.ThreadID == m.identity.RootID)
+	if !rootOwner {
+		m.goalModeActive, m.goalTurnID = false, ""
+		if binding != nil {
+			binding.GoalModeActive, binding.GoalTurnID = false, ""
+		}
+		m.mu.Unlock()
+		return false
+	}
+	m.mu.Unlock()
+	if !active && !codexBodyMayContainGoalSignalWithMeta(body, meta) {
+		return false
+	}
 	signal := codexGoalSignal(body)
+	turnID := ""
+	if signal != codexGoalTurnInactive {
+		turnID = codexDownstreamTurnID(headers, body)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	binding := m.binding
+	binding = m.binding
 	if binding == nil {
 		binding = m.prospective
 	}
@@ -362,7 +397,7 @@ func (m *codexSessionMapping) observeGoalTurn(headers http.Header, body []byte) 
 	if binding != nil {
 		active, latchedTurn = binding.GoalModeActive, binding.GoalTurnID
 	}
-	rootOwner := strings.TrimSpace(m.identity.ParentID) == "" && strings.TrimSpace(m.identity.ForkedFromID) == "" &&
+	rootOwner = strings.TrimSpace(m.identity.ParentID) == "" && strings.TrimSpace(m.identity.ForkedFromID) == "" &&
 		(strings.TrimSpace(m.identity.ThreadID) == "" || strings.TrimSpace(m.identity.RootID) == "" || m.identity.ThreadID == m.identity.RootID)
 	if !rootOwner {
 		active, latchedTurn = false, ""
@@ -386,6 +421,28 @@ func (m *codexSessionMapping) observeGoalTurn(headers http.Header, body []byte) 
 		binding.GoalModeActive, binding.GoalTurnID = active, latchedTurn
 	}
 	return active && (turnID == "" || latchedTurn == "" || turnID == latchedTurn)
+}
+
+func codexBodyMayContainGoalSignal(body []byte) bool {
+	// Every supported marker contains the stable lowercase token "goal". Reject
+	// ordinary large contexts with one scan before checking the rarer exact forms.
+	if !bytes.Contains(body, []byte("goal")) {
+		return false
+	}
+	if bytes.Contains(body, []byte("Continue working toward the active thread goal.")) ||
+		bytes.Contains(body, []byte(`"create_goal"`)) || bytes.Contains(body, []byte(`"update_goal"`)) {
+		return true
+	}
+	// Tool outputs are commonly JSON encoded inside a JSON string, so their quotes
+	// are escaped. The stable key names remain a narrow, allocation-free prefilter.
+	return bytes.Contains(body, []byte("status"))
+}
+
+func codexBodyMayContainGoalSignalWithMeta(body []byte, meta *bodysource.BodyMeta) bool {
+	if meta != nil && meta.Size == int64(len(body)) {
+		return meta.GoalSignalQualified
+	}
+	return codexBodyMayContainGoalSignal(body)
 }
 
 // withCodexStrictCPA marks the narrow native Responses path on which context and
@@ -741,8 +798,20 @@ func (s *Server) recoverCodexSessionMapping(ctx context.Context, r *http.Request
 	// risk response arrives, but it has no durable binding until response.completed.
 	// Permit that one case to rotate too; all other recovery still requires a known
 	// durable epoch.
-	if !hasBinding && (!hasProspective || reason != "mapped_session_risk") {
-		return codexContextMigration{}, false, nil
+	if !hasBinding {
+		switch reason {
+		case "mapped_session_risk":
+			if !hasProspective {
+				return codexContextMigration{}, false, nil
+			}
+		case codexRecoveryReasonUnidentifiedMapping:
+			// A terminal may have committed its encrypted Goal checkpoint while the
+			// optional CPA alias write was lost, conflicted, or interrupted. In that
+			// narrow state there is no old binding to retire, but the exact durable
+			// response alias is still sufficient to build a safe fresh epoch below.
+		default:
+			return codexContextMigration{}, false, nil
+		}
 	}
 
 	var retry codexRetryRequest
@@ -750,6 +819,10 @@ func (s *Server) recoverCodexSessionMapping(ctx context.Context, r *http.Request
 	if replay := s.goalReplayBody(ctx, r, "codex", body); replay.Kind == goalResumeFound {
 		retry = codexRetryRequest{Raw: replay.Body, Header: stripCodexServerStateHeaders(header)}
 		mode = "rebuilt"
+	} else if reason == codexRecoveryReasonUnidentifiedMapping {
+		// Never degrade or guess when the CPA lookup itself is missing. The only
+		// authorized source for a replacement epoch is an exact Goal checkpoint.
+		return codexContextMigration{}, false, nil
 	} else {
 		var ok bool
 		retry, mode, ok = s.recoverResponsesContext(ctx, body, header, contextError)
@@ -1322,7 +1395,7 @@ func (m *codexSessionMapping) durableMainCLI() bool {
 // while this request is creating a prospective root. A durable continuation must
 // keep its native payload byte-for-byte because its bound upstream can decrypt the
 // original blocks; child/fork requests likewise retain their parent-owned state.
-func (m *codexSessionMapping) sanitizePendingRootAgentEncryptedContent(body []byte, header http.Header) ([]byte, int) {
+func (m *codexSessionMapping) sanitizePendingRootAgentEncryptedContent(body []byte, _ http.Header, metadata ...*bodysource.BodyMeta) ([]byte, int) {
 	if m == nil || !m.enabled {
 		return body, 0
 	}
@@ -1345,7 +1418,10 @@ func (m *codexSessionMapping) sanitizePendingRootAgentEncryptedContent(body []by
 			prospective.ParentThreadID == "" && prospective.ForkedFromThreadID == ""
 	}
 	m.mu.Unlock()
-	if !pendingRoot || codexDownstreamSessionIdentity(header, body).stateful() {
+	if !pendingRoot {
+		return body, 0
+	}
+	if len(metadata) > 0 && metadata[0] != nil && metadata[0].Size == int64(len(body)) && !metadata[0].EncryptedContentKey {
 		return body, 0
 	}
 	return stripAgentMessageEncryptedContent(body)
@@ -1759,7 +1835,7 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 	// detach downstream cancellation while keeping all request-scoped values and
 	// cap the write. This also prevents a graceful worker drain from abandoning a
 	// terminal it has already delivered.
-	persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), codexStateCommitTimeout)
 	defer persistCancel()
 	mapping.mu.Lock()
 	defer mapping.mu.Unlock()
@@ -1787,35 +1863,25 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 	instructionSnapshot := mapping.instructions.snapshotCommit(binding.TreeID, expiresAt)
 	aliases := mapping.identity.aliasesForBinding(*binding, responseID, turnState)
 	aliases = append(aliases, mapping.recoveryAliases...)
-	filteredAliases, droppedHierarchyAliases, err := s.filterLegacyCodexHierarchyAliasConflicts(
-		persistCtx, mapping.namespace, binding.ID, aliases,
-	)
+	droppedHierarchyAliases := 0
+	committed, err := s.persistCodexStateCommit(persistCtx, storage.CodexSessionCommit{
+		Namespace:                       mapping.namespace,
+		Binding:                         *binding,
+		Aliases:                         aliases,
+		ExpiresAt:                       expiresAt,
+		InstructionSnapshot:             instructionSnapshot,
+		DropConflictingHierarchyAliases: true,
+		DroppedHierarchyAliases:         &droppedHierarchyAliases,
+	}, compact)
 	if err != nil {
 		return err
-	}
-	committed, err := s.store.CommitCodexSessionBinding(persistCtx, storage.CodexSessionCommit{
-		Namespace:           mapping.namespace,
-		Binding:             *binding,
-		Aliases:             filteredAliases,
-		ExpiresAt:           expiresAt,
-		InstructionSnapshot: instructionSnapshot,
-	})
-	if err != nil {
-		return err
-	}
-	if compact {
-		advanced, advanceErr := s.store.AdvanceCodexSessionWindowGeneration(persistCtx, committed.ID, committed.Epoch, committed.WindowGeneration, expiresAt)
-		if advanceErr != nil {
-			return advanceErr
-		}
-		committed = advanced
 	}
 	mapping.binding = &committed
 	mapping.prospective = nil
 	mapping.requiredAccount, mapping.requiredEgress = committed.AccountID, committed.EgressID
 	if created {
 		atomic.AddUint64(&s.codexMappingBindingsCreated, 1)
-		_ = s.store.InsertAuditLog(persistCtx, storage.AuditLogRow{
+		s.enqueueAudit(storage.AuditLogRow{
 			Action: "codex_session_binding_created",
 			State:  "active",
 			Reason: "terminal_success",
@@ -1832,55 +1898,6 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 	}
 	s.recordCodexUpstreamAttemptBinding(persistCtx, committed, lease, egress, "terminal_success", http.StatusOK)
 	return nil
-}
-
-// filterLegacyCodexHierarchyAliasConflicts contains damage left by older or
-// concurrently active workers without weakening the state-pointer contract.
-// A unique terminal response alias is still committed, so the next stateful turn
-// can resume exactly. Conflicting root/session/branch hints are omitted rather
-// than rolling back that terminal mapping. Response aliases remain strict and
-// CommitCodexSessionBinding will reject any collision involving them.
-func (s *Server) filterLegacyCodexHierarchyAliasConflicts(ctx context.Context, namespace, bindingID string, aliases []storage.CodexSessionAlias) ([]storage.CodexSessionAlias, int, error) {
-	hasResponseAlias := false
-	for _, alias := range aliases {
-		if strings.EqualFold(strings.TrimSpace(alias.Type), "response") && strings.TrimSpace(alias.Value) != "" {
-			hasResponseAlias = true
-			break
-		}
-	}
-	if !hasResponseAlias {
-		return aliases, 0, nil
-	}
-	filtered := make([]storage.CodexSessionAlias, 0, len(aliases))
-	dropped := 0
-	for _, alias := range aliases {
-		typ := strings.ToLower(strings.TrimSpace(alias.Type))
-		if typ != "root" && typ != "session" && typ != "branch" {
-			filtered = append(filtered, alias)
-			continue
-		}
-		rows, err := s.store.FindCodexSessionAlias(ctx, namespace, alias)
-		if errors.Is(err, storage.ErrCodexSessionMappingNotFound) {
-			filtered = append(filtered, alias)
-			continue
-		}
-		if err != nil {
-			return nil, dropped, err
-		}
-		conflict := false
-		for _, owner := range rows {
-			if owner.State == "active" && owner.ID != bindingID {
-				conflict = true
-				break
-			}
-		}
-		if conflict {
-			dropped++
-			continue
-		}
-		filtered = append(filtered, alias)
-	}
-	return filtered, dropped, nil
 }
 
 func (s *Server) recordCodexUpstreamAttempt(ctx context.Context, mapping *codexSessionMapping, lease scheduler.Lease, egress storage.EgressProfile, state string, statusCode int) {
@@ -1917,9 +1934,6 @@ func (s *Server) recordCodexUpstreamAttemptBinding(ctx context.Context, binding 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	requestID := requestIDFromContext(ctx)
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-	defer cancel()
 	if accountID := strings.TrimSpace(lease.Account.ID); accountID != "" {
 		binding.AccountID = accountID
 	}
@@ -1928,9 +1942,10 @@ func (s *Server) recordCodexUpstreamAttemptBinding(ctx context.Context, binding 
 	}
 	expiresAt := binding.ExpiresAt
 	if expiresAt <= time.Now().Unix() {
-		expiresAt = time.Now().Add(s.codexSessionMappingRetention(persistCtx)).Unix()
+		expiresAt = time.Now().Add(s.codexSessionMappingRetention(context.WithoutCancel(ctx))).Unix()
 	}
-	if err := s.store.InsertCodexUpstreamAttempt(persistCtx, storage.CodexUpstreamAttempt{
+	s.enqueueCodexUpstreamAttempt(storage.CodexUpstreamAttempt{
+		EventID:    "ATT-" + strings.TrimPrefix(newRequestID(), "REQ-"),
 		TreeID:     binding.TreeID,
 		AccountID:  binding.AccountID,
 		EgressID:   binding.EgressID,
@@ -1938,9 +1953,7 @@ func (s *Server) recordCodexUpstreamAttemptBinding(ctx context.Context, binding 
 		State:      state,
 		StatusCode: statusCode,
 		ExpiresAt:  expiresAt,
-	}); err != nil {
-		log.Printf("[CODEX-UPSTREAM-ATTEMPT] record request_id=%s: %v", requestID, err)
-	}
+	})
 }
 
 func (s *Server) retireCodexSessionMapping(ctx context.Context, mapping *codexSessionMapping, reason string) error {
@@ -2025,5 +2038,11 @@ func codexMappingRequiredRoute(mapping *codexSessionMapping, route scheduler.Rou
 	route.RequiredAccountID = accountID
 	route.RequiredEgressID = egressID
 	route.ImmutableAffinity = true
+	// A completed main-CLI epoch owns an encrypted replay checkpoint. If its exact
+	// account is already quota-cooled/recheck-pending, return control to the CPA
+	// recovery layer immediately; waiting for the account circuit breaker would
+	// strand unrelated mapped sessions that have not yet observed the same outage.
+	// Child/fork and prospective roots remain strict and never rotate this way.
+	route.FailFastBoundRecovery = mapping.durableMainCLI()
 	return route
 }

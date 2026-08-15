@@ -474,6 +474,89 @@ func stripCodexResponsesPromptCacheRetentionWithFields(raw []byte, fields map[st
 	return out
 }
 
+// stripCodexUnsupportedPromptCacheControls removes cache hints emitted by generic
+// Responses clients but rejected by the ChatGPT Codex transport. The supported
+// prompt_cache_key remains byte-identical. RawMessage + targeted sjson edits avoid
+// rounding large schema/tool integers and run after every envelope rewrite, so a
+// system/developer role conversion cannot accidentally restore the unsupported
+// nested member.
+func stripCodexUnsupportedPromptCacheControls(raw []byte) []byte {
+	if !bytes.Contains(raw, []byte(`"prompt_cache_options"`)) && !bytes.Contains(raw, []byte(`"prompt_cache_breakpoint"`)) {
+		return raw
+	}
+	out := raw
+	var root map[string]json.RawMessage
+	if json.Unmarshal(out, &root) != nil {
+		return raw
+	}
+	if _, present := root["prompt_cache_options"]; present {
+		var err error
+		out, err = sjson.DeleteBytes(out, "prompt_cache_options")
+		if err != nil {
+			return raw
+		}
+		if json.Unmarshal(out, &root) != nil {
+			return raw
+		}
+	}
+	inputRaw, present := root["input"]
+	if !present || !bytes.Contains(inputRaw, []byte(`"prompt_cache_breakpoint"`)) {
+		return out
+	}
+	var input []json.RawMessage
+	if json.Unmarshal(inputRaw, &input) != nil {
+		return raw
+	}
+	changed := false
+	for inputIndex, itemRaw := range input {
+		var item map[string]json.RawMessage
+		if json.Unmarshal(itemRaw, &item) != nil {
+			continue
+		}
+		contentRaw, ok := item["content"]
+		if !ok || !bytes.Contains(contentRaw, []byte(`"prompt_cache_breakpoint"`)) {
+			continue
+		}
+		var content []json.RawMessage
+		if json.Unmarshal(contentRaw, &content) != nil {
+			continue
+		}
+		itemChanged := false
+		for contentIndex, blockRaw := range content {
+			var block map[string]json.RawMessage
+			if json.Unmarshal(blockRaw, &block) != nil {
+				continue
+			}
+			if _, exists := block["prompt_cache_breakpoint"]; !exists {
+				continue
+			}
+			updated, err := sjson.DeleteBytes(blockRaw, "prompt_cache_breakpoint")
+			if err != nil {
+				return raw
+			}
+			content[contentIndex] = updated
+			itemChanged = true
+		}
+		if !itemChanged {
+			continue
+		}
+		updated, err := sjson.SetRawBytes(itemRaw, "content", marshalCodexRawArray(content))
+		if err != nil {
+			return raw
+		}
+		input[inputIndex] = updated
+		changed = true
+	}
+	if !changed {
+		return out
+	}
+	updated, err := sjson.SetRawBytes(out, "input", marshalCodexRawArray(input))
+	if err != nil {
+		return raw
+	}
+	return updated
+}
+
 // stripCodexResponsesMaxOutputTokens removes the public Responses API output limit
 // at the ChatGPT Codex transport boundary. The OAuth/WHAM endpoint rejects this field
 // with "Unsupported parameter: max_output_tokens", while the official Codex client

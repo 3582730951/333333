@@ -52,6 +52,7 @@ export function KeyReveal({ secret }) {
   const cmd = installCommand(secret);
   return (
     <div className="pool-key-reveal">
+      <p className="pool-key-reveal__warning" role="status">{t('keys.one_time_warning')}</p>
       <div className="pool-copy-line">
         <Typography.Text className="pool-mono pool-copy-code">{secret}</Typography.Text>
         <Button icon={<IconCopy />} onClick={() => copyText(secret, t('keys.copied_key'))}>{t('keys.copy_key')}</Button>

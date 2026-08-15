@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -121,8 +122,11 @@ var codexFailedLeakSignatures = []string{
 	"usage_not_included",
 	"usage_limit_reached",
 	"usage limit",
+	"overloaded_error",
+	"service_unavailable_error",
 	"server_is_overloaded",
 	"slow_down",
+	"currently overloaded",
 	"at capacity",
 	"try a different model",
 	"switch to another model",
@@ -300,9 +304,11 @@ func NeutralizeResponsesJSON(body []byte) ([]byte, bool) {
 // the operator sensitive-word matcher over the frames it keeps. One filter per
 // stream (it is stateful); not safe for concurrent use.
 type SSEFilter struct {
-	provider string
-	words    *streamrewrite.Matcher
-	buf      []byte
+	provider            string
+	words               *streamrewrite.Matcher
+	buf                 []byte
+	codexSawLifecycle   bool
+	codexSemanticOutput bool
 }
 
 // NewSSEFilter builds an SSE filter for the given protocol ("claude" or codex)
@@ -444,7 +450,7 @@ func ParseCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 		builtinRetryable = false
 	}
 	if status == 0 && builtinRetryable {
-		if containsAnyFold(lower, []string{"server_is_overloaded", "slow_down", "at capacity", "try a different model"}) {
+		if containsAnyFold(lower, []string{"overloaded_error", "service_unavailable_error", "server_is_overloaded", "slow_down", "currently overloaded", "at capacity", "try a different model"}) {
 			status = http.StatusServiceUnavailable
 		} else {
 			status = http.StatusTooManyRequests
@@ -467,6 +473,31 @@ func ParseCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 		Header:           header,
 		Body:             append([]byte(nil), data...),
 	}, true
+}
+
+var (
+	upstreamAbsoluteURLPattern = regexp.MustCompile(`(?i)\b(?:https?|wss?)://[^\s"'<>\\]+`)
+	upstreamIPPortPattern      = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}\b`)
+	upstreamHostPortPattern    = regexp.MustCompile(`(?i)\b(?:localhost|(?:[a-z0-9-]+\.)+[a-z0-9-]+):\d{1,5}\b`)
+	upstreamDialTargetPattern  = regexp.MustCompile(`(?i)(\bdial\s+(?:tcp|udp)\s+)(?:\[[0-9a-f:]+\]|[a-z0-9._-]+):\d{1,5}`)
+)
+
+// RedactUpstreamTopology removes transport addresses from an upstream error
+// envelope without otherwise rewriting its protocol shape. This is an invariant,
+// independent of optional quota/leak scrubbing: a normal downstream API key must
+// never reveal a custom provider's internal URL, redirect target, or dial address.
+func RedactUpstreamTopology(body []byte) ([]byte, bool) {
+	if len(body) == 0 {
+		return body, false
+	}
+	out := upstreamAbsoluteURLPattern.ReplaceAll(body, []byte("<upstream>"))
+	out = upstreamIPPortPattern.ReplaceAll(out, []byte("<upstream>"))
+	out = upstreamHostPortPattern.ReplaceAll(out, []byte("<upstream>"))
+	out = upstreamDialTargetPattern.ReplaceAll(out, []byte("$1<upstream>"))
+	if bytes.Equal(out, body) {
+		return body, false
+	}
+	return out, true
 }
 
 func structuredResponseErrorCode(raw json.RawMessage) string {
@@ -862,6 +893,17 @@ func (f *SSEFilter) processFrame(frame []byte) []byte {
 			frame = nb
 		}
 	} else {
+		f.ObserveFrameForRelay(frame)
+		// An upstream can occasionally emit response.created followed immediately
+		// by response.completed with no output and no usage. That is a silent
+		// upstream refusal, not a successful assistant turn. Preserve legitimate
+		// no-text turns when a tool/reasoning item was already emitted or when the
+		// terminal carries usage evidence, but turn the truly empty terminal into a
+		// protocol-visible retryable failure so clients never checkpoint an empty
+		// response as valid context.
+		if f.codexSawLifecycle && !f.codexSemanticOutput && IsEmptyCodexCompletionFrame(frame) {
+			frame = neutralResponsesFailureSSEFrame()
+		}
 		// safety_buffering is an upstream-only UI control signal. When pool leak
 		// scrubbing is enabled it must never reach any Responses client, regardless
 		// of whether an administrator also configured a dedicated heartbeat rule.
@@ -878,6 +920,125 @@ func (f *SSEFilter) processFrame(frame []byte) []byte {
 		return f.words.ReplaceAll(frame)
 	}
 	return frame
+}
+
+// ObserveFrameForRelay advances only stream-semantic state. Rule pipelines call
+// this before an operator filter can intentionally remove an output delta; the
+// following response.completed must still remain a valid terminal rather than be
+// mistaken for an upstream-empty response.
+func (f *SSEFilter) ObserveFrameForRelay(frame []byte) {
+	if f == nil || f.provider == "claude" {
+		return
+	}
+	if codexSSEFrameStartsResponse(frame) {
+		f.codexSawLifecycle = true
+	}
+	if codexSSEFrameHasSemanticOutput(frame) {
+		f.codexSemanticOutput = true
+	}
+}
+
+func codexSSEFrameStartsResponse(frame []byte) bool {
+	eventType, data := parseSSEFrame(frame)
+	if len(data) == 0 {
+		return false
+	}
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(data, &envelope) != nil {
+		return false
+	}
+	kind := strings.TrimSpace(envelope.Type)
+	if kind == "" {
+		kind = strings.TrimSpace(eventType)
+	}
+	return kind == "response.created"
+}
+
+// IsEmptyCodexCompletionFrame reports the narrow malformed-success shape seen in
+// production: response.completed with neither semantic output nor usage evidence.
+// It intentionally does not consider earlier frames; the stateful SSEFilter and
+// the early probe separately require that no prior content was observed.
+func IsEmptyCodexCompletionFrame(frame []byte) bool {
+	eventType, data := parseSSEFrame(frame)
+	if len(data) == 0 {
+		return false
+	}
+	var envelope struct {
+		Type     string          `json:"type"`
+		Response json.RawMessage `json:"response"`
+	}
+	if json.Unmarshal(data, &envelope) != nil {
+		return false
+	}
+	kind := strings.TrimSpace(envelope.Type)
+	if kind == "" {
+		kind = strings.TrimSpace(eventType)
+	}
+	if kind != "response.completed" || len(bytes.TrimSpace(envelope.Response)) == 0 || bytes.Equal(bytes.TrimSpace(envelope.Response), []byte("null")) {
+		return false
+	}
+	var response struct {
+		Output     json.RawMessage `json:"output"`
+		OutputText string          `json:"output_text"`
+		Usage      json.RawMessage `json:"usage"`
+		Error      json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(envelope.Response, &response) != nil {
+		return false
+	}
+	if strings.TrimSpace(response.OutputText) != "" || jsonContainerHasValues(response.Output) || jsonContainerHasValues(response.Usage) || jsonContainerHasValues(response.Error) {
+		return false
+	}
+	return true
+}
+
+func codexSSEFrameHasSemanticOutput(frame []byte) bool {
+	eventType, data := parseSSEFrame(frame)
+	if len(data) == 0 {
+		return false
+	}
+	var envelope struct {
+		Type     string          `json:"type"`
+		Delta    json.RawMessage `json:"delta"`
+		Item     json.RawMessage `json:"item"`
+		Response json.RawMessage `json:"response"`
+	}
+	if json.Unmarshal(data, &envelope) != nil {
+		return false
+	}
+	kind := strings.TrimSpace(envelope.Type)
+	if kind == "" {
+		kind = strings.TrimSpace(eventType)
+	}
+	switch {
+	case kind == "response.output_item.added", kind == "response.output_item.done":
+		return jsonContainerHasValues(envelope.Item)
+	case strings.HasPrefix(kind, "response.output_text."),
+		strings.HasPrefix(kind, "response.function_call_arguments."),
+		strings.HasPrefix(kind, "response.custom_tool_call_input."),
+		strings.HasPrefix(kind, "response.reasoning."),
+		strings.HasPrefix(kind, "response.audio."),
+		strings.HasPrefix(kind, "response.image_generation_call."):
+		return jsonContainerHasValues(envelope.Delta) || len(bytes.TrimSpace(data)) > 0
+	case kind == "response.completed" && len(envelope.Response) > 0:
+		var response struct {
+			Output     json.RawMessage `json:"output"`
+			OutputText string          `json:"output_text"`
+		}
+		return json.Unmarshal(envelope.Response, &response) == nil &&
+			(strings.TrimSpace(response.OutputText) != "" || jsonContainerHasValues(response.Output))
+	}
+	return false
+}
+
+func jsonContainerHasValues(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) || bytes.Equal(trimmed, []byte("[]")) || bytes.Equal(trimmed, []byte(`""`)) {
+		return false
+	}
+	return true
 }
 
 // ProcessFrameForRelay applies the same frame policy as Copy to one complete

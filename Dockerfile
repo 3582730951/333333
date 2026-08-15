@@ -56,12 +56,12 @@ RUN mkdir -p /usr/local/lib/codex-pool/releases/docker \
       /var/lib/codex-pool/run /var/lib/codex-pool/data/spool \
       /var/lib/codex-pool/data/journal /var/lib/codex-pool/data/diagnostics \
       /var/lib/codex-pool/data/tmp/browser /var/lib/codex-pool/data/run \
-      /var/lib/codex-pool/data/keys && \
+      /var/lib/codex-pool/data/keys /var/lib/codex-pool/data/core-state && \
     chmod 0700 /var/lib/codex-pool /var/lib/codex-pool/run /var/lib/codex-pool/data \
       /var/lib/codex-pool/data/spool /var/lib/codex-pool/data/journal \
       /var/lib/codex-pool/data/diagnostics /var/lib/codex-pool/data/tmp \
       /var/lib/codex-pool/data/tmp/browser /var/lib/codex-pool/data/run \
-      /var/lib/codex-pool/data/keys && \
+      /var/lib/codex-pool/data/keys /var/lib/codex-pool/data/core-state && \
     chown -R codex-pool:codex-pool /var/lib/codex-pool
 COPY --from=build /out/codex-pool-server /usr/local/lib/codex-pool/releases/docker/codex-pool-server
 COPY --from=build /out/codex-pool-handoff /usr/local/bin/codex-pool-handoff

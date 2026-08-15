@@ -208,12 +208,14 @@ async function fetchDirectArchive(
   endpoint: string,
   fallbackName: string,
   signal?: AbortSignal,
+  timeout?: number,
 ): Promise<AuditArchive> {
   // Let the browser construct the Blob directly. Fetching an ArrayBuffer and then
   // wrapping it in a Blob can briefly retain two full copies of a large archive.
   throwIfAborted(signal);
   const response = await api.get(endpoint, {
     responseType: 'blob',
+    ...(timeout ? { timeout } : {}),
     ...(signal ? { signal } : {}),
   });
   const archive = await zipBlobFromResponse(response, fallbackName);
@@ -334,7 +336,31 @@ export async function fetchAuditArchive(
   kind: AuditExportKind,
   diagnosticOptions: DiagnosticExportOptions = {},
 ): Promise<AuditArchive> {
-  if (kind === 'diagnostics') return fetchDiagnosticArchive(diagnosticOptions);
+  if (kind === 'diagnostics') {
+    try {
+      return await fetchDiagnosticArchive(diagnosticOptions);
+    } catch (primaryError) {
+      // A context-loss incident can coincide with a stopped or stranded optional
+      // diagnostics worker. Preserve cancellation semantics, but otherwise fall
+      // back to the authenticated same-origin rescue stream on the request worker.
+      // This path uses the existing admin export route and still validates content
+      // type plus the ZIP signature before exposing a download.
+      throwIfAborted(diagnosticOptions.signal);
+      try {
+        return await fetchDirectArchive(
+          '/admin/export/logs?mode=rescue',
+          diagnosticFallbackName,
+          diagnosticOptions.signal,
+          Math.max(diagnosticOptions.timeoutMs ?? diagnosticTimeoutMs, 60_000),
+        );
+      } catch (rescueError) {
+        throwIfAborted(diagnosticOptions.signal);
+        const primary = primaryError instanceof Error ? primaryError.message : String(primaryError);
+        const rescue = rescueError instanceof Error ? rescueError.message : String(rescueError);
+        throw new Error(`${primary} Emergency diagnostic export also failed: ${rescue}`);
+      }
+    }
+  }
   const definition = archiveDefinitions[kind];
   return fetchDirectArchive(definition.endpoint, definition.fallbackName, diagnosticOptions.signal);
 }
