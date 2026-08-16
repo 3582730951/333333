@@ -16,6 +16,23 @@
 - 普通回答的旧 reasoning 不回放；带工具调用的 assistant 轮必须完整回放
   `reasoning_content`，并与该轮全部并行工具调用保持在同一个 assistant message 中。
 
+## 官方 harness 中可直接复用的做法
+
+`deepseek-harness` 没有通过缩短上下文或降低推理档位换取缓存。它采用以下三个可验证约束：
+
+1. DeepSeek 请求序列化始终保持 system → 既有 messages 的顺序，工具数组按注册顺序输出；
+   可选字段不存在时直接省略，不在不同轮次间交替发送 `null` 和缺省值。
+2. 压缩请求完整重放当前会话的 system、tools 和待压缩历史，只把压缩指令作为最后一条
+   user message 追加。这样压缩调用本身复用刚刚发送过的前缀，不会为 summarizer 重建另一套
+   system prompt。
+3. 官方真实 API E2E 使用“首轮工具调用 + 工具结果续轮 + 普通 follow-up”，并断言冷请求之后
+   每次 `cacheReadTokens > 0`；同时验证工具结果仍出现在最终答案，避免以破坏上下文换取假命中。
+
+Pool 对应地在任何协议桥接之前保存原始下游亲和键。Codex 的 `prompt_cache_key`、root/parent
+thread，及 Claude Code 的 `X-Claude-Code-Session-Id` 都从原始请求提取，再绑定到同一上游
+API Key；桥接后不重新按已变化的 JSON 前缀选账号。额度耗尽时仍只以完整、自包含历史切换
+账号，缓存冷启动可以接受，丢上下文不可以接受。
+
 ## 各协议的安全策略
 
 | 下游 / 上游 | 缓存策略 | 上下文保护 |

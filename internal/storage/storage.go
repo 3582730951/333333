@@ -10513,27 +10513,19 @@ func (s *Store) UsageCompleteness(ctx context.Context, snapshotAt int64) (UsageC
 		snapshotAt = Now()
 	}
 	cutoff := snapshotAt - 2*60*60
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return UsageCompleteness{}, err
-	}
-	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO audit_log(account_id, action, state, reason, detail, created_at)
-SELECT account_id, 'usage_missing', 'warning', 'billing hold exceeded two-hour usage deadline', id, ?
-FROM billing_holds WHERE usage_expected=1 AND usage_recorded_at=0 AND created_at < ? AND status <> 'usage_missing'`, snapshotAt, cutoff); err != nil {
-		return UsageCompleteness{}, err
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE billing_holds SET status='usage_missing', updated_at=? WHERE usage_expected=1 AND usage_recorded_at=0 AND created_at < ?`, snapshotAt, cutoff); err != nil {
-		return UsageCompleteness{}, err
-	}
 	var pending, earliest, gaps int64
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MIN(created_at),0) FROM billing_holds WHERE usage_expected=1 AND usage_recorded_at=0 AND status <> 'usage_missing'`).Scan(&pending, &earliest); err != nil {
-		return UsageCompleteness{}, err
-	}
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM billing_holds WHERE status='usage_missing'`).Scan(&gaps); err != nil {
-		return UsageCompleteness{}, err
-	}
-	if err = tx.Commit(); err != nil {
+	// This endpoint feeds every usage/dashboard read. It must remain read-only:
+	// turning an observability GET into a write transaction made concurrent UI
+	// refreshes contend with context and telemetry commits on SQLite's single
+	// writer. Unreconciled old holds are classified as gaps directly in the
+	// aggregate, so the answer stays correct while the background reconciler is
+	// waiting for a safe write window.
+	err := s.rdb.QueryRowContext(ctx, `SELECT
+	COALESCE(SUM(CASE WHEN usage_expected=1 AND usage_recorded_at=0 AND created_at>=? AND status<>'usage_missing' THEN 1 ELSE 0 END),0),
+	COALESCE(MIN(CASE WHEN usage_expected=1 AND usage_recorded_at=0 AND created_at>=? AND status<>'usage_missing' THEN created_at END),0),
+	COALESCE(SUM(CASE WHEN status='usage_missing' OR (usage_expected=1 AND usage_recorded_at=0 AND created_at<?) THEN 1 ELSE 0 END),0)
+FROM billing_holds`, cutoff, cutoff, cutoff).Scan(&pending, &earliest, &gaps)
+	if err != nil {
 		return UsageCompleteness{}, err
 	}
 	watermark := snapshotAt - 5
@@ -10548,6 +10540,36 @@ FROM billing_holds WHERE usage_expected=1 AND usage_recorded_at=0 AND created_at
 		UsageLagSeconds: snapshotAt - watermark, PendingUsageRequests: pending,
 		PartialData: pending > 0 || gaps > 0, CompletenessGapCount: gaps,
 	}, nil
+}
+
+// ReconcileUsageMissing durably marks billing holds whose upstream usage never
+// arrived. It is deliberately separate from UsageCompleteness so control-plane
+// reads never acquire the SQLite write lock. The active-role billing maintenance
+// loop calls this operation with a bounded context; the predicate and transaction
+// make retries idempotent.
+func (s *Store) ReconcileUsageMissing(ctx context.Context, snapshotAt int64) (int64, error) {
+	if snapshotAt <= 0 {
+		snapshotAt = Now()
+	}
+	cutoff := snapshotAt - 2*60*60
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO audit_log(account_id, action, state, reason, detail, created_at)
+SELECT account_id, 'usage_missing', 'warning', 'billing hold exceeded two-hour usage deadline', id, ?
+FROM billing_holds WHERE usage_expected=1 AND usage_recorded_at=0 AND created_at < ? AND status <> 'usage_missing'`, snapshotAt, cutoff); err != nil {
+		return 0, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE billing_holds SET status='usage_missing', updated_at=? WHERE usage_expected=1 AND usage_recorded_at=0 AND created_at < ? AND status <> 'usage_missing'`, snapshotAt, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const (

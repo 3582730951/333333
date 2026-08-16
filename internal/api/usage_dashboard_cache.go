@@ -19,10 +19,11 @@ const (
 )
 
 type dashboardSnapshot struct {
-	status  int
-	header  http.Header
-	body    []byte
-	created time.Time
+	status             int
+	header             http.Header
+	body               []byte
+	created            time.Time
+	diagnosticErrClass string
 }
 
 type dashboardCacheEntry struct {
@@ -47,9 +48,10 @@ func newUsageDashboardResponseCache() *usageDashboardResponseCache {
 }
 
 type dashboardCaptureWriter struct {
-	header http.Header
-	status int
-	body   bytes.Buffer
+	header             http.Header
+	status             int
+	body               bytes.Buffer
+	diagnosticErrClass string
 }
 
 func newDashboardCaptureWriter() *dashboardCaptureWriter {
@@ -57,6 +59,11 @@ func newDashboardCaptureWriter() *dashboardCaptureWriter {
 }
 
 func (w *dashboardCaptureWriter) Header() http.Header { return w.header }
+func (w *dashboardCaptureWriter) setDiagnosticFailureClass(class string) {
+	if w.diagnosticErrClass == "" {
+		w.diagnosticErrClass = class
+	}
+}
 func (w *dashboardCaptureWriter) WriteHeader(status int) {
 	if w.status != http.StatusOK || status == http.StatusOK {
 		return
@@ -113,6 +120,7 @@ func renderDashboardSnapshot(r *http.Request, render http.HandlerFunc) dashboard
 	return dashboardSnapshot{
 		status: capture.status, header: capture.header.Clone(),
 		body: append([]byte(nil), capture.body.Bytes()...), created: time.Now(),
+		diagnosticErrClass: capture.diagnosticErrClass,
 	}
 }
 
@@ -156,6 +164,7 @@ func (c *usageDashboardResponseCache) store(key string, snapshot dashboardSnapsh
 }
 
 func writeDashboardSnapshot(w http.ResponseWriter, snapshot dashboardSnapshot, state string, age time.Duration) {
+	setDiagnosticFailureClass(w, snapshot.diagnosticErrClass)
 	for key, values := range snapshot.header {
 		for _, value := range values {
 			w.Header().Add(key, value)

@@ -7,7 +7,7 @@ import { t } from '../lib/i18n.js';
 
 const C = COLORS;
 const moduleColor = { running: 'green', completed: 'green', restarting: 'amber', panic: 'red', failed: 'red', stopped: 'grey' };
-const eventColor = { panic: 'red', panic_restart: 'red', failed: 'red', unexpected_exit: 'amber', event: 'blue' };
+const eventColor = { panic: 'red', panic_restart: 'red', failed: 'red', unexpected_exit: 'amber', http_error: 'amber', event: 'blue' };
 const meterColor = (p) => (p >= 90 ? C.red : p >= 70 ? C.amber : C.green);
 const problemStatuses = new Set(['panic', 'restarting', 'failed']);
 const fmtMillis = (ms) => (ms ? fmtDuration(Math.ceil(Number(ms) / 1000)) : '');
@@ -86,7 +86,7 @@ function SupervisorEventLine({ events = [] }) {
   return (
     <div className="pool-health-event">
       <div className="pool-health-event-head">
-        <Tag size="small" color={eventColor[type] || 'grey'}>{type}</Tag>
+        <Tag size="small" color={eventColor[type] || 'grey'}>{t(`system.event_type.${type}`, type)}</Tag>
         <span className="pool-mono">{event.module || 'background'}</span>
         <span className="pool-muted">{fmtRelative(event.time_unix)}</span>
       </div>

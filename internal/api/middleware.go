@@ -42,10 +42,41 @@ type clientErrorReport struct {
 
 type responseRecorder struct {
 	http.ResponseWriter
-	status   int
-	wrote    bool
-	hijacked bool
-	bytes    int64
+	status             int
+	wrote              bool
+	hijacked           bool
+	bytes              int64
+	diagnosticErrClass string
+}
+
+type diagnosticFailureClassWriter interface {
+	setDiagnosticFailureClass(string)
+}
+
+func (r *responseRecorder) setDiagnosticFailureClass(class string) {
+	class = strings.TrimSpace(class)
+	if r == nil || class == "" || r.diagnosticErrClass != "" {
+		return
+	}
+	r.diagnosticErrClass = class
+}
+
+func setDiagnosticFailureClass(w http.ResponseWriter, class string) {
+	class = strings.TrimSpace(class)
+	if w == nil || class == "" {
+		return
+	}
+	for depth := 0; depth < 8 && w != nil; depth++ {
+		if recorder, ok := w.(diagnosticFailureClassWriter); ok {
+			recorder.setDiagnosticFailureClass(class)
+			return
+		}
+		unwrapper, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return
+		}
+		w = unwrapper.Unwrap()
+	}
 }
 
 func (r *responseRecorder) WriteHeader(status int) {
@@ -147,14 +178,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.httpMetrics.finish(metricRoute, rec.status, requestBytes, rec.bytes, duration)
 		s.recordHTTPRequest(requestID, r.Method, routeName, rec.status, requestBytes, rec.bytes, duration)
 		if rec.status >= http.StatusInternalServerError && !panicRecovered {
+			errorClass := strings.TrimSpace(rec.diagnosticErrClass)
+			if errorClass == "" {
+				errorClass = "http_status_5xx"
+			}
+			severity := "error"
+			if rec.status == http.StatusServiceUnavailable || isTransientHTTPFailureClass(errorClass) {
+				severity = "warning"
+			}
 			log.Printf("[HTTP-ERROR] request_id=%s status=%d method=%s path=%s bytes=%d duration=%s",
 				requestID, rec.status, r.Method, r.URL.Path, rec.bytes, duration.Round(time.Millisecond))
 			supervisor.Report(supervisor.Event{
-				Type: "http_error", Severity: "error", Module: "http-request",
-				Operation: "serve_http", ErrorClass: "http_status_5xx",
+				Type: "http_error", Severity: severity, Module: "http-request",
+				Operation: "serve_http", ErrorClass: errorClass,
 				RequestID: requestID, Route: routeName, Status: rec.status,
 				Recovered: true, ResponseCommitted: rec.wrote || rec.hijacked,
-				Message: "HTTP request completed with a server error",
+				Message: diagnosticHTTPFailureMessage(errorClass),
 			})
 		}
 	}()
@@ -164,10 +203,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writePublicServiceUnavailable(rec)
 		return
 	}
-	// The emergency diagnostics route is the evidence path for exactly the cases
-	// where inference admission is saturated or paused. It remains admin-gated in
-	// the router, but must not consume or wait for an inference scheduler token.
-	if s.scheduler != nil && !isEmergencyDiagnosticExportRequest(r) {
+	// Admission protects model traffic, not the control plane. Reserving inference
+	// headroom for every admin GET made the dashboard, diagnostics, registration
+	// stats, and settings disappear precisely while model traffic was saturated.
+	// Body capture has its own bounded memory/disk budget for non-inference routes.
+	if s.scheduler != nil && requiresInferenceAdmission(r) {
 		reserveBytes := int64(256 << 10)
 		release, reserveErr := s.scheduler.Reserve(r.Context(), reserveBytes)
 		if reserveErr != nil {
@@ -231,12 +271,55 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(rec, r)
 }
 
+func isTransientHTTPFailureClass(class string) bool {
+	switch class {
+	case "admission_capacity", "database_busy", "database_readonly", "deadline_exceeded", "service_unavailable", "storage_unavailable":
+		return true
+	default:
+		return false
+	}
+}
+
+func diagnosticHTTPFailureMessage(class string) string {
+	switch class {
+	case "admission_capacity":
+		return "Model request admission is temporarily saturated"
+	case "database_busy":
+		return "Control-plane storage is busy; the request may be retried"
+	case "database_readonly":
+		return "Control-plane storage is temporarily read-only"
+	case "deadline_exceeded":
+		return "HTTP request exceeded its bounded deadline"
+	case "storage_unavailable":
+		return "Control-plane storage is temporarily unavailable"
+	case "service_unavailable":
+		return "HTTP request was temporarily unavailable"
+	default:
+		return "HTTP request completed with an internal server error"
+	}
+}
+
 func isEmergencyDiagnosticExportRequest(r *http.Request) bool {
 	if r == nil || r.Method != http.MethodGet || r.URL == nil || r.URL.Path != "/admin/export/logs" {
 		return false
 	}
 	mode := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("mode")))
 	return mode == "rescue" || mode == "emergency"
+}
+
+func requiresInferenceAdmission(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	path := r.URL.Path
+	if isInferenceRequestPath(path) || path == "/v1/alpha/search" {
+		return true
+	}
+	if !strings.HasPrefix(path, "/public-chat/") || r.Method != http.MethodPost {
+		return false
+	}
+	_, action, ok := parsePublicChatAPIPath(path)
+	return ok && action == "messages"
 }
 
 // diagnosticHTTPRouteName turns a repository-owned ServeMux pattern into a

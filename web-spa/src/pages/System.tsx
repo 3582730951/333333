@@ -18,7 +18,7 @@ const DataTable = ResourceTable as any;
 const Section = Panel as any;
 const C = COLORS;
 const kindColor: Record<string, string> = { node: 'green', chrome: 'blue', xvfb: 'violet', other: 'grey' };
-const eventColor: Record<string, string> = { panic: 'red', panic_restart: 'red', failed: 'red', unexpected_exit: 'amber', event: 'blue' };
+const eventColor: Record<string, string> = { panic: 'red', panic_restart: 'red', failed: 'red', unexpected_exit: 'amber', http_error: 'amber', event: 'blue' };
 const moduleColor: Record<string, string> = { running: 'green', completed: 'green', restarting: 'amber', panic: 'red', failed: 'red', stopped: 'grey' };
 const passiveHealthColor: Record<string, string> = { healthy: 'green', degraded: 'amber', unhealthy: 'red', unknown: 'grey' };
 const compatibilityColor: Record<string, string> = {
@@ -51,6 +51,17 @@ const moduleStateLabel = (state: unknown) => {
 const eventTypeLabel = (type: unknown) => {
   const value = String(type || 'event');
   return t(`system.event_type.${value}`, value);
+};
+const problemModuleStatuses = new Set(['panic', 'restarting', 'failed']);
+const moduleStatusMessage = (row: SupervisorModule) => {
+  const status = String(row.status || '');
+  if (problemModuleStatuses.has(status) && row.last_panic) {
+    return `${row.last_message || 'panic'}: ${row.last_panic}`;
+  }
+  if (status === 'completed' && row.last_message === 'task completed') return t('system.task_completed_detail');
+  if (status === 'running' && row.last_message === 'module running') return t('system.module_running_detail');
+  if (status === 'stopped' && row.last_message === 'module stopped') return t('system.module_stopped_detail');
+  return row.last_message || '—';
 };
 const fmtModuleRuntime = (_: unknown, row: SupervisorModule) => fmtMillis(row.status === 'running' ? row.uptime_millis : (row.last_uptime_millis || row.uptime_millis));
 
@@ -273,7 +284,7 @@ export default function System() {
         [t('system.current_previous'), fmtModuleRuntime(null, row)],
         [t('system.backoff'), fmtMillis(row.restart_backoff_millis)],
         [t('system.next_retry'), fmtDateTime(row.next_restart_unix)],
-        [t('system.recent_status'), row.last_panic ? `${row.last_message || 'panic'}: ${row.last_panic}` : (row.last_message || '—')],
+        [t('system.recent_status'), moduleStatusMessage(row)],
       ],
     });
   };
@@ -287,7 +298,7 @@ export default function System() {
       rows: [
         [t('system.time'), fmtDateTime(row.time_unix)],
         [t('system.module'), row.module || '—'],
-        [t('system.kind'), type],
+        [t('system.kind'), eventTypeLabel(type)],
         [t('system.description'), message],
         [t('system.runtime'), fmtMillis(row.uptime_millis)],
         [t('system.backoff'), fmtMillis(row.backoff_millis)],
@@ -354,7 +365,7 @@ export default function System() {
     { title: t('system.current_previous'), dataIndex: 'uptime_millis', width: 110, align: 'right', render: fmtModuleRuntime },
     { title: t('system.backoff'), dataIndex: 'restart_backoff_millis', width: 110, align: 'right', render: fmtMillis },
     { title: t('system.next_retry'), dataIndex: 'next_restart_unix', width: 140, render: fmtDateTime },
-    { title: t('system.recent_status'), dataIndex: 'last_message', render: (value: string | undefined, row: SupervisorModule) => row.last_panic ? `${value || 'panic'}: ${row.last_panic}` : (value || '—') },
+    { title: t('system.recent_status'), dataIndex: 'last_message', render: (_value: string | undefined, row: SupervisorModule) => moduleStatusMessage(row) },
   ];
   const passiveHealthColumns: any[] = [
     { title: t('system.provider'), dataIndex: 'provider', width: 130, render: (value: string) => <span className="pool-mono">{value}</span> },
@@ -631,7 +642,7 @@ export default function System() {
           mobileListLabel={t('system.module_health')}
           mobileRenderer={(row: SupervisorModule) => {
             const name = row.name || t('common.unknown');
-            const message = row.last_panic ? `${row.last_message || 'panic'}: ${row.last_panic}` : (row.last_message || '—');
+            const message = moduleStatusMessage(row);
             return (
               <CompactSystemRecord
                 title={<span className="pool-mono">{name}</span>}

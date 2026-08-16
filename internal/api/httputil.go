@@ -6,6 +6,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -351,6 +352,7 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeRaw(w http.ResponseWriter, status int, headers http.Header, body []byte) {
 	if status >= http.StatusBadRequest {
+		setDiagnosticFailureClass(w, "upstream_error")
 		writePublicServiceUnavailable(w)
 		return
 	}
@@ -364,6 +366,7 @@ func writeError(w http.ResponseWriter, status int, err error) {
 		status = http.StatusRequestEntityTooLarge
 	}
 	if status < 400 || status >= 500 {
+		setDiagnosticFailureClass(w, safeDiagnosticErrorClass(err))
 		writePublicServiceUnavailable(w)
 		return
 	}
@@ -385,6 +388,31 @@ func writeError(w http.ResponseWriter, status int, err error) {
 			"request_id": publicRequestID(w),
 		},
 	})
+}
+
+func safeDiagnosticErrorClass(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return "request_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+	if err == nil {
+		return "internal_error"
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "database is locked"),
+		strings.Contains(message, "database is busy"),
+		strings.Contains(message, "sqlite_busy"):
+		return "database_busy"
+	case strings.Contains(message, "readonly"), strings.Contains(message, "read-only"):
+		return "database_readonly"
+	case strings.Contains(message, "database is closed"), strings.Contains(message, "sql: database is closed"):
+		return "storage_unavailable"
+	default:
+		return "internal_error"
+	}
 }
 
 // PublicError is restricted to messages and codes that are safe to expose. Raw
@@ -450,6 +478,7 @@ func resetPublicErrorHeaders(w http.ResponseWriter) {
 }
 
 func writePublicServiceUnavailable(w http.ResponseWriter) {
+	setDiagnosticFailureClass(w, "service_unavailable")
 	requestID := publicRequestID(w)
 	resetPublicErrorHeaders(w)
 	w.Header().Set(requestIDHeader, requestID)
@@ -465,6 +494,7 @@ func writePublicServiceUnavailable(w http.ResponseWriter) {
 }
 
 func writeResourceExhausted(w http.ResponseWriter, message string) {
+	setDiagnosticFailureClass(w, "admission_capacity")
 	writePublicServiceUnavailable(w)
 }
 

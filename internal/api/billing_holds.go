@@ -55,13 +55,19 @@ func (s *Server) settleBillingHoldIfHeld(_ context.Context, id, status string) e
 
 func (s *Server) startBillingHoldExpiryLoop(ctx context.Context) {
 	expire := func() {
-		n, err := s.store.ExpireStaleBillingHolds(ctx, s.billingHoldExpiryAge())
+		maintenanceCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		n, err := s.store.ExpireStaleBillingHolds(maintenanceCtx, s.billingHoldExpiryAge())
 		if err != nil {
 			log.Printf("[BILLING-HOLDS] expire stale holds: %v", err)
-			return
-		}
-		if n > 0 {
+		} else if n > 0 {
 			log.Printf("[BILLING-HOLDS] expired_unsettled=%d", n)
+		}
+		missing, reconcileErr := s.store.ReconcileUsageMissing(maintenanceCtx, storage.Now())
+		if reconcileErr != nil {
+			log.Printf("[BILLING-HOLDS] reconcile missing usage: %v", reconcileErr)
+		} else if missing > 0 {
+			log.Printf("[BILLING-HOLDS] usage_missing=%d", missing)
 		}
 	}
 	expire()

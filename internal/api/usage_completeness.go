@@ -17,12 +17,13 @@ func (s *Server) currentUsageCompleteness(ctx context.Context, snapshotAt int64)
 	flushCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	timedOut, flushErr := s.flushTelemetry(flushCtx)
 	cancel()
-	if flushErr != nil {
-		return storage.UsageCompleteness{}, flushErr
-	}
 	meta, err := s.store.UsageCompleteness(ctx, snapshotAt)
 	meta.TelemetryFlushTimedOut = timedOut
-	if timedOut {
+	// Telemetry is durable in the journal before this barrier runs. A busy SQLite
+	// materializer therefore makes the view partial, not unavailable. Returning a
+	// stable read snapshot keeps the control plane alive under writer pressure and
+	// lets the normal replayer catch up without losing usage records.
+	if timedOut || flushErr != nil {
 		meta.PartialData = true
 	}
 	return meta, err

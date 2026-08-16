@@ -203,11 +203,16 @@ func markModuleStopped(name string) {
 func markModuleCompleted(name string) {
 	now := time.Now().Unix()
 	moduleStates.update(name, func(state ModuleState) ModuleState {
+		if state.LastStartUnix > 0 && now >= state.LastStartUnix {
+			state.LastUptimeMillis = (now - state.LastStartUnix) * 1000
+		}
 		state.Status = StatusCompleted
 		state.LastEventUnix = now
 		state.NextRestartUnix = 0
+		state.UptimeMillis = 0
 		state.RestartBackoffMillis = 0
 		state.LastMessage = "task completed"
+		state.LastPanic = ""
 		return state
 	})
 }

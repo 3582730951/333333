@@ -352,6 +352,54 @@ type customCall struct {
 	provider string
 }
 
+// customProviderAffinityContextKey carries the affinity derived from the original
+// downstream protocol body. Responses -> Chat conversion intentionally omits
+// prompt_cache_key, while Messages -> Chat changes the structural prefix used by
+// Claude Code. Re-deriving affinity after either bridge can therefore move an
+// append-only conversation to another provider account and discard that account's
+// warm KV cache even though the client supplied a stable session key.
+type customProviderAffinityContextKey struct{}
+
+func withCustomProviderDownstreamAffinity(r *http.Request, body []byte, proto string) *http.Request {
+	if r == nil {
+		return nil
+	}
+	affinity := customProviderProtocolAffinity(r, body, proto)
+	diagnostics := usageDiagnosticsFromCtx(r.Context())
+	diagnostics.AffinitySource = affinity.Source
+	var prefix routing.PromptPrefixFingerprint
+	if strings.EqualFold(strings.TrimSpace(proto), "claude") {
+		prefix = routing.AnthropicStablePromptPrefixFingerprint(body)
+	} else {
+		prefix = routing.StablePromptPrefixFingerprint(body)
+		if routing.PromptCacheKey(body) != "" {
+			diagnostics.PromptCacheKeyPresent = true
+			diagnostics.PromptCacheKeySource = "downstream"
+		}
+	}
+	diagnostics.StablePrefixSource = prefix.Source
+	diagnostics.StablePrefixReason = prefix.Reason
+	diagnostics.StablePrefixBytes = prefix.PrefixBytes
+	ctx := withUsageDiagnostics(r.Context(), diagnostics)
+	if strings.TrimSpace(affinity.Hash) != "" {
+		ctx = context.WithValue(ctx, customProviderAffinityContextKey{}, affinity)
+	}
+	return r.WithContext(ctx)
+}
+
+func customProviderProtocolAffinity(r *http.Request, body []byte, proto string) routing.AffinityKey {
+	if r != nil {
+		if affinity, ok := r.Context().Value(customProviderAffinityContextKey{}).(routing.AffinityKey); ok &&
+			strings.TrimSpace(affinity.Hash) != "" {
+			return affinity
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(proto), "claude") {
+		return routing.ExtractClaudeAffinityKey(r, body)
+	}
+	return routing.ExtractAffinityKey(r, body)
+}
+
 func customProviderDownstreamScope(r *http.Request) string {
 	identity := "anonymous"
 	if r != nil {
@@ -492,7 +540,10 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 		}
 	}
 	retryBody := body
-	affinity := customProviderScopedAffinity(r, provider, routing.ExtractAffinityKey(r, body))
+	// Use the original downstream envelope when the entrypoint preserved it in the
+	// request context. This keeps Codex prompt_cache_key/thread hierarchies and
+	// Claude Code session identifiers stable across protocol conversion.
+	affinity := customProviderScopedAffinity(r, provider, customProviderProtocolAffinity(r, body, proto))
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
 		Group:           routeGroup,
 		Provider:        provider.ID,
@@ -656,6 +707,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 // sides speak Chat Completions, so the body and response pass through unchanged (only
 // sensitive-word scrubbing + usage capture are applied).
 func (s *Server) handleChatViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
+	r = withCustomProviderDownstreamAffinity(r, raw, "codex")
 	provider, _ = storage.ResolveCustomProviderRoute(provider, storage.CustomProviderDownstreamChat)
 	switch provider.UpstreamProtocol {
 	case storage.CustomProviderProtocolResponses:
@@ -709,6 +761,7 @@ func (s *Server) handleChatViaCustom(w http.ResponseWriter, r *http.Request, raw
 // handleResponsesViaCustom serves a Codex /v1/responses request from a custom provider:
 // Responses request → chat, then chat response/SSE → Responses response/SSE.
 func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
+	r = withCustomProviderDownstreamAffinity(r, raw, "codex")
 	provider, _ = storage.ResolveCustomProviderRoute(provider, storage.CustomProviderDownstreamResponses)
 	switch provider.UpstreamProtocol {
 	case storage.CustomProviderProtocolResponses:
@@ -1051,6 +1104,7 @@ func (s *Server) handleMessagesViaResponsesCustom(w http.ResponseWriter, r *http
 // handleMessagesViaCustom serves a Claude Code /v1/messages request from a custom
 // provider: Anthropic request → chat, then chat response/SSE → Anthropic response/SSE.
 func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
+	r = withCustomProviderDownstreamAffinity(r, raw, "claude")
 	provider, _ = resolveLiveCustomProviderRoute(provider, storage.CustomProviderDownstreamMessages)
 	switch provider.UpstreamProtocol {
 	case storage.CustomProviderProtocolAnthropicMessages:
@@ -1459,6 +1513,7 @@ func (s *Server) settleValidatedStreamUsage(r *http.Request, cc customCall, usca
 func customUsageContext(ctx context.Context, cc customCall) context.Context {
 	diagnostics := usageDiagnosticsFromCtx(ctx)
 	diagnostics.UsageProvider = strings.TrimSpace(cc.provider)
+	diagnostics.AffinitySource = strings.TrimSpace(cc.affinity.Source)
 	diagnostics.RouteEpoch = cc.lease.RouteEpoch
 	ctx = withUsageDiagnostics(ctx, diagnostics)
 	return withBillingHold(ctx, cc.holdID)
