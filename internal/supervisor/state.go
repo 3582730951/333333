@@ -13,6 +13,7 @@ const (
 	StatusPanic      = "panic"
 	StatusFailed     = "failed"
 	StatusStopped    = "stopped"
+	StatusCompleted  = "completed"
 )
 
 // ModuleState is the latest known health state for a supervised module.
@@ -202,7 +203,7 @@ func markModuleStopped(name string) {
 func markModuleCompleted(name string) {
 	now := time.Now().Unix()
 	moduleStates.update(name, func(state ModuleState) ModuleState {
-		state.Status = StatusStopped
+		state.Status = StatusCompleted
 		state.LastEventUnix = now
 		state.NextRestartUnix = 0
 		state.RestartBackoffMillis = 0
@@ -263,7 +264,7 @@ func stateRank(status string) int {
 		return 0
 	case StatusStopped:
 		return 1
-	case StatusRunning:
+	case StatusRunning, StatusCompleted:
 		return 2
 	default:
 		return 3

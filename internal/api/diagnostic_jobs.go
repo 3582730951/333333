@@ -1058,10 +1058,23 @@ func (s *Server) adminDiagnosticsExport(w http.ResponseWriter, r *http.Request) 
 	// streams directly on the requesting worker without relying on the background
 	// diagnostic loop. Physical storage/database failure can still make any export
 	// impossible, but a context-loss incident or dead renderer cannot.
+	if r.Method == http.MethodGet && r.URL.Query().Get("mode") == "emergency" {
+		w.Header().Set("X-Codex-Diagnostic-Mode", "emergency")
+		started, err := s.streamEmergencyDiagnosticsExport(w, nil)
+		if err != nil && !started {
+			writeError(w, http.StatusInternalServerError, err)
+		} else if err != nil {
+			log.Printf("[DIAGNOSTICS] emergency archive delivery failed after response start: %v", err)
+		}
+		return
+	}
 	if r.Method == http.MethodGet && r.URL.Query().Get("mode") == "rescue" {
 		w.Header().Set("X-Codex-Diagnostic-Mode", "rescue")
-		if err := s.streamDiagnosticsExport(r.Context(), w); err != nil {
+		started, err := s.streamRescueDiagnosticsExport(r.Context(), w)
+		if err != nil && !started {
 			writeError(w, http.StatusInternalServerError, err)
+		} else if err != nil {
+			log.Printf("[DIAGNOSTICS] rescue archive delivery failed after response start: %v", err)
 		}
 		return
 	}

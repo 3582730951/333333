@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"runtime/debug"
+	"sync"
 	"time"
 )
 
@@ -27,6 +28,55 @@ type Options struct {
 	Logf           Logf
 }
 
+// Restartable owns one generation of a supervised module at a time. Calling
+// Start cancels the previous generation and waits for its supervisor boundary to
+// finish before launching the replacement. This is intended for active-role
+// workers whose parent context is replaced after an A/B demotion/promotion.
+//
+// A plain sync.Once is incorrect for those workers: the first demotion cancels
+// the only generation permanently. Starting two independent supervisor.Go loops
+// is also unsafe because the retiring generation can publish "stopped" after the
+// replacement has already published "running". Restartable serializes that
+// hand-off without blocking the caller.
+type Restartable struct {
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// Start replaces the currently owned generation, if any.
+func (r *Restartable) Start(ctx context.Context, opts Options, run func(context.Context)) {
+	if r == nil || run == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	opts = normalizeOptions(opts)
+	childCtx, cancel := context.WithCancel(ctx)
+
+	r.mu.Lock()
+	previousCancel, previousDone := r.cancel, r.done
+	done := make(chan struct{})
+	r.cancel, r.done = cancel, done
+	r.mu.Unlock()
+
+	if previousCancel != nil {
+		previousCancel()
+	}
+	go func() {
+		defer RecoverWithLogf(opts.Name+"-restartable-launch", opts.Logf)
+		defer close(done)
+		if previousDone != nil {
+			<-previousDone
+		}
+		if childCtx.Err() != nil {
+			return
+		}
+		runSupervised(childCtx, opts, run)
+	}()
+}
+
 // Go runs a long-lived background module and restarts it when it panics or returns
 // before ctx is cancelled. The restart is delayed with a bounded backoff so a broken
 // module cannot spin in a tight crash loop.
@@ -37,14 +87,16 @@ func Go(ctx context.Context, name string, run func(context.Context)) {
 // GoWithOptions is Go with explicit restart/backoff settings.
 func GoWithOptions(ctx context.Context, opts Options, run func(context.Context)) {
 	opts = normalizeOptions(opts)
-	go func() {
-		defer func() {
-			if v := recover(); v != nil {
-				LogPanicWithLogf(opts.Name, fmt.Sprintf("supervisor loop panic: %v", v), opts.Logf)
-			}
-		}()
-		supervise(ctx, opts, run)
+	go runSupervised(ctx, opts, run)
+}
+
+func runSupervised(ctx context.Context, opts Options, run func(context.Context)) {
+	defer func() {
+		if v := recover(); v != nil {
+			LogPanicWithLogf(opts.Name, fmt.Sprintf("supervisor loop panic: %v", v), opts.Logf)
+		}
 	}()
+	supervise(ctx, opts, run)
 }
 
 // GoOnce runs a one-shot goroutine and logs any panic with module context. Use this

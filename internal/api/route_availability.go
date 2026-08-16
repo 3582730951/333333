@@ -39,7 +39,7 @@ type routeAvailabilityIndex struct {
 	routes                map[string]scheduler.Route
 	customProviderVersion string
 	cursor                int
-	started               sync.Once
+	runner                supervisor.Restartable
 	wake                  chan struct{}
 
 	enabled    atomic.Bool
@@ -93,9 +93,7 @@ func (i *routeAvailabilityIndex) Start(ctx context.Context) {
 		return
 	}
 	i.enabled.Store(true)
-	i.started.Do(func() {
-		supervisor.Go(ctx, "user-group-route-availability", i.run)
-	})
+	i.runner.Start(ctx, supervisor.Options{Name: "user-group-route-availability"}, i.run)
 }
 
 func (i *routeAvailabilityIndex) Enable() {

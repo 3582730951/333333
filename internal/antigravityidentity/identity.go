@@ -34,16 +34,14 @@ var (
 	versionMu     sync.RWMutex
 	cachedVersion = FallbackVersion
 	versionExpiry time.Time
-	updaterOnce   sync.Once
+	updater       supervisor.Restartable
 )
 
 // StartVersionUpdater refreshes the Hub version in a background worker. The
 // caller supplies the active-runtime context so standby workers and shutdown
 // processes do not keep an updater alive.
 func StartVersionUpdater(ctx context.Context) {
-	updaterOnce.Do(func() {
-		supervisor.Go(ctx, "antigravity-version-updater", runVersionUpdater)
-	})
+	updater.Start(ctx, supervisor.Options{Name: "antigravity-version-updater"}, runVersionUpdater)
 }
 
 func runVersionUpdater(ctx context.Context) {

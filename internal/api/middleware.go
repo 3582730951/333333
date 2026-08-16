@@ -164,7 +164,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writePublicServiceUnavailable(rec)
 		return
 	}
-	if s.scheduler != nil {
+	// The emergency diagnostics route is the evidence path for exactly the cases
+	// where inference admission is saturated or paused. It remains admin-gated in
+	// the router, but must not consume or wait for an inference scheduler token.
+	if s.scheduler != nil && !isEmergencyDiagnosticExportRequest(r) {
 		reserveBytes := int64(256 << 10)
 		release, reserveErr := s.scheduler.Reserve(r.Context(), reserveBytes)
 		if reserveErr != nil {
@@ -226,6 +229,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx = contextWithRuntimeSettingsCache(ctx)
 	r = r.WithContext(ctx)
 	s.mux.ServeHTTP(rec, r)
+}
+
+func isEmergencyDiagnosticExportRequest(r *http.Request) bool {
+	if r == nil || r.Method != http.MethodGet || r.URL == nil || r.URL.Path != "/admin/export/logs" {
+		return false
+	}
+	mode := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("mode")))
+	return mode == "rescue" || mode == "emergency"
 }
 
 // diagnosticHTTPRouteName turns a repository-owned ServeMux pattern into a

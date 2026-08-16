@@ -19,7 +19,7 @@ const Section = Panel as any;
 const C = COLORS;
 const kindColor: Record<string, string> = { node: 'green', chrome: 'blue', xvfb: 'violet', other: 'grey' };
 const eventColor: Record<string, string> = { panic: 'red', panic_restart: 'red', failed: 'red', unexpected_exit: 'amber', event: 'blue' };
-const moduleColor: Record<string, string> = { running: 'green', restarting: 'amber', panic: 'red', failed: 'red', stopped: 'grey' };
+const moduleColor: Record<string, string> = { running: 'green', completed: 'green', restarting: 'amber', panic: 'red', failed: 'red', stopped: 'grey' };
 const passiveHealthColor: Record<string, string> = { healthy: 'green', degraded: 'amber', unhealthy: 'red', unknown: 'grey' };
 const compatibilityColor: Record<string, string> = {
   current: 'green', unchanged: 'green', last_known_good: 'green', degraded_last_known_good: 'amber',
@@ -28,11 +28,11 @@ const compatibilityColor: Record<string, string> = {
 const meterColor = (percent: number) => (percent >= 90 ? C.red : percent >= 70 ? C.amber : C.green);
 
 // Chart palette for the same maps above. Tag colours are names, charts need values.
-const MODULE_CHART_COLOR: Record<string, string> = { running: C.green, restarting: C.amber, panic: C.red, failed: C.red, stopped: C.grey };
+const MODULE_CHART_COLOR: Record<string, string> = { running: C.green, completed: C.green, restarting: C.amber, panic: C.red, failed: C.red, stopped: C.grey };
 const KIND_CHART_COLOR: Record<string, string> = { node: C.green, chrome: C.blue, xvfb: C.violet, other: C.grey };
 // Composition order for the module meter, healthiest first. `panic` and `failed` share a colour
 // because both mean the module is down; they stay separate segments so the counts differ.
-const MODULE_STATE_ORDER = ['running', 'restarting', 'panic', 'failed', 'stopped'];
+const MODULE_STATE_ORDER = ['running', 'completed', 'restarting', 'panic', 'failed', 'stopped'];
 // Guard levels, best first. The backend derives the snapshot level from the worst filesystem,
 // so these are also the only values a filesystem entry can carry.
 const GUARD_COLOR: Record<string, string> = { normal: C.green, pressure: C.amber, critical: C.red };

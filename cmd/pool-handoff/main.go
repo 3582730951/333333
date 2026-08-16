@@ -330,6 +330,7 @@ func writeHandoffUnavailable(w http.ResponseWriter, requestID string) {
 }
 
 func (h *handoff) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	emergencyDiagnostic := isHandoffEmergencyDiagnosticRequest(r)
 	switch r.URL.Path {
 	case "/handoffz":
 		h.serveStatus(w, false)
@@ -341,13 +342,33 @@ func (h *handoff) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Deployment and load-balancer probes must remain observable while normal
 		// admission is paused. /readyz is also the installer's post-switch proof.
 	default:
-		if err := h.gate.await(r.Context()); err != nil {
-			return
+		if emergencyDiagnostic {
+			paused, _, _, _, _ := h.gate.snapshot()
+			if paused {
+				// A synchronous full snapshot could prolong the SQLite lock recovery
+				// that paused admission. Ask the worker for its database-independent,
+				// in-memory archive while retaining normal downstream admin auth.
+				query := r.URL.Query()
+				query.Set("mode", "emergency")
+				r.URL.RawQuery = query.Encode()
+			}
+		} else {
+			if err := h.gate.await(r.Context()); err != nil {
+				return
+			}
 		}
 	}
 	h.inflight.Add(1)
 	defer h.inflight.Add(-1)
 	h.proxy.ServeHTTP(w, r)
+}
+
+func isHandoffEmergencyDiagnosticRequest(r *http.Request) bool {
+	if r == nil || r.Method != http.MethodGet || r.URL == nil || r.URL.Path != "/admin/export/logs" {
+		return false
+	}
+	mode := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("mode")))
+	return mode == "rescue" || mode == "emergency"
 }
 
 func (h *handoff) serveControl(w http.ResponseWriter, r *http.Request, trustedUnixSocket bool) {

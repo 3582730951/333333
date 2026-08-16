@@ -830,6 +830,7 @@ const en = {
   'system.no_events': 'No module panics, unexpected exits, or restart events',
   'system.no_processes': 'No node, Chrome, or Xvfb registration processes',
   'system.state.running': 'Running',
+  'system.state.completed': 'Completed',
   'system.state.restarting': 'Restarting',
   'system.state.panic': 'Error',
   'system.state.failed': 'Failed',

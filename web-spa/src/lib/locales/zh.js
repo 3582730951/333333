@@ -834,6 +834,7 @@ const zh = {
   'system.no_events': '当前没有模块 panic、异常退出或重启记录',
   'system.no_processes': '当前没有 node、Chrome 或 Xvfb 注册进程',
   'system.state.running': '运行中',
+  'system.state.completed': '已完成',
   'system.state.restarting': '重启中',
   'system.state.panic': '异常',
   'system.state.failed': '失败',

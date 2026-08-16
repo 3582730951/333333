@@ -450,7 +450,8 @@ func (h *deploymentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveStandbyReady(w, r)
 		return
 	}
-	if !h.ready.Load() || h.draining.Load() || h.next == nil {
+	emergencyDiagnostic := isWorkerEmergencyDiagnosticRequest(r)
+	if h.next == nil || ((!h.ready.Load() || h.draining.Load()) && !emergencyDiagnostic) {
 		writeWorkerUnavailable(w)
 		return
 	}
@@ -458,6 +459,14 @@ func (h *deploymentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer h.inflight.Add(-1)
 	w.Header().Set("X-Codex-Pool-Release", h.releaseID)
 	h.next.ServeHTTP(w, r)
+}
+
+func isWorkerEmergencyDiagnosticRequest(r *http.Request) bool {
+	if r == nil || r.Method != http.MethodGet || r.URL == nil || r.URL.Path != "/admin/export/logs" {
+		return false
+	}
+	mode := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("mode")))
+	return mode == "rescue" || mode == "emergency"
 }
 
 func (h *deploymentHandler) serveReady(w http.ResponseWriter, r *http.Request) {

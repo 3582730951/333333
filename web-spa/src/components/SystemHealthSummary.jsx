@@ -6,7 +6,7 @@ import { fmtBytes, fmtDuration, fmtInt, fmtKB, fmtRelative } from '../lib/format
 import { t } from '../lib/i18n.js';
 
 const C = COLORS;
-const moduleColor = { running: 'green', restarting: 'amber', panic: 'red', failed: 'red', stopped: 'grey' };
+const moduleColor = { running: 'green', completed: 'green', restarting: 'amber', panic: 'red', failed: 'red', stopped: 'grey' };
 const eventColor = { panic: 'red', panic_restart: 'red', failed: 'red', unexpected_exit: 'amber', event: 'blue' };
 const meterColor = (p) => (p >= 90 ? C.red : p >= 70 ? C.amber : C.green);
 const problemStatuses = new Set(['panic', 'restarting', 'failed']);

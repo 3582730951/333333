@@ -92,6 +92,68 @@ type diagnosticHTTPRequest struct {
 	CreatedAt     int64
 }
 
+// Diagnostic supervisor snapshots intentionally omit LastMessage, LastPanic,
+// Event.Message and Event.Panic. Those fields are useful in the authenticated
+// live UI but can contain an upstream URL, filesystem path, or account label.
+// The structured fields below are sufficient to prove that a module stopped,
+// restarted, panicked, or completed without putting raw incident text into an
+// export that may be attached to a support ticket.
+type diagnosticSupervisorModule struct {
+	Name                 string `json:"name"`
+	Status               string `json:"status"`
+	LastStartUnix        int64  `json:"last_start_unix,omitempty"`
+	LastEventUnix        int64  `json:"last_event_unix,omitempty"`
+	NextRestartUnix      int64  `json:"next_restart_unix,omitempty"`
+	RestartCount         int64  `json:"restart_count"`
+	PanicCount           int64  `json:"panic_count"`
+	UnexpectedExitCount  int64  `json:"unexpected_exit_count"`
+	UptimeMillis         int64  `json:"uptime_millis,omitempty"`
+	LastUptimeMillis     int64  `json:"last_uptime_millis,omitempty"`
+	RestartBackoffMillis int64  `json:"restart_backoff_millis,omitempty"`
+}
+
+type diagnosticSupervisorEvent struct {
+	TimeUnix          int64  `json:"time_unix"`
+	Type              string `json:"type"`
+	Severity          string `json:"severity"`
+	Module            string `json:"module"`
+	Operation         string `json:"operation,omitempty"`
+	ErrorClass        string `json:"error_class,omitempty"`
+	Route             string `json:"route,omitempty"`
+	Status            int    `json:"status,omitempty"`
+	Recovered         bool   `json:"recovered,omitempty"`
+	ResponseCommitted bool   `json:"response_committed,omitempty"`
+	UptimeMillis      int64  `json:"uptime_millis,omitempty"`
+	BackoffMillis     int64  `json:"backoff_millis,omitempty"`
+}
+
+func diagnosticSupervisorSnapshot() map[string]interface{} {
+	states := supervisor.ModuleStates()
+	modules := make([]diagnosticSupervisorModule, 0, len(states))
+	for _, state := range states {
+		modules = append(modules, diagnosticSupervisorModule{
+			Name: state.Name, Status: state.Status,
+			LastStartUnix: state.LastStartUnix, LastEventUnix: state.LastEventUnix,
+			NextRestartUnix: state.NextRestartUnix, RestartCount: state.RestartCount,
+			PanicCount: state.PanicCount, UnexpectedExitCount: state.UnexpectedExitCount,
+			UptimeMillis: state.UptimeMillis, LastUptimeMillis: state.LastUptimeMillis,
+			RestartBackoffMillis: state.RestartBackoffMillis,
+		})
+	}
+	eventsRaw := supervisor.RecentEvents()
+	events := make([]diagnosticSupervisorEvent, 0, len(eventsRaw))
+	for _, event := range eventsRaw {
+		events = append(events, diagnosticSupervisorEvent{
+			TimeUnix: event.TimeUnix, Type: event.Type, Severity: event.Severity,
+			Module: event.Module, Operation: event.Operation, ErrorClass: event.ErrorClass,
+			Route: event.Route, Status: event.Status, Recovered: event.Recovered,
+			ResponseCommitted: event.ResponseCommitted, UptimeMillis: event.UptimeMillis,
+			BackoffMillis: event.BackoffMillis,
+		})
+	}
+	return map[string]interface{}{"modules": modules, "events": events}
+}
+
 func (s *Server) runtimeStorageDiagnostics() map[string]interface{} {
 	budget := s.bodyBudgetSnapshot()
 	var filesystem bodysource.DiskReserverSnapshot
@@ -109,6 +171,7 @@ func (s *Server) runtimeStorageDiagnostics() map[string]interface{} {
 		"filesystem":          filesystem,
 		"disk_guard":          s.diskGuardSnapshot(),
 		"routing_audit":       s.routingAuditDiagnostics(),
+		"supervisor":          diagnosticSupervisorSnapshot(),
 		"exception_callbacks": supervisor.EventCallbackStates(),
 		"exception_journal": func() interface{} {
 			if s == nil || s.incidentReporter == nil {
