@@ -164,9 +164,9 @@ func run() int {
 	}
 	defer store.Close()
 
-	if err := store.InitWithProgress(ctx, func(phase string) {
+	if err := initStorageWithLockRetry(ctx, store.InitWithProgress, func(phase string) {
 		log.Printf("startup: storage phase=%s elapsed=%s", phase, time.Since(storageInitStarted).Round(time.Millisecond))
-	}); err != nil {
+	}, log.Printf); err != nil {
 		log.Printf("init storage: %v", err)
 		reportStartupFailure("init_storage", err)
 		return 1

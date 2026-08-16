@@ -27,6 +27,8 @@ cmd/pool-server/deferred_migrations.go
 cmd/pool-server/deferred_migrations_test.go
 cmd/pool-server/main.go
 cmd/pool-server/main_test.go
+cmd/pool-server/storage_init_retry.go
+cmd/pool-server/storage_init_retry_test.go
 cmd/pool-server/worker_role.go
 cmd/pool-server/worker_role_test.go
 deploy/cloudflare-mailbox/README.md
