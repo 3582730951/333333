@@ -205,6 +205,7 @@ type Server struct {
 	codexNativeContinues        uint64
 	codexEOFCompensations       uint64
 	diskGuard                   atomic.Value // DiskGuardSnapshot
+	goalPolicyDefaultsMigrated  atomic.Bool
 	storageAdmissionBlocked     atomic.Bool
 	storageLargeRequestsPaused  atomic.Bool
 	usageDirectWrites           atomic.Bool

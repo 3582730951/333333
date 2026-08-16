@@ -8405,8 +8405,8 @@ func (s *Store) CleanupAffinityAliases(ctx context.Context, batch int) (int64, e
 	defer tx.Rollback()
 	var deleted int64
 	for _, statement := range []string{
-		`DELETE FROM affinity_aliases WHERE rowid IN (SELECT rowid FROM affinity_aliases WHERE expires_at<=? ORDER BY expires_at LIMIT ?)`,
-		`DELETE FROM affinity_bindings WHERE rowid IN (SELECT rowid FROM affinity_bindings WHERE source='previous_response_id' AND expires_at>0 AND expires_at<=? ORDER BY expires_at LIMIT ?)`,
+		`DELETE FROM affinity_aliases WHERE route_key_hash IN (SELECT route_key_hash FROM affinity_aliases WHERE expires_at<=? ORDER BY expires_at,route_key_hash LIMIT ?)`,
+		`DELETE FROM affinity_bindings WHERE route_key_hash IN (SELECT route_key_hash FROM affinity_bindings WHERE source='previous_response_id' AND expires_at>0 AND expires_at<=? ORDER BY expires_at,route_key_hash LIMIT ?)`,
 	} {
 		result, execErr := tx.ExecContext(ctx, statement, now, batch)
 		if execErr != nil {

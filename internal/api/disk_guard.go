@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
@@ -26,6 +27,9 @@ const (
 	goalStorageReserveMin             = int64(8 << 20)
 	goalStorageReserveMax             = int64(128 << 20)
 	goalStorageMaintenanceStepsPerRun = 16
+	diskGuardProbeInterval            = 15 * time.Second
+	diskGuardNormalCleanupInterval    = 5 * time.Minute
+	diskGuardCleanupTimeout           = 10 * time.Second
 	// Headroom maintenance leaves below the new-goal admission ceiling, so a fresh
 	// session is admitted without a foreground reclaim. Bounded on both sides: large
 	// enough for several ordinary turns, small enough to stay a rounding-scale slice
@@ -42,28 +46,37 @@ type DiskFilesystemSnapshot struct {
 }
 
 type DiskGuardSnapshot struct {
-	Level                   string                   `json:"level"`
-	FreePercent             float64                  `json:"free_percent"`
-	FreeBytes               uint64                   `json:"free_bytes"`
-	Filesystems             []DiskFilesystemSnapshot `json:"filesystems,omitempty"`
-	ForcedContextTTLSeconds int                      `json:"forced_context_ttl_seconds"`
-	ContextsDeleted         int64                    `json:"contexts_deleted"`
-	GoalsDeleted            int64                    `json:"goals_deleted"`
-	GoalBytesReclaimed      int64                    `json:"goal_bytes_reclaimed"`
-	GoalStorageTargetBytes  int64                    `json:"goal_storage_target_bytes"`
-	GoalStorageReserveBytes int64                    `json:"goal_storage_reserve_bytes"`
-	CodexMappingsDeleted    int64                    `json:"codex_mappings_deleted"`
-	RouteBindingsDeleted    int64                    `json:"route_bindings_deleted"`
-	LogsDeleted             int64                    `json:"logs_deleted"`
-	LastRunAt               int64                    `json:"last_run_at"`
-	LastLogCleanupAt        int64                    `json:"last_log_cleanup_at,omitempty"`
-	DatabaseWritable        bool                     `json:"database_writable"`
-	JournalWritable         bool                     `json:"journal_writable"`
-	SpoolWritable           bool                     `json:"spool_writable"`
-	BackgroundPaused        bool                     `json:"background_paused"`
-	LargeRequestsPaused     bool                     `json:"large_requests_paused"`
-	AdmissionBlocked        bool                     `json:"admission_blocked"`
-	LastError               string                   `json:"last_error,omitempty"`
+	Level                      string                   `json:"level"`
+	FreePercent                float64                  `json:"free_percent"`
+	FreeBytes                  uint64                   `json:"free_bytes"`
+	Filesystems                []DiskFilesystemSnapshot `json:"filesystems,omitempty"`
+	ForcedContextTTLSeconds    int                      `json:"forced_context_ttl_seconds"`
+	ContextsDeleted            int64                    `json:"contexts_deleted"`
+	GoalsDeleted               int64                    `json:"goals_deleted"`
+	GoalBytesReclaimed         int64                    `json:"goal_bytes_reclaimed"`
+	GoalStorageTargetBytes     int64                    `json:"goal_storage_target_bytes"`
+	GoalStorageReserveBytes    int64                    `json:"goal_storage_reserve_bytes"`
+	CodexMappingsDeleted       int64                    `json:"codex_mappings_deleted"`
+	RouteBindingsDeleted       int64                    `json:"route_bindings_deleted"`
+	LogsDeleted                int64                    `json:"logs_deleted"`
+	LastRunAt                  int64                    `json:"last_run_at"`
+	LastMaintenanceAt          int64                    `json:"last_maintenance_at,omitempty"`
+	LastLogCleanupAt           int64                    `json:"last_log_cleanup_at,omitempty"`
+	DatabaseWritable           bool                     `json:"database_writable"`
+	DatabaseBackpressured      bool                     `json:"database_backpressured,omitempty"`
+	DatabaseErrorClass         string                   `json:"database_error_class,omitempty"`
+	DatabaseBackpressureEvents uint64                   `json:"database_backpressure_events,omitempty"`
+	LastDatabaseErrorAt        int64                    `json:"last_database_error_at,omitempty"`
+	JournalWritable            bool                     `json:"journal_writable"`
+	SpoolWritable              bool                     `json:"spool_writable"`
+	BackgroundPaused           bool                     `json:"background_paused"`
+	LargeRequestsPaused        bool                     `json:"large_requests_paused"`
+	AdmissionBlocked           bool                     `json:"admission_blocked"`
+	CleanupFailureEvents       uint64                   `json:"cleanup_failure_events,omitempty"`
+	CleanupErrorOperation      string                   `json:"cleanup_error_operation,omitempty"`
+	CleanupErrorClass          string                   `json:"cleanup_error_class,omitempty"`
+	LastCleanupErrorAt         int64                    `json:"last_cleanup_error_at,omitempty"`
+	LastError                  string                   `json:"last_error,omitempty"`
 }
 
 type diskGuardPath struct {
@@ -103,43 +116,70 @@ func (s *Server) StorageAdmissionReady() bool {
 
 func (s *Server) startDiskGuard(ctx context.Context) {
 	supervisor.Go(ctx, "disk-space-guard", func(ctx context.Context) {
-		s.runDiskGuard(ctx)
-		t := time.NewTicker(15 * time.Second)
+		s.runDiskGuardCycle(ctx, false)
+		t := time.NewTicker(diskGuardProbeInterval)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				s.runDiskGuard(ctx)
+				s.runDiskGuardCycle(ctx, false)
 			}
 		}
 	})
 }
 
 func (s *Server) runDiskGuard(ctx context.Context) {
-	policyMigration, policyMigrationErr := s.store.MigrateGoalPolicyDefaults(ctx,
-		s.cfg.GoalStorageMaxMB, config.LegacyDefaultGoalStorageMaxMB, config.DefaultGoalStorageMaxMB,
-		s.cfg.GoalLegacyJournalDualWrite)
+	s.runDiskGuardCycle(ctx, true)
+}
+
+func (s *Server) runDiskGuardCycle(ctx context.Context, forceCleanup bool) {
+	var policyMigration storage.GoalPolicyDefaultsMigration
+	var policyMigrationErr error
+	if !s.goalPolicyDefaultsMigrated.Load() {
+		migrationCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		policyMigration, policyMigrationErr = s.store.MigrateGoalPolicyDefaults(migrationCtx,
+			s.cfg.GoalStorageMaxMB, config.LegacyDefaultGoalStorageMaxMB, config.DefaultGoalStorageMaxMB,
+			s.cfg.GoalLegacyJournalDualWrite)
+		cancel()
+		if policyMigrationErr == nil {
+			s.goalPolicyDefaultsMigrated.Store(true)
+		}
+	}
 	if policyMigrationErr == nil && (policyMigration.StorageDefaultUpgraded || policyMigration.LegacyDualWriteDisabled) {
 		log.Printf("[GOAL-CONTINUITY] migrated inherited defaults storage_1gib=%t legacy_dual_write_disabled=%t",
 			policyMigration.StorageDefaultUpgraded, policyMigration.LegacyDualWriteDisabled)
 	}
 	previous := s.diskGuardSnapshot()
 	probes, probeCodes := s.probeDiskFilesystems(previous.Level)
+	databaseWritable, databaseBackpressured, databaseErrorClass := s.databaseWriteProbe(ctx, previous.DatabaseWritable)
 	snap := DiskGuardSnapshot{
-		Level:                "normal",
-		LastRunAt:            storage.Now(),
-		ContextsDeleted:      previous.ContextsDeleted,
-		GoalsDeleted:         previous.GoalsDeleted,
-		GoalBytesReclaimed:   previous.GoalBytesReclaimed,
-		CodexMappingsDeleted: previous.CodexMappingsDeleted,
-		RouteBindingsDeleted: previous.RouteBindingsDeleted,
-		LogsDeleted:          previous.LogsDeleted,
-		LastLogCleanupAt:     previous.LastLogCleanupAt,
-		DatabaseWritable:     s.databaseWritable(ctx),
-		JournalWritable:      s.journalWritable(),
-		SpoolWritable:        s.managedDirectoryWritable(s.cfg.BodySpoolDir),
+		Level:                      "normal",
+		LastRunAt:                  storage.Now(),
+		ContextsDeleted:            previous.ContextsDeleted,
+		GoalsDeleted:               previous.GoalsDeleted,
+		GoalBytesReclaimed:         previous.GoalBytesReclaimed,
+		CodexMappingsDeleted:       previous.CodexMappingsDeleted,
+		RouteBindingsDeleted:       previous.RouteBindingsDeleted,
+		LogsDeleted:                previous.LogsDeleted,
+		LastMaintenanceAt:          previous.LastMaintenanceAt,
+		LastLogCleanupAt:           previous.LastLogCleanupAt,
+		DatabaseWritable:           databaseWritable,
+		DatabaseBackpressured:      databaseBackpressured,
+		DatabaseErrorClass:         databaseErrorClass,
+		DatabaseBackpressureEvents: previous.DatabaseBackpressureEvents,
+		LastDatabaseErrorAt:        previous.LastDatabaseErrorAt,
+		JournalWritable:            s.journalWritable(),
+		SpoolWritable:              s.managedDirectoryWritable(s.cfg.BodySpoolDir),
+		CleanupFailureEvents:       previous.CleanupFailureEvents,
+		CleanupErrorOperation:      previous.CleanupErrorOperation,
+		CleanupErrorClass:          previous.CleanupErrorClass,
+		LastCleanupErrorAt:         previous.LastCleanupErrorAt,
+	}
+	if databaseBackpressured {
+		snap.DatabaseBackpressureEvents++
+		snap.LastDatabaseErrorAt = snap.LastRunAt
 	}
 	snap.GoalStorageTargetBytes, snap.GoalStorageReserveBytes = goalStorageMaintenanceTarget(s.goalStorageMaxBytes(ctx))
 	snap.Filesystems, snap.Level, snap.FreePercent, snap.FreeBytes = summarizeFilesystemProbes(probes)
@@ -173,12 +213,18 @@ func (s *Server) runDiskGuard(ctx context.Context) {
 	s.storageLargeRequestsPaused.Store(snap.LargeRequestsPaused)
 	// At critical pressure, prefer the idempotent database transaction over growing
 	// the journal. A failed direct write still falls back to the journal.
-	s.usageDirectWrites.Store(snap.LargeRequestsPaused && snap.DatabaseWritable)
+	s.usageDirectWrites.Store(snap.LargeRequestsPaused && snap.DatabaseWritable && !snap.DatabaseBackpressured)
 
-	if snap.DatabaseWritable {
+	cleanupDue := diskGuardCleanupDue(snap.LastRunAt, snap.LastMaintenanceAt, snap.Level, forceCleanup)
+	if cleanupDue && snap.DatabaseWritable && !snap.DatabaseBackpressured {
+		// These two fields describe the most recent maintenance attempt. Preserve
+		// them across probe-only ticks, then clear them only when a new attempt starts.
+		snap.CleanupErrorOperation = ""
+		snap.CleanupErrorClass = ""
 		s.runSafeDiskCleanup(ctx, &snap)
+		snap.LastMaintenanceAt = snap.LastRunAt
 	}
-	if snap.Level != "normal" && snap.DatabaseWritable {
+	if snap.Level != "normal" && snap.DatabaseWritable && !snap.DatabaseBackpressured {
 		checkpointCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		if err := s.store.CheckpointLogStorage(checkpointCtx); err != nil {
 			snap.LastError = appendDiskGuardCode(snap.LastError, "checkpoint_failed")
@@ -196,18 +242,31 @@ func (s *Server) runDiskGuard(ctx context.Context) {
 	s.diskGuard.Store(snap)
 }
 
+func diskGuardCleanupDue(now, lastMaintenance int64, level string, force bool) bool {
+	return force || lastMaintenance == 0 || level != "normal" ||
+		now-lastMaintenance >= int64(diskGuardNormalCleanupInterval/time.Second)
+}
+
 func (s *Server) runSafeDiskCleanup(ctx context.Context, snap *DiskGuardSnapshot) {
-	cleanupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	cleanupCtx, cancel := context.WithTimeout(ctx, diskGuardCleanupTimeout)
 	defer cancel()
 	if deleted, err := s.store.CleanupContextJournal(cleanupCtx); err != nil {
-		snap.LastError = appendDiskGuardCode(snap.LastError, "context_cleanup_failed")
+		noteDiskCleanupFailure(snap, "context_cleanup", "context_cleanup_failed", err)
+		return
 	} else {
 		snap.ContextsDeleted += deleted
 	}
+	if !diskCleanupBudgetAvailable(cleanupCtx, snap) {
+		return
+	}
 	if goals, err := s.store.CleanupGoalContinuity(cleanupCtx); err != nil {
-		snap.LastError = appendDiskGuardCode(snap.LastError, "goal_cleanup_failed")
+		noteDiskCleanupFailure(snap, "goal_cleanup", "goal_cleanup_failed", err)
+		return
 	} else {
 		snap.GoalsDeleted += goals
+	}
+	if !diskCleanupBudgetAvailable(cleanupCtx, snap) {
+		return
 	}
 	// Converge below the target, not to it. See goalStorageMaintenanceFloor: the
 	// target doubles as CommitGoalTurn's admission ceiling for a new goal.
@@ -215,34 +274,64 @@ func (s *Server) runSafeDiskCleanup(ctx context.Context, snap *DiskGuardSnapshot
 	for step := 0; step < goalStorageMaintenanceStepsPerRun; step++ {
 		used, err := s.store.GoalStorageBytes(cleanupCtx)
 		if err != nil {
-			snap.LastError = appendDiskGuardCode(snap.LastError, "goal_budget_measure_failed")
-			break
+			noteDiskCleanupFailure(snap, "goal_budget_measure", "goal_budget_measure_failed", err)
+			return
 		}
 		if used <= maintenanceFloor {
 			break
 		}
 		reclaimed, err := s.store.EnforceGoalStorageBudgetStep(cleanupCtx, maintenanceFloor)
 		if err != nil {
-			snap.LastError = appendDiskGuardCode(snap.LastError, "goal_budget_cleanup_failed")
-			break
+			noteDiskCleanupFailure(snap, "goal_budget_cleanup", "goal_budget_cleanup_failed", err)
+			return
 		}
 		snap.GoalBytesReclaimed += reclaimed.BytesFreed
 		snap.GoalsDeleted += reclaimed.Goals
 		if !reclaimed.Progressed {
 			break
 		}
+		if !diskCleanupBudgetAvailable(cleanupCtx, snap) {
+			return
+		}
 	}
 	if mappings, err := s.store.CleanupCodexSessionMappings(cleanupCtx); err != nil {
-		snap.LastError = appendDiskGuardCode(snap.LastError, "mapping_cleanup_failed")
+		noteDiskCleanupFailure(snap, "mapping_cleanup", "mapping_cleanup_failed", err)
+		return
 	} else {
 		snap.CodexMappingsDeleted += mappings
 	}
+	if !diskCleanupBudgetAvailable(cleanupCtx, snap) {
+		return
+	}
 	if bindings, err := s.store.CleanupInactiveRouteBindings(cleanupCtx, 256); err != nil {
-		snap.LastError = appendDiskGuardCode(snap.LastError, "route_binding_cleanup_failed")
+		noteDiskCleanupFailure(snap, "route_binding_cleanup", "route_binding_cleanup_failed", err)
+		return
 	} else {
 		snap.RouteBindingsDeleted += bindings.Total()
 	}
-	s.cleanupExpiredDiagnosticJobs(cleanupCtx)
+	if diskCleanupBudgetAvailable(cleanupCtx, snap) {
+		s.cleanupExpiredDiagnosticJobs(cleanupCtx)
+	}
+}
+
+func diskCleanupBudgetAvailable(ctx context.Context, snap *DiskGuardSnapshot) bool {
+	if err := ctx.Err(); err != nil {
+		noteDiskCleanupFailure(snap, "maintenance", "cleanup_budget_exhausted", err)
+		return false
+	}
+	return true
+}
+
+func noteDiskCleanupFailure(snap *DiskGuardSnapshot, operation, code string, err error) {
+	if snap == nil {
+		return
+	}
+	snap.LastError = appendDiskGuardCode(snap.LastError, code)
+	snap.CleanupErrorOperation = operation
+	snap.CleanupErrorClass = classifyStorageFailure(err)
+	snap.CleanupFailureEvents++
+	snap.LastCleanupErrorAt = storage.Now()
+	log.Printf("[DISK-GUARD] cleanup operation=%s error_class=%s", operation, snap.CleanupErrorClass)
 }
 
 // goalStorageMaintenanceFloor is the value background maintenance actually converges
@@ -289,13 +378,68 @@ func goalStorageMaintenanceTarget(maxBytes int64) (target, reserve int64) {
 	return maxBytes - reserve, reserve
 }
 
-func (s *Server) databaseWritable(ctx context.Context) bool {
+func (s *Server) databaseWriteProbe(ctx context.Context, previousWritable bool) (writable, backpressured bool, errorClass string) {
 	if s.store == nil {
-		return false
+		return false, false, "unavailable"
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	return s.store.CheckWritable(checkCtx) == nil
+	err := s.store.CheckWritable(checkCtx)
+	if err == nil {
+		return true, false, ""
+	}
+	errorClass = classifyStorageFailure(err)
+	if errorClass == "busy" || errorClass == "timeout" || errorClass == "cancelled" {
+		// A write probe shares the deliberately single-connection SQLite writer with
+		// foreground context commits. Timing out in that queue proves backpressure,
+		// not a read-only filesystem. Preserve the last confirmed writability state,
+		// skip optional maintenance, and let foreground writes/journal replay drain.
+		return previousWritable, true, errorClass
+	}
+	return false, false, errorClass
+}
+
+func classifyStorageFailure(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "database is locked"),
+		strings.Contains(message, "database table is locked"),
+		strings.Contains(message, "sqlite_busy"),
+		strings.Contains(message, "sqlite_locked"),
+		strings.Contains(message, "deadlock"),
+		strings.Contains(message, "serialization failure"),
+		strings.Contains(message, "too many connections"):
+		return "busy"
+	case strings.Contains(message, "readonly"),
+		strings.Contains(message, "read-only"),
+		strings.Contains(message, "permission denied"),
+		strings.Contains(message, "operation not permitted"):
+		return "readonly"
+	case strings.Contains(message, "database or disk is full"),
+		strings.Contains(message, "no space left"),
+		strings.Contains(message, "enospc"),
+		strings.Contains(message, "disk quota exceeded"):
+		return "full"
+	case strings.Contains(message, "database disk image is malformed"),
+		strings.Contains(message, "database corruption"),
+		strings.Contains(message, "sqlite_corrupt"):
+		return "corrupt"
+	case strings.Contains(message, "disk i/o error"),
+		strings.Contains(message, "input/output error"),
+		strings.Contains(message, "sqlite_ioerr"):
+		return "io"
+	default:
+		return "unavailable"
+	}
 }
 
 func (s *Server) journalWritable() bool {
@@ -517,8 +661,7 @@ func diskGuardChanged(previous, current DiskGuardSnapshot) bool {
 		previous.SpoolWritable != current.SpoolWritable ||
 		previous.AdmissionBlocked != current.AdmissionBlocked ||
 		previous.GoalStorageTargetBytes != current.GoalStorageTargetBytes ||
-		previous.GoalStorageReserveBytes != current.GoalStorageReserveBytes ||
-		previous.LastError != current.LastError
+		previous.GoalStorageReserveBytes != current.GoalStorageReserveBytes
 }
 
 func (s *Server) recordDiskGuardEvent(ctx context.Context, previous, current DiskGuardSnapshot) {
@@ -526,16 +669,22 @@ func (s *Server) recordDiskGuardEvent(ctx context.Context, previous, current Dis
 		return
 	}
 	detail, _ := json.Marshal(map[string]interface{}{
-		"previous_level":             previous.Level,
-		"level":                      current.Level,
-		"admission_blocked":          current.AdmissionBlocked,
-		"database_writable":          current.DatabaseWritable,
-		"journal_writable":           current.JournalWritable,
-		"spool_writable":             current.SpoolWritable,
-		"goal_bytes_reclaimed":       current.GoalBytesReclaimed,
-		"goal_storage_target_bytes":  current.GoalStorageTargetBytes,
-		"goal_storage_reserve_bytes": current.GoalStorageReserveBytes,
-		"error_code":                 current.LastError,
+		"previous_level":               previous.Level,
+		"level":                        current.Level,
+		"admission_blocked":            current.AdmissionBlocked,
+		"database_writable":            current.DatabaseWritable,
+		"database_backpressured":       current.DatabaseBackpressured,
+		"database_error_class":         current.DatabaseErrorClass,
+		"database_backpressure_events": current.DatabaseBackpressureEvents,
+		"cleanup_failure_events":       current.CleanupFailureEvents,
+		"cleanup_error_operation":      current.CleanupErrorOperation,
+		"cleanup_error_class":          current.CleanupErrorClass,
+		"journal_writable":             current.JournalWritable,
+		"spool_writable":               current.SpoolWritable,
+		"goal_bytes_reclaimed":         current.GoalBytesReclaimed,
+		"goal_storage_target_bytes":    current.GoalStorageTargetBytes,
+		"goal_storage_reserve_bytes":   current.GoalStorageReserveBytes,
+		"error_code":                   current.LastError,
 	})
 	eventCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()

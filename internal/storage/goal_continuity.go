@@ -1463,12 +1463,12 @@ func (s *Store) ReclaimGoalStorageHeadroom(ctx context.Context, targetBytes int6
 	return total, nil
 }
 
-// GoalStorageBytes returns the transaction-writer view used by the hard budget
-// check. Maintenance uses it between bounded reclaim steps so it can stop as soon
-// as reserve headroom is restored without relying on a potentially stale replica.
+// GoalStorageBytes measures committed goal storage through the WAL read pool.
+// Maintenance does not need to occupy SQLite's sole writer merely to read an
+// aggregate; each subsequent reclaim step revalidates state in its write transaction.
 func (s *Store) GoalStorageBytes(ctx context.Context) (int64, error) {
 	var used int64
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(storage_bytes),0) FROM goal_session`).Scan(&used)
+	err := s.rdb.QueryRowContext(ctx, `SELECT COALESCE(SUM(storage_bytes),0) FROM goal_session`).Scan(&used)
 	return used, err
 }
 

@@ -96,6 +96,8 @@ var (
 	ErrCodexInstructionSnapshotNotFound = errors.New("codex instruction snapshot not found")
 )
 
+const defaultCodexSessionCleanupBatch = 256
+
 // CodexSessionAlias is plaintext only at the API/storage boundary.  Store methods
 // HMAC it before it reaches SQLite.  Callers must not log Value.
 type CodexSessionAlias struct {
@@ -840,39 +842,45 @@ func (s *Store) CleanupCodexSessionMappings(ctx context.Context) (int64, error) 
 		return 0, err
 	}
 	defer tx.Rollback()
-	// Aggregate and delete expired detail in one transaction. A failed cleanup can
-	// therefore be retried without incrementing a daily bucket twice.
-	if _, err := tx.ExecContext(ctx, `INSERT INTO codex_upstream_attempt_daily(
-day_start,account_id,egress_id,state,status_code,attempt_count,first_created_at,last_created_at,updated_at,expires_at)
-SELECT created_at-(created_at%86400),account_id,egress_id,state,status_code,COUNT(*),MIN(created_at),MAX(created_at),?,
-       created_at-(created_at%86400)+?
-FROM codex_upstream_attempt WHERE expires_at<=?
-GROUP BY created_at-(created_at%86400),account_id,egress_id,state,status_code
-ON CONFLICT(day_start,account_id,egress_id,state,status_code) DO UPDATE SET
-attempt_count=codex_upstream_attempt_daily.attempt_count+excluded.attempt_count,
-first_created_at=MIN(codex_upstream_attempt_daily.first_created_at,excluded.first_created_at),
-last_created_at=MAX(codex_upstream_attempt_daily.last_created_at,excluded.last_created_at),
-updated_at=excluded.updated_at,
-expires_at=MAX(codex_upstream_attempt_daily.expires_at,excluded.expires_at)`,
-		now, int64((30*24*time.Hour)/time.Second), now); err != nil {
+	// Aggregate and delete one bounded detail batch in the same transaction. The
+	// production table can exceed 100k rows; selecting stable IDs prevents a long
+	// writer monopoly while preserving exactly-once daily counts under retries.
+	if _, err := cleanupExpiredCodexUpstreamAttempts(ctx, tx, now, defaultCodexSessionCleanupBatch); err != nil {
 		return 0, err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM codex_upstream_attempt WHERE expires_at<=?`, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM codex_upstream_attempt_daily
+WHERE (day_start,account_id,egress_id,state,status_code) IN (
+ SELECT day_start,account_id,egress_id,state,status_code
+ FROM codex_upstream_attempt_daily
+ WHERE expires_at<=?
+ ORDER BY expires_at,day_start,account_id,egress_id,state,status_code
+ LIMIT ?
+)`, now, defaultCodexSessionCleanupBatch); err != nil {
 		return 0, err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM codex_upstream_attempt_daily WHERE expires_at<=?`, now); err != nil {
-		return 0, err
-	}
-	result, err := tx.ExecContext(ctx, `DELETE FROM codex_session_binding WHERE expires_at<=?`, now)
+	result, err := tx.ExecContext(ctx, `DELETE FROM codex_session_binding WHERE id IN (
+ SELECT id FROM codex_session_binding WHERE expires_at<=? ORDER BY expires_at,id LIMIT ?
+)`, now, defaultCodexSessionCleanupBatch)
 	if err != nil {
 		return 0, err
 	}
-	// SQLite foreign keys may be disabled in an externally-opened legacy DB.  Keep
-	// aliases tidy even there without relying solely on ON DELETE CASCADE.
-	if _, err := tx.ExecContext(ctx, `DELETE FROM codex_session_alias WHERE expires_at<=? OR binding_id NOT IN (SELECT id FROM codex_session_binding)`, now); err != nil {
+	// SQLite foreign keys may be disabled in an externally-opened legacy DB. Keep
+	// aliases tidy there too, but cap orphan detection and deletion to one batch.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM codex_session_alias
+WHERE (alias_hash,binding_id) IN (
+ SELECT a.alias_hash,a.binding_id FROM codex_session_alias a
+ WHERE a.expires_at<=? OR NOT EXISTS (SELECT 1 FROM codex_session_binding b WHERE b.id=a.binding_id)
+ ORDER BY a.expires_at,a.alias_hash,a.binding_id
+ LIMIT ?
+)`, now, defaultCodexSessionCleanupBatch); err != nil {
 		return 0, err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM codex_instruction_snapshot WHERE expires_at<=? OR tree_id NOT IN (SELECT DISTINCT tree_id FROM codex_session_binding)`, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM codex_instruction_snapshot WHERE tree_id IN (
+ SELECT i.tree_id FROM codex_instruction_snapshot i
+ WHERE i.expires_at<=? OR NOT EXISTS (SELECT 1 FROM codex_session_binding b WHERE b.tree_id=i.tree_id)
+ ORDER BY i.expires_at,i.tree_id
+ LIMIT ?
+)`, now, defaultCodexSessionCleanupBatch); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -880,6 +888,68 @@ expires_at=MAX(codex_upstream_attempt_daily.expires_at,excluded.expires_at)`,
 	}
 	n, _ := result.RowsAffected()
 	return n, nil
+}
+
+func cleanupExpiredCodexUpstreamAttempts(ctx context.Context, tx *sql.Tx, now int64, batch int) (int64, error) {
+	if batch <= 0 {
+		batch = defaultCodexSessionCleanupBatch
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM codex_upstream_attempt
+WHERE expires_at<=? ORDER BY expires_at,id LIMIT ?`, now, batch)
+	if err != nil {
+		return 0, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	aggregateQuery := `INSERT INTO codex_upstream_attempt_daily(
+day_start,account_id,egress_id,state,status_code,attempt_count,first_created_at,last_created_at,updated_at,expires_at)
+SELECT created_at-(created_at%86400),account_id,egress_id,state,status_code,COUNT(*),MIN(created_at),MAX(created_at),?,
+       created_at-(created_at%86400)+?
+FROM codex_upstream_attempt WHERE id IN (` + placeholders + `)
+GROUP BY created_at-(created_at%86400),account_id,egress_id,state,status_code
+ON CONFLICT(day_start,account_id,egress_id,state,status_code) DO UPDATE SET
+attempt_count=codex_upstream_attempt_daily.attempt_count+excluded.attempt_count,
+first_created_at=CASE WHEN codex_upstream_attempt_daily.first_created_at<excluded.first_created_at
+ THEN codex_upstream_attempt_daily.first_created_at ELSE excluded.first_created_at END,
+last_created_at=CASE WHEN codex_upstream_attempt_daily.last_created_at>excluded.last_created_at
+ THEN codex_upstream_attempt_daily.last_created_at ELSE excluded.last_created_at END,
+updated_at=excluded.updated_at,
+expires_at=CASE WHEN codex_upstream_attempt_daily.expires_at>excluded.expires_at
+ THEN codex_upstream_attempt_daily.expires_at ELSE excluded.expires_at END`
+	aggregateArgs := make([]interface{}, 0, len(ids)+2)
+	aggregateArgs = append(aggregateArgs, now, int64((30*24*time.Hour)/time.Second))
+	for _, id := range ids {
+		aggregateArgs = append(aggregateArgs, id)
+	}
+	if _, err := tx.ExecContext(ctx, aggregateQuery, aggregateArgs...); err != nil {
+		return 0, err
+	}
+	deleteArgs := make([]interface{}, 0, len(ids))
+	for _, id := range ids {
+		deleteArgs = append(deleteArgs, id)
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM codex_upstream_attempt WHERE id IN (`+placeholders+`)`, deleteArgs...)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // CodexSessionMappingMetrics exposes aggregate-only counters for safe observability.

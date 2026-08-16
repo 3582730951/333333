@@ -21,6 +21,8 @@ type ContextJournal struct {
 	ExpiresAt    int64
 }
 
+const defaultContextJournalCleanupBatch = 16
+
 func (s *Store) PutContextJournal(ctx context.Context, j ContextJournal) error {
 	now := Now()
 	if j.CreatedAt == 0 {
@@ -56,7 +58,23 @@ func (s *Store) TouchContextJournal(ctx context.Context, id string, expiresAt in
 }
 
 func (s *Store) CleanupContextJournal(ctx context.Context) (int64, error) {
-	r, e := s.db.ExecContext(ctx, `DELETE FROM context_journal WHERE expires_at<=?`, Now())
+	return s.CleanupContextJournalBatch(ctx, defaultContextJournalCleanupBatch)
+}
+
+// CleanupContextJournalBatch removes a bounded set of already-expired replay rows.
+// Large encrypted contexts can occupy hundreds of MiB, so an unbounded DELETE holds
+// SQLite's sole writer long enough to starve foreground continuity commits and make a
+// healthy database look read-only to the write probe.
+func (s *Store) CleanupContextJournalBatch(ctx context.Context, batch int) (int64, error) {
+	if batch <= 0 {
+		batch = defaultContextJournalCleanupBatch
+	}
+	if batch > 4096 {
+		batch = 4096
+	}
+	r, e := s.db.ExecContext(ctx, `DELETE FROM context_journal WHERE response_id IN (
+SELECT response_id FROM context_journal WHERE expires_at<=? ORDER BY expires_at,response_id LIMIT ?
+)`, Now(), batch)
 	if e != nil {
 		return 0, e
 	}

@@ -1139,7 +1139,7 @@ func sanitizeDiagnosticEventValue(field string, value interface{}, codebook diag
 		if typed == "" {
 			return ""
 		}
-		if diagnosticEventTypedStringField(field) && diagnosticEventEnumRE.MatchString(strings.ToLower(typed)) {
+		if diagnosticEventTypedStringField(field) && diagnosticEventSafeEnumValue(field, typed) {
 			return strings.ToLower(typed)
 		}
 		sanitized := codebook.sanitize(typed)
@@ -1154,9 +1154,33 @@ func sanitizeDiagnosticEventValue(field string, value interface{}, codebook diag
 	}
 }
 
+func diagnosticEventSafeEnumValue(field, value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if diagnosticEventEnumRE.MatchString(value) {
+		return true
+	}
+	// Storage pressure historically records several stable machine codes in one
+	// comma-separated error_code. Treat only a small list of individually valid
+	// enums as safe; arbitrary text, paths, credentials, and messages stay aliased.
+	if field != "error_code" {
+		return false
+	}
+	parts := strings.Split(value, ",")
+	if len(parts) < 2 || len(parts) > 16 {
+		return false
+	}
+	for _, part := range parts {
+		if !diagnosticEventEnumRE.MatchString(strings.TrimSpace(part)) {
+			return false
+		}
+	}
+	return true
+}
+
 func diagnosticEventTypedStringField(field string) bool {
 	switch field {
 	case "action", "component", "delivery", "error_class", "error_code", "fingerprint", "level", "mode", "operation", "phase",
+		"database_error_class", "cleanup_error_class", "cleanup_error_operation",
 		"previous_level", "reason", "resource_type", "result", "role", "route", "source", "state", "status":
 		return true
 	default:
