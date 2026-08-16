@@ -65,12 +65,18 @@ WORKER_START_RESTART_LIMIT="${WORKER_START_RESTART_LIMIT:-5}"
 # the old generation must be quiesced before the staged binary can run additive
 # migrations; blindly extending worker retry time cannot release another PID's lock.
 SQLITE_LOCK_PROBE_TIMEOUT_MS="${SQLITE_LOCK_PROBE_TIMEOUT_MS:-2000}"
-SQLITE_LOCK_DRAIN_TIMEOUT="${SQLITE_LOCK_DRAIN_TIMEOUT:-30}"
+# Zero is deliberately lossless/unbounded. A model response can legitimately run
+# longer than an arbitrary installer deadline, and a downstream Responses WebSocket
+# can remain connected between turns. Operators that prefer a bounded maintenance
+# attempt may set a positive number of seconds; expiry aborts the deployment and
+# resumes admission without stopping the old worker or severing a connection.
+SQLITE_LOCK_DRAIN_TIMEOUT="${SQLITE_LOCK_DRAIN_TIMEOUT:-0}"
 SQLITE_LOCK_RELEASE_TIMEOUT="${SQLITE_LOCK_RELEASE_TIMEOUT:-90}"
-# DRAIN_TIMEOUT controls only the background reaper's progress-log cadence. It is
-# not an installation deadline: install.sh returns after the atomic traffic switch,
-# while the superseded worker keeps its established HTTP/SSE/WebSocket requests and
-# is reclaimed automatically after they finish.
+# DRAIN_TIMEOUT controls only the ordinary post-switch reaper's progress-log cadence.
+# It is not an installation deadline: after an atomic traffic switch, the superseded
+# worker drains in the background. The exceptional pre-switch SQLite-lock path above
+# must first wait for established requests because both generations cannot own that
+# legacy writer concurrently.
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-30}"
 WORKER_DESTROY_TIMEOUT="${WORKER_DESTROY_TIMEOUT:-30}"
 DEPLOY_LOCK_FILE="${DEPLOY_LOCK_FILE:-/var/lock/codex-pool-install.lock}"
@@ -204,8 +210,9 @@ Environment overrides:
   SIDECAR_ADDR, SIDECAR_VENV, SIDECAR_INSTALL_DIR, SIDECAR_COOKIE_DIR,
   INSTALL_GO, GO_INSTALL_VERSION, GO_INSTALL_ROOT, GO_BIN, HEALTH_TIMEOUT,
   WORKER_START_RESTART_LIMIT, SQLITE_LOCK_PROBE_TIMEOUT_MS,
-  SQLITE_LOCK_DRAIN_TIMEOUT, SQLITE_LOCK_RELEASE_TIMEOUT,
-  DRAIN_TIMEOUT (background drain log interval; install never waits for streams),
+  SQLITE_LOCK_DRAIN_TIMEOUT (0=wait without severing established streams),
+  SQLITE_LOCK_RELEASE_TIMEOUT,
+  DRAIN_TIMEOUT (ordinary post-switch background drain log interval),
   SKIP_OS_PACKAGES, GO_TARBALL_SHA256,
   WITH_REGISTRATION, NODE_MIN_MAJOR, NODE_INSTALL_MAJOR, NODE_BIN, CHROME_BIN,
   REGISTRAR_SOURCE, REGISTRAR_INSTALL, PY_REGISTRAR_SOURCE,
@@ -1769,21 +1776,74 @@ handoff_inflight_count() {
   printf '%s\n' "$count"
 }
 
+worker_supports_idle_websocket_drain() {
+  local socket="$1" payload
+  [[ -S "$socket" ]] || return 1
+  payload="$(curl --noproxy '*' --silent --max-time 2 --unix-socket "$socket" \
+    http://localhost/readyz 2>/dev/null || true)"
+  [[ "$payload" == *'"idle_websocket_drain_signal":"SIGUSR1"'* ]]
+}
+
+request_worker_idle_websocket_drain() {
+  local unit="$1" socket="$2"
+  worker_supports_idle_websocket_drain "$socket" || return 1
+  if run_root systemctl kill --kill-who=main --signal=SIGUSR1 "$unit"; then
+    log "Requested turn-safe WebSocket rotation from ${unit}; active model turns may finish before reconnect"
+    return 0
+  fi
+  warn "${unit} advertised turn-safe WebSocket rotation but SIGUSR1 delivery failed; waiting for natural connection drain"
+  return 1
+}
+
+HANDOFF_DRAIN_ERROR=""
+
 wait_handoff_inflight_zero() {
-  local timeout="$1" started="$SECONDS" count next_report=0
+  local timeout="$1" started="$SECONDS" count elapsed stall
+  local next_report=0 next_stall_report=60 lowest_count="" last_progress="$SECONDS"
+  local unknown_since=-1
+  HANDOFF_DRAIN_ERROR=""
   [[ "$timeout" =~ ^[0-9]+$ ]] || return 1
-  while (( SECONDS - started <= timeout )); do
+  while true; do
     count="$(handoff_inflight_count 2>/dev/null || true)"
     if [[ "$count" == "0" ]]; then
       return 0
     fi
+    if [[ "$count" =~ ^[0-9]+$ ]]; then
+      unknown_since=-1
+      if [[ -z "$lowest_count" ]] || (( count < lowest_count )); then
+        lowest_count="$count"
+        last_progress="$SECONDS"
+        next_stall_report=60
+      fi
+    else
+      if (( unknown_since < 0 )); then
+        unknown_since="$SECONDS"
+      elif (( SECONDS - unknown_since >= 15 )); then
+        HANDOFF_DRAIN_ERROR="handoff status was unavailable for 15s; the old worker was left running"
+        return 1
+      fi
+    fi
+
+    elapsed=$((SECONDS - started))
+    stall=$((SECONDS - last_progress))
+    if (( timeout > 0 && elapsed >= timeout )); then
+      HANDOFF_DRAIN_ERROR="configured ${timeout}s drain deadline elapsed with ${count:-unknown} established request(s); the old worker was left running"
+      return 1
+    fi
     if (( SECONDS >= next_report )); then
-      warn "Waiting for established requests before SQLite lock recovery: inflight=${count:-unknown} elapsed=$((SECONDS - started))s"
+      if (( timeout > 0 )); then
+        warn "Waiting for established requests before SQLite lock recovery: inflight=${count:-unknown} elapsed=${elapsed}s remaining=$((timeout - elapsed))s"
+      else
+        warn "Waiting without a destructive deadline for established requests before SQLite lock recovery: inflight=${count:-unknown} elapsed=${elapsed}s"
+      fi
       next_report=$((SECONDS + 5))
+    fi
+    if (( stall >= next_stall_report )); then
+      warn "SQLite lock drain has made no progress for ${stall}s (lowest inflight=${lowest_count:-unknown}). A long-lived SSE/WebSocket may still be open; close an idle CLI session to let the lossless upgrade continue, or interrupt the installer to resume admission safely."
+      next_stall_report=$((next_stall_report + 60))
     fi
     sleep 0.2
   done
-  return 1
 }
 
 # A persistent writer owned by the active generation makes SQLite DDL impossible.
@@ -1812,9 +1872,11 @@ prepare_sqlite_for_staged_worker() {
   [[ "$SQLITE_LOCK_RELEASE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] ||
     die "SQLITE_LOCK_RELEASE_TIMEOUT must be a positive integer"
 
+  unit="${SERVICE_NAME}-worker@${old_worker_release}.service"
   pause_handoff_admission || die "could not pause new admissions for SQLite lock recovery"
+  request_worker_idle_websocket_drain "$unit" "$old_socket" || true
   if ! wait_handoff_inflight_zero "$SQLITE_LOCK_DRAIN_TIMEOUT"; then
-    abort_sqlite_lock_recovery "SQLite lock recovery refused to stop the old worker while established requests remain"
+    abort_sqlite_lock_recovery "SQLite lock recovery refused to stop the old worker: ${HANDOFF_DRAIN_ERROR:-established requests remain}"
   fi
 
   ACTIVATION_PENDING=1
@@ -1823,7 +1885,6 @@ prepare_sqlite_for_staged_worker() {
   ACTIVATION_OLD_WORKER_RELEASE="$old_worker_release"
   ACTIVATION_NEW_RELEASE="$RELEASE_ID"
   SQLITE_LOCK_RECOVERY_ATTEMPTED=1
-  unit="${SERVICE_NAME}-worker@${old_worker_release}.service"
   log "Established requests are drained; gracefully quiescing ${unit} to release SQLite"
   run_root systemctl stop --no-block "$unit" || die "could not quiesce SQLite lock-holding worker ${unit}"
 

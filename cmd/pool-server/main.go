@@ -333,17 +333,28 @@ func run() int {
 	supervisor.Go(ctx, "worker-role", roleController.Run)
 
 	stop := make(chan os.Signal, 1)
+	webSocketDrain := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(webSocketDrain, syscall.SIGUSR1)
 	defer signal.Stop(stop)
+	defer signal.Stop(webSocketDrain)
 
 	var serveFailure error
-	select {
-	case sig := <-stop:
-		log.Printf("received %s, shutting down", sig)
-	case err := <-serveErr:
-		if err != nil {
-			serveFailure = err
-			log.Printf("http server: %v", err)
+	serving := true
+	for serving {
+		select {
+		case sig := <-stop:
+			log.Printf("received %s, shutting down", sig)
+			serving = false
+		case <-webSocketDrain:
+			total, idle := app.DrainEstablishedWebSockets()
+			log.Printf("deployment: rotating established WebSockets total=%d idle_closed=%d active_deferred=%d", total, idle, total-idle)
+		case err := <-serveErr:
+			if err != nil {
+				serveFailure = err
+				log.Printf("http server: %v", err)
+			}
+			serving = false
 		}
 	}
 	deployment.beginDraining()
@@ -490,6 +501,7 @@ func (h *deploymentHandler) serveReady(w http.ResponseWriter, r *http.Request) {
 		"worker_socket":    h.workerAddr,
 		"fencing_token":    fencingToken,
 		"checks":           map[string]bool{"storage": checkErr == nil},
+		"capabilities":     map[string]string{"idle_websocket_drain_signal": "SIGUSR1"},
 	})
 }
 
@@ -532,6 +544,7 @@ func (h *deploymentHandler) serveStandbyReady(w http.ResponseWriter, r *http.Req
 		"worker_socket":    h.workerAddr,
 		"fencing_token":    fencingToken,
 		"checks":           map[string]bool{"storage": checkErr == nil},
+		"capabilities":     map[string]string{"idle_websocket_drain_signal": "SIGUSR1"},
 	})
 }
 

@@ -114,7 +114,8 @@ type Server struct {
 	routingAuditSuppressed atomic.Uint64
 	// httpMetrics is fixed-cardinality and allocation-free on the request path.
 	// Operators can inspect it in /admin/system or scrape /admin/metrics.
-	httpMetrics httpRequestMetrics
+	httpMetrics        httpRequestMetrics
+	responsesWSDrainer responsesWebSocketDrainRegistry
 	// relState holds per-conversation working_state for the gateway reliability layer
 	// (in-memory + TTL'd + size-bounded; same pattern as oauth/login). Only written
 	// when the gateway_reliability flag is on. See reliability.go.

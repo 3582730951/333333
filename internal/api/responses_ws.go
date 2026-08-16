@@ -56,6 +56,113 @@ type responsesWebSocketConn struct {
 	lastWrite time.Time
 }
 
+// responsesWebSocketDrainRegistry rotates only the WebSocket sessions that
+// existed when a deployment drain was requested. An idle session is closed
+// immediately; a session processing a model turn is marked and closed only after
+// that turn has emitted its terminal frame. Registrations created later are not
+// poisoned, which makes a failed/aborted deployment safe to resume without a
+// process restart.
+type responsesWebSocketDrainRegistry struct {
+	mu          sync.Mutex
+	connections map[*responsesWebSocketDrainConnection]struct{}
+}
+
+type responsesWebSocketDrainConnection struct {
+	registry   *responsesWebSocketDrainRegistry
+	raw        io.Closer
+	downstream webSocketMessageWriter
+	active     bool
+	drain      bool
+	closeOnce  sync.Once
+}
+
+func (r *responsesWebSocketDrainRegistry) register(raw io.Closer, downstream webSocketMessageWriter) *responsesWebSocketDrainConnection {
+	connection := &responsesWebSocketDrainConnection{registry: r, raw: raw, downstream: downstream}
+	r.mu.Lock()
+	if r.connections == nil {
+		r.connections = make(map[*responsesWebSocketDrainConnection]struct{})
+	}
+	r.connections[connection] = struct{}{}
+	r.mu.Unlock()
+	return connection
+}
+
+func (c *responsesWebSocketDrainConnection) unregister() {
+	if c == nil || c.registry == nil {
+		return
+	}
+	c.registry.mu.Lock()
+	delete(c.registry.connections, c)
+	c.registry.mu.Unlock()
+}
+
+func (c *responsesWebSocketDrainConnection) beginWork() bool {
+	if c == nil || c.registry == nil {
+		return false
+	}
+	c.registry.mu.Lock()
+	defer c.registry.mu.Unlock()
+	if c.drain {
+		return false
+	}
+	c.active = true
+	return true
+}
+
+// endWork returns true when the completed unit of work was the last operation
+// this pre-drain session may perform. The close frame is serialized with normal
+// response writes by responsesWebSocketConn.
+func (c *responsesWebSocketDrainConnection) endWork() bool {
+	if c == nil || c.registry == nil {
+		return false
+	}
+	c.registry.mu.Lock()
+	c.active = false
+	shouldClose := c.drain
+	c.registry.mu.Unlock()
+	if shouldClose {
+		c.closeForRestart()
+	}
+	return shouldClose
+}
+
+func (c *responsesWebSocketDrainConnection) closeForRestart() {
+	if c == nil {
+		return
+	}
+	c.closeOnce.Do(func() {
+		if c.downstream != nil {
+			_ = c.downstream.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(
+				websocket.CloseServiceRestart, "pool worker upgrade; reconnect to continue",
+			))
+		}
+		if c.raw != nil {
+			_ = c.raw.Close()
+		}
+	})
+}
+
+// drainExisting marks a stable snapshot. Active turns are never interrupted;
+// idle readers are closed outside the registry lock so a network write cannot
+// block connection registration or turn completion.
+func (r *responsesWebSocketDrainRegistry) drainExisting() (total, idle int) {
+	r.mu.Lock()
+	toClose := make([]*responsesWebSocketDrainConnection, 0, len(r.connections))
+	for connection := range r.connections {
+		total++
+		connection.drain = true
+		if !connection.active {
+			idle++
+			toClose = append(toClose, connection)
+		}
+	}
+	r.mu.Unlock()
+	for _, connection := range toClose {
+		connection.closeForRestart()
+	}
+	return total, idle
+}
+
 type responsesWebSocketState struct {
 	mu                 sync.Mutex
 	previousResponseID string
@@ -235,6 +342,16 @@ func isResponsesWebSocketUpgrade(r *http.Request) bool {
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
+// DrainEstablishedWebSockets asks sessions that predate a worker upgrade to
+// reconnect. Idle sessions close now; active model turns close after their normal
+// terminal frame. The returned counts are safe to expose in deployment logs.
+func (s *Server) DrainEstablishedWebSockets() (total, idle int) {
+	if s == nil {
+		return 0, 0
+	}
+	return s.responsesWSDrainer.drainExisting()
+}
+
 func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) {
 	upgrader := websocket.Upgrader{HandshakeTimeout: 15 * time.Second, EnableCompression: true}
 	responseHeader := http.Header{}
@@ -252,6 +369,8 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 	})
 	defer conn.Close()
 	downstream := newResponsesWebSocketConn(conn)
+	drainConnection := s.responsesWSDrainer.register(conn, downstream)
+	defer drainConnection.unregister()
 	state := &responsesWebSocketState{}
 	session := upstream.NewCodexResponsesWebSocketSession()
 	defer session.Close()
@@ -264,6 +383,10 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 		}
 		if messageType != websocket.TextMessage {
 			_ = writeWebSocketError(downstream, http.StatusBadRequest, "unexpected non-text websocket message")
+			return
+		}
+		if !drainConnection.beginWork() {
+			drainConnection.closeForRestart()
 			return
 		}
 		source, meta, err := captureJSONRequestBody(baseCtx, message, s.cfg, s.requestBodyBudget, s.identitySecretCached)
@@ -289,6 +412,9 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 			_ = source.Close()
 			if err != nil {
 				_ = writeWebSocketError(downstream, http.StatusBadGateway, err.Error())
+				return
+			}
+			if drainConnection.endWork() {
 				return
 			}
 			continue
@@ -370,6 +496,9 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 				return
 			}
 			if writerErr != nil {
+				return
+			}
+			if drainConnection.endWork() {
 				return
 			}
 		default:
