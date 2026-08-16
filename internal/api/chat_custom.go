@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -205,14 +206,13 @@ func applyCustomProviderModelMapping(provider storage.CustomProvider, raw []byte
 }
 
 // ensureDeepSeekV4ReasoningContent repairs the OpenAI-compatible replay contract
-// used by DeepSeek V4 (including OpenRouter routes). Some upstreams return the
+// used by DeepSeek reasoning models (including OpenRouter routes). Some upstreams return the
 // assistant's thinking text as `reasoning`, while DeepSeek requires the same value
 // under `reasoning_content` when that assistant tool-call message is submitted on
 // the next turn. The client is replaying text it already received; this narrow
 // last-mile alias neither exposes new reasoning nor changes any other model.
 func ensureDeepSeekV4ReasoningContent(body []byte, model string) ([]byte, error) {
-	lowerModel := strings.ToLower(strings.TrimSpace(model))
-	if !strings.Contains(lowerModel, "deepseek-v4") {
+	if !prompt.IsDeepSeekModel(model) {
 		return body, nil
 	}
 	messages := gjson.GetBytes(body, "messages")
@@ -223,6 +223,21 @@ func ensureDeepSeekV4ReasoningContent(body []byte, model string) ([]byte, error)
 	for index, message := range messages.Array() {
 		if !strings.EqualFold(strings.TrimSpace(message.Get("role").String()), "assistant") {
 			continue
+		}
+		toolCalls := message.Get("tool_calls")
+		legacyFunctionCall := message.Get("function_call")
+		if (!toolCalls.IsArray() || len(toolCalls.Array()) == 0) && !legacyFunctionCall.IsObject() {
+			// DeepSeek ignores reasoning_content on a plain assistant turn. Omitting it
+			// matches the official harness and keeps the append-only cache prefix small.
+			continue
+		}
+		content := message.Get("content")
+		if !content.Exists() || content.Type == gjson.Null {
+			var err error
+			out, err = sjson.SetBytes(out, fmt.Sprintf("messages.%d.content", index), "")
+			if err != nil {
+				return body, fmt.Errorf("deepseek reasoning replay content: %w", err)
+			}
 		}
 		existing := message.Get("reasoning_content")
 		if existing.Exists() && (existing.Type != gjson.String || strings.TrimSpace(existing.String()) != "") {
@@ -235,10 +250,88 @@ func ensureDeepSeekV4ReasoningContent(body []byte, model string) ([]byte, error)
 		var err error
 		out, err = sjson.SetBytes(out, fmt.Sprintf("messages.%d.reasoning_content", index), reasoning.String())
 		if err != nil {
-			return body, fmt.Errorf("deepseek v4 reasoning replay: %w", err)
+			return body, fmt.Errorf("deepseek reasoning replay: %w", err)
 		}
 	}
 	return out, nil
+}
+
+func officialDeepSeekAPIURL(raw string) (*url.URL, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || !strings.EqualFold(parsed.Scheme, "https") ||
+		!strings.EqualFold(parsed.Hostname(), "api.deepseek.com") || parsed.Port() != "" ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, false
+	}
+	return parsed, true
+}
+
+// normalizeOfficialDeepSeekChatRequest applies only compatibility rules declared
+// by the official V4 API. Removing tool_choice=auto preserves its default semantics;
+// an explicit required/forced choice is rejected instead of silently changing intent.
+// Codex's nonstandard ultra effort maps to DeepSeek's highest supported level.
+func normalizeOfficialDeepSeekChatRequest(body []byte, model string) ([]byte, error) {
+	if !strings.Contains(strings.ToLower(strings.TrimSpace(model)), "deepseek-v4") {
+		return body, nil
+	}
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String()), "disabled") {
+		return body, nil
+	}
+	out := body
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(out, "reasoning_effort").String()), "ultra") {
+		var err error
+		out, err = sjson.SetBytes(out, "reasoning_effort", "max")
+		if err != nil {
+			return body, fmt.Errorf("deepseek reasoning effort: %w", err)
+		}
+	}
+	choice := gjson.GetBytes(out, "tool_choice")
+	if !choice.Exists() {
+		return out, nil
+	}
+	auto := choice.Type == gjson.Null || choice.Type == gjson.String && strings.EqualFold(strings.TrimSpace(choice.String()), "auto")
+	if choice.IsObject() {
+		auto = strings.EqualFold(strings.TrimSpace(choice.Get("type").String()), "auto") && len(choice.Map()) == 1
+	}
+	if !auto {
+		return body, errors.New("DeepSeek V4 thinking mode does not support an explicit tool_choice")
+	}
+	var err error
+	out, err = sjson.DeleteBytes(out, "tool_choice")
+	if err != nil {
+		return body, fmt.Errorf("deepseek tool choice: %w", err)
+	}
+	return out, nil
+}
+
+// resolveLiveCustomProviderRoute applies the operator's explicit route first. A
+// legacy/default DeepSeek provider pointed at the exact official API host then gets
+// the provider's native Anthropic endpoint for /v1/messages. This avoids translating
+// Claude Code tool/thinking blocks through Chat Completions, while explicit routes,
+// proxies, ports and every Responses/Codex path retain their configured behavior.
+func resolveLiveCustomProviderRoute(provider storage.CustomProvider, downstreamPath string) (storage.CustomProvider, string) {
+	resolved, routeID := storage.ResolveCustomProviderRoute(provider, downstreamPath)
+	if routeID != "default" || downstreamPath != storage.CustomProviderDownstreamMessages {
+		return resolved, routeID
+	}
+	parsed, ok := officialDeepSeekAPIURL(resolved.BaseURL)
+	if !ok {
+		return resolved, routeID
+	}
+	path := strings.TrimRight(parsed.EscapedPath(), "/")
+	switch path {
+	case "", "/v1", "/anthropic":
+		parsed.Path = "/anthropic"
+		parsed.RawPath = ""
+	default:
+		return resolved, routeID
+	}
+	resolved.BaseURL = parsed.String()
+	resolved.UpstreamProtocol = storage.CustomProviderProtocolAnthropicMessages
+	resolved.TransportProfile = storage.CustomProviderTransportClaudeCode
+	resolved.ResolvedRouteID = "deepseek-official-anthropic"
+	resolved.ResolvedDownstreamPath = storage.CustomProviderDownstreamMessages
+	return resolved, resolved.ResolvedRouteID
 }
 
 func (s *Server) customProviderByID(ctx context.Context, id string) (storage.CustomProvider, bool) {
@@ -385,6 +478,13 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 	if provider.UpstreamProtocol == storage.CustomProviderProtocolChatCompletions &&
 		strings.Trim(strings.TrimSpace(upstreamPath), "/") == "chat/completions" {
 		var normalizeErr error
+		if _, official := officialDeepSeekAPIURL(provider.BaseURL); official {
+			body, normalizeErr = normalizeOfficialDeepSeekChatRequest(body, model)
+			if normalizeErr != nil {
+				writeError(w, http.StatusBadRequest, normalizeErr)
+				return customCall{}, false
+			}
+		}
 		body, normalizeErr = ensureDeepSeekV4ReasoningContent(body, model)
 		if normalizeErr != nil {
 			writeError(w, http.StatusBadRequest, normalizeErr)
@@ -951,7 +1051,7 @@ func (s *Server) handleMessagesViaResponsesCustom(w http.ResponseWriter, r *http
 // handleMessagesViaCustom serves a Claude Code /v1/messages request from a custom
 // provider: Anthropic request → chat, then chat response/SSE → Anthropic response/SSE.
 func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
-	provider, _ = storage.ResolveCustomProviderRoute(provider, storage.CustomProviderDownstreamMessages)
+	provider, _ = resolveLiveCustomProviderRoute(provider, storage.CustomProviderDownstreamMessages)
 	switch provider.UpstreamProtocol {
 	case storage.CustomProviderProtocolAnthropicMessages:
 		s.handleNativeAnthropicMessagesViaCustom(w, r, raw, model, routeGroup, provider)

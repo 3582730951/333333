@@ -257,7 +257,8 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-Pool-Resolved-Model", targetModel)
 			w.Header().Set("X-Pool-Model-Override-Source", "custom_provider_mapping:"+prov.ID)
 		}
-		if prov.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages &&
+		effectiveProv, _ := resolveLiveCustomProviderRoute(prov, storage.CustomProviderDownstreamMessages)
+		if effectiveProv.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages &&
 			strings.EqualFold(customRequestedModel.ContextMode, "1m") {
 			r = withAnthropicContext1MBeta(r)
 		}
@@ -265,7 +266,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": virtual.EstimateTokensJSON(raw)})
 			return
 		}
-		if prov.UpstreamProtocol == storage.CustomProviderProtocolChatCompletions {
+		if effectiveProv.UpstreamProtocol == storage.CustomProviderProtocolChatCompletions {
 			if caps := claudeOnlyCapabilitiesForChatBridge(r.Header, raw); len(caps) > 0 {
 				s.writeCapabilityUnavailable(w, http.StatusBadRequest,
 					"Claude-only capability cannot be represented through the Chat Completions bridge",

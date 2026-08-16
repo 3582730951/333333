@@ -198,7 +198,7 @@ func ResponsesRequestToChatCompletionBridge(raw []byte) (ResponsesChatBridgeResu
 	if instr, ok := root["instructions"].(string); ok && strings.TrimSpace(instr) != "" {
 		messages = append(messages, map[string]interface{}{"role": "system", "content": instr})
 	}
-	convertedMessages, err := responsesInputToChatMessagesBridge(input, plan, losses)
+	convertedMessages, err := responsesInputToChatMessagesBridge(input, plan, losses, IsDeepSeekModel(stringOr(root["model"], "")))
 	if err != nil {
 		return ResponsesChatBridgeResult{}, err
 	}
@@ -213,6 +213,15 @@ func ResponsesRequestToChatCompletionBridge(raw []byte) (ResponsesChatBridgeResu
 	}
 	if v, ok := root["top_p"]; ok {
 		out["top_p"] = v
+	}
+	// Chat reasoning providers (including DeepSeek V4) accept the same effort
+	// vocabulary used by Responses. Preserve the caller's requested effort; never
+	// lower it as a cache optimization. Provider-specific compatibility mapping
+	// (for example xhigh -> max) remains an upstream concern.
+	if reasoning, ok := root["reasoning"].(map[string]interface{}); ok {
+		if effort := strings.ToLower(strings.TrimSpace(stringOr(reasoning["effort"], ""))); effort != "" && effort != "none" && effort != "minimal" {
+			out["reasoning_effort"] = effort
+		}
 	}
 	if n := firstNum(root, "max_output_tokens", "max_tokens", "max_completion_tokens"); n > 0 {
 		out["max_tokens"] = n
@@ -296,10 +305,10 @@ func discoveredToolSearchTools(input interface{}) []interface{} {
 // responsesInputToChatMessages converts a Responses `input` (a bare string, or an
 // array of input items) into Chat Completions messages.
 func responsesInputToChatMessages(input interface{}) ([]interface{}, error) {
-	return responsesInputToChatMessagesBridge(input, NewResponsesToolBridgePlan(), compatibilityLossSet{})
+	return responsesInputToChatMessagesBridge(input, NewResponsesToolBridgePlan(), compatibilityLossSet{}, false)
 }
 
-func responsesInputToChatMessagesBridge(input interface{}, plan *ResponsesToolBridgePlan, losses compatibilityLossSet) ([]interface{}, error) {
+func responsesInputToChatMessagesBridge(input interface{}, plan *ResponsesToolBridgePlan, losses compatibilityLossSet, preserveDeepSeekReasoning bool) ([]interface{}, error) {
 	switch t := input.(type) {
 	case string:
 		if strings.TrimSpace(t) == "" {
@@ -308,58 +317,87 @@ func responsesInputToChatMessagesBridge(input interface{}, plan *ResponsesToolBr
 		return []interface{}{map[string]interface{}{"role": "user", "content": t}}, nil
 	case []interface{}:
 		out := make([]interface{}, 0, len(t))
+		var pendingAssistant map[string]interface{}
+		ensureAssistant := func() map[string]interface{} {
+			if pendingAssistant == nil {
+				pendingAssistant = map[string]interface{}{"role": "assistant"}
+			}
+			return pendingAssistant
+		}
+		flushAssistant := func() {
+			if pendingAssistant == nil {
+				return
+			}
+			_, hasContent := pendingAssistant["content"]
+			toolCalls, _ := pendingAssistant["tool_calls"].([]interface{})
+			if len(toolCalls) == 0 {
+				// DeepSeek ignores reasoning_content on a completed, tool-free turn.
+				// Keep the assistant answer, but omit the ignored replay field so the
+				// next append-only prefix is both smaller and more stable.
+				delete(pendingAssistant, "reasoning_content")
+			}
+			if !hasContent && len(toolCalls) == 0 {
+				// A standalone reasoning item from a completed, tool-free turn is
+				// intentionally not replayed. DeepSeek documents that it is ignored;
+				// retaining it only enlarges and fragments the cache prefix.
+				pendingAssistant = nil
+				return
+			}
+			if !hasContent {
+				pendingAssistant["content"] = nil
+			}
+			out = append(out, pendingAssistant)
+			pendingAssistant = nil
+		}
+		appendToolCall := func(identity ResponsesToolIdentity, id string, arguments interface{}) {
+			assistant := ensureAssistant()
+			toolCalls, _ := assistant["tool_calls"].([]interface{})
+			toolCalls = append(toolCalls, map[string]interface{}{
+				"id": id, "type": "function",
+				"function": map[string]interface{}{
+					"name": plan.ensureAlias(identity), "arguments": arguments,
+				},
+			})
+			assistant["tool_calls"] = toolCalls
+		}
 		for _, item := range t {
 			m, ok := item.(map[string]interface{})
 			if !ok {
 				continue
 			}
 			switch itemType, _ := m["type"].(string); itemType {
+			case "reasoning":
+				flushAssistant()
+				if reasoning, ok := deepSeekReasoningFromResponsesItem(m); ok {
+					if preserveDeepSeekReasoning {
+						ensureAssistant()["reasoning_content"] = reasoning
+					}
+					continue
+				}
+				out = append(out, responsesHistoryItemAsChatMessage(m))
+				losses.add(LossResponsesHistoryItemJSON)
 			case "function_call":
 				identity := ResponsesToolIdentity{
 					Kind: ResponsesToolFunction, Namespace: stringOr(m["namespace"], ""), Name: stringOr(m["name"], ""),
 				}
-				alias := plan.ensureAlias(identity)
-				out = append(out, map[string]interface{}{
-					"role":    "assistant",
-					"content": nil,
-					"tool_calls": []interface{}{map[string]interface{}{
-						"id":   stringOr(firstPresent(m["call_id"], m["id"]), ""),
-						"type": "function",
-						"function": map[string]interface{}{
-							"name":      alias,
-							"arguments": jsonValueString(m["arguments"]),
-						},
-					}},
-				})
+				appendToolCall(identity, stringOr(firstPresent(m["call_id"], m["id"]), ""), jsonValueString(m["arguments"]))
 			case "custom_tool_call":
 				identity := ResponsesToolIdentity{
 					Kind: ResponsesToolCustom, Namespace: stringOr(m["namespace"], ""), Name: stringOr(m["name"], ""),
 				}
-				alias := plan.ensureAlias(identity)
 				arguments, _ := json.Marshal(map[string]interface{}{"input": stringOr(m["input"], "")})
-				out = append(out, map[string]interface{}{
-					"role": "assistant", "content": nil,
-					"tool_calls": []interface{}{map[string]interface{}{
-						"id": stringOr(firstPresent(m["call_id"], m["id"]), ""), "type": "function",
-						"function": map[string]interface{}{"name": alias, "arguments": string(arguments)},
-					}},
-				})
+				appendToolCall(identity, stringOr(firstPresent(m["call_id"], m["id"]), ""), string(arguments))
 			case "tool_search_call":
 				if !strings.EqualFold(stringOr(m["execution"], "client"), "client") {
+					flushAssistant()
 					out = append(out, responsesHistoryItemAsChatMessage(m))
 					losses.add(LossResponsesHistoryItemJSON)
 					continue
 				}
 				identity := ResponsesToolIdentity{Kind: ResponsesToolSearch, Name: "tool_search", Execution: "client"}
-				alias := plan.ensureAlias(identity)
-				out = append(out, map[string]interface{}{
-					"role": "assistant", "content": nil,
-					"tool_calls": []interface{}{map[string]interface{}{
-						"id": stringOr(firstPresent(m["call_id"], m["id"]), ""), "type": "function",
-						"function": map[string]interface{}{"name": alias, "arguments": jsonValueString(m["arguments"])},
-					}},
-				})
+				appendToolCall(identity, stringOr(firstPresent(m["call_id"], m["id"]), ""), jsonValueString(m["arguments"]))
 			case "function_call_output", "custom_tool_call_output", "mcp_tool_call_output", "tool_search_output":
+				flushAssistant()
 				if itemType == "tool_search_output" && (strings.EqualFold(stringOr(m["execution"], ""), "server") || stringOr(firstPresent(m["call_id"], m["id"]), "") == "") {
 					out = append(out, responsesHistoryItemAsChatMessage(m))
 					losses.add(LossResponsesHistoryItemJSON)
@@ -379,15 +417,24 @@ func responsesInputToChatMessagesBridge(input interface{}, plan *ResponsesToolBr
 				if role == "" {
 					role = "user"
 				}
-				out = append(out, map[string]interface{}{
-					"role":    role,
-					"content": chatContentToText(m["content"]),
-				})
+				if role == "assistant" {
+					assistant := ensureAssistant()
+					if _, alreadyHasContent := assistant["content"]; alreadyHasContent {
+						flushAssistant()
+						assistant = ensureAssistant()
+					}
+					assistant["content"] = chatContentToText(m["content"])
+					continue
+				}
+				flushAssistant()
+				out = append(out, map[string]interface{}{"role": role, "content": chatContentToText(m["content"])})
 			default:
+				flushAssistant()
 				out = append(out, responsesHistoryItemAsChatMessage(m))
 				losses.add(LossResponsesHistoryItemJSON)
 			}
 		}
+		flushAssistant()
 		return out, nil
 	}
 	return nil, nil
@@ -692,7 +739,14 @@ func ChatCompletionToResponsesResponse(raw []byte, model string, plans ...*Respo
 		}
 	}
 	text, toolCalls := chatChoiceTextAndToolCalls(root)
-	output := make([]interface{}, 0, 1+len(toolCalls))
+	reasoning := ""
+	if IsDeepSeekModel(model) {
+		reasoning = chatChoiceReasoningContent(root)
+	}
+	output := make([]interface{}, 0, 2+len(toolCalls))
+	if reasoning != "" {
+		output = append(output, DeepSeekReasoningItem("rs_"+id, reasoning))
+	}
 	if text != "" || len(toolCalls) == 0 {
 		output = append(output, map[string]interface{}{
 			"type":    "message",
@@ -802,6 +856,26 @@ func chatChoiceTextAndToolCalls(root map[string]interface{}) (string, []interfac
 		}
 	}
 	return text, toolCalls
+}
+
+// chatChoiceReasoningContent returns the provider's replayable thinking text. The
+// reasoning alias is accepted for OpenRouter-style DeepSeek responses; the official
+// API spelling always wins when both are present.
+func chatChoiceReasoningContent(root map[string]interface{}) string {
+	choices, ok := root["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return ""
+	}
+	choice, _ := choices[0].(map[string]interface{})
+	message, _ := choice["message"].(map[string]interface{})
+	if message == nil {
+		return ""
+	}
+	if reasoning, ok := message["reasoning_content"].(string); ok && reasoning != "" {
+		return reasoning
+	}
+	reasoning, _ := message["reasoning"].(string)
+	return reasoning
 }
 
 // ChatUsageToResponses maps Chat Completions usage to Responses usage field names.

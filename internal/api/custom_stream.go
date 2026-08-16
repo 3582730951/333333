@@ -38,11 +38,11 @@ type chatToolCallDelta struct {
 }
 
 type chatChunkDelta struct {
-	Content      *string                `json:"content"`
-	ToolCalls    []chatToolCallDelta    `json:"tool_calls"`
-	FunctionCall *chatFunctionCallDelta `json:"function_call"`
-	// reasoning_content (deepseek-reasoner CoT) is intentionally ignored — only
-	// the final answer in `content` is surfaced.
+	Content          *string                `json:"content"`
+	ReasoningContent *string                `json:"reasoning_content"`
+	Reasoning        *string                `json:"reasoning"`
+	ToolCalls        []chatToolCallDelta    `json:"tool_calls"`
+	FunctionCall     *chatFunctionCallDelta `json:"function_call"`
 }
 
 type chatChunk struct {
@@ -70,6 +70,18 @@ func normalizedChatToolCallDeltas(delta chatChunkDelta) []chatToolCallDelta {
 	return []chatToolCallDelta{{
 		Index: 0, ID: "call_legacy_function", Function: *delta.FunctionCall,
 	}}
+}
+
+// chatReasoningDelta accepts the official DeepSeek spelling first and the
+// OpenRouter-compatible alias second. A present official empty delta still wins.
+func chatReasoningDelta(delta chatChunkDelta) string {
+	if delta.ReasoningContent != nil {
+		return *delta.ReasoningContent
+	}
+	if delta.Reasoning != nil {
+		return *delta.Reasoning
+	}
+	return ""
 }
 
 func newChatSSEScanner(body io.Reader) *bufio.Scanner {
@@ -357,6 +369,7 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 }
 
 func chatStreamToResponsesSSEWithOptions(ctx context.Context, w http.ResponseWriter, body io.Reader, model string, scrubber *streamrewrite.Matcher, options bodysource.CaptureOptions, plans ...*prompt.ResponsesToolBridgePlan) map[string]interface{} {
+	preserveDeepSeekReasoning := prompt.IsDeepSeekModel(model)
 	plan := prompt.NewResponsesToolBridgePlan()
 	if len(plans) > 0 && plans[0] != nil {
 		plan = plans[0]
@@ -375,10 +388,14 @@ func chatStreamToResponsesSSEWithOptions(ctx context.Context, w http.ResponseWri
 		}
 	}
 
-	var respID, msgItemID string
+	var respID, msgItemID, reasoningItemID string
 	created := false
 	msgOpened := false
 	msgOutputIndex := -1
+	reasoningOpened := false
+	reasoningOutputIndex := -1
+	reasoningBuf := newStreamAccumulator(ctx, options, "codex-pool-chat-response-reasoning-*")
+	defer reasoningBuf.Close()
 	textBuf := newStreamAccumulator(ctx, options, "codex-pool-chat-response-text-*")
 	defer textBuf.Close()
 	nextOutputIndex := 0
@@ -430,6 +447,19 @@ func chatStreamToResponsesSSEWithOptions(ctx context.Context, w http.ResponseWri
 		emit(map[string]interface{}{
 			"type": "response.content_part.added", "item_id": msgItemID, "output_index": msgOutputIndex,
 			"content_index": 0, "part": map[string]interface{}{"type": "output_text", "text": ""},
+		})
+	}
+	ensureReasoningOpen := func() {
+		if reasoningOpened {
+			return
+		}
+		reasoningOutputIndex = nextOutputIndex
+		nextOutputIndex++
+		reasoningItemID = "rs_" + respID
+		reasoningOpened = true
+		emit(map[string]interface{}{
+			"type": "response.output_item.added", "output_index": reasoningOutputIndex,
+			"item": map[string]interface{}{"type": "reasoning", "id": reasoningItemID, "summary": []interface{}{}},
 		})
 	}
 	openTool := func(acc *toolAcc) {
@@ -513,6 +543,17 @@ scanLoop:
 			usage = u
 		}
 		for _, choice := range c.Choices {
+			if reasoning := chatReasoningDelta(choice.Delta); preserveDeepSeekReasoning && reasoning != "" {
+				ensureReasoningOpen()
+				reasoning = scrubber.ReplaceString(reasoning)
+				if accumulationErr = reasoningBuf.WriteString(reasoning); accumulationErr != nil {
+					break scanLoop
+				}
+				emit(map[string]interface{}{
+					"type": "response.reasoning_summary_text.delta", "item_id": reasoningItemID,
+					"output_index": reasoningOutputIndex, "delta": reasoning,
+				})
+			}
 			if choice.Delta.Content != nil && *choice.Delta.Content != "" {
 				ensureMsgOpen()
 				txt := scrubber.ReplaceString(*choice.Delta.Content)
@@ -581,6 +622,26 @@ scanLoop:
 		ensureMsgOpen()
 	}
 	ordered := make([]interface{}, nextOutputIndex)
+	if reasoningOpened {
+		reasoning, err := reasoningBuf.String()
+		if err != nil {
+			emit(map[string]interface{}{
+				"type": "response.failed",
+				"response": map[string]interface{}{
+					"id": respID, "object": "response", "status": "failed", "model": model,
+					"error": map[string]interface{}{"type": "server_error", "code": "server_error", "message": publicRetryMessage},
+				},
+			})
+			return usage
+		}
+		emit(map[string]interface{}{
+			"type": "response.reasoning_summary_text.done", "item_id": reasoningItemID,
+			"output_index": reasoningOutputIndex, "text": reasoning,
+		})
+		reasoningItem := prompt.DeepSeekReasoningItem(reasoningItemID, reasoning)
+		emit(map[string]interface{}{"type": "response.output_item.done", "output_index": reasoningOutputIndex, "item": reasoningItem})
+		ordered[reasoningOutputIndex] = reasoningItem
+	}
 	if msgOpened {
 		finalText, err := textBuf.String()
 		if err != nil {
@@ -705,6 +766,7 @@ func chatStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, model strin
 }
 
 func chatStreamToAnthropicSSEWithOptions(ctx context.Context, w http.ResponseWriter, body io.Reader, model string, scrubber *streamrewrite.Matcher, options bodysource.CaptureOptions) map[string]interface{} {
+	preserveDeepSeekReasoning := prompt.IsDeepSeekModel(model)
 	flusher, _ := w.(http.Flusher)
 	emit := func(event string, payload map[string]interface{}) {
 		payload["type"] = event
@@ -722,6 +784,10 @@ func chatStreamToAnthropicSSEWithOptions(ctx context.Context, w http.ResponseWri
 	started := false
 	nextBlock := 0
 	openBlock := -1 // currently-open content block index, -1 if none
+	reasoningBlock := -1
+	reasoningSigned := false
+	reasoningBuf := newStreamAccumulator(ctx, options, "codex-pool-chat-anthropic-reasoning-*")
+	defer reasoningBuf.Close()
 	textBlock := -1
 	type toolBlock struct {
 		blockIndex int
@@ -752,6 +818,18 @@ func chatStreamToAnthropicSSEWithOptions(ctx context.Context, w http.ResponseWri
 	}
 	closeOpen := func() {
 		if openBlock >= 0 {
+			if openBlock == reasoningBlock && !reasoningSigned {
+				reasoning, err := reasoningBuf.String()
+				if err != nil {
+					accumulationErr = err
+					return
+				}
+				emit("content_block_delta", map[string]interface{}{
+					"index": reasoningBlock,
+					"delta": map[string]interface{}{"type": "signature_delta", "signature": prompt.EncodeDeepSeekReasoningContent(reasoning)},
+				})
+				reasoningSigned = true
+			}
 			emit("content_block_stop", map[string]interface{}{"index": openBlock})
 			openBlock = -1
 		}
@@ -793,9 +871,38 @@ func chatStreamToAnthropicSSEWithOptions(ctx context.Context, w http.ResponseWri
 			if choice.FinishReason != nil && *choice.FinishReason != "" {
 				finish = *choice.FinishReason
 			}
+			if reasoning := chatReasoningDelta(choice.Delta); preserveDeepSeekReasoning && reasoning != "" {
+				if reasoningBlock < 0 {
+					closeOpen()
+					if accumulationErr != nil {
+						break
+					}
+					reasoningBlock = nextBlock
+					nextBlock++
+					emit("content_block_start", map[string]interface{}{
+						"index":         reasoningBlock,
+						"content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
+					})
+					openBlock = reasoningBlock
+				} else if openBlock != reasoningBlock {
+					accumulationErr = errors.New("custom chat stream interleaved reasoning after another content block")
+					break
+				}
+				reasoning = scrubber.ReplaceString(reasoning)
+				if accumulationErr = reasoningBuf.WriteString(reasoning); accumulationErr != nil {
+					break
+				}
+				emit("content_block_delta", map[string]interface{}{
+					"index": reasoningBlock,
+					"delta": map[string]interface{}{"type": "thinking_delta", "thinking": reasoning},
+				})
+			}
 			if choice.Delta.Content != nil && *choice.Delta.Content != "" {
 				if textBlock < 0 {
 					closeOpen()
+					if accumulationErr != nil {
+						break
+					}
 					textBlock = nextBlock
 					nextBlock++
 					emit("content_block_start", map[string]interface{}{"index": textBlock, "content_block": map[string]interface{}{"type": "text", "text": ""}})
@@ -854,6 +961,12 @@ func chatStreamToAnthropicSSEWithOptions(ctx context.Context, w http.ResponseWri
 
 	ensureStarted("")
 	closeOpen()
+	if accumulationErr != nil {
+		emit("error", map[string]interface{}{"error": map[string]interface{}{
+			"type": "api_error", "code": "server_error", "message": publicRetryMessage,
+		}})
+		return usage
+	}
 	for _, index := range toolOrder {
 		tb := toolBlocks[index]
 		tb.blockIndex = nextBlock

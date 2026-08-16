@@ -61,6 +61,12 @@ HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
 # Abort a candidate that is crashing in a loop instead of silently polling the
 # Unix socket for the full health timeout. A transient first restart is allowed.
 WORKER_START_RESTART_LIMIT="${WORKER_START_RESTART_LIMIT:-5}"
+# A healthy SQLite write is far shorter than this probe. A persistent lock means
+# the old generation must be quiesced before the staged binary can run additive
+# migrations; blindly extending worker retry time cannot release another PID's lock.
+SQLITE_LOCK_PROBE_TIMEOUT_MS="${SQLITE_LOCK_PROBE_TIMEOUT_MS:-2000}"
+SQLITE_LOCK_DRAIN_TIMEOUT="${SQLITE_LOCK_DRAIN_TIMEOUT:-30}"
+SQLITE_LOCK_RELEASE_TIMEOUT="${SQLITE_LOCK_RELEASE_TIMEOUT:-90}"
 # DRAIN_TIMEOUT controls only the background reaper's progress-log cadence. It is
 # not an installation deadline: install.sh returns after the atomic traffic switch,
 # while the superseded worker keeps its established HTTP/SSE/WebSocket requests and
@@ -81,6 +87,8 @@ ACTIVATION_OLD_RELEASE=""
 ACTIVATION_OLD_SOCKET=""
 ACTIVATION_OLD_WORKER_RELEASE=""
 ACTIVATION_NEW_RELEASE=""
+SQLITE_LOCK_RECOVERY_ATTEMPTED=0
+SQLITE_LOCK_FAILURE_REPORT=""
 # Set by install_sidecar: 1 when the sidecar source changed (or first install), 0 when
 # unchanged — lets the restart block skip a needless sidecar restart that would sever
 # in-flight upstream streams.
@@ -195,7 +203,8 @@ Environment overrides:
   LISTEN_ADDR, ADMIN_TOKEN, PUBLIC_URL, OPEN_FIREWALL,
   SIDECAR_ADDR, SIDECAR_VENV, SIDECAR_INSTALL_DIR, SIDECAR_COOKIE_DIR,
   INSTALL_GO, GO_INSTALL_VERSION, GO_INSTALL_ROOT, GO_BIN, HEALTH_TIMEOUT,
-  WORKER_START_RESTART_LIMIT,
+  WORKER_START_RESTART_LIMIT, SQLITE_LOCK_PROBE_TIMEOUT_MS,
+  SQLITE_LOCK_DRAIN_TIMEOUT, SQLITE_LOCK_RELEASE_TIMEOUT,
   DRAIN_TIMEOUT (background drain log interval; install never waits for streams),
   SKIP_OS_PACKAGES, GO_TARBALL_SHA256,
   WITH_REGISTRATION, NODE_MIN_MAJOR, NODE_INSTALL_MAJOR, NODE_BIN, CHROME_BIN,
@@ -1579,6 +1588,8 @@ capture_worker_startup_failure() {
     run_root free -h 2>&1 || true
     run_root df -h "$DATA_DIR" "$APP_DIR" 2>&1 || true
     run_root ls -l "$socket" 2>&1 || true
+    printf '\n[sqlite-locks]\n'
+    emit_sqlite_lock_evidence 2>&1 || true
   } >"$tmp" 2>&1
 
   if run_root install -d -m 0750 "$failure_dir" && run_root install -m 0640 "$tmp" "$failure_file"; then
@@ -1641,6 +1652,203 @@ handoff_is_ready() {
   payload="$(curl --noproxy '*' --silent --max-time 2 "$(handoff_public_base_url)/handoffz" 2>/dev/null || true)"
   [[ "$payload" == *'"deployment_state":"handoff"'* && "$payload" == *'"ready":true'* ]] || return 1
   [[ -z "$expected_instance" || "$payload" == *"\"instance_id\":\"${expected_instance}\""* ]]
+}
+
+runtime_storage_driver() {
+  local driver
+  driver="${CODEX_POOL_STORAGE_DRIVER:-}"
+  if [[ -z "$driver" ]]; then
+    driver="$(config_string_value "$CONFIG_FILE" storage_driver 2>/dev/null || true)"
+  fi
+  driver="${driver,,}"
+  printf '%s\n' "${driver:-sqlite}"
+}
+
+SQLITE_WRITE_PROBE_ERROR=""
+
+# Return 0 when a short SQLite schema transaction can complete, 2 for BUSY/LOCKED,
+# and 1 for every other probe error. Startup performs additive DDL, so probing only
+# BEGIN IMMEDIATE is insufficient in WAL mode: an old reader can permit a data write
+# while still blocking CREATE TRIGGER/CREATE TABLE. The transaction always rolls
+# back, including when sqlite3 is interrupted, and never changes application data.
+sqlite_write_probe() {
+  local output status
+  SQLITE_WRITE_PROBE_ERROR=""
+  [[ "$(runtime_storage_driver)" == "sqlite" ]] || return 0
+  [[ -f "$DATABASE_PATH" ]] || return 0
+  [[ "$SQLITE_LOCK_PROBE_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]] || {
+    SQLITE_WRITE_PROBE_ERROR="SQLITE_LOCK_PROBE_TIMEOUT_MS must be a positive integer"
+    return 1
+  }
+  command -v sqlite3 >/dev/null 2>&1 || {
+    SQLITE_WRITE_PROBE_ERROR="sqlite3 is required for the deployment write-lock probe"
+    return 1
+  }
+  if output="$(run_root sqlite3 -batch -cmd ".timeout ${SQLITE_LOCK_PROBE_TIMEOUT_MS}" "$DATABASE_PATH" \
+      'BEGIN IMMEDIATE; CREATE TABLE "__codex_pool_deploy_lock_probe"(id INTEGER); ROLLBACK;' 2>&1)"; then
+    return 0
+  else
+    status=$?
+  fi
+  SQLITE_WRITE_PROBE_ERROR="${output:-sqlite3 exited with status ${status}}"
+  if [[ "${SQLITE_WRITE_PROBE_ERROR,,}" == *"database is locked"* ||
+        "${SQLITE_WRITE_PROBE_ERROR,,}" == *"database is busy"* ||
+        "${SQLITE_WRITE_PROBE_ERROR,,}" == *"sqlite_busy"* ||
+        "${SQLITE_WRITE_PROBE_ERROR,,}" == *"sqlite_locked"* ]]; then
+    return 2
+  fi
+  return 1
+}
+
+emit_sqlite_lock_evidence() {
+  printf 'database=%s\nprobe_error=%s\n' "$DATABASE_PATH" "${SQLITE_WRITE_PROBE_ERROR:-none}"
+  printf '\n[lsof]\n'
+  if command -v lsof >/dev/null 2>&1; then
+    run_root lsof -nP "$DATABASE_PATH" "${DATABASE_PATH}-wal" "${DATABASE_PATH}-shm" 2>&1 || true
+  else
+    printf 'lsof unavailable\n'
+  fi
+  printf '\n[lslocks]\n'
+  if command -v lslocks >/dev/null 2>&1; then
+    run_root lslocks -n -o PID,COMMAND,TYPE,MODE,START,END,PATH 2>&1 |
+      grep -F "$DATABASE_PATH" || true
+  else
+    printf 'lslocks unavailable\n'
+  fi
+  printf '\n[worker-units]\n'
+  run_root systemctl list-units --type=service --all --no-pager --full \
+    "${SERVICE_NAME}-worker@*.service" "${SERVICE_NAME}.service" 2>&1 || true
+}
+
+report_sqlite_lock_evidence() {
+  warn "SQLite write lock evidence follows; no unknown process will be terminated automatically"
+  emit_sqlite_lock_evidence >&2
+}
+
+persist_sqlite_lock_failure() {
+  local reason="$1" failure_dir failure_file tmp
+  failure_dir="${DATA_DIR%/}/deploy-failures"
+  failure_file="${failure_dir%/}/sqlite-lock-${RELEASE_ID:-unknown}.log"
+  tmp="$(mktemp)"
+  {
+    printf 'captured_at=%s\nrelease=%s\nreason=%s\n' \
+      "$(date -u +%FT%TZ)" "${RELEASE_ID:-unknown}" "$reason"
+    emit_sqlite_lock_evidence
+  } >"$tmp" 2>&1
+  if run_root install -d -m 0750 "$failure_dir" && run_root install -m 0640 "$tmp" "$failure_file"; then
+    run_root chown "root:${SERVICE_GROUP}" "$failure_file" 2>/dev/null || true
+    SQLITE_LOCK_FAILURE_REPORT="$failure_file"
+    warn "SQLite deployment failure report saved to ${failure_file}"
+  else
+    warn "Could not persist SQLite deployment failure report"
+  fi
+  rm -f "$tmp"
+}
+
+abort_sqlite_lock_recovery() {
+  local message="$1" hint=""
+  report_sqlite_lock_evidence
+  persist_sqlite_lock_failure "$message"
+  [[ -z "$SQLITE_LOCK_FAILURE_REPORT" ]] || hint="; failure report: ${SQLITE_LOCK_FAILURE_REPORT}"
+  die "${message}${hint}"
+}
+
+staged_worker_failure_is_sqlite_lock() {
+  local report="${1:-$WORKER_FAILURE_REPORT}"
+  [[ -n "$report" ]] || return 1
+  run_root grep -Eqi \
+    'database (is|table is|schema is) (locked|busy)|SQLITE_(BUSY|LOCKED)|storage remained locked' \
+    "$report" 2>/dev/null
+}
+
+handoff_inflight_count() {
+  local payload count
+  payload="$(handoff_control_get 2>/dev/null || true)"
+  count="$(printf '%s' "$payload" | sed -n 's/.*"inflight":[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+  [[ "$count" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$count"
+}
+
+wait_handoff_inflight_zero() {
+  local timeout="$1" started="$SECONDS" count next_report=0
+  [[ "$timeout" =~ ^[0-9]+$ ]] || return 1
+  while (( SECONDS - started <= timeout )); do
+    count="$(handoff_inflight_count 2>/dev/null || true)"
+    if [[ "$count" == "0" ]]; then
+      return 0
+    fi
+    if (( SECONDS >= next_report )); then
+      warn "Waiting for established requests before SQLite lock recovery: inflight=${count:-unknown} elapsed=$((SECONDS - started))s"
+      next_report=$((SECONDS + 5))
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+# A persistent writer owned by the active generation makes SQLite DDL impossible.
+# Pause only new admissions, prove every established request has completed, then
+# stop that known worker without SIGKILL. The activation rollback state is armed
+# before the stop, so any later candidate failure restarts the exact old release.
+prepare_sqlite_for_staged_worker() {
+  local old_worker_release="$1" old_socket="$2" old_release="$3"
+  local probe_status unit started state next_report=0
+  if sqlite_write_probe; then
+    return 0
+  else
+    probe_status=$?
+  fi
+  if (( probe_status != 2 )); then
+    abort_sqlite_lock_recovery "SQLite deployment write probe failed: ${SQLITE_WRITE_PROBE_ERROR}"
+  fi
+
+  report_sqlite_lock_evidence
+  [[ -n "$old_worker_release" && -n "$old_socket" && -n "$old_release" ]] ||
+    abort_sqlite_lock_recovery "SQLite is persistently locked, but no rollback-safe active A/B worker was identified"
+  handoff_control_is_available ||
+    abort_sqlite_lock_recovery "SQLite is persistently locked and the independent handoff control plane is unavailable"
+  [[ "$SQLITE_LOCK_DRAIN_TIMEOUT" =~ ^[0-9]+$ ]] ||
+    die "SQLITE_LOCK_DRAIN_TIMEOUT must be a non-negative integer"
+  [[ "$SQLITE_LOCK_RELEASE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] ||
+    die "SQLITE_LOCK_RELEASE_TIMEOUT must be a positive integer"
+
+  pause_handoff_admission || die "could not pause new admissions for SQLite lock recovery"
+  if ! wait_handoff_inflight_zero "$SQLITE_LOCK_DRAIN_TIMEOUT"; then
+    abort_sqlite_lock_recovery "SQLite lock recovery refused to stop the old worker while established requests remain"
+  fi
+
+  ACTIVATION_PENDING=1
+  ACTIVATION_OLD_RELEASE="$old_release"
+  ACTIVATION_OLD_SOCKET="$old_socket"
+  ACTIVATION_OLD_WORKER_RELEASE="$old_worker_release"
+  ACTIVATION_NEW_RELEASE="$RELEASE_ID"
+  SQLITE_LOCK_RECOVERY_ATTEMPTED=1
+  unit="${SERVICE_NAME}-worker@${old_worker_release}.service"
+  log "Established requests are drained; gracefully quiescing ${unit} to release SQLite"
+  run_root systemctl stop --no-block "$unit" || die "could not quiesce SQLite lock-holding worker ${unit}"
+
+  started="$SECONDS"
+  while (( SECONDS - started < SQLITE_LOCK_RELEASE_TIMEOUT )); do
+    if sqlite_write_probe; then
+      log "SQLite write lock released after $((SECONDS - started))s; staged startup may proceed"
+      return 0
+    else
+      probe_status=$?
+    fi
+    if (( probe_status != 2 )); then
+      abort_sqlite_lock_recovery "SQLite write probe failed after old-worker quiesce: ${SQLITE_WRITE_PROBE_ERROR}"
+    fi
+    state="$(run_root systemctl show "$unit" --property=ActiveState --value 2>/dev/null || true)"
+    if [[ "$state" == "inactive" || "$state" == "failed" ]]; then
+      abort_sqlite_lock_recovery "SQLite remains locked after the known old worker stopped; inspect the reported external lock holder"
+    fi
+    if (( SECONDS >= next_report )); then
+      warn "Waiting for graceful old-worker SQLite release: elapsed=$((SECONDS - started))s state=${state:-unknown}"
+      next_report=$((SECONDS + 5))
+    fi
+    sleep 0.25
+  done
+  abort_sqlite_lock_recovery "old worker did not release SQLite within ${SQLITE_LOCK_RELEASE_TIMEOUT}s"
 }
 
 wait_handoff_control_ready() {
@@ -2115,6 +2323,8 @@ activate_staged_release() {
     valid_worker_release_id "$old_worker_release" || die "malformed active worker socket target: ${old_socket}"
   fi
 
+  prepare_sqlite_for_staged_worker "$old_worker_release" "$old_socket" "$old_release"
+
   log "Starting staged worker ${RELEASE_ID} on ${new_socket}"
   startup_started="$(date +%s)"
   WORKER_FAILURE_REPORT=""
@@ -2130,7 +2340,28 @@ activate_staged_release() {
     capture_worker_startup_failure "$RELEASE_ID" "$startup_started"
     run_root systemctl stop "$new_unit" || true
     [[ -z "$WORKER_FAILURE_REPORT" ]] || failure_hint="; failure report: ${WORKER_FAILURE_REPORT}"
-    die "staged worker ${RELEASE_ID} did not pass /standbyz; active release was not changed${failure_hint}"
+    if (( SQLITE_LOCK_RECOVERY_ATTEMPTED == 0 )) && staged_worker_failure_is_sqlite_lock; then
+      warn "Staged startup encountered a SQLite lock after preflight; performing one rollback-safe quiesce and retry"
+      prepare_sqlite_for_staged_worker "$old_worker_release" "$old_socket" "$old_release"
+      run_root systemctl reset-failed "$new_unit" >/dev/null 2>&1 || true
+      startup_started="$(date +%s)"
+      WORKER_FAILURE_REPORT=""
+      failure_hint=""
+      if ! run_root systemctl start "$new_unit"; then
+        capture_worker_startup_failure "$RELEASE_ID" "$startup_started"
+        [[ -z "$WORKER_FAILURE_REPORT" ]] || failure_hint="; failure report: ${WORKER_FAILURE_REPORT}"
+        die "could not restart staged worker ${RELEASE_ID} after SQLite lock recovery${failure_hint}"
+      fi
+      if ! wait_worker_ready "$new_socket" "$RELEASE_ID" "$HEALTH_TIMEOUT"; then
+        capture_worker_startup_failure "$RELEASE_ID" "$startup_started"
+        run_root systemctl stop "$new_unit" || true
+        [[ -z "$WORKER_FAILURE_REPORT" ]] || failure_hint="; failure report: ${WORKER_FAILURE_REPORT}"
+        die "staged worker ${RELEASE_ID} still failed after SQLite lock recovery${failure_hint}"
+      fi
+      log "Staged worker ${RELEASE_ID} recovered after safe SQLite old-generation quiesce"
+    else
+      die "staged worker ${RELEASE_ID} did not pass /standbyz; active release was not changed${failure_hint}"
+    fi
   fi
 
   ACTIVATION_PENDING=1

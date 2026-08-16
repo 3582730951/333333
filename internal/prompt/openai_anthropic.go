@@ -55,6 +55,7 @@ func AnthropicRequestToChatCompletion(raw []byte) ([]byte, error) {
 	}
 
 	messages := make([]interface{}, 0, 8)
+	preserveToolReasoning := IsDeepSeekModel(stringOr(root["model"], ""))
 	if sys := anthropicSystemToText(root["system"]); strings.TrimSpace(sys) != "" {
 		messages = append(messages, map[string]interface{}{"role": "system", "content": sys})
 	}
@@ -64,7 +65,7 @@ func AnthropicRequestToChatCompletion(raw []byte) ([]byte, error) {
 			continue
 		}
 		role, _ := m["role"].(string)
-		messages = append(messages, anthropicMessageToChat(role, m["content"])...)
+		messages = append(messages, anthropicMessageToChat(role, m["content"], preserveToolReasoning)...)
 	}
 	out["messages"] = messages
 
@@ -142,12 +143,13 @@ func anthropicSystemToText(v interface{}) string {
 // assistant message carrying tool_calls; a user turn's tool_result blocks become
 // tool-role messages (emitted BEFORE any user text so they immediately follow the
 // assistant tool_calls turn, as the Chat Completions API requires).
-func anthropicMessageToChat(role string, content interface{}) []interface{} {
+func anthropicMessageToChat(role string, content interface{}, preserveToolReasoning bool) []interface{} {
 	switch c := content.(type) {
 	case string:
 		return []interface{}{map[string]interface{}{"role": role, "content": c}}
 	case []interface{}:
 		var textParts []string
+		var reasoningParts []string
 		var toolCalls []interface{}
 		var toolResults []interface{}
 		for _, b := range c {
@@ -159,6 +161,14 @@ func anthropicMessageToChat(role string, content interface{}) []interface{} {
 			case "text":
 				if s, ok := bm["text"].(string); ok {
 					textParts = append(textParts, s)
+				}
+			case "thinking":
+				if s, ok := bm["thinking"].(string); ok && s != "" {
+					reasoningParts = append(reasoningParts, s)
+				}
+			case "redacted_thinking":
+				if s, ok := DecodeDeepSeekReasoningContent(stringOr(bm["data"], "")); ok {
+					reasoningParts = append(reasoningParts, s)
 				}
 			case "tool_use":
 				args, _ := json.Marshal(bm["input"])
@@ -185,6 +195,13 @@ func anthropicMessageToChat(role string, content interface{}) []interface{} {
 			msg := map[string]interface{}{"role": "assistant"}
 			if len(toolCalls) > 0 {
 				msg["tool_calls"] = toolCalls
+				// DeepSeek thinking-mode tool rounds require the complete reasoning
+				// text on every replay. Plain assistant turns intentionally omit it:
+				// the provider ignores it there, while retaining it would enlarge and
+				// destabilize the next cache prefix for no model-visible benefit.
+				if reasoning := strings.Join(reasoningParts, ""); preserveToolReasoning && reasoning != "" {
+					msg["reasoning_content"] = reasoning
+				}
 				if text != "" {
 					msg["content"] = text
 				} else {
@@ -301,7 +318,18 @@ func ChatCompletionToAnthropicResponse(raw []byte, model string) ([]byte, error)
 		}
 	}
 	text, toolCalls := chatChoiceTextAndToolCalls(root)
-	content := make([]interface{}, 0, 1+len(toolCalls))
+	reasoning := ""
+	if IsDeepSeekModel(model) {
+		reasoning = chatChoiceReasoningContent(root)
+	}
+	content := make([]interface{}, 0, 2+len(toolCalls))
+	if reasoning != "" {
+		content = append(content, map[string]interface{}{
+			"type":      "thinking",
+			"thinking":  reasoning,
+			"signature": EncodeDeepSeekReasoningContent(reasoning),
+		})
+	}
 	if text != "" {
 		content = append(content, map[string]interface{}{"type": "text", "text": text})
 	}

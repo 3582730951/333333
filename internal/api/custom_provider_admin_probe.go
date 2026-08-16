@@ -77,7 +77,7 @@ func (s *Server) adminCustomProviderModelTest(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, errors.New("downstream_path is invalid"))
 		return
 	}
-	provider, _ = storage.ResolveCustomProviderRoute(provider, request.DownstreamPath)
+	provider, _ = resolveLiveCustomProviderRoute(provider, request.DownstreamPath)
 	targetModel, _ := customProviderMappedModel(provider, request.Model)
 	result := customProviderModelTestResult{
 		ProviderID: provider.ID, RequestedModel: request.Model, TargetModel: targetModel,

@@ -42,6 +42,7 @@
 - 通用「自定义供应商」框架：任何 **OpenAI Chat-Completions 兼容**、**OpenAI Responses 原生**或 **Anthropic Messages** 上游都能接入。新数据库不预置第三方供应商；升级只清理从未编辑且没有账号引用的旧版精确示例，用户配置保持不变。
 - 每个供应商显式声明 `upstream_protocol`：默认 `chat_completions`（Tier 3，Responses→Chat 桥接，支持稳定版 function/namespace/custom/client tool-search，兼容性损失显式报告）；可选 `responses`（Tier 2，`/v1/responses` 原生透明转发，保留 typed tools、`include`、`previous_response_id` 与未来字段/事件）。
 - 一个供应商可为 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 和其他资源路径分别配置 Base URL、协议与传输画像；精确路径优先于 `*` 回退。每条路径的粘性会话和 Cookie jar 均按下游身份隔离。
+- DeepSeek V4 官方 API 会为 Claude Code 的 `/v1/messages` 自动选择原生 Anthropic 路径；Codex 的 Responses↔Chat 桥保留工具轮 `reasoning_content`、非 null content 与并行工具归属。缓存和双 CLI 配置见 [`docs/operations/DEEPSEEK_CACHE_AND_CLI.md`](docs/operations/DEEPSEEK_CACHE_AND_CLI.md)。
 - 模型可**自动发现**（探测 `{base_url}/models` 并回写）或手动维护；管理端「供应商」页用普通表单新增，不依赖厂商预设。
 - REST:`GET/POST /admin/providers`、`DELETE /admin/providers/{id}`、`POST /admin/accounts/import-key`(裸 API Key 入池)。
 

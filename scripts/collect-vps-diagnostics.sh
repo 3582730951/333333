@@ -3,10 +3,11 @@ set -Eeuo pipefail
 
 umask 077
 
-script_version="2"
+script_version="3"
 base_url="${CODEX_POOL_BASE_URL:-http://127.0.0.1:8787}"
 admin_token="${CODEX_POOL_ADMIN_TOKEN:-}"
 database_path="${CODEX_POOL_DATABASE:-}"
+runtime_root="${CODEX_POOL_DATA_DIR:-/var/lib/codex-pool}"
 output_file=""
 app_zip=""
 journal_since="6 hours ago"
@@ -33,6 +34,7 @@ Options:
 
 The bundle never copies the database, key files, config contents, credentials,
 cookies, request bodies, or process command lines. Text is redacted and DLP-scanned.
+CODEX_POOL_DATA_DIR may override /var/lib/codex-pool for an isolated deployment.
 
 Example:
   read -rsp "Admin token: " CODEX_POOL_ADMIN_TOKEN; export CODEX_POOL_ADMIN_TOKEN; echo
@@ -274,22 +276,39 @@ if command -v docker >/dev/null 2>&1; then
     --format 'table {{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.CreatedSince}}\t{{.Size}}'
 fi
 
-for path in /var/lib/codex-pool /var/lib/codex-pool/data /var/lib/codex-pool/run /etc/codex-pool /usr/local/lib/codex-pool; do
+for path in "$runtime_root" "$runtime_root/data" "$runtime_root/run" /etc/codex-pool /usr/local/lib/codex-pool; do
   if [[ -e "$path" ]]; then
     capture "storage/stat-$(printf '%s' "$path" | tr '/' '_').txt" stat -c '%n %F %a %U:%G %s %y' "$path"
   fi
 done
-if [[ -d /var/lib/codex-pool ]]; then
-  capture "storage/usage.txt" du -x -h -d 2 /var/lib/codex-pool
-  capture "storage/layout.txt" find /var/lib/codex-pool -xdev -maxdepth 3 \
+if [[ -d "$runtime_root" ]]; then
+  capture "storage/usage.txt" du -x -h -d 2 "$runtime_root"
+  capture "storage/layout.txt" find "$runtime_root" -xdev -maxdepth 3 \
     -printf '%y %m %u:%g %s %p -> %l\n'
 fi
-if [[ -e /var/lib/codex-pool/run/active-worker.sock ]]; then
-  capture "service/active-worker-link.txt" readlink -f /var/lib/codex-pool/run/active-worker.sock
+if [[ -e "$runtime_root/run/active-worker.sock" ]]; then
+  capture "service/active-worker-link.txt" readlink -f "$runtime_root/run/active-worker.sock"
+fi
+
+# Installer failures can happen before the application diagnostics endpoint exists.
+# Include the five newest bounded text reports through the same redaction/DLP path so
+# a failed /standbyz deployment is still fully diagnosable without copying the DB.
+deploy_failure_dir="$runtime_root/deploy-failures"
+if [[ -d "$deploy_failure_dir" ]]; then
+  capture "service/deploy-failure-index.txt" find "$deploy_failure_dir" -maxdepth 1 \
+    -type f -name '*.log' -printf '%TY-%Tm-%TdT%TH:%TM:%TSZ %m %u:%g %s %f\n'
+  deploy_failure_index=0
+  while IFS='|' read -r _ failure_file; do
+    [[ -n "$failure_file" && -f "$failure_file" ]] || continue
+    ((deploy_failure_index += 1))
+    capture "service/deploy-failure-${deploy_failure_index}.txt" tail -n 800 "$failure_file"
+    (( deploy_failure_index < 5 )) || break
+  done < <(find "$deploy_failure_dir" -maxdepth 1 -type f -name '*.log' \
+    -printf '%T@|%p\n' | sort -t '|' -k1,1nr)
 fi
 
 if [[ -z "$database_path" ]]; then
-  for candidate in /var/lib/codex-pool/pool.sqlite3 /var/lib/codex-pool/codex-pool.sqlite3; do
+  for candidate in "$runtime_root/pool.sqlite3" "$runtime_root/codex-pool.sqlite3"; do
     if [[ -f "$candidate" ]]; then
       database_path="$candidate"
       break
@@ -298,6 +317,10 @@ if [[ -z "$database_path" ]]; then
 fi
 
 if [[ -n "$database_path" && -f "$database_path" ]]; then
+  if command -v lsof >/dev/null 2>&1; then
+    capture "storage/sqlite-open-files.txt" lsof -nP \
+      "$database_path" "${database_path}-wal" "${database_path}-shm"
+  fi
   python3 - "$database_path" >"$bundle_root/storage/database-metadata.json.raw" 2>&1 <<'PY'
 import json
 import sqlite3
@@ -403,7 +426,7 @@ included_app_zip=0
 if ((collect_app)); then
   if [[ -z "$app_zip" ]]; then
     newest_app_zip=""
-    for candidate in /var/lib/codex-pool/data/diagnostics/diagjob_*.zip; do
+    for candidate in "$runtime_root"/data/diagnostics/diagjob_*.zip; do
       [[ -f "$candidate" ]] || continue
       if [[ -z "$newest_app_zip" || "$candidate" -nt "$newest_app_zip" ]]; then
         newest_app_zip="$candidate"

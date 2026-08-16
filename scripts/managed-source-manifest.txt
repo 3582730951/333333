@@ -602,6 +602,7 @@ internal/prompt/anthropic_responses.go
 internal/prompt/anthropic_responses_test.go
 internal/prompt/anthropic_test.go
 internal/prompt/compat_error.go
+internal/prompt/deepseek_reasoning.go
 internal/prompt/openai_anthropic.go
 internal/prompt/openai_compat_test.go
 internal/prompt/openai_responses.go
