@@ -5016,34 +5016,36 @@ so the mark owns the size
 
 .pool-ai-settings-layout {
   display: grid;
-  grid-template-columns: minmax(176px, 208px) minmax(0, 1fr);
-  gap: 20px;
+  grid-template-columns: 196px minmax(0, 1fr);
+  gap: var(--pool-space-8);
   align-items: start;
+  max-width: 1320px;
 }
 
 .pool-ai-settings-nav {
   position: sticky;
   top: 76px;
   display: grid;
-  gap: 4px;
-  padding: 0 0 0 8px;
-  border: 0;
-  border-left: 1px solid var(--pool-border);
-  border-radius: 0;
-  background: transparent;
+  gap: var(--pool-space-1);
+  padding: var(--pool-space-2);
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-card);
+  background: var(--pool-bg-surface-2);
 }
 
 .pool-ai-settings-nav button {
-  min-height: 42px;
-  padding: 9px 12px;
+  min-height: var(--pool-hit-target);
+  padding: 10px 12px;
   border: 0;
-  border-radius: var(--pool-radius-xs);
+  border-radius: var(--pool-radius-control);
   background: transparent;
   color: var(--pool-text-2);
   font: inherit;
-  font-weight: 620;
+  font-size: var(--pool-type-body);
+  font-weight: 590;
   text-align: left;
   cursor: pointer;
+  transition: color var(--pool-motion-fast) var(--pool-motion-ease), background var(--pool-motion-fast) var(--pool-motion-ease);
 }
 
 .pool-ai-settings-nav button:hover {
@@ -5052,40 +5054,136 @@ so the mark owns the size
 }
 
 .pool-ai-settings-nav button:focus-visible {
-  outline: 2px solid var(--pool-accent);
-  outline-offset: 1px;
+  outline: 3px solid var(--pool-focus-color);
+  outline-offset: 2px;
 }
 
 .pool-ai-settings-nav button.is-active {
   background: var(--pool-accent-soft);
-  color: var(--pool-accent);
+  color: var(--pool-accent-text);
+  font-weight: 680;
 }
 
 .pool-ai-settings-content {
   min-width: 0;
-  max-width: 940px;
+  max-width: 1080px;
 }
 
 .pool-ai-settings-heading {
   display: flex;
-  min-height: 52px;
-  margin-bottom: 14px;
+  min-height: 76px;
+  margin-bottom: var(--pool-space-6);
   align-items: flex-start;
   justify-content: space-between;
-  gap: 16px;
+  gap: var(--pool-space-6);
+}
+
+.pool-ai-settings-heading__subtitle,
+.pool-ai-settings-heading__count {
+  display: block;
+}
+
+.pool-ai-settings-heading__subtitle {
+  margin-top: var(--pool-space-2);
+  line-height: var(--pool-leading-body);
+}
+
+.pool-ai-settings-heading__count {
+  margin-top: var(--pool-space-2);
+}
+
+.pool-ai-settings-sections {
+  display: grid;
+  gap: var(--pool-space-6);
 }
 
 .pool-ai-settings-card {
-  margin-bottom: 16px;
+  padding: 0;
+  overflow: clip;
+  border-radius: var(--pool-radius-card);
+}
+
+.pool-ai-settings-card .pool-card-head {
+  min-height: 60px;
+  margin: 0;
+  padding: var(--pool-space-4) var(--pool-space-6);
+  border-bottom: 1px solid var(--pool-border);
+  background: var(--pool-bg-surface-2);
+}
+
+.pool-ai-settings-card__count {
+  display: inline-grid;
+  min-width: 28px;
+  min-height: 24px;
+  place-items: center;
+  padding: 0 var(--pool-space-2);
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-pill);
+  background: var(--pool-bg-surface);
+  color: var(--pool-text-2);
+  font-size: var(--pool-type-caption);
+  font-variant-numeric: tabular-nums;
+}
+
+.pool-ai-settings-card .pool-card-body {
+  padding: 0 var(--pool-space-6);
 }
 
 .pool-ai-settings-row {
+  grid-template-columns: minmax(260px, 1fr) minmax(260px, 360px);
+  gap: var(--pool-space-8);
+  min-height: 112px;
+  padding: var(--pool-space-5) 0;
+  border-color: var(--pool-border-subtle);
   scroll-margin-top: 96px;
+}
+
+.pool-ai-settings-row .pool-settings-row__title {
+  font-size: var(--pool-type-body);
+  font-weight: 650;
+  line-height: var(--pool-leading-body);
+  cursor: pointer;
+}
+
+.pool-ai-settings-row .pool-settings-row__help {
+  max-width: 660px;
+  margin-top: var(--pool-space-2);
+  color: var(--pool-text-2);
+  line-height: var(--pool-leading-body);
+}
+
+.pool-ai-settings-row .pool-settings-row__key {
+  margin-top: var(--pool-space-2);
+  color: var(--pool-text-3);
+  font-size: var(--pool-type-caption);
+  line-height: 1.4;
+}
+
+.pool-ai-settings-row .pool-settings-row__control {
+  align-self: center;
 }
 
 .pool-ai-settings-skeleton {
   min-height: 240px;
   border-radius: var(--pool-radius-md);
+}
+
+@media (min-width: 768px) and (max-width: 900px) {
+  .pool-ai-settings-layout {
+    grid-template-columns: 168px minmax(0, 1fr);
+    gap: var(--pool-space-5);
+  }
+
+  .pool-ai-settings-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--pool-space-3);
+    min-height: 0;
+  }
+
+  .pool-ai-settings-row .pool-settings-row__control {
+    width: min(100%, 360px);
+    justify-self: start;
+  }
 }
 
 .pool-ordered-select {
@@ -5782,7 +5880,7 @@ so the mark owns the size
 
   .pool-ai-settings-layout {
     grid-template-columns: 1fr;
-    gap: 14px;
+    gap: var(--pool-space-5);
   }
 
   /* Wraps, deliberately, instead of scrolling sideways.
@@ -5828,6 +5926,27 @@ so the mark owns the size
 
   .pool-ai-settings-heading {
     min-height: 0;
+    margin-bottom: var(--pool-space-5);
+    gap: var(--pool-space-3);
+  }
+
+  .pool-ai-settings-sections {
+    gap: var(--pool-space-4);
+  }
+
+  .pool-ai-settings-card .pool-card-head {
+    min-height: 56px;
+    padding: var(--pool-space-4);
+  }
+
+  .pool-ai-settings-card .pool-card-body {
+    padding: 0 var(--pool-space-4);
+  }
+
+  .pool-ai-settings-row {
+    min-height: 0;
+    padding: var(--pool-space-5) 0;
+    gap: var(--pool-space-3);
   }
 
   .pool-user-group-grid {

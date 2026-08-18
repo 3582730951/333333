@@ -417,6 +417,15 @@ func responsesInputToChatMessagesBridge(input interface{}, plan *ResponsesToolBr
 				if role == "" {
 					role = "user"
 				}
+				// DeepSeek's Chat Completions schema accepts system, user,
+				// assistant, and tool roles, but Codex Responses requests can
+				// contain developer messages. Preserve their exact position and
+				// content while expressing the same instruction precedence with
+				// the provider-supported system role. Keep this provider-specific:
+				// other OpenAI-compatible backends may natively support developer.
+				if preserveDeepSeekReasoning && role == "developer" {
+					role = "system"
+				}
 				if role == "assistant" {
 					assistant := ensureAssistant()
 					if _, alreadyHasContent := assistant["content"]; alreadyHasContent {

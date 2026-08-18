@@ -45,16 +45,23 @@ func (s *Server) journalReplayBody(ctx context.Context, current []byte) ([]byte,
 	if err != nil {
 		return current, false
 	}
-	base["model"] = cur["model"]
-	for _, k := range []string{"instructions", "tools", "reasoning", "stream", "include"} {
-		if v, ok := cur[k]; ok {
-			base[k] = v
+	// The current turn owns the complete request envelope, including future fields
+	// such as text, tool_choice, parallel_tool_calls and reasoning controls. Only the
+	// chronological input prefix comes from the encrypted journal.
+	rebuilt := make(map[string]interface{}, len(cur)+1)
+	for key, value := range cur {
+		switch key {
+		case "input", "messages", "previous_response_id", "turn_state":
+			continue
+		default:
+			rebuilt[key] = value
 		}
 	}
-	base["input"] = appendItems(base["input"], cur["input"])
-	delete(base, "previous_response_id")
-	delete(base, "turn_state")
-	out, e := json.Marshal(base)
+	if _, ok := rebuilt["model"]; !ok {
+		rebuilt["model"] = base["model"]
+	}
+	rebuilt["input"] = mergeCodexGoalReplayInput(base["input"], cur["input"])
+	out, e := json.Marshal(rebuilt)
 	return out, e == nil
 }
 
@@ -79,6 +86,14 @@ func (s *Server) persistContextJournal(ctx context.Context, requestBody, respons
 		// but do not keep copying complete histories once v2 recovery is validated.
 		return nil
 	}
+	return s.persistContextJournalFallback(ctx, requestBody, responseBody, affinityHash, accountID)
+}
+
+// persistContextJournalFallback writes one encrypted v1 tail even when goal-v2 is
+// enabled. It is used only when v2 could not create a reachable session (for example
+// a bare Responses client whose first durable identifier is the response id returned
+// by this turn), or when a v2 commit failed. Normal v2 sessions never dual-write.
+func (s *Server) persistContextJournalFallback(ctx context.Context, requestBody, responseBody []byte, affinityHash, accountID string) error {
 	req, reqErr := decodeContextJSONMap(requestBody)
 	resp, respErr := decodeContextJSONMap(responseBody)
 	if reqErr != nil || respErr != nil {
@@ -91,8 +106,12 @@ func (s *Server) persistContextJournal(ctx context.Context, requestBody, respons
 	if prev, _ := req["previous_response_id"].(string); prev != "" {
 		if j, e := s.store.GetContextJournal(ctx, prev); e == nil {
 			if base, decodeErr := decodeContextJSONMap([]byte(j.Payload)); decodeErr == nil {
-				base["input"] = appendItems(base["input"], req["input"])
-				req = base
+				// Persist the current request envelope exactly as the next-turn
+				// authority while extending only its chronological input. Reusing
+				// the old envelope here would silently resurrect a prior model,
+				// instruction, tool set, reasoning effort, or future option on the
+				// following turn.
+				req["input"] = mergeCodexGoalReplayInput(base["input"], req["input"])
 			}
 			// Keep the chain's live tail warm as the conversation advances.
 			s.touchContextJournal(ctx, prev)

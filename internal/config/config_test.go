@@ -357,6 +357,7 @@ func TestExampleConfigKeepsOptimizedCacheDefaults(t *testing.T) {
 		"leak_scrub_enabled":                    true,
 		"token_save_enabled":                    false,
 		"codex_install_model":                   "gpt-5.6-sol",
+		"codex_install_context_window":          float64(0),
 		"codex_install_effort":                  "",
 		"codex_install_approval_policy":         "",
 		"codex_install_sandbox_mode":            "",
@@ -383,6 +384,9 @@ func TestExampleConfigKeepsOptimizedCacheDefaults(t *testing.T) {
 	}
 	if cfg.CodexInstallModel != "gpt-5.6-sol" {
 		t.Fatalf("CodexInstallModel = %q, want gpt-5.6-sol", cfg.CodexInstallModel)
+	}
+	if cfg.CodexInstallContextWindow != 0 {
+		t.Fatalf("CodexInstallContextWindow = %d, want 0 (preserve client/model default)", cfg.CodexInstallContextWindow)
 	}
 	if cfg.CodexInstallEffort != "" || cfg.CodexInstallApprovalPolicy != "" || cfg.CodexInstallSandboxMode != "" {
 		t.Fatalf("Codex client policy defaults must be preserved, got effort=%q approval=%q sandbox=%q", cfg.CodexInstallEffort, cfg.CodexInstallApprovalPolicy, cfg.CodexInstallSandboxMode)

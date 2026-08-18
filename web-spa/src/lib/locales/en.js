@@ -181,6 +181,7 @@ const en = {
   'ai_settings.codex_subtitle': 'Responses, Codex client profile, model windows, and reasoning',
   'ai_settings.claude_code_subtitle': 'Messages, Claude Code sessions, beta flags, and protocol profile',
   'ai_settings.global': 'Global',
+  'ai_settings.field_count': '{count} settings',
   'ai_settings.unsaved_count': '{count} unsaved',
   'ai_settings.load_failed': 'AI settings unavailable',
   'ai_settings.empty_title': 'No dedicated settings',

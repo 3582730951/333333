@@ -24,8 +24,9 @@ fi
 echo "ok"
 
 step "2/7 deployment shell lifecycle"
-bash -n scripts/install.sh scripts/rollback-release.sh scripts/fetch-diagnostics.sh scripts/collect-vps-diagnostics.sh scripts/test-install-single-worker.sh
+bash -n scripts/install.sh scripts/rollback-release.sh scripts/fetch-diagnostics.sh scripts/collect-vps-diagnostics.sh scripts/test-install-single-worker.sh scripts/test-collect-vps-diagnostics.sh
 bash scripts/test-install-single-worker.sh
+bash scripts/test-collect-vps-diagnostics.sh
 echo "ok"
 
 step "3/7 go vet"

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -173,9 +174,21 @@ func workerLinkTargets(activeLink, workerSocket string) bool {
 	if activeLink == "" || workerSocket == "" {
 		return false
 	}
-	resolved, err := filepath.EvalSymlinks(activeLink)
-	if err != nil {
-		return false
+	// Compare the link target itself instead of requiring EvalSymlinks to reach a
+	// currently existing socket. During promotion the pre-init listener closes and
+	// the full worker rebinds the same path; the symlink is intentionally dangling
+	// for that brief interval. A restarted promoted worker must still identify itself
+	// as active rather than re-entering pre-init standby forever.
+	resolved, err := os.Readlink(activeLink)
+	if err == nil {
+		if !filepath.IsAbs(resolved) {
+			resolved = filepath.Join(filepath.Dir(activeLink), resolved)
+		}
+	} else {
+		resolved, err = filepath.EvalSymlinks(activeLink)
+		if err != nil {
+			return false
+		}
 	}
 	resolved, err = filepath.Abs(resolved)
 	if err != nil {

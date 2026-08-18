@@ -100,6 +100,75 @@ func TestGoWithOptionsRestartsUnexpectedReturn(t *testing.T) {
 	}
 }
 
+func TestRestartableSerializesActiveRoleGenerations(t *testing.T) {
+	clearRecentEventsForTest()
+	clearModuleStatesForTest()
+	t.Cleanup(clearRecentEventsForTest)
+	t.Cleanup(clearModuleStatesForTest)
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	defer cancelFirst()
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	defer cancelSecond()
+
+	var runner Restartable
+	var calls atomic.Int32
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	firstStarted := make(chan struct{})
+	firstStopped := make(chan struct{})
+	secondStarted := make(chan struct{})
+	run := func(ctx context.Context) {
+		call := calls.Add(1)
+		current := active.Add(1)
+		for {
+			maximum := maxActive.Load()
+			if current <= maximum || maxActive.CompareAndSwap(maximum, current) {
+				break
+			}
+		}
+		if call == 1 {
+			close(firstStarted)
+		} else {
+			select {
+			case <-firstStopped:
+			default:
+				t.Error("replacement generation started before predecessor stopped")
+			}
+			close(secondStarted)
+		}
+		<-ctx.Done()
+		active.Add(-1)
+		if call == 1 {
+			close(firstStopped)
+		}
+	}
+
+	runner.Start(firstCtx, Options{Name: "active-role-module"}, run)
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first generation did not start")
+	}
+	runner.Start(secondCtx, Options{Name: "active-role-module"}, run)
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("replacement generation did not start")
+	}
+	if maxActive.Load() != 1 {
+		t.Fatalf("concurrent supervised generations = %d, want 1", maxActive.Load())
+	}
+	state := moduleStateByName(t, "active-role-module")
+	if state.Status != StatusRunning {
+		t.Fatalf("replacement module state = %#v, want running", state)
+	}
+	cancelSecond()
+	waitForModuleState(t, "active-role-module", func(state ModuleState) bool {
+		return state.Status == StatusStopped
+	})
+}
+
 func TestGoWithOptionsDoesNotStartBareSuperviseGoroutine(t *testing.T) {
 	source, err := os.ReadFile("supervisor.go")
 	if err != nil {
@@ -222,7 +291,7 @@ func TestGoUntilSuccessRetriesErrorsAndStopsAfterSuccess(t *testing.T) {
 		t.Fatal("finite task did not reach success")
 	}
 	state := waitForModuleState(t, "finite-retry-task", func(state ModuleState) bool {
-		return state.Status == StatusStopped && state.LastMessage == "task completed"
+		return state.Status == StatusCompleted && state.LastMessage == "task completed"
 	})
 	if got := calls.Load(); got != 3 {
 		t.Fatalf("successful finite task calls=%d, want exactly 3", got)
@@ -231,7 +300,7 @@ func TestGoUntilSuccessRetriesErrorsAndStopsAfterSuccess(t *testing.T) {
 		strings.Contains(got, "exited unexpectedly") {
 		t.Fatalf("finite retry logs=%q", got)
 	}
-	if state.Status != StatusStopped || state.LastMessage != "task completed" ||
+	if state.Status != StatusCompleted || state.LastMessage != "task completed" ||
 		state.RestartCount != 2 || state.UnexpectedExitCount != 0 {
 		t.Fatalf("finite retry state=%#v", state)
 	}
@@ -267,10 +336,10 @@ func TestGoUntilSuccessRetriesPanicThenCompletes(t *testing.T) {
 		t.Fatal("finite task did not retry its panic")
 	}
 	state := waitForModuleState(t, "finite-panic-task", func(state ModuleState) bool {
-		return state.Status == StatusStopped && state.LastMessage == "task completed"
+		return state.Status == StatusCompleted && state.LastMessage == "task completed"
 	})
-	if state.Status != StatusStopped || state.LastMessage != "task completed" ||
-		state.RestartCount != 1 || state.PanicCount != 1 {
+	if state.Status != StatusCompleted || state.LastMessage != "task completed" ||
+		state.RestartCount != 1 || state.PanicCount != 1 || state.LastPanic != "" {
 		t.Fatalf("finite panic state=%#v", state)
 	}
 	if got := logs.string(); !strings.Contains(got, "panic=finite boom") ||

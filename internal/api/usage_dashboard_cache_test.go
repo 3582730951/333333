@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -55,5 +56,21 @@ func TestUsageDashboardResponseCacheFreshAndStaleRefresh(t *testing.T) {
 	cache.Serve(latest, request, render)
 	if body := latest.Body.String(); body != `{"render":2}` {
 		t.Fatalf("refreshed body = %s", body)
+	}
+}
+
+func TestUsageDashboardResponseCachePropagatesSafeFailureClass(t *testing.T) {
+	cache := newUsageDashboardResponseCache()
+	request := httptest.NewRequest(http.MethodGet, "/admin/usage/dashboard", nil)
+	underlying := httptest.NewRecorder()
+	recorder := &responseRecorder{ResponseWriter: underlying, status: http.StatusOK}
+	cache.Serve(recorder, request, func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusInternalServerError, errors.New("database is locked (5)"))
+	})
+	if underlying.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", underlying.Code, underlying.Body.String())
+	}
+	if recorder.diagnosticErrClass != "database_busy" {
+		t.Fatalf("diagnostic error class=%q", recorder.diagnosticErrClass)
 	}
 }

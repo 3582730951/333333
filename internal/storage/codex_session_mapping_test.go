@@ -624,3 +624,64 @@ tree_id,account_id,egress_id,epoch,state,status_code,created_at,expires_at) VALU
 		t.Fatalf("second cleanup duplicated aggregate: rows=%+v err=%v", rows, err)
 	}
 }
+
+func TestCleanupCodexUpstreamAttemptsUsesBoundedExactlyOnceBatches(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := Now()
+	day := now - now%86400
+	tx, err := store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const expiredTotal = 600
+	for index := 0; index < expiredTotal; index++ {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO codex_upstream_attempt(
+tree_id,account_id,egress_id,epoch,state,status_code,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)`,
+			fmt.Sprintf("expired-batch-%03d", index), "account-batch", "egress-batch", 1,
+			"response_headers", 429, day+int64(index), now-1); err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO codex_upstream_attempt(
+tree_id,account_id,egress_id,epoch,state,status_code,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)`,
+		"live-batch", "account-batch", "egress-batch", 1, "request_sent", 0, now, now+3600); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	for pass, wantExpired := range []int{344, 88, 0} {
+		if _, err = store.CleanupCodexSessionMappings(ctx); err != nil {
+			t.Fatalf("pass %d: %v", pass+1, err)
+		}
+		var expired, live, aggregated int
+		if err = store.DB().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM codex_upstream_attempt WHERE expires_at<=?`, now).Scan(&expired); err != nil {
+			t.Fatal(err)
+		}
+		if err = store.DB().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM codex_upstream_attempt WHERE expires_at>?`, now).Scan(&live); err != nil {
+			t.Fatal(err)
+		}
+		if err = store.DB().QueryRowContext(ctx,
+			`SELECT COALESCE(SUM(attempt_count),0) FROM codex_upstream_attempt_daily`).Scan(&aggregated); err != nil {
+			t.Fatal(err)
+		}
+		if expired != wantExpired || live != 1 || aggregated != expiredTotal-wantExpired {
+			t.Fatalf("pass %d expired/live/aggregated=%d/%d/%d want=%d/1/%d",
+				pass+1, expired, live, aggregated, wantExpired, expiredTotal-wantExpired)
+		}
+	}
+	if _, err = store.CleanupCodexSessionMappings(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var aggregated int
+	if err = store.DB().QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(attempt_count),0) FROM codex_upstream_attempt_daily`).Scan(&aggregated); err != nil || aggregated != expiredTotal {
+		t.Fatalf("retry aggregate=%d err=%v", aggregated, err)
+	}
+}

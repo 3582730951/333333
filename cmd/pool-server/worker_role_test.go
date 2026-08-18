@@ -102,6 +102,21 @@ func TestWorkerLinkTargetsUsesResolvedExactPath(t *testing.T) {
 	}
 }
 
+func TestWorkerLinkTargetsAcceptsPromotedDanglingSocket(t *testing.T) {
+	dir := t.TempDir()
+	worker := filepath.Join(dir, "worker-promoted.sock")
+	link := filepath.Join(dir, "active-worker.sock")
+	// The pre-init listener removes its socket before the promoted full worker
+	// rebinds it. The atomic target is still authoritative during this interval.
+	replaceWorkerLink(t, link, worker)
+	if _, err := os.Stat(worker); !os.IsNotExist(err) {
+		t.Fatalf("fixture socket unexpectedly exists: %v", err)
+	}
+	if !workerLinkTargets(link, worker) {
+		t.Fatal("promoted dangling socket target was not recognized")
+	}
+}
+
 func TestLeaseRenewTimeoutLeavesExpiryHeadroom(t *testing.T) {
 	for _, test := range []struct {
 		ttl, want time.Duration

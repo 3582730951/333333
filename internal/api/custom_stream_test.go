@@ -433,6 +433,30 @@ func TestCustomProviderResponsesStreaming(t *testing.T) {
 	if compatibility != wantLosses {
 		t.Fatalf("recorded compatibility losses = %q, want %q", compatibility, wantLosses)
 	}
+
+	// The terminal event must be durably committed before it is released to the
+	// client. A following stateless Chat-provider turn can therefore rebuild the
+	// streamed user/assistant prefix instead of starting a cache-cold conversation.
+	followup, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(
+		`{"model":"deepseek-chat","previous_response_id":"resp_c1","input":[{"role":"user","content":"continue"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	followupBody, _ := io.ReadAll(followup.Body)
+	followup.Body.Close()
+	if followup.StatusCode != http.StatusOK || !bytes.Contains(followupBody, []byte("hello world")) {
+		t.Fatalf("stream continuation status=%d body=%s", followup.StatusCode, followupBody)
+	}
+	if got := followup.Header.Get("X-MiCliProxy-Context-Status"); !strings.HasPrefix(got, "rebuilt") {
+		t.Fatalf("stream continuation context status=%q", got)
+	}
+	requests := h.requests()
+	warm := requests[len(requests)-1].Body
+	for _, want := range []string{`"content":"hi"`, `"content":"hello"`, `"content":"continue"`} {
+		if !strings.Contains(warm, want) {
+			t.Fatalf("stream continuation lost %s: %s", want, warm)
+		}
+	}
 }
 
 func TestChatStreamToResponsesSSEUsesBridgePlanForStableTools(t *testing.T) {
@@ -507,6 +531,51 @@ func TestChatStreamToAnthropicSSESerializesInterleavedTools(t *testing.T) {
 	secondStart := strings.Index(got, `"name":"Write"`)
 	if firstStart < 0 || firstStop < firstStart || secondStart < firstStop {
 		t.Fatalf("tool blocks were not serialized contiguously:\n%s", got)
+	}
+}
+
+func TestChatStreamToResponsesSSEPreservesDeepSeekToolReasoning(t *testing.T) {
+	stream := "data: " + `{"id":"deepseek-stream","choices":[{"delta":{"reasoning_content":"inspect "}}]}` + "\n\n" +
+		"data: " + `{"id":"deepseek-stream","choices":[{"delta":{"reasoning_content":"first","tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}` + "\n\n" +
+		"data: " + `{"id":"deepseek-stream","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.go\"}"}}]},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	recorder := httptest.NewRecorder()
+	chatStreamToResponsesSSE(recorder, strings.NewReader(stream), "deepseek-v4-pro", streamrewrite.New(nil))
+	got := recorder.Body.String()
+	for _, want := range []string{
+		`"type":"response.reasoning_summary_text.delta"`, `"delta":"inspect "`, `"delta":"first"`,
+		`"type":"reasoning"`, `"encrypted_content":"pool-deepseek-reasoning-v1:`,
+		`"type":"function_call"`, `"name":"read_file"`, `"arguments":"{\"path\":\"a.go\"}"`,
+		`"type":"response.completed"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("DeepSeek Responses stream missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Index(got, `"type":"reasoning"`) > strings.Index(got, `"type":"function_call"`) {
+		t.Fatalf("reasoning item must precede its tool call:\n%s", got)
+	}
+}
+
+func TestChatStreamToAnthropicSSEPreservesDeepSeekToolReasoning(t *testing.T) {
+	stream := "data: " + `{"id":"deepseek-claude","choices":[{"delta":{"reasoning":"plan "}}]}` + "\n\n" +
+		"data: " + `{"id":"deepseek-claude","choices":[{"delta":{"reasoning":"tool","tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"key\":\"x\"}"}}]},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	recorder := httptest.NewRecorder()
+	chatStreamToAnthropicSSE(recorder, strings.NewReader(stream), "deepseek-v4-pro", streamrewrite.New(nil))
+	got := recorder.Body.String()
+	for _, want := range []string{
+		`"type":"thinking"`, `"type":"thinking_delta"`, `"thinking":"plan "`, `"thinking":"tool"`,
+		`"type":"signature_delta"`, `"signature":"pool-deepseek-reasoning-v1:`,
+		`"type":"tool_use"`, `"name":"lookup"`, `"partial_json":"{\"key\":\"x\"}"`,
+		`"stop_reason":"tool_use"`, "event: message_stop",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("DeepSeek Anthropic stream missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Index(got, `"type":"signature_delta"`) > strings.Index(got, `"type":"tool_use"`) {
+		t.Fatalf("reasoning signature must close before its tool call:\n%s", got)
 	}
 }
 

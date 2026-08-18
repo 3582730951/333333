@@ -3,7 +3,9 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -93,6 +95,49 @@ func TestDiagnosticHTTPRouteNameUsesOnlyMuxPattern(t *testing.T) {
 	for pattern, want := range tests {
 		if got := diagnosticHTTPRouteName(pattern); got != want {
 			t.Fatalf("diagnosticHTTPRouteName(%q) = %q, want %q", pattern, got, want)
+		}
+	}
+}
+
+func TestRequiresInferenceAdmissionKeepsControlPlaneIndependent(t *testing.T) {
+	tests := []struct {
+		method string
+		path   string
+		want   bool
+	}{
+		{http.MethodPost, "/v1/responses", true},
+		{http.MethodPost, "/v1/messages", true},
+		{http.MethodPost, "/v1/alpha/search", true},
+		{http.MethodPost, "/public-chat/demo/messages", true},
+		{http.MethodGet, "/public-chat/demo/config", false},
+		{http.MethodGet, "/admin/usage/dashboard", false},
+		{http.MethodGet, "/admin/usage/model-audit", false},
+		{http.MethodGet, "/admin/register/stats", false},
+		{http.MethodGet, "/admin/export/logs?mode=emergency", false},
+	}
+	for _, test := range tests {
+		req := httptest.NewRequest(test.method, test.path, nil)
+		if got := requiresInferenceAdmission(req); got != test.want {
+			t.Errorf("requiresInferenceAdmission(%s %s)=%v, want %v", test.method, test.path, got, test.want)
+		}
+	}
+}
+
+func TestSafeDiagnosticErrorClass(t *testing.T) {
+	tests := []struct {
+		err  error
+		want string
+	}{
+		{context.Canceled, "request_canceled"},
+		{context.DeadlineExceeded, "deadline_exceeded"},
+		{errors.New("database is locked (5)"), "database_busy"},
+		{errors.New("attempt to write a readonly database"), "database_readonly"},
+		{errors.New("sql: database is closed"), "storage_unavailable"},
+		{errors.New("synthetic failure"), "internal_error"},
+	}
+	for _, test := range tests {
+		if got := safeDiagnosticErrorClass(test.err); got != test.want {
+			t.Errorf("safeDiagnosticErrorClass(%v)=%q, want %q", test.err, got, test.want)
 		}
 	}
 }

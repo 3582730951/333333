@@ -66,6 +66,18 @@ func run() int {
 	if releaseID == "" {
 		releaseID = "development"
 	}
+	// An A/B candidate must be observable before it competes with the active
+	// generation for SQLite migrations or runtime leases. In auto mode, an existing
+	// active-worker link that points elsewhere means this process is a staged
+	// candidate: serve only the private deployment contract until the installer
+	// atomically promotes this socket, then exec the same binary into full startup.
+	if handled, standbyErr := runPreinitStandby(unixSocket, releaseID, deploymentRole); handled {
+		if standbyErr != nil {
+			log.Printf("pre-init standby: %v", standbyErr)
+			return 1
+		}
+		return 0
+	}
 
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -387,6 +399,127 @@ func run() int {
 		return 1
 	}
 	return 0
+}
+
+type preinitStandbyHandler struct {
+	releaseID  string
+	workerAddr string
+	startedAt  time.Time
+}
+
+func (h *preinitStandbyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Codex-Pool-Release", h.releaseID)
+	switch r.URL.Path {
+	case "/livez":
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok": true, "release_id": h.releaseID, "deployment_state": "preinit_standby",
+		})
+	case "/standbyz":
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":               true,
+			"standby_ready":    true,
+			"release_id":       h.releaseID,
+			"deployment_state": "preinit_standby",
+			"started_at":       h.startedAt.Format(time.RFC3339Nano),
+			"worker_socket":    h.workerAddr,
+			"checks":           map[string]bool{"storage": false},
+			"capabilities": map[string]string{
+				"preinit_promotion": "exec_on_active_link",
+			},
+		})
+	case "/readyz":
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok": false, "ready": false, "release_id": h.releaseID,
+			"deployment_state": "preinit_standby", "checks": map[string]bool{"storage": false},
+		})
+	default:
+		writeWorkerUnavailable(w)
+	}
+}
+
+// runPreinitStandby returns handled=false for ordinary/fresh startup. A staged A/B
+// candidate instead remains a tiny deployment-only process until active-worker.sock
+// points to its private socket. No config, key, database, migration, optional module,
+// or application router is opened in this phase.
+func runPreinitStandby(unixSocket, releaseID, deploymentRole string) (bool, error) {
+	mode := strings.ToLower(strings.TrimSpace(deploymentRole))
+	if mode == "" {
+		mode = "auto"
+	}
+	workerSocket := filepath.Clean(strings.TrimSpace(unixSocket))
+	if mode != "auto" || workerSocket == "" || workerSocket == "." {
+		return false, nil
+	}
+	activeLink := filepath.Join(filepath.Dir(workerSocket), "active-worker.sock")
+	if _, err := os.Lstat(activeLink); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return true, fmt.Errorf("inspect active worker link: %w", err)
+	}
+	if workerLinkTargets(activeLink, workerSocket) {
+		return false, nil
+	}
+
+	handler := &preinitStandbyHandler{releaseID: releaseID, workerAddr: workerSocket, startedAt: time.Now().UTC()}
+	httpServer := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	serveErr := make(chan error, 1)
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				supervisor.LogPanic("preinit-standby-http", recovered)
+				serveErr <- fmt.Errorf("pre-init standby HTTP panic: %v", recovered)
+			}
+		}()
+		serveErr <- serveHTTPServerOn(httpServer, workerSocket)
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(stop)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	shutdown := func() error {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		shutdownErr := httpServer.Shutdown(shutdownCtx)
+		select {
+		case err := <-serveErr:
+			return errors.Join(shutdownErr, err)
+		case <-shutdownCtx.Done():
+			return errors.Join(shutdownErr, shutdownCtx.Err())
+		}
+	}
+
+	for {
+		select {
+		case sig := <-stop:
+			log.Printf("pre-init standby received %s", sig)
+			return true, shutdown()
+		case err := <-serveErr:
+			return true, err
+		case <-ticker.C:
+			if !workerLinkTargets(activeLink, workerSocket) {
+				continue
+			}
+			log.Printf("pre-init standby promoted release=%s; entering full worker startup", releaseID)
+			if err := shutdown(); err != nil {
+				return true, fmt.Errorf("close pre-init listener: %w", err)
+			}
+			executable, err := os.Executable()
+			if err != nil {
+				return true, fmt.Errorf("resolve worker executable: %w", err)
+			}
+			if err := syscall.Exec(executable, os.Args, os.Environ()); err != nil {
+				return true, fmt.Errorf("exec promoted worker: %w", err)
+			}
+			return true, nil
+		}
+	}
 }
 
 func startActiveLedgerPurge(ctx context.Context, store *storage.Store, cfg config.Config) {

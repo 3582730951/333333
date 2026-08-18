@@ -58,13 +58,26 @@ function fieldValue(field: ConfigField, pending: SettingsValues) {
   return hasOwnValue(pending, field.key) ? pending[field.key] : field.value;
 }
 
-function fieldControl(field: ConfigField, value: unknown, onChange: (key: string, value: unknown) => void) {
+
+function fieldControl(
+  field: ConfigField,
+  value: unknown,
+  onChange: (key: string, value: unknown) => void,
+  controlId: string,
+  describedBy?: string,
+) {
+  const accessibilityProps = {
+    id: controlId,
+    'aria-describedby': describedBy,
+    disabled: field.effect === 'restart',
+  };
   switch (field.type) {
     case 'bool':
-      return <Switch aria-label={field.label} checked={Boolean(value)} onChange={(next: boolean) => onChange(field.key, next)} />;
+      return <Switch {...accessibilityProps} checked={Boolean(value)} onChange={(next: boolean) => onChange(field.key, next)} />;
     case 'select':
       return (
         <Select
+          {...accessibilityProps}
           aria-label={field.label}
           value={value ?? ''}
           onChange={(next: unknown) => onChange(field.key, next)}
@@ -73,29 +86,44 @@ function fieldControl(field: ConfigField, value: unknown, onChange: (key: string
         />
       );
     case 'int':
-      return <InputNumber aria-label={field.label} value={Number(value) || 0} onChange={(next: number) => onChange(field.key, next)} style={{ width: 180 }} />;
+      return (
+        <InputNumber
+          {...accessibilityProps}
+          aria-label={field.label}
+          value={Number(value) || 0}
+          min={field.key === 'codex_install_context_window' ? 0 : undefined}
+          max={field.key === 'codex_install_context_window' ? 4194304 : undefined}
+          step={field.key === 'codex_install_context_window' ? 1024 : undefined}
+          onChange={(next: number) => onChange(field.key, next)}
+          style={{ width: field.key === 'codex_install_context_window' ? 240 : 180 }}
+        />
+      );
     default:
-      return <Input aria-label={field.label} value={value ?? ''} onChange={(next: unknown) => onChange(field.key, next)} style={{ width: 300 }} />;
+      return <Input {...accessibilityProps} aria-label={field.label} value={value ?? ''} onChange={(next: unknown) => onChange(field.key, next)} style={{ width: 300 }} />;
   }
 }
 
 function ConfigFieldRow({ field, pending, onChange }: { field: ConfigField; pending: SettingsValues; onChange: (key: string, value: unknown) => void }) {
   const changed = hasOwnValue(pending, field.key);
+  const controlId = `setting-control-${field.key}`;
+  const helpId = field.help ? `setting-help-${field.key}` : undefined;
+  const errorId = field.settings_error ? `setting-error-${field.key}` : undefined;
+  const describedBy = [helpId, errorId].filter(Boolean).join(' ') || undefined;
   return (
     <div className="pool-settings-row pool-ai-settings-row" id={`setting-${field.key}`} data-setting-key={field.key}>
       <div className="pool-settings-row__meta">
-        <div className="pool-settings-row__title">
+        <label className="pool-settings-row__title" htmlFor={controlId}>
           {field.label}
           {field.scope === 'global' ? <Tag size="small" color="blue">{t('ai_settings.global')}</Tag> : null}
           {field.overridden ? <Tag size="small" color="blue">{t('settings.overridden')}</Tag> : null}
           {field.effect === 'restart' ? <Tag size="small" color="orange">{t('settings.restart_required')}</Tag> : null}
           {changed ? <Tag size="small" color="green">{t('settings.pending')}</Tag> : null}
-        </div>
-        {field.help ? <Typography.Text type="tertiary" size="small" className="pool-settings-row__help">{field.help}</Typography.Text> : null}
-        {field.settings_error ? <Typography.Text type="danger" size="small" className="pool-settings-row__error">{field.settings_error}</Typography.Text> : null}
+        </label>
+        {field.help ? <Typography.Text id={helpId} type="tertiary" size="small" className="pool-settings-row__help">{field.help}</Typography.Text> : null}
+        {field.settings_error ? <Typography.Text id={errorId} type="danger" size="small" className="pool-settings-row__error">{field.settings_error}</Typography.Text> : null}
+        <Typography.Text type="quaternary" size="small" className="pool-settings-row__key">{field.key}</Typography.Text>
       </div>
-      <div className="pool-settings-row__control">{fieldControl(field, fieldValue(field, pending), onChange)}</div>
-      <Typography.Text type="quaternary" size="small" className="pool-settings-row__key">{field.key}</Typography.Text>
+      <div className="pool-settings-row__control">{fieldControl(field, fieldValue(field, pending), onChange, controlId, describedBy)}</div>
     </div>
   );
 }
@@ -221,7 +249,10 @@ export default function AISettings() {
           <div className="pool-ai-settings-heading">
             <div>
               <Typography.Title heading={2} style={{ margin: 0 }}>{copy.title}</Typography.Title>
-              <Typography.Text type="tertiary">{t(copy.subtitleKey)}</Typography.Text>
+              <Typography.Text type="tertiary" className="pool-ai-settings-heading__subtitle">{t(copy.subtitleKey)}</Typography.Text>
+              <Typography.Text type="quaternary" size="small" className="pool-ai-settings-heading__count">
+                {t('ai_settings.field_count').replace('{count}', String(fields.length))}
+              </Typography.Text>
             </div>
             {dirty ? <Tag color="orange">{t('ai_settings.unsaved_count').replace('{count}', String(Object.keys(pending).length))}</Tag> : null}
           </div>
@@ -229,11 +260,18 @@ export default function AISettings() {
           {loading && fields.length === 0 ? (
             <Card className="pool-card"><div className="pool-skel pool-ai-settings-skeleton" /></Card>
           ) : Object.keys(groups).length ? (
-            Object.entries(groups).map(([section, sectionFields]) => (
-              <Card className="pool-card pool-ai-settings-card" key={section} title={sectionFields[0]?.category || section}>
-                {sectionFields.map((field) => <ConfigFieldRow key={field.key} field={field} pending={pending} onChange={changeField} />)}
-              </Card>
-            ))
+            <div className="pool-ai-settings-sections">
+              {Object.entries(groups).map(([section, sectionFields]) => (
+                <Card
+                  className="pool-card pool-ai-settings-card"
+                  key={section}
+                  title={sectionFields[0]?.category || section}
+                  headerExtraContent={<span className="pool-ai-settings-card__count">{sectionFields.length}</span>}
+                >
+                  {sectionFields.map((field) => <ConfigFieldRow key={field.key} field={field} pending={pending} onChange={changeField} />)}
+                </Card>
+              ))}
+            </div>
           ) : (
             <Banner type="info" title={t('ai_settings.empty_title')} description={t('ai_settings.empty_description')} />
           )}

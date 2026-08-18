@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -181,6 +182,22 @@ func TestDiagnosticJobV3StableAliasesDLPAndRangeDownload(t *testing.T) {
 	}
 }
 
+func TestDiagnosticEventSafeEnumValueKeepsStructuredCleanupCodes(t *testing.T) {
+	if !diagnosticEventSafeEnumValue("error_code",
+		"context_cleanup_failed,goal_cleanup_failed,goal_budget_measure_failed,mapping_cleanup_failed,route_binding_cleanup_failed") {
+		t.Fatal("stable comma-separated cleanup codes were aliased out of the diagnostic package")
+	}
+	for _, value := range []string{
+		"context_cleanup_failed,/srv/private/key",
+		"context_cleanup_failed,bearer token",
+		strings.Repeat("cleanup_failed,", 17),
+	} {
+		if diagnosticEventSafeEnumValue("error_code", value) {
+			t.Fatalf("unsafe enum list accepted: %q", value)
+		}
+	}
+}
+
 func TestDiagnosticDLPAllowsPublicSupportRequestID(t *testing.T) {
 	for _, value := range []string{
 		"REQ-89C6735FD8ABC561",
@@ -272,6 +289,129 @@ func TestDiagnosticRescueExportDoesNotRequireBackgroundWorker(t *testing.T) {
 	if !strings.Contains(files["audit_log.csv"], "stateless_durable_replay") {
 		t.Fatalf("rescue bundle lost context recovery evidence: %s", files["audit_log.csv"])
 	}
+}
+
+func TestDiagnosticRescueFallsBackToValidatedMemoryArchive(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	if err := h.store.InsertAuditLog(context.Background(), storage.AuditLogRow{
+		Action: "diagnostic_export_repro", State: "failed",
+		Reason: "database_not_writable", Detail: "context_cleanup_failed,goal_cleanup_failed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Make the normal rescue renderer fail before it writes response headers. The
+	// emergency archive must not need this spool path.
+	blockedSpool := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedSpool, []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.app.cfg.BodySpoolDir = blockedSpool
+
+	request, _ := http.NewRequest(http.MethodGet, h.pool.URL+"/admin/export/logs?mode=rescue", nil)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, readErr := io.ReadAll(response.Body)
+	response.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if response.StatusCode != http.StatusOK ||
+		response.Header.Get("X-Codex-Diagnostic-Mode") != "rescue" ||
+		response.Header.Get("X-Codex-Diagnostic-Degraded") != "true" ||
+		!strings.Contains(response.Header.Get("Content-Type"), "application/zip") {
+		t.Fatalf("emergency response status=%d headers=%v body=%s", response.StatusCode, response.Header, raw)
+	}
+	if err := validateEmergencyDiagnosticArchive(raw); err != nil {
+		t.Fatalf("memory archive validation failed: %v", err)
+	}
+	files := readZipFiles(t, raw)
+	for _, name := range []string{"manifest.json", "diagnostic_summary.json", "runtime_storage.json", "goal_continuity.csv", "audit_log.csv"} {
+		if _, ok := files[name]; !ok {
+			t.Fatalf("memory archive missing %s: %v", name, zipFileNames(files))
+		}
+	}
+	if !strings.Contains(files["audit_log.csv"], "diagnostic_export_repro") ||
+		!strings.Contains(files["audit_log.csv"], "database_not_writable") {
+		t.Fatalf("bounded audit evidence missing: %s", files["audit_log.csv"])
+	}
+	var manifest map[string]interface{}
+	if err := json.Unmarshal([]byte(files["manifest.json"]), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest["mode"] != "emergency_memory" || manifest["degraded"] != true {
+		t.Fatalf("emergency manifest = %#v", manifest)
+	}
+	var runtimeStorage map[string]interface{}
+	if err := json.Unmarshal([]byte(files["runtime_storage.json"]), &runtimeStorage); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := runtimeStorage["supervisor"]; !ok {
+		t.Fatalf("emergency runtime omitted supervisor state: %#v", runtimeStorage)
+	}
+}
+
+func TestEmergencyDiagnosticArchiveSurvivesClosedDatabase(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	// Stop request/async writers before closing the database, then exercise the
+	// database-independent route directly. Cleanup is intentionally idempotent.
+	h.closeRuntime()
+	if err := h.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	started, err := h.app.streamEmergencyDiagnosticsExport(recorder, errors.New("database is locked"))
+	if err != nil || !started || recorder.Code != http.StatusOK {
+		t.Fatalf("closed-database emergency started=%v status=%d err=%v body=%s", started, recorder.Code, err, recorder.Body.String())
+	}
+	if recorder.Header().Get("X-Codex-Diagnostic-Full-Error") != "database_locked" {
+		t.Fatalf("closed-database failure code headers=%v", recorder.Header())
+	}
+	raw := recorder.Body.Bytes()
+	if err := validateEmergencyDiagnosticArchive(raw); err != nil {
+		t.Fatalf("closed-database archive failed validation: %v", err)
+	}
+	files := readZipFiles(t, raw)
+	var manifest struct {
+		Mode      string   `json:"mode"`
+		Degraded  bool     `json:"degraded"`
+		DataGaps  []string `json:"data_gaps"`
+		ErrorCode string   `json:"full_export_error_code"`
+	}
+	if err := json.Unmarshal([]byte(files["manifest.json"]), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Mode != "emergency_memory" || !manifest.Degraded || manifest.ErrorCode != "database_locked" ||
+		!containsDiagnosticGap(manifest.DataGaps, "audit_log") || !containsDiagnosticGap(manifest.DataGaps, "goal_continuity") {
+		t.Fatalf("closed-database manifest = %#v", manifest)
+	}
+}
+
+func TestEmergencyDiagnosticRouteStillRequiresAdminAuthentication(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	h.app.cfg.AdminToken = "diagnostic-admin-secret"
+	response, err := http.Get(h.pool.URL + "/admin/export/logs?mode=emergency")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, readErr := io.ReadAll(response.Body)
+	response.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if response.StatusCode != http.StatusUnauthorized || strings.Contains(response.Header.Get("Content-Type"), "application/zip") {
+		t.Fatalf("unauthenticated emergency status=%d headers=%v body=%s", response.StatusCode, response.Header, raw)
+	}
+}
+
+func containsDiagnosticGap(gaps []string, want string) bool {
+	for _, gap := range gaps {
+		if gap == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestDiagnosticJobCreateWakesActiveWorker(t *testing.T) {

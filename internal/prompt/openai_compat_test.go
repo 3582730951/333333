@@ -1,6 +1,8 @@
 package prompt
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -59,6 +61,41 @@ func TestResponsesRequestToChatCompletion(t *testing.T) {
 	fn := tools[0].(map[string]interface{})["function"].(map[string]interface{})
 	if fn["name"] != "get_weather" {
 		t.Fatalf("tool not flattened to chat shape: %v", tools)
+	}
+}
+
+func TestResponsesRequestToChatCompletionMapsDeveloperOnlyForDeepSeek(t *testing.T) {
+	const developerText = "Keep this exact developer instruction."
+	for _, tc := range []struct {
+		name     string
+		model    string
+		wantRole string
+	}{
+		{name: "deepseek", model: "deepseek-v4-flash", wantRole: "system"},
+		{name: "other compatible provider", model: "other-chat-model", wantRole: "developer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			converted, err := ResponsesRequestToChatCompletionBridge([]byte(`{
+			  "model":"` + tc.model + `",
+			  "instructions":"stable system prefix",
+			  "input":[
+			    {"type":"message","role":"developer","content":[{"type":"input_text","text":"` + developerText + `"}]},
+			    {"type":"message","role":"user","content":"answer exactly"}
+			  ]
+			}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := mustUnmarshal(t, converted.Body)
+			messages := root["messages"].([]interface{})
+			if len(messages) != 3 {
+				t.Fatalf("messages = %v, want instructions, developer, and user", messages)
+			}
+			developer := messages[1].(map[string]interface{})
+			if developer["role"] != tc.wantRole || developer["content"] != developerText {
+				t.Fatalf("developer bridge = %v, want role %q with byte-identical content", developer, tc.wantRole)
+			}
+		})
 	}
 }
 
@@ -618,5 +655,276 @@ func TestChatCompletionToAnthropicResponseToolUse(t *testing.T) {
 	}
 	if input, ok := tu["input"].(map[string]interface{}); !ok || input["a"].(float64) != 1 {
 		t.Fatalf("tool input not parsed from arguments json: %v", tu["input"])
+	}
+}
+
+func TestDeepSeekToolReasoningRoundTripsThroughResponsesWithParallelCalls(t *testing.T) {
+	const reasoning = "inspect repository, then run both independent tools"
+	chatResponse := []byte(`{
+	  "id":"chatcmpl-deepseek-tools","model":"deepseek-v4-pro",
+	  "choices":[{"index":0,"message":{"role":"assistant","content":null,
+	    "reasoning_content":"` + reasoning + `",
+	    "tool_calls":[
+	      {"id":"call_read","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.go\"}"}},
+	      {"id":"call_search","type":"function","function":{"name":"search","arguments":"{\"query\":\"TODO\"}"}}
+	    ]},"finish_reason":"tool_calls"}]
+	}`)
+	responsesRaw, err := ChatCompletionToResponsesResponse(chatResponse, "deepseek-v4-pro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	responses := mustUnmarshal(t, responsesRaw)
+	requestRaw, _ := json.Marshal(map[string]interface{}{
+		"model": "deepseek-v4-pro", "reasoning": map[string]interface{}{"effort": "xhigh"},
+		"input": responses["output"],
+	})
+	bridge, err := ResponsesRequestToChatCompletionBridge(requestRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat := mustUnmarshal(t, bridge.Body)
+	if chat["reasoning_effort"] != "xhigh" {
+		t.Fatalf("reasoning effort changed: %v", chat)
+	}
+	messages := chat["messages"].([]interface{})
+	if len(messages) != 1 {
+		t.Fatalf("parallel tool calls split into multiple assistant turns: %v", messages)
+	}
+	assistant := messages[0].(map[string]interface{})
+	if assistant["reasoning_content"] != reasoning {
+		t.Fatalf("reasoning replay changed: %v", assistant)
+	}
+	toolCalls := assistant["tool_calls"].([]interface{})
+	if len(toolCalls) != 2 {
+		t.Fatalf("parallel tool calls were not coalesced: %v", assistant)
+	}
+	if toolCalls[0].(map[string]interface{})["id"] != "call_read" || toolCalls[1].(map[string]interface{})["id"] != "call_search" {
+		t.Fatalf("tool order or ids changed: %v", toolCalls)
+	}
+}
+
+func TestDeepSeekToolFreeReasoningIsNotReplayedThroughResponses(t *testing.T) {
+	chatResponse := []byte(`{"id":"plain","choices":[{"message":{"role":"assistant","reasoning_content":"ignored old thinking","content":"final answer"},"finish_reason":"stop"}]}`)
+	responsesRaw, err := ChatCompletionToResponsesResponse(chatResponse, "deepseek-v4-pro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	responses := mustUnmarshal(t, responsesRaw)
+	requestRaw, _ := json.Marshal(map[string]interface{}{"model": "deepseek-v4-pro", "input": responses["output"]})
+	chatRaw, err := ResponsesRequestToChatCompletion(requestRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := mustUnmarshal(t, chatRaw)["messages"].([]interface{})
+	if len(messages) != 1 {
+		t.Fatalf("tool-free answer changed shape: %v", messages)
+	}
+	assistant := messages[0].(map[string]interface{})
+	if assistant["content"] != "final answer" {
+		t.Fatalf("assistant answer changed: %v", assistant)
+	}
+	if _, replayed := assistant["reasoning_content"]; replayed {
+		t.Fatalf("ignored tool-free reasoning fragmented the next cache prefix: %v", assistant)
+	}
+}
+
+func TestDeepSeekToolReasoningRoundTripsThroughAnthropicMessages(t *testing.T) {
+	const reasoning = "reason before calling the tool"
+	chatResponse := []byte(`{"id":"anthropic-roundtrip","choices":[{"message":{"role":"assistant","content":null,"reasoning":"` + reasoning + `","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"key\":\"x\"}"}}]},"finish_reason":"tool_calls"}]}`)
+	messageRaw, err := ChatCompletionToAnthropicResponse(chatResponse, "deepseek-v4-pro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := mustUnmarshal(t, messageRaw)
+	content := message["content"].([]interface{})
+	thinking := content[0].(map[string]interface{})
+	if thinking["type"] != "thinking" || thinking["thinking"] != reasoning {
+		t.Fatalf("DeepSeek reasoning did not reach Claude Code: %v", content)
+	}
+	if decoded, ok := DecodeDeepSeekReasoningContent(thinking["signature"].(string)); !ok || decoded != reasoning {
+		t.Fatalf("Claude replay signature is not lossless: %v", thinking)
+	}
+
+	requestRaw, _ := json.Marshal(map[string]interface{}{
+		"model": "deepseek-v4-pro", "max_tokens": 1024,
+		"messages": []interface{}{
+			map[string]interface{}{"role": "assistant", "content": content},
+			map[string]interface{}{"role": "user", "content": []interface{}{map[string]interface{}{
+				"type": "tool_result", "tool_use_id": "call_1", "content": "value",
+			}}},
+		},
+	})
+	chatRaw, err := AnthropicRequestToChatCompletion(requestRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := mustUnmarshal(t, chatRaw)["messages"].([]interface{})
+	assistant := messages[0].(map[string]interface{})
+	if assistant["reasoning_content"] != reasoning || len(assistant["tool_calls"].([]interface{})) != 1 {
+		t.Fatalf("Claude Code tool round lost reasoning or tool call: %v", assistant)
+	}
+}
+
+func TestNonDeepSeekProvidersDoNotReceiveDeepSeekReplayFields(t *testing.T) {
+	chatResponse := []byte(`{"id":"other","choices":[{"message":{"role":"assistant","content":null,"reasoning":"provider-private","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`)
+	responsesRaw, err := ChatCompletionToResponsesResponse(chatResponse, "other-reasoner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	responsesOutput := mustUnmarshal(t, responsesRaw)["output"].([]interface{})
+	if len(responsesOutput) != 1 || responsesOutput[0].(map[string]interface{})["type"] != "function_call" {
+		t.Fatalf("DeepSeek reasoning carrier leaked to another Responses bridge: %v", responsesOutput)
+	}
+	messageRaw, err := ChatCompletionToAnthropicResponse(chatResponse, "other-reasoner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageContent := mustUnmarshal(t, messageRaw)["content"].([]interface{})
+	if len(messageContent) != 1 || messageContent[0].(map[string]interface{})["type"] != "tool_use" {
+		t.Fatalf("DeepSeek thinking carrier leaked to another Messages bridge: %v", messageContent)
+	}
+	request := []byte(`{"model":"other-reasoner","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"provider-private"},{"type":"tool_use","id":"call_1","name":"lookup","input":{}}]}]}`)
+	chatRaw, err := AnthropicRequestToChatCompletion(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assistant := mustUnmarshal(t, chatRaw)["messages"].([]interface{})[0].(map[string]interface{})
+	if _, leaked := assistant["reasoning_content"]; leaked {
+		t.Fatalf("DeepSeek replay field leaked to another Chat provider: %v", assistant)
+	}
+	switchedRequest, _ := json.Marshal(map[string]interface{}{
+		"model": "other-reasoner",
+		"input": []interface{}{
+			DeepSeekReasoningItem("rs_old", "old DeepSeek reasoning"),
+			map[string]interface{}{"type": "function_call", "call_id": "call_old", "name": "lookup", "arguments": "{}"},
+		},
+	})
+	switchedRaw, err := ResponsesRequestToChatCompletion(switchedRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	switchedAssistant := mustUnmarshal(t, switchedRaw)["messages"].([]interface{})[0].(map[string]interface{})
+	if _, leaked := switchedAssistant["reasoning_content"]; leaked {
+		t.Fatalf("old DeepSeek reasoning crossed a model switch: %v", switchedAssistant)
+	}
+}
+
+func TestDeepSeekContextTiersKeepStablePrefixAcrossCodexAndClaudeToolTurns(t *testing.T) {
+	for _, tokenTier := range []int{128_000, 256_000, 1_000_000} {
+		t.Run(strings.ReplaceAll(strings.TrimSpace(jsonValueString(tokenTier)), ".", "_"), func(t *testing.T) {
+			marker := "DEEPSEEK_CONTEXT_STABLE_" + jsonValueString(tokenTier)
+			payload := marker + strings.Repeat(" a", tokenTier) + marker
+			digest := sha256.Sum256([]byte(payload))
+			userItem := map[string]interface{}{
+				"role": "user", "content": []interface{}{map[string]interface{}{"type": "input_text", "text": payload}},
+			}
+			tools := []interface{}{
+				map[string]interface{}{"type": "function", "name": "network_search", "parameters": map[string]interface{}{"type": "object"}},
+				map[string]interface{}{"type": "function", "name": "skill_call", "parameters": map[string]interface{}{"type": "object"}},
+				map[string]interface{}{"type": "function", "name": "shell", "parameters": map[string]interface{}{"type": "object"}},
+			}
+			baseRequest, _ := json.Marshal(map[string]interface{}{
+				"model": "deepseek-v4-pro", "instructions": "stable system contract",
+				"reasoning": map[string]interface{}{"effort": "xhigh"}, "input": []interface{}{userItem}, "tools": tools,
+			})
+			baseRaw, err := ResponsesRequestToChatCompletion(baseRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			base := mustUnmarshal(t, baseRaw)
+
+			reasoning := "select network_search without changing the existing context"
+			extendedRequest, _ := json.Marshal(map[string]interface{}{
+				"model": "deepseek-v4-pro", "instructions": "stable system contract",
+				"reasoning": map[string]interface{}{"effort": "xhigh"}, "tools": tools,
+				"input": []interface{}{
+					userItem,
+					DeepSeekReasoningItem("rs_cache", reasoning),
+					map[string]interface{}{"type": "function_call", "call_id": "call_search", "name": "network_search", "arguments": `{"query":"cache"}`},
+					map[string]interface{}{"type": "function_call_output", "call_id": "call_search", "output": "result"},
+					map[string]interface{}{"role": "user", "content": "continue"},
+				},
+			})
+			extendedRaw, err := ResponsesRequestToChatCompletion(extendedRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			extended := mustUnmarshal(t, extendedRaw)
+			baseMessages := base["messages"].([]interface{})
+			extendedMessages := extended["messages"].([]interface{})
+			if len(baseMessages) != 2 || len(extendedMessages) != 5 {
+				t.Fatalf("tier %d unexpected history shape base=%d extended=%d", tokenTier, len(baseMessages), len(extendedMessages))
+			}
+			basePrefix, _ := json.Marshal(baseMessages)
+			extendedPrefix, _ := json.Marshal(extendedMessages[:2])
+			if !bytes.Equal(basePrefix, extendedPrefix) {
+				t.Fatalf("tier %d changed the stable system/user prefix", tokenTier)
+			}
+			baseTools, _ := json.Marshal(base["tools"])
+			extendedTools, _ := json.Marshal(extended["tools"])
+			if !bytes.Equal(baseTools, extendedTools) || base["reasoning_effort"] != "xhigh" || extended["reasoning_effort"] != "xhigh" {
+				t.Fatalf("tier %d changed tools or reasoning effort", tokenTier)
+			}
+			userText := extendedMessages[1].(map[string]interface{})["content"].(string)
+			if sha256.Sum256([]byte(userText)) != digest {
+				t.Fatalf("tier %d context digest changed", tokenTier)
+			}
+			assistant := extendedMessages[2].(map[string]interface{})
+			if assistant["reasoning_content"] != reasoning || len(assistant["tool_calls"].([]interface{})) != 1 {
+				t.Fatalf("tier %d lost reasoning/tool pairing: %v", tokenTier, assistant)
+			}
+
+			claudeTools := []interface{}{
+				map[string]interface{}{"name": "network_search", "input_schema": map[string]interface{}{"type": "object"}},
+				map[string]interface{}{"name": "skill_call", "input_schema": map[string]interface{}{"type": "object"}},
+				map[string]interface{}{"name": "shell", "input_schema": map[string]interface{}{"type": "object"}},
+			}
+			claudeBaseRequest, _ := json.Marshal(map[string]interface{}{
+				"model": "deepseek-v4-pro[1m]", "max_tokens": 384_000,
+				"system": "stable system contract", "output_config": map[string]interface{}{"effort": "max"},
+				"messages": []interface{}{map[string]interface{}{"role": "user", "content": payload}}, "tools": claudeTools,
+			})
+			claudeBaseRaw, err := AnthropicRequestToChatCompletion(claudeBaseRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claudeBase := mustUnmarshal(t, claudeBaseRaw)
+			claudeExtendedRequest, _ := json.Marshal(map[string]interface{}{
+				"model": "deepseek-v4-pro[1m]", "max_tokens": 384_000,
+				"system": "stable system contract", "output_config": map[string]interface{}{"effort": "max"}, "tools": claudeTools,
+				"messages": []interface{}{
+					map[string]interface{}{"role": "user", "content": payload},
+					map[string]interface{}{"role": "assistant", "content": []interface{}{
+						map[string]interface{}{"type": "thinking", "thinking": reasoning, "signature": EncodeDeepSeekReasoningContent(reasoning)},
+						map[string]interface{}{"type": "tool_use", "id": "call_search", "name": "network_search", "input": map[string]interface{}{"query": "cache"}},
+					}},
+					map[string]interface{}{"role": "user", "content": []interface{}{
+						map[string]interface{}{"type": "tool_result", "tool_use_id": "call_search", "content": "result"},
+						map[string]interface{}{"type": "text", "text": "continue"},
+					}},
+				},
+			})
+			claudeExtendedRaw, err := AnthropicRequestToChatCompletion(claudeExtendedRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claudeExtended := mustUnmarshal(t, claudeExtendedRaw)
+			claudeBaseMessages := claudeBase["messages"].([]interface{})
+			claudeExtendedMessages := claudeExtended["messages"].([]interface{})
+			claudePrefix, _ := json.Marshal(claudeBaseMessages)
+			claudeExtendedPrefix, _ := json.Marshal(claudeExtendedMessages[:2])
+			if !bytes.Equal(claudePrefix, claudeExtendedPrefix) {
+				t.Fatalf("tier %d changed Claude Code stable system/user prefix", tokenTier)
+			}
+			claudeBaseToolsRaw, _ := json.Marshal(claudeBase["tools"])
+			claudeExtendedToolsRaw, _ := json.Marshal(claudeExtended["tools"])
+			if !bytes.Equal(claudeBaseToolsRaw, claudeExtendedToolsRaw) || claudeBase["reasoning_effort"] != "max" || claudeExtended["reasoning_effort"] != "max" {
+				t.Fatalf("tier %d changed Claude Code tools or provider-max effort", tokenTier)
+			}
+			claudeAssistant := claudeExtendedMessages[2].(map[string]interface{})
+			if claudeAssistant["reasoning_content"] != reasoning || len(claudeAssistant["tool_calls"].([]interface{})) != 1 {
+				t.Fatalf("tier %d Claude Code lost reasoning/tool pairing: %v", tokenTier, claudeAssistant)
+			}
+		})
 	}
 }

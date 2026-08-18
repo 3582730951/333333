@@ -598,6 +598,50 @@ func runCodexSetupScript(t *testing.T, codexHome, script string) {
 	}
 }
 
+func TestCodexSetupScriptContextWindowIsExplicitAndNonDestructive(t *testing.T) {
+	t.Run("positive override replaces only the managed root key", func(t *testing.T) {
+		home := t.TempDir()
+		configPath := filepath.Join(home, "config.toml")
+		if err := os.WriteFile(configPath, []byte("model_context_window = 128000\npersonality = \"pragmatic\"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runCodexSetupScript(t, home, buildCodexConfigScript(
+			"https://pool.example", "cap_context", "gpt-5.6-sol", "", "", "",
+			CodexSetupScriptOptions{CodexOnly: true, ContextWindow: 262144},
+		))
+		data, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(data)
+		if strings.Count(got, "model_context_window = 262144") != 1 || strings.Contains(got, "model_context_window = 128000") {
+			t.Fatalf("context window was not replaced exactly once:\n%s", got)
+		}
+		if !strings.Contains(got, `personality = "pragmatic"`) {
+			t.Fatalf("context window update removed client-owned config:\n%s", got)
+		}
+	})
+
+	t.Run("zero preserves an existing client choice", func(t *testing.T) {
+		home := t.TempDir()
+		configPath := filepath.Join(home, "config.toml")
+		if err := os.WriteFile(configPath, []byte("model_context_window = 128000\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runCodexSetupScript(t, home, buildCodexConfigScript(
+			"https://pool.example", "cap_context", "gpt-5.6-sol", "", "", "",
+			CodexSetupScriptOptions{CodexOnly: true, ContextWindow: 0},
+		))
+		data, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Count(string(data), "model_context_window = 128000") != 1 {
+			t.Fatalf("zero override changed the client-owned context window:\n%s", data)
+		}
+	})
+}
+
 // TestCodexConfigScriptUnknownKeyRequired confirms that, when downstream keys are
 // required, an unknown key is refused with a clear message rather than a script
 // that would 401 on first use.

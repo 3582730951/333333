@@ -73,3 +73,31 @@ tools/acceptance/cluster_failover.sh
 ```
 
 `extreme_load_host.sh` is the fallback for a remote host whose root cgroup cannot create a Docker domain child. It pins the pool to two CPUs, sets `GOMAXPROCS=2`, kills the run above 2 GiB RSS, and records RSS, FD, thread, goroutine, and spool peaks. Its result is explicitly labeled `taskset+RSS-watchdog`; it does not replace the default Docker cgroup gate.
+
+## Pinned old-release live upgrade
+
+`old_release_live_upgrade.sh` downloads the exact `d76f7ce8545f` parent of the current
+`cache-hit-optimization` branch, builds it with a test-only same-PID SQLite fault
+injector, and keeps that old worker running while it seeds representative Codex and
+Kiro accounts, 128k-class usage rows, affinity, Goal v2, context-journal, and
+root/child session data. It then proves all of the following against the current
+candidate:
+
+- a lock owned by the old worker reproduces the failed `/standbyz` startup and does
+  not expose a half-initialized candidate socket;
+- the independent handoff pauses new admission and reports zero established requests
+  before the known old PID is gracefully stopped;
+- an atomic backend-link switch makes the candidate active and admission resumes;
+- SQLite `quick_check` and the complete pre/post fixture snapshot remain identical.
+
+The default uses local processes and the immutable GitHub commit archive. It never
+uses real provider credentials or quota:
+
+```bash
+GO_BIN=/path/to/go1.25.12/bin/go KEEP_ARTIFACTS=1 \
+  tools/acceptance/old_release_live_upgrade.sh
+```
+
+Set `OLD_RELEASE_SOURCE` to an already downloaded checkout for an offline rerun. The
+fault injector exists only inside the temporary old-source build tree and is never
+installed or shipped in a production binary.

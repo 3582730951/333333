@@ -430,6 +430,8 @@ func configFields() []configField {
 		{Key: "codex_install_sandbox_mode", Label: "Codex 沙箱模式", Category: catReg, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"", "danger-full-access", "workspace-write", "read-only"},
 			Help:    "空值=保留 Codex 配置；非空时作为显式沙箱模式覆盖。", boot: func(c config.Config) interface{} { return c.CodexInstallSandboxMode }},
+		{Key: "codex_install_context_window", Label: "Codex 最大上下文窗口", Category: catReg, Type: fieldInt, Effect: effectHot,
+			Help: "管理员可手动填写一键安装脚本写入 config.toml 的 model_context_window（token）。0=保留客户端和模型默认；非零值只声明客户端可用窗口，不会突破上游模型的真实限制。", boot: func(c config.Config) interface{} { return c.CodexInstallContextWindow }},
 
 		// ── 接码多平台智能选国家 ───────────────────────────────────────────
 		{Key: "sms_platform_strategy", Label: "接码国家策略", Category: catReg, Type: fieldSelect, Effect: effectHot,
@@ -814,6 +816,16 @@ func validateSettingValue(f configField, v interface{}) (string, error) {
 		n, _ := strconv.ParseInt(raw, 10, 64)
 		if n < 0 {
 			return "", fmt.Errorf("must be zero (disabled) or greater")
+		}
+		return raw, nil
+	case "codex_install_context_window":
+		raw, err := validateIntegerSetting(v)
+		if err != nil {
+			return "", err
+		}
+		n, _ := strconv.ParseInt(raw, 10, 64)
+		if n != 0 && (n < 16384 || n > 4194304) {
+			return "", fmt.Errorf("must be zero or between 16384 and 4194304")
 		}
 		return raw, nil
 	case "resource_headroom_percent":

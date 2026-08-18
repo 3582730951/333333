@@ -181,6 +181,7 @@ const zh = {
   'ai_settings.codex_subtitle': 'Responses、Codex 客户端画像、模型窗口与 reasoning',
   'ai_settings.claude_code_subtitle': 'Messages、Claude Code 会话、beta 与协议画像',
   'ai_settings.global': '全局生效',
+  'ai_settings.field_count': '共 {count} 项配置',
   'ai_settings.unsaved_count': '{count} 项未保存',
   'ai_settings.load_failed': 'AI 配置读取失败',
   'ai_settings.empty_title': '暂无专属配置',

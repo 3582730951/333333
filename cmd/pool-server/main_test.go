@@ -42,6 +42,10 @@ func TestDeploymentHandlerReadinessAndInflight(t *testing.T) {
 	if status["release_id"] != "release-test" || status["deployment_state"] != "active" || status["inflight"] != float64(1) {
 		t.Fatalf("unexpected readiness: %#v", status)
 	}
+	capabilities, _ := status["capabilities"].(map[string]interface{})
+	if capabilities["idle_websocket_drain_signal"] != "SIGUSR1" {
+		t.Fatalf("readiness omitted turn-safe WebSocket drain capability: %#v", status)
+	}
 	close(release)
 	<-normalDone
 	h.ready.Store(false)
@@ -88,6 +92,67 @@ func TestDeploymentHandlerStandbyIsObservableButRejectsTraffic(t *testing.T) {
 	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"deployment_state":"standby_ready"`) {
 		t.Fatalf("active readiness while standby = %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPreinitStandbyExposesOnlyDeploymentContract(t *testing.T) {
+	h := &preinitStandbyHandler{
+		releaseID:  "release-preinit",
+		workerAddr: "/run/codex-pool/worker-release-preinit.sock",
+		startedAt:  time.Unix(123, 0).UTC(),
+	}
+
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/standbyz", nil))
+	if recorder.Code != http.StatusOK ||
+		!strings.Contains(recorder.Body.String(), `"standby_ready":true`) ||
+		!strings.Contains(recorder.Body.String(), `"deployment_state":"preinit_standby"`) ||
+		!strings.Contains(recorder.Body.String(), `"storage":false`) ||
+		!strings.Contains(recorder.Body.String(), `"preinit_promotion":"exec_on_active_link"`) {
+		t.Fatalf("preinit standby = %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"ready":false`) {
+		t.Fatalf("preinit ready = %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", nil))
+	if recorder.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(recorder.Body.String(), `"code":"service_unavailable"`) {
+		t.Fatalf("preinit traffic = %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestDeploymentHandlerAllowsOnlyEmergencyDiagnosticOnStandby(t *testing.T) {
+	var reached int
+	h := newDeploymentHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached++
+		_, _ = io.WriteString(w, r.URL.Query().Get("mode"))
+	}), "release-standby", "/tmp/worker-standby.sock")
+	h.standbyReady.Store(true)
+
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/export/logs?mode=rescue", nil))
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "rescue" || reached != 1 {
+		t.Fatalf("standby rescue = status %d body %q reached %d", recorder.Code, recorder.Body.String(), reached)
+	}
+
+	for _, target := range []string{
+		"/admin/export/logs",
+		"/admin/export/logs?mode=other",
+		"/admin/diagnostics/jobs",
+	} {
+		recorder = httptest.NewRecorder()
+		h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, target, nil))
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("standby non-emergency target %q status=%d", target, recorder.Code)
+		}
+	}
+	if reached != 1 {
+		t.Fatalf("non-emergency standby requests reached application: %d", reached)
 	}
 }
 

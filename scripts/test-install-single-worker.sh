@@ -18,6 +18,7 @@ declare -A unit_state=()
 declare -A unit_pid=()
 declare -A unit_enabled=()
 declare -a root_chown_calls=()
+declare -a root_systemctl_calls=()
 
 current_unit="${SERVICE_NAME}-worker@release-current.service"
 old_unit="${SERVICE_NAME}-worker@release-old.service"
@@ -52,6 +53,10 @@ run_root() {
     command "$@"
     return
   fi
+  root_systemctl_calls+=("$*")
+  if [[ -n "${SQLITE_TEST_SYSTEMCTL_LOG:-}" ]]; then
+    printf '%s\n' "$*" >>"$SQLITE_TEST_SYSTEMCTL_LOG"
+  fi
   shift
   local action="$1" unit prop
   shift
@@ -71,10 +76,19 @@ run_root() {
         MainPID) printf '%s\n' "${unit_pid[$unit]:-0}" ;;
       esac
       ;;
-    stop|kill)
+    stop)
       unit="${!#}"
       unit_state["$unit"]="inactive"
       unit_pid["$unit"]="0"
+      ;;
+    kill)
+      unit="${!#}"
+      if [[ " $* " == *" --signal=SIGUSR1 "* ]]; then
+        [[ "${unit_state[$unit]:-inactive}" == active ]] || return 1
+      else
+        unit_state["$unit"]="inactive"
+        unit_pid["$unit"]="0"
+      fi
       ;;
     disable)
       unit="${!#}"
@@ -245,6 +259,10 @@ test_lossless_upgrade_contract() {
     die "old-release drain starts before cutover completes or blocks install.sh"
   [[ "$activate_body" != *'while true; do'* && "$activate_body" != *'worker_inflight'* && "$activate_body" != *'destroy_worker_instance "$old_worker_release"'* ]] ||
     die "install.sh still waits for or destroys the old worker synchronously"
+  [[ "$activate_body" == *'pre-initialized staged worker'* && "$activate_body" == *'atomic_symlink "$new_socket"'* ]] ||
+    die "release activation does not use the database-free pre-init promotion contract"
+  [[ "$activate_body" != *'sqlite_write_probe'* && "$activate_body" != *'wait_handoff_inflight_zero'* && "$activate_body" != *'prepare_sqlite_for_staged_worker'* ]] ||
+    die "release activation still requires SQLite preflight or zero established connections"
   [[ "$legacy_body" != *'SIGKILL'* && "$legacy_body" == *'preserving it instead of forcing client-visible errors'* ]] ||
     die "legacy upgrade can still force-kill established connections"
   [[ "$reauth_body" != *'systemctl restart'* && "$reauth_body" == *'next cold start'* ]] ||
@@ -265,6 +283,8 @@ test_lossless_upgrade_contract() {
     die "staged-worker health gate does not expose progress or stop a crash loop"
   [[ "$capture_body" == *'journalctl'*'-u "$unit"'* && "$capture_body" == *'[kernel-oom]'* && "$capture_body" == *'deploy-failures'* ]] ||
     die "staged-worker failure capture does not preserve unit journal and OOM evidence"
+  [[ "$capture_body" == *'[sqlite-locks]'* ]] ||
+    die "staged-worker failure capture omits SQLite lock evidence"
   [[ "$activate_body" == *'capture_worker_startup_failure'*'systemctl stop "$new_unit"'* ]] ||
     die "candidate cleanup runs before its startup evidence is captured"
 }
@@ -351,6 +371,7 @@ test_worker_failure_report_capture() {
   grep -Fq '[kernel-oom]' "$WORKER_FAILURE_REPORT" ||
     die "failure report omitted kernel OOM evidence"
 }
+
 reclaim_superseded_install_resources "release-current"
 [[ ! -e "$PROC_ROOT/555" && -e "$PROC_ROOT/666/exe" ]]
 [[ -L "$PROC_ROOT/777/exe" ]]

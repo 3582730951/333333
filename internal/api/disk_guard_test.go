@@ -3,9 +3,11 @@ package api
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/storage"
@@ -81,6 +83,115 @@ func TestDiskGuardChangeIgnoresCumulativeCleanupProgress(t *testing.T) {
 	current.Level = "pressure"
 	if !diskGuardChanged(previous, current) {
 		t.Fatal("an operational disk state transition must still be emitted")
+	}
+}
+
+func TestDiskGuardChangeIgnoresCleanupErrorChurn(t *testing.T) {
+	previous := DiskGuardSnapshot{
+		Level: "normal", DatabaseWritable: true, JournalWritable: true, SpoolWritable: true,
+		GoalStorageTargetBytes: 896 << 20, GoalStorageReserveBytes: 128 << 20,
+		LastError: "context_cleanup_failed",
+	}
+	current := previous
+	current.LastError = "goal_cleanup_failed,mapping_cleanup_failed"
+	current.CleanupFailureEvents = 9000
+	current.CleanupErrorOperation = "mapping_cleanup"
+	current.CleanupErrorClass = "timeout"
+	if diskGuardChanged(previous, current) {
+		t.Fatal("cleanup error churn must not recursively write storage-pressure events")
+	}
+}
+
+func TestDiskGuardCleanupCadence(t *testing.T) {
+	now := int64(10_000)
+	interval := int64(diskGuardNormalCleanupInterval / time.Second)
+	cases := []struct {
+		name        string
+		last        int64
+		level       string
+		force, want bool
+	}{
+		{name: "startup", last: 0, level: "normal", want: true},
+		{name: "probe_only", last: now - interval + 1, level: "normal", want: false},
+		{name: "normal_due", last: now - interval, level: "normal", want: true},
+		{name: "pressure", last: now - 1, level: "pressure", want: true},
+		{name: "forced", last: now - 1, level: "normal", force: true, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := diskGuardCleanupDue(now, tc.last, tc.level, tc.force); got != tc.want {
+				t.Fatalf("cleanup due=%t want=%t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestClassifyStorageFailureUsesStableNonSensitiveClasses(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{context.DeadlineExceeded, "timeout"},
+		{context.Canceled, "cancelled"},
+		{errors.New("database is locked"), "busy"},
+		{errors.New("attempt to write a readonly database"), "readonly"},
+		{errors.New("database or disk is full"), "full"},
+		{errors.New("database disk image is malformed"), "corrupt"},
+		{errors.New("disk I/O error"), "io"},
+		{errors.New("credential-shaped unknown failure secret=do-not-export"), "unavailable"},
+	}
+	for _, tc := range cases {
+		if got := classifyStorageFailure(tc.err); got != tc.want {
+			t.Errorf("error=%q class=%q want=%q", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestDatabaseWriteProbeTreatsWriterQueueTimeoutAsBackpressure(t *testing.T) {
+	store, err := storage.OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := store.DB().BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	s := &Server{store: store}
+	probeCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	writable, backpressured, class := s.databaseWriteProbe(probeCtx, true)
+	if !writable || !backpressured || class != "timeout" {
+		t.Fatalf("probe writable=%t backpressured=%t class=%q", writable, backpressured, class)
+	}
+}
+
+func TestDiskCleanupWriterBackpressureReportsOnlyRootOperation(t *testing.T) {
+	store, err := storage.OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := store.DB().BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	s := &Server{store: store, cfg: config.Default()}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	snap := DiskGuardSnapshot{}
+	s.runSafeDiskCleanup(ctx, &snap)
+	if snap.LastError != "context_cleanup_failed" || snap.CleanupFailureEvents != 1 ||
+		snap.CleanupErrorOperation != "context_cleanup" || snap.CleanupErrorClass != "timeout" {
+		t.Fatalf("cleanup snapshot=%+v", snap)
 	}
 }
 

@@ -763,6 +763,20 @@ func (s *Server) handleChatViaCustom(w http.ResponseWriter, r *http.Request, raw
 func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
 	r = withCustomProviderDownstreamAffinity(r, raw, "codex")
 	provider, _ = storage.ResolveCustomProviderRoute(provider, storage.CustomProviderDownstreamResponses)
+	// Chat Completions and Anthropic Messages are stateless with respect to the
+	// Responses API's previous_response_id. Rebuild that state into one append-only
+	// request before protocol conversion; otherwise the bridge would silently drop
+	// the identifier and turn every continuation into a fresh, cache-cold prompt.
+	// A native Responses provider keeps its own continuation semantics unchanged.
+	finishGoal := func() {}
+	if provider.UpstreamProtocol != storage.CustomProviderProtocolResponses {
+		var ok bool
+		raw, finishGoal, ok = s.rebuildCustomResponsesBridgeRequest(w, r, raw)
+		if !ok {
+			return
+		}
+		defer finishGoal()
+	}
 	switch provider.UpstreamProtocol {
 	case storage.CustomProviderProtocolResponses:
 		s.handleNativeResponsesViaCustom(w, r, raw, model, routeGroup, provider)
@@ -805,7 +819,25 @@ func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request
 		flushWriter(w)
 		uscan := usage.NewStreamScanner("openai_chat")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "custom_openai", model, cc.resp.StatusCode), provider.ID)
-		chatStreamToResponsesSSE(rw, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber, bridge.Plan)
+		streamRecorder := s.newCodexStreamLedgerRecorder(r.Context())
+		defer streamRecorder.Close()
+		commitWriter := newTerminalCommitWriter(rw, func() error {
+			streamRecorder.finish()
+			if !streamRecorder.completedSuccessfully() {
+				return nil
+			}
+			return s.persistCustomResponsesContinuity(r.Context(), r, raw, streamRecorder.ResponseJSON(), cc)
+		})
+		observed := &responsesLedgerWriter{ResponseWriter: commitWriter, recorder: streamRecorder}
+		chatStreamToResponsesSSEWithOptions(r.Context(), observed, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber, s.responseBodyCaptureOptions(r.Context()), bridge.Plan)
+		streamRecorder.finish()
+		if closeErr := commitWriter.Close(); closeErr != nil {
+			log.Printf("[GOAL-CONTINUITY] custom responses terminal writer request_id=%s: %v", requestIDFromContext(r.Context()), closeErr)
+		}
+		if persistErr := commitWriter.PersistenceError(); persistErr != nil {
+			log.Printf("[GOAL-CONTINUITY] custom responses persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
+			s.auditGoalPersistenceDegraded(r.Context(), "custom_responses_stream", persistErr)
+		}
 		s.settleStreamUsage(r, cc, uscan)
 		return
 	}
@@ -822,6 +854,10 @@ func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request
 	}
 	s.recordCustomUsage(r, cc, body)
 	_ = s.settleBillingHold(r.Context(), cc.holdID, "settled")
+	if err := s.persistCustomResponsesContinuity(r.Context(), r, raw, out, cc); err != nil {
+		log.Printf("[GOAL-CONTINUITY] custom responses persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), err)
+		s.auditGoalPersistenceDegraded(r.Context(), "custom_responses_terminal", err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
@@ -1002,7 +1038,25 @@ func (s *Server) handleResponsesViaAnthropicMessagesCustom(w http.ResponseWriter
 		flushWriter(w)
 		uscan := usage.NewStreamScanner("claude")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "responses", model, cc.resp.StatusCode), provider.ID)
-		anthropicStreamToResponsesCustomSSE(rw, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber, bridge.Plan)
+		streamRecorder := s.newCodexStreamLedgerRecorder(r.Context())
+		defer streamRecorder.Close()
+		commitWriter := newTerminalCommitWriter(rw, func() error {
+			streamRecorder.finish()
+			if !streamRecorder.completedSuccessfully() {
+				return nil
+			}
+			return s.persistCustomResponsesContinuity(r.Context(), r, raw, streamRecorder.ResponseJSON(), cc)
+		})
+		observed := &responsesLedgerWriter{ResponseWriter: commitWriter, recorder: streamRecorder}
+		anthropicStreamToResponsesCustomSSE(observed, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber, bridge.Plan)
+		streamRecorder.finish()
+		if closeErr := commitWriter.Close(); closeErr != nil {
+			log.Printf("[GOAL-CONTINUITY] custom Anthropic responses terminal writer request_id=%s: %v", requestIDFromContext(r.Context()), closeErr)
+		}
+		if persistErr := commitWriter.PersistenceError(); persistErr != nil {
+			log.Printf("[GOAL-CONTINUITY] custom Anthropic responses persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
+			s.auditGoalPersistenceDegraded(r.Context(), "custom_anthropic_responses_stream", persistErr)
+		}
 		s.settleStreamUsage(r, cc, uscan)
 		return
 	}
@@ -1024,9 +1078,101 @@ func (s *Server) handleResponsesViaAnthropicMessagesCustom(w http.ResponseWriter
 	}
 	s.recordCustomUsage(r, cc, responseBody)
 	_ = s.settleBillingHold(r.Context(), cc.holdID, "settled")
+	if err := s.persistCustomResponsesContinuity(r.Context(), r, raw, out, cc); err != nil {
+		log.Printf("[GOAL-CONTINUITY] custom Anthropic responses persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), err)
+		s.auditGoalPersistenceDegraded(r.Context(), "custom_anthropic_responses_terminal", err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(cc.resp.StatusCode)
 	_, _ = w.Write(out)
+}
+
+// rebuildCustomResponsesBridgeRequest turns a server-side Responses continuation
+// into a self-contained body before it reaches a stateless protocol bridge. The
+// original downstream affinity was captured by the caller before this function, so
+// rebuilding history cannot move an active conversation to another provider key.
+func (s *Server) rebuildCustomResponsesBridgeRequest(w http.ResponseWriter, r *http.Request, raw []byte) ([]byte, func(), bool) {
+	finish := func() {}
+	previousID := strings.TrimSpace(gjson.GetBytes(raw, "previous_response_id").String())
+	turnState := ""
+	if r != nil {
+		turnState = strings.TrimSpace(r.Header.Get("X-Codex-Turn-State"))
+	}
+	if previousID == "" && turnState == "" {
+		return raw, finish, true
+	}
+
+	replay := s.goalReplayBody(r.Context(), r, "codex", raw)
+	switch replay.Kind {
+	case goalResumeFound:
+		closeRun, err := s.beginGoalRun(r.Context(), replay.Session.ID, "running")
+		if err != nil {
+			kind := goalResumeUnidentified
+			if errors.Is(err, storage.ErrGoalInProgress) {
+				kind = goalResumeInProgress
+			}
+			writeGoalResumeError(w, isStreamRequest(raw), "codex", kind, err.Error())
+			return nil, finish, false
+		}
+		w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt")
+		w.Header().Set("X-MiCliProxy-Goal-Status", replay.Session.State)
+		return replay.Body, closeRun, true
+	case goalResumeAmbiguous, goalResumeRequiresToolResult, goalResumeStorageExhausted, goalResumeProtocolMismatch:
+		writeGoalResumeError(w, isStreamRequest(raw), "codex", replay.Kind, replay.Reason)
+		return nil, finish, false
+	}
+
+	// During the goal-v2 migration, or when the feature was temporarily disabled,
+	// a completed prior response may exist only in the encrypted v1 journal.
+	if legacy, ok := s.journalReplayBody(r.Context(), raw); ok {
+		w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt-legacy")
+		return legacy, finish, true
+	}
+	writeGoalResumeError(w, isStreamRequest(raw), "codex", goalResumeUnidentified, replay.Reason)
+	return nil, finish, false
+}
+
+// responsesLedgerWriter observes the exact canonical Responses events before the
+// terminal commit writer releases response.completed. Recorder faults are isolated
+// from the live relay; the terminal callback will simply skip an incomplete record.
+type responsesLedgerWriter struct {
+	http.ResponseWriter
+	recorder *codexStreamLedgerRecorder
+}
+
+func (w *responsesLedgerWriter) Write(p []byte) (int, error) {
+	if w.recorder != nil {
+		_, _ = w.recorder.Write(p)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *responsesLedgerWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// persistCustomResponsesContinuity advances goal-v2 for Responses-shaped clients.
+// If the first turn carried no durable client identity, the generated response id is
+// still a valid next-turn handle; retain that one chain in the encrypted v1 journal
+// instead of acknowledging a response that can never be reconstructed.
+func (s *Server) persistCustomResponsesContinuity(ctx context.Context, r *http.Request, requestBody, responseBody []byte, cc customCall) error {
+	if len(responseBody) == 0 {
+		return nil
+	}
+	session, goalErr := s.persistGoalContinuity(ctx, r, "codex", requestBody, responseBody)
+	if goalErr == nil && strings.TrimSpace(session.ID) != "" {
+		return nil
+	}
+	journalErr := s.persistContextJournalFallback(ctx, requestBody, responseBody, cc.affinity.Hash, cc.lease.Account.ID)
+	if goalErr != nil && journalErr != nil {
+		return errors.Join(goalErr, journalErr)
+	}
+	if journalErr != nil {
+		return journalErr
+	}
+	return goalErr
 }
 
 func (s *Server) handleMessagesViaResponsesCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {

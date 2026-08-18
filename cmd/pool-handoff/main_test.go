@@ -449,6 +449,52 @@ func TestAdmissionPauseReleasesAllConcurrentRequests(t *testing.T) {
 	waitQueued(t, h, 0)
 }
 
+func TestAdmissionPauseRoutesRescueAsMemoryEmergency(t *testing.T) {
+	dir := t.TempDir()
+	socket, link := filepath.Join(dir, "worker-diagnostic.sock"), filepath.Join(dir, "active-diagnostic.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mode := make(chan string, 1)
+	worker := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mode <- r.URL.Query().Get("mode")
+		_, _ = io.WriteString(w, "diagnostic")
+	})}
+	go worker.Serve(listener)
+	t.Cleanup(func() { _ = worker.Close() })
+	replaceLink(t, link, socket)
+	h := newHandoff(link)
+	front := httptest.NewServer(h)
+	defer front.Close()
+
+	response := postControl(t, front.URL, pausePath)
+	_ = response.Body.Close()
+	response, err = http.Get(front.URL + "/admin/export/logs?mode=rescue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if readErr != nil || response.StatusCode != http.StatusOK || string(body) != "diagnostic" {
+		t.Fatalf("paused rescue status=%d body=%q err=%v", response.StatusCode, body, readErr)
+	}
+	select {
+	case got := <-mode:
+		if got != "emergency" {
+			t.Fatalf("paused rescue mode = %q, want emergency", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("paused rescue did not reach worker")
+	}
+	paused, queued, _, _, _ := h.gate.snapshot()
+	if !paused || queued != 0 {
+		t.Fatalf("diagnostic changed pause barrier: paused=%v queued=%d", paused, queued)
+	}
+	response = postControl(t, front.URL, resumePath)
+	_ = response.Body.Close()
+}
+
 func TestAdmissionControlRejectsNonLoopbackAndWrongMethod(t *testing.T) {
 	h := newHandoff(filepath.Join(t.TempDir(), "missing.sock"))
 

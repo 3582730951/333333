@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -81,6 +82,64 @@ func TestContextJournalDefaultTTLMigrationIsOneTime(t *testing.T) {
 	value, _, err = store.GetSetting(ctx, "context_journal_ttl_seconds")
 	if err != nil || value != "86400" {
 		t.Fatalf("one-time migration overwrote admin value: ttl=%q err=%v", value, err)
+	}
+}
+
+func TestCleanupContextJournalIsBoundedAndPreservesLiveRows(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "cleanup.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 300; index++ {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO context_journal(
+response_id,affinity_hash,account_id,encrypted_payload,created_at,expires_at) VALUES(?,?,?,?,?,?)`,
+			fmt.Sprintf("expired-%03d", index), "", "", "payload", Now()-10, Now()-1); err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO context_journal(
+response_id,affinity_hash,account_id,encrypted_payload,created_at,expires_at) VALUES(?,?,?,?,?,?)`,
+		"live", "", "", "payload", Now(), Now()+3600); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := store.CleanupContextJournal(ctx)
+	if err != nil || deleted != defaultContextJournalCleanupBatch {
+		t.Fatalf("first cleanup deleted=%d err=%v", deleted, err)
+	}
+	var expired, live int
+	if err = store.DB().QueryRowContext(ctx, `SELECT
+SUM(CASE WHEN expires_at<=? THEN 1 ELSE 0 END),
+SUM(CASE WHEN expires_at>? THEN 1 ELSE 0 END) FROM context_journal`, Now(), Now()).Scan(&expired, &live); err != nil {
+		t.Fatal(err)
+	}
+	if expired != 300-defaultContextJournalCleanupBatch || live != 1 {
+		t.Fatalf("remaining expired/live=%d/%d", expired, live)
+	}
+	totalDeleted := deleted
+	for totalDeleted < 300 {
+		deleted, err = store.CleanupContextJournal(ctx)
+		if err != nil || deleted <= 0 || deleted > defaultContextJournalCleanupBatch {
+			t.Fatalf("bounded cleanup deleted=%d total=%d err=%v", deleted, totalDeleted, err)
+		}
+		totalDeleted += deleted
+	}
+	if totalDeleted != 300 {
+		t.Fatalf("total deleted=%d", totalDeleted)
 	}
 }
 

@@ -663,11 +663,13 @@ type Config struct {
 	// Codex install settings used by the generated ~/.codex/config.toml setup script
 	// (GET /file/<key>). Model/provider/auth are always managed. Empty effort,
 	// approval, and sandbox values preserve the client's existing settings; non-empty
-	// values are explicit operator overrides validated against codex-rs enums.
+	// values are explicit operator overrides validated against codex-rs enums. A zero
+	// context window likewise preserves the client/model default.
 	CodexInstallModel          string `json:"codex_install_model"`           // default "gpt-5.6-sol"
 	CodexInstallEffort         string `json:"codex_install_effort"`          // default empty: preserve Codex config
 	CodexInstallApprovalPolicy string `json:"codex_install_approval_policy"` // default empty: preserve Codex config
 	CodexInstallSandboxMode    string `json:"codex_install_sandbox_mode"`    // default empty: preserve Codex config
+	CodexInstallContextWindow  int    `json:"codex_install_context_window"`  // default 0: preserve Codex/model context window
 	// SuperInstructLocalEnabled is retained for configuration compatibility only.
 	// Runtime Super-Instruct capability is the intersection of the resolved user
 	// group policy and the request's explicit client opt-in header.
@@ -1022,6 +1024,7 @@ func Default() Config {
 		CodexInstallEffort:                     "",
 		CodexInstallApprovalPolicy:             "",
 		CodexInstallSandboxMode:                "",
+		CodexInstallContextWindow:              0,
 		SuperInstructLocalEnabled:              false,
 		ClaudeGatewayInterceptHosts:            DefaultClaudeGatewayInterceptHosts(),
 		ClaudeGatewayForwardHosts:              DefaultClaudeGatewayForwardHosts(),

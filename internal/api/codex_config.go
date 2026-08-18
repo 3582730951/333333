@@ -101,6 +101,7 @@ func (s *Server) handleCodexConfigScript(w http.ResponseWriter, r *http.Request)
 		DisableNonessentialEnv: s.flagEnabled(r.Context(), "claude_gateway_disable_nonessential_env", s.cfg.ClaudeGatewayDisableNonessentialEnv),
 		CodexOnly:              codexOnly,
 		SuperInstruct:          superInstructPolicy,
+		ContextWindow:          s.settingInt(r.Context(), "codex_install_context_window", s.cfg.CodexInstallContextWindow),
 	}
 	_, _ = w.Write([]byte(buildCodexConfigScript(origin, key, model, effort, approval, sandbox, scriptOptions)))
 }
@@ -238,6 +239,9 @@ func isCodexSource(source string) bool {
 type CodexSetupScriptOptions struct {
 	StrictLinuxDefault     bool
 	DisableNonessentialEnv bool
+	// ContextWindow writes Codex's documented model_context_window root key when
+	// positive. Zero keeps an existing client override and the model default intact.
+	ContextWindow int
 	// CodexOnly emits a direct configuration-only installer. It has no Claude
 	// gateway, RTK, skill, plugin, model-cache, or client-ID branch.
 	CodexOnly bool
@@ -375,8 +379,8 @@ func defaultCodexSetupScriptOptions() CodexSetupScriptOptions {
 
 // buildCodexConfigScript renders the bash installer. It backs up any existing
 // config.toml, honors CODEX_HOME, and normally manages only model, model_provider,
-// and Pool's provider authentication table. Reasoning effort, approval, and sandbox
-// become managed root keys only when an operator supplied a non-empty override;
+// and Pool's provider authentication table. Reasoning effort, approval, sandbox and
+// model_context_window become managed root keys only when an operator supplied an override;
 // all other Codex settings remain client-owned. Claude Code remains a separate
 // local-gateway branch.
 func buildCodexConfigScript(origin, apiKey, model, effort, approval, sandbox string, options ...CodexSetupScriptOptions) string {
@@ -406,6 +410,10 @@ func buildCodexConfigScript(origin, apiKey, model, effort, approval, sandbox str
 	}
 	var extra strings.Builder
 	managedRootKeys := []string{"model", "model_provider"}
+	if scriptOptions.ContextWindow > 0 {
+		fmt.Fprintf(&extra, "model_context_window = %d\n", scriptOptions.ContextWindow)
+		managedRootKeys = append(managedRootKeys, "model_context_window")
+	}
 	if e := clean(effort); e != "" {
 		fmt.Fprintf(&extra, "model_reasoning_effort = \"%s\"\n", e)
 		managedRootKeys = append(managedRootKeys, "model_reasoning_effort")

@@ -177,6 +177,7 @@
   "codex_install_effort": "",
   "codex_install_approval_policy": "",
   "codex_install_sandbox_mode": "",
+  "codex_install_context_window": 0,
   "super_instruct_local_enabled": false,
   "warp_enabled": false,
   "warp_exit_count": 0,

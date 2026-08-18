@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"io"
 	"strings"
@@ -19,6 +20,34 @@ type recordingWebSocketWriter struct {
 	mu       sync.Mutex
 	messages [][]byte
 	notify   chan struct{}
+}
+
+type drainRecordingSocket struct {
+	mu          sync.Mutex
+	closed      bool
+	messageType int
+	payload     []byte
+}
+
+func (s *drainRecordingSocket) WriteMessage(messageType int, payload []byte) error {
+	s.mu.Lock()
+	s.messageType = messageType
+	s.payload = append([]byte(nil), payload...)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *drainRecordingSocket) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *drainRecordingSocket) snapshot() (bool, int, []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed, s.messageType, append([]byte(nil), s.payload...)
 }
 
 func (w *recordingWebSocketWriter) WriteMessage(messageType int, data []byte) error {
@@ -62,6 +91,48 @@ func (w *recordingMessage) Write(payload []byte) (int, error) { return w.body.Wr
 
 func (w *recordingMessage) Close() error {
 	return w.owner.WriteMessage(w.messageType, w.body.Bytes())
+}
+
+func TestResponsesWebSocketDeploymentDrainClosesIdleAndDefersActiveTurn(t *testing.T) {
+	var registry responsesWebSocketDrainRegistry
+	idleSocket := &drainRecordingSocket{}
+	activeSocket := &drainRecordingSocket{}
+	idle := registry.register(idleSocket, idleSocket)
+	active := registry.register(activeSocket, activeSocket)
+	defer idle.unregister()
+	defer active.unregister()
+	if !active.beginWork() {
+		t.Fatal("active session could not begin before drain")
+	}
+
+	total, idleCount := registry.drainExisting()
+	if total != 2 || idleCount != 1 {
+		t.Fatalf("drain snapshot total=%d idle=%d", total, idleCount)
+	}
+	closed, messageType, payload := idleSocket.snapshot()
+	if !closed || messageType != websocket.CloseMessage || len(payload) < 2 || binary.BigEndian.Uint16(payload[:2]) != websocket.CloseServiceRestart {
+		t.Fatalf("idle socket did not receive service-restart close: closed=%v type=%d payload=%v", closed, messageType, payload)
+	}
+	if closed, _, _ = activeSocket.snapshot(); closed {
+		t.Fatal("active model turn was interrupted by deployment drain")
+	}
+	if !active.endWork() {
+		t.Fatal("active session was not marked to close after its turn")
+	}
+	closed, messageType, payload = activeSocket.snapshot()
+	if !closed || messageType != websocket.CloseMessage || len(payload) < 2 || binary.BigEndian.Uint16(payload[:2]) != websocket.CloseServiceRestart {
+		t.Fatalf("active socket did not close after terminal turn: closed=%v type=%d payload=%v", closed, messageType, payload)
+	}
+
+	newSocket := &drainRecordingSocket{}
+	newSession := registry.register(newSocket, newSocket)
+	defer newSession.unregister()
+	if !newSession.beginWork() {
+		t.Fatal("a connection registered after the drain snapshot inherited stale drain state")
+	}
+	if newSession.endWork() {
+		t.Fatal("post-drain connection was unexpectedly closed")
+	}
 }
 
 func TestResponsesWebSocketRequestConversionPreservesContextBytes(t *testing.T) {
