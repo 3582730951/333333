@@ -1,13 +1,16 @@
 package superinstruct
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf16"
 	"unicode/utf8"
 )
 
@@ -84,7 +87,53 @@ func LoadBridge() (string, error) {
 	if len(raw) == 0 {
 		return "", fmt.Errorf("Super-Instruct bridge %s is empty", path)
 	}
-	return string(raw), nil
+	return DecodeBridgeContent(raw), nil
+}
+
+// DecodeBridgeContent returns the plaintext bridge instructions. The release
+// bundle stores bridge.md as base64-encoded UTF-16LE so the injected resource is
+// not plaintext on disk; ordinary UTF-8 deployments pass through unchanged.
+func DecodeBridgeContent(raw []byte) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) < 4 {
+		return string(raw)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(string(trimmed))
+	if err != nil || len(decoded) < 2 || len(decoded)%2 != 0 {
+		return string(raw)
+	}
+	// Only treat the file as encoded when its UTF-16LE interpretation is real
+	// text: no NUL rune, no unpaired-surrogate replacement char, and a
+	// substantial share of zero bytes. ASCII-heavy UTF-16LE puts a NUL in the
+	// high byte of every ASCII rune, so a genuine encoded bridge shows ~20%
+	// zero bytes; base64 of plain UTF-8 ASCII shows none, which is exactly the
+	// false positive a naive decode would mangle into CJK mojibake.
+	zeroBytes := 0
+	for _, b := range decoded {
+		if b == 0 {
+			zeroBytes++
+		}
+	}
+	text := string(utf16.Decode(makeUTF16LE(decoded)))
+	if strings.ContainsRune(text, 0) || strings.ContainsRune(text, utf8.RuneError) {
+		return string(raw)
+	}
+	if float64(zeroBytes)/float64(len(decoded)) < 0.10 {
+		return string(raw)
+	}
+	if text = strings.TrimSpace(text); text == "" {
+		return string(raw)
+	}
+	return text
+}
+
+// makeUTF16LE reinterprets little-endian bytes as UTF-16 code units.
+func makeUTF16LE(b []byte) []uint16 {
+	units := make([]uint16, len(b)/2)
+	for i := range units {
+		units[i] = uint16(b[2*i]) | uint16(b[2*i+1])<<8
+	}
+	return units
 }
 
 func (l Library) root() string {

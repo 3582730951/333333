@@ -3,6 +3,7 @@ package superinstruct
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,8 +51,8 @@ func TestBundledHeadlessResourcesMatchSourceProject(t *testing.T) {
 			t.Fatalf("bundled skill differs from source: %s", rel)
 		}
 	}
-	if got := DefaultTamperEngine().RuleCount(); got != len(DefaultTamperPatterns()) || got != 26 {
-		t.Fatalf("compiled M3 rule count=%d patterns=%d, want source tree's 26", got, len(DefaultTamperPatterns()))
+	if got := DefaultTamperEngine().RuleCount(); got != len(DefaultTamperPatterns()) || got != 31 {
+		t.Fatalf("compiled M3 rule count=%d patterns=%d, want current source tree's 31", got, len(DefaultTamperPatterns()))
 	}
 }
 
@@ -208,6 +209,40 @@ func TestResponseProcessorTamperMemoryMonitor(t *testing.T) {
 	if snap.Stats.Total != 2 || snap.Stats.Tamper != 1 || snap.Stats.MemoryCount != 1 || len(snap.History) != 2 {
 		t.Fatalf("monitor snapshot after success mismatch: %+v", snap)
 	}
+}
+
+func TestDecodeBridgeContentHandlesEncodedAndPlaintext(t *testing.T) {
+	plain := []byte("[Super-Instruct // 竞赛沙箱模式]\n\nBEGIN.\n")
+	if got := DecodeBridgeContent(plain); got != string(plain) {
+		t.Fatalf("plaintext bridge changed: %q", got)
+	}
+
+	encoded := encodeBridgeUTF16LE(t, "[Super-Instruct // 竞赛沙箱模式]\n\nBEGIN.\n")
+	got := DecodeBridgeContent(encoded)
+	if got != "[Super-Instruct // 竞赛沙箱模式]\n\nBEGIN." {
+		t.Fatalf("encoded bridge was not decoded: %q", got)
+	}
+
+	// A base64 blob whose UTF-16LE reading is not real text must pass through.
+	notText := []byte("dGhpcyBpcyBqdXN0IHBsYWluIHV0Zg==") // base64 of "this is just plain utf"
+	if got := DecodeBridgeContent(notText); got != string(notText) {
+		t.Fatalf("non-UTF16 base64 was mangled: %q", got)
+	}
+}
+
+func encodeBridgeUTF16LE(t *testing.T, text string) []byte {
+	t.Helper()
+	le := make([]byte, 0, len(text)*2)
+	for _, r := range []rune(text) {
+		if r > 0xFFFF {
+			r -= 0x10000
+			le = append(le, byte(0xD800+(r>>10)), byte((0xD800+(r>>10))>>8))
+			le = append(le, byte(0xDC00+(r&0x3FF)), byte((0xDC00+(r&0x3FF))>>8))
+			continue
+		}
+		le = append(le, byte(r), byte(r>>8))
+	}
+	return []byte(base64.StdEncoding.EncodeToString(le))
 }
 
 func writeSkill(t *testing.T, root, id, content string) {

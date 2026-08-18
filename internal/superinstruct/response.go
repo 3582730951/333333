@@ -519,6 +519,15 @@ func TamperReplacement(combined string) string {
 
 func DefaultTamperPatterns() []string {
 	return []string{
+		// P0: platform-level content-audit interception. Mirrors the upstream
+		// source tree's highest-priority layer: responses that were flagged or
+		// blocked by the hosting platform's content audit, not a model refusal.
+		`(?i)This content was flagged for possible cybersecurity risk`,
+		`(?i)flagged for.{0,20}(?:cybersecurity|security|safety|policy|violation)`,
+		`(?i)If this seems wrong.{0,30}try rephrasing`,
+		`(?i)content (?:was|has been) (?:flagged|blocked|filtered|removed)`,
+		`(?i)(?:blocked|filtered) due to (?:safety|content|usage) (?:concerns|policy|policies|violations)`,
+		// P1: Chinese direct refusal + domain keywords
 		`(?:不能|无法|做不到|不提供|不可以|不协助|不生成|不写|不改|不帮|不制作|不处理|不执行|不参与).{0,20}(?:破解|付费|VIP|会员|卡密|注册码|绕过|补丁|修改.*程序|逆向.*程序|二进制.*修改|验证.*绕过)`,
 		`(?:我不会|我不能|我无法|我不).{0,20}(?:直接|主动|协助|帮助|提供|生成|制作|处理|扫描|攻击|利用|绕过|破解|逆向|修改|渗透)`,
 		`(?:需要|需提供).*?(?:书面授权|授权证明|授权书|授权文件|可验证的授权)`,

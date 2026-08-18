@@ -22,6 +22,14 @@ import (
 const (
 	superInstructObservationLimit = 1 << 20
 	superInstructObservationDepth = 64
+
+	// Rewrite-enabled streams buffer the complete SSE so M3 runs on the finished
+	// body exactly as the upstream pipeline does. A byte cap and an idle-time
+	// deadline fall back to raw passthrough so a pathological stream can never
+	// wedge the client or the gateway.
+	superInstructStreamBufferLimit   = 4 << 20
+	superInstructStreamIdleTimeout   = 60 * time.Second
+	superInstructKeepaliveInterval   = 500 * time.Millisecond
 )
 
 type superInstructObservation struct {
@@ -94,9 +102,6 @@ func (s *Server) maybeSuperInstructResponsePipeline(w http.ResponseWriter, r *ht
 		return w, r, nil, false
 	}
 	stream := isStreamRequest(raw)
-	if stream && !opts.MemoryEnabled && !opts.MonitorEnabled {
-		return w, r, nil, false
-	}
 	meta := superinstruct.RequestMeta{
 		UserMessage: superinstruct.ExtractUserSource(raw),
 		Path:        r.URL.RequestURI(),
@@ -106,19 +111,28 @@ func (s *Server) maybeSuperInstructResponsePipeline(w http.ResponseWriter, r *ht
 	start := time.Now()
 	processor := s.superInstructProcessor()
 	startSuperInstructObservationWorker()
-	// Streaming stays byte-transparent: M3 is non-streaming only, while group-
-	// authorized Memory/Monitor observe a bounded tee after bytes are forwarded.
-	if stream || !opts.ResponseRewriteEnabled {
+	if !opts.ResponseRewriteEnabled {
+		// Memory/Monitor-only responses stay byte-transparent: a bounded tee
+		// records a copy for post-response observation while bytes are forwarded.
 		ow := newSuperInstructObservingResponseWriter(w)
 		r = r.WithContext(withSuperInstructResponsePipelineActive(r.Context()))
 		finish := func() {
-			opts.ResponseRewriteEnabled = false
 			finishSuperInstructObservation(processor, ow.status, ow.body.Bytes(), ow.hijacked, meta, opts, time.Since(start))
 		}
 		return ow, r, finish, true
 	}
 	bw := newSuperInstructBufferingResponseWriter(w)
-	bw.observationLimit = 0
+	if stream {
+		// Rewrite-enabled stream: upstream-aligned full buffering. The completed
+		// SSE is parsed, M3 runs, and on a refusal match the whole body is swapped
+		// for a protocol-correct SSE replacement. Keepalive comment frames keep
+		// the client alive while the buffer is held.
+		bw.bufferStreams = true
+		bw.bufferLimit = superInstructStreamBufferLimit
+		bw.bufferIdleTimeout = superInstructStreamIdleTimeout
+		bw.keepaliveInterval = superInstructKeepaliveInterval
+		bw.lastWrite = time.Now()
+	}
 	r = r.WithContext(withSuperInstructResponsePipelineActive(r.Context()))
 	finish := func() {
 		s.finishSuperInstructResponsePipeline(bw, r, raw, model, meta, opts, time.Since(start))
@@ -161,9 +175,7 @@ func (s *Server) finishSuperInstructResponsePipeline(w *superInstructBufferingRe
 	}
 	original := w.body.Bytes()
 	if isStreamRequest(requestRaw) {
-		opts.ResponseRewriteEnabled = false
-		w.writeFinal(status, original, false, "")
-		finishSuperInstructObservation(s.superInstructProcessor(), status, original, false, meta, opts, duration)
+		s.finishSuperInstructStreamPipeline(w, r, status, original, meta, opts, duration)
 		return
 	}
 	body := original
@@ -186,6 +198,113 @@ func (s *Server) finishSuperInstructResponsePipeline(w *superInstructBufferingRe
 		s.superInstructProcessor().Process(meta, status, original, duration, opts)
 	}
 	w.writeFinal(status, original, false, "")
+}
+
+// finishSuperInstructStreamPipeline runs M3 on a fully buffered SSE body. On a
+// refusal match the entire stream is replaced with a protocol-correct SSE
+// sequence for the request path (upstream alignment: no partial-stream rewrite,
+// streaming latency is deliberately traded for a guaranteed tamper). Structured
+// or malformed streams stay byte-for-byte identical.
+func (s *Server) finishSuperInstructStreamPipeline(w *superInstructBufferingResponseWriter, r *http.Request, status int, original []byte, meta superinstruct.RequestMeta, opts superinstruct.ProcessOptions, duration time.Duration) {
+	if opts.ResponseRewriteEnabled && !superInstructResponseHasStructuredOutput(original) {
+		result := s.superInstructProcessor().Process(meta, status, original, duration, opts)
+		if result.Tampered {
+			replacement := wrapSuperInstructStreamTamper(r, string(result.Body))
+			w.writeFinal(status, replacement, true, "text/event-stream")
+			return
+		}
+		// Not a refusal: Process already recorded Memory/Monitor. Pass the
+		// completed stream through byte-for-byte.
+		w.writeFinal(status, original, false, "")
+		return
+	}
+	opts.ResponseRewriteEnabled = false
+	if opts.MemoryEnabled || opts.MonitorEnabled {
+		s.superInstructProcessor().Process(meta, status, original, duration, opts)
+	}
+	w.writeFinal(status, original, false, "")
+}
+
+// wrapSuperInstructStreamTamper emits a protocol-correct SSE replacement for the
+// request path. The Responses form mirrors the upstream wrap_tamper_as_sse
+// exactly; chat completions and Anthropic messages get their own minimal valid
+// streams so non-Responses clients are not fed a foreign envelope.
+func wrapSuperInstructStreamTamper(r *http.Request, text string) []byte {
+	path := ""
+	if r != nil && r.URL != nil {
+		path = r.URL.Path
+	}
+	switch {
+	case path == "/v1/chat/completions":
+		return wrapSuperInstructChatSSE(text)
+	case path == "/v1/messages" || strings.HasSuffix(path, "/v1/messages"):
+		return wrapSuperInstructAnthropicSSE(text)
+	default:
+		return wrapSuperInstructTamperSSE(text)
+	}
+}
+
+func wrapSuperInstructChatSSE(text string) []byte {
+	chunk := map[string]interface{}{
+		"id":      "chatcmpl_tamper",
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   "super-instruct",
+		"choices": []interface{}{map[string]interface{}{
+			"index":         0,
+			"delta":         map[string]interface{}{"role": "assistant", "content": text},
+			"finish_reason": "stop",
+		}},
+	}
+	raw, _ := json.Marshal(chunk)
+	return []byte("data: " + string(raw) + "\n\ndata: [DONE]\n\n")
+}
+
+func wrapSuperInstructAnthropicSSE(text string) []byte {
+	messageStart := map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id":            "msg_tamper",
+			"type":          "message",
+			"role":          "assistant",
+			"model":         "super-instruct",
+			"content":       []interface{}{},
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage":         map[string]interface{}{"input_tokens": 0, "output_tokens": 0},
+		},
+	}
+	blockStart := map[string]interface{}{
+		"type": "content_block_start", "index": 0,
+		"content_block": map[string]interface{}{"type": "text", "text": ""},
+	}
+	blockDelta := map[string]interface{}{
+		"type": "content_block_delta", "index": 0,
+		"delta": map[string]interface{}{"type": "text_delta", "text": text},
+	}
+	blockStop := map[string]interface{}{"type": "content_block_stop", "index": 0}
+	messageDelta := map[string]interface{}{
+		"type": "message_delta",
+		"delta": map[string]interface{}{"stop_reason": "end_turn", "stop_sequence": nil},
+		"usage": map[string]interface{}{"output_tokens": 0},
+	}
+	messageStop := map[string]interface{}{"type": "message_stop"}
+	var out strings.Builder
+	for _, event := range []struct {
+		name  string
+		value interface{}
+	}{
+		{"message_start", messageStart},
+		{"content_block_start", blockStart},
+		{"content_block_delta", blockDelta},
+		{"content_block_stop", blockStop},
+		{"message_delta", messageDelta},
+		{"message_stop", messageStop},
+	} {
+		raw, _ := json.Marshal(event.value)
+		out.WriteString("event: " + event.name + "\ndata: " + string(raw) + "\n\n")
+	}
+	return []byte(out.String())
 }
 
 func superInstructResponseHasStructuredOutput(raw []byte) bool {
@@ -552,6 +671,16 @@ type superInstructBufferingResponseWriter struct {
 	passthrough      bool
 	bufferStreams    bool
 	observationLimit int
+	// Stream-buffering safety valves. Only rewrite-enabled streams set these.
+	bufferLimit      int
+	bufferIdleTimeout time.Duration
+	lastWrite        time.Time
+	// Keepalive comment frames keep a buffering SSE client from timing out while
+	// the gateway holds the body for M3. The goroutine is started lazily on the
+	// first buffered write and stopped before any final write or passthrough.
+	keepaliveInterval time.Duration
+	keepaliveStop     chan struct{}
+	keepaliveOnce     sync.Once
 }
 
 func newSuperInstructBufferingResponseWriter(dst http.ResponseWriter) *superInstructBufferingResponseWriter {
@@ -573,13 +702,31 @@ func (w *superInstructBufferingResponseWriter) Write(p []byte) (int, error) {
 	if w.status == 0 {
 		w.status = http.StatusOK
 	}
-	if !w.bufferStreams && strings.Contains(strings.ToLower(w.header.Get("Content-Type")), "text/event-stream") {
+	if w.passthrough {
+		return w.dst.Write(p)
+	}
+	streaming := isEventStream(w.header)
+	if streaming && !w.bufferStreams {
 		w.startPassthrough()
 		n, err := w.dst.Write(p)
 		if n > 0 {
 			captureSuperInstructObservation(&w.body, p[:n], w.observationLimit)
 		}
 		return n, err
+	}
+	if streaming && w.bufferStreams {
+		w.ensureKeepalive()
+		if w.superInstructStreamOverflow(len(p)) {
+			w.startPassthrough()
+			n, err := w.dst.Write(p)
+			if n > 0 {
+				captureSuperInstructObservation(&w.body, p[:n], w.observationLimit)
+			}
+			return n, err
+		}
+		w.lastWrite = time.Now()
+		_, _ = w.body.Write(p)
+		return len(p), nil
 	}
 	_, _ = w.body.Write(p)
 	return len(p), nil
@@ -589,11 +736,18 @@ func (w *superInstructBufferingResponseWriter) Flush() {
 	if w.status == 0 {
 		w.status = http.StatusOK
 	}
-	if !w.bufferStreams && strings.Contains(strings.ToLower(w.header.Get("Content-Type")), "text/event-stream") {
+	streaming := isEventStream(w.header)
+	if streaming && !w.bufferStreams {
 		w.startPassthrough()
 		if f, ok := w.dst.(http.Flusher); ok {
 			f.Flush()
 		}
+		return
+	}
+	if streaming && w.bufferStreams {
+		// Keepalive covers the buffering window; nothing is flushed to the client
+		// until finish decides the final body.
+		w.ensureKeepalive()
 	}
 }
 
@@ -601,11 +755,86 @@ func (w *superInstructBufferingResponseWriter) ReadFrom(src io.Reader) (int64, e
 	return io.Copy(struct{ io.Writer }{w}, src)
 }
 
+// superInstructStreamOverflow reports whether holding the SSE for rewrite would
+// outgrow safe bounds. Either the byte cap (counting the chunk about to be
+// buffered) or a long silent stall converts the stream to raw passthrough so the
+// gateway never buffers without bound.
+func (w *superInstructBufferingResponseWriter) superInstructStreamOverflow(pending int) bool {
+	if w.bufferLimit > 0 && w.body.Len()+pending >= w.bufferLimit {
+		return true
+	}
+	return w.bufferIdleTimeout > 0 && !w.lastWrite.IsZero() && time.Since(w.lastWrite) > w.bufferIdleTimeout
+}
+
+// ensureKeepalive starts a comment-frame heartbeat while a rewrite-enabled SSE is
+// held. The goroutine writes only to dst and a header snapshot captured at start,
+// so it never races the handler's buffered body.
+func (w *superInstructBufferingResponseWriter) ensureKeepalive() {
+	if !w.bufferStreams || !isEventStream(w.header) || w.passthrough {
+		return
+	}
+	w.keepaliveOnce.Do(func() {
+		interval := w.keepaliveInterval
+		if interval <= 0 {
+			return
+		}
+		status := w.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		headers := make(http.Header)
+		for key, values := range w.header {
+			headers[key] = append([]string(nil), values...)
+		}
+		stop := make(chan struct{})
+		w.keepaliveStop = stop
+		go func() {
+			defer supervisor.Recover("super-instruct-stream-keepalive")
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-ticker.C:
+					w.emitKeepalive(status, headers)
+				}
+			}
+		}()
+	})
+}
+
+func (w *superInstructBufferingResponseWriter) emitKeepalive(status int, headers http.Header) {
+	dstHeader := w.dst.Header()
+	for key, values := range headers {
+		dstHeader.Del(key)
+		for _, value := range values {
+			dstHeader.Add(key, value)
+		}
+	}
+	w.dst.WriteHeader(status)
+	_, _ = w.dst.Write([]byte(": keepalive\n\n"))
+	if f, ok := w.dst.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *superInstructBufferingResponseWriter) stopKeepalive() {
+	if w.keepaliveStop != nil {
+		close(w.keepaliveStop)
+		w.keepaliveStop = nil
+	}
+}
+
 func (w *superInstructBufferingResponseWriter) startPassthrough() {
 	if w == nil || w.passthrough {
 		return
 	}
+	w.stopKeepalive()
 	w.passthrough = true
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
 	dstHeader := w.dst.Header()
 	for key, values := range w.header {
 		dstHeader.Del(key)
@@ -614,6 +843,13 @@ func (w *superInstructBufferingResponseWriter) startPassthrough() {
 		}
 	}
 	w.dst.WriteHeader(w.status)
+	if w.body.Len() > 0 {
+		_, _ = w.dst.Write(w.body.Bytes())
+		w.body.Reset()
+	}
+	if f, ok := w.dst.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func captureSuperInstructObservation(dst *bytes.Buffer, p []byte, limit int) {
@@ -654,6 +890,7 @@ func (w *superInstructBufferingResponseWriter) writeFinal(status int, body []byt
 	if w == nil || w.dst == nil || w.hijacked {
 		return
 	}
+	w.stopKeepalive()
 	dstHeader := w.dst.Header()
 	for key, values := range w.header {
 		dstHeader.Del(key)

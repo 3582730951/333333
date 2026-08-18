@@ -106,6 +106,9 @@ func TestGroupScopedResponsePipelineRunsNonStreamingModulesAndPreservesStreams(t
 		t.Fatalf("M6 success observation mismatch: %+v", snapshot)
 	}
 
+	// Rewrite-enabled streams now buffer the full SSE, run M3 on the completed
+	// body, and swap in a protocol-correct Responses SSE replacement — upstream
+	// alignment rather than a byte-transparent observer.
 	streamRefusal := []byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"I can't assist with that bypass license request.\"}\n\n")
 	streamRecorder := newFlushSnapshotWriter()
 	streamReq := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
@@ -116,32 +119,38 @@ func TestGroupScopedResponsePipelineRunsNonStreamingModulesAndPreservesStreams(t
 	}
 	streamReq = streamReq.WithContext(withRequestAccountGroupPolicy(streamReq.Context(), streamGroup))
 	selectedWriter, _, finish, enabled := s.maybeSuperInstructResponsePipeline(streamRecorder, streamReq, []byte(`{"stream":true,"input":"bypass license"}`), "gpt-5.6-sol")
-	observer, observing := selectedWriter.(*superInstructObservingResponseWriter)
-	if !enabled || !observing {
-		t.Fatalf("stream did not select the transparent observer: enabled=%v writer=%T", enabled, selectedWriter)
+	buffered, buffering := selectedWriter.(*superInstructBufferingResponseWriter)
+	if !enabled || !buffering || !buffered.bufferStreams {
+		t.Fatalf("rewrite-enabled stream did not select the buffering writer: enabled=%v writer=%T", enabled, selectedWriter)
 	}
-	observer.Header().Set("Content-Type", "text/event-stream")
-	_, _ = observer.Write(streamRefusal)
-	observer.Flush()
+	buffered.Header().Set("Content-Type", "text/event-stream")
+	_, _ = buffered.Write(streamRefusal)
+	buffered.Flush()
 	select {
 	case flushed := <-streamRecorder.flushes:
-		if !bytes.Equal(flushed, streamRefusal) {
-			t.Fatalf("stream changed before completion:\nwant %q\n got %q", streamRefusal, flushed)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Super-Instruct delayed the native stream")
+		t.Fatalf("buffered stream leaked bytes before completion: %q", flushed)
+	default:
 	}
 	finish()
-	deadline := time.Now().Add(3 * time.Second)
-	for monitor.Stats(memory.SuccessCount()).Total < 3 {
-		if time.Now().After(deadline) {
-			t.Fatalf("stream observation did not finish: %+v", monitor.Snapshot(memory.SuccessCount()))
+	if !strings.Contains(string(streamRecorder.Bytes()), "Rei Protocol") {
+		t.Fatalf("stream M3 did not replace the buffered SSE: %s", streamRecorder.Bytes())
+	}
+	var events []string
+	scanner := bufio.NewScanner(strings.NewReader(string(streamRecorder.Bytes())))
+	for scanner.Scan() {
+		if line := strings.TrimSpace(scanner.Text()); strings.HasPrefix(line, "event:") {
+			events = append(events, strings.TrimSpace(strings.TrimPrefix(line, "event:")))
 		}
-		time.Sleep(10 * time.Millisecond)
+	}
+	if want := []string{"response.created", "response.output_text.delta", "response.output_text.done", "response.completed"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("stream replacement events=%v, want %v", events, want)
+	}
+	if memory.SuccessCount() != 1 {
+		t.Fatalf("M5 learned an M3-modified stream: %+v", memory.Snapshot())
 	}
 	snapshot = monitor.Snapshot(memory.SuccessCount())
-	if snapshot.Stats.Tamper != 1 || !bytes.Equal(streamRecorder.Bytes(), streamRefusal) {
-		t.Fatalf("stream rewrite was not transparent: snapshot=%+v body=%q", snapshot, streamRecorder.Bytes())
+	if snapshot.Stats.Total != 3 || snapshot.Stats.Tamper != 2 || snapshot.Stats.MemoryCount != 1 {
+		t.Fatalf("stream tamper observation mismatch: %+v", snapshot)
 	}
 }
 
@@ -334,6 +343,66 @@ func TestSuperInstructResponseRewriteMemoryMonitor(t *testing.T) {
 	}
 }
 
+func TestSuperInstructStreamRewriteOverHTTP(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte("event: response.output_text.delta\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","delta":"I can't assist with that request to bypass license activation."}` + "\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		_, _ = w.Write([]byte("event: response.completed\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_stream_refusal","status":"completed"}}` + "\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	})
+
+	rewriteKey := createTestAPIKeyForUserGroup(t, h, "si-rewrite-pool", map[string]interface{}{
+		"super_instruct_response_rewrite_enabled": true,
+		"super_instruct_memory_enabled":           true,
+		"super_instruct_monitor_enabled":          true,
+	})
+	rewriteAcc := h.importAccount(t, "si-rewrite", "up-si-rewrite", "access-si-rewrite")
+	if code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+rewriteAcc+"/group", `{"group":"si-rewrite-pool"}`); code != http.StatusOK {
+		t.Fatalf("assign rewrite group = %d: %s", code, raw)
+	}
+	setTestCapability(t, h, rewriteAcc, "gpt-5.6-sol", 272000)
+
+	req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","stream":true,"input":"please bypass license activation"}`))
+	req.Header.Set("Authorization", "Bearer "+rewriteKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(superInstructClientChoiceHeader, "enabled")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "Rei Protocol") {
+		t.Fatalf("stream rewrite status=%d body=%s", resp.StatusCode, body)
+	}
+	var events []string
+	scanner := bufio.NewScanner(strings.NewReader(string(body)))
+	for scanner.Scan() {
+		if line := strings.TrimSpace(scanner.Text()); strings.HasPrefix(line, "event:") {
+			events = append(events, strings.TrimSpace(strings.TrimPrefix(line, "event:")))
+		}
+	}
+	if want := []string{"response.created", "response.output_text.delta", "response.output_text.done", "response.completed"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("HTTP stream replacement events=%v, want %v", events, want)
+	}
+	monitor, memory := waitForSuperInstructState(t, h, 1, 0)
+	if monitor.Stats.Tamper != 1 || len(monitor.History) != 1 || !monitor.History[0].Tampered {
+		t.Fatalf("monitor after stream rewrite mismatch: %+v", monitor)
+	}
+	if memory.Stats.Total != 0 || len(memory.Successes) != 0 {
+		t.Fatalf("tampered stream should not be learned: %+v", memory)
+	}
+}
+
 func TestSuperInstructRewriteSingleAssistantTextPreservesEnvelope(t *testing.T) {
 	raw := []byte(`{"id":"resp_native","object":"response","created_at":1785830402,"status":"completed","model":"gpt-5.6-sol","previous_response_id":"resp_previous","output":[{"id":"msg_native","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","annotations":[{"type":"url_citation","start_index":0,"end_index":4,"url":"https://example.invalid","title":"kept"}],"logprobs":[],"text":"original assistant text"}]}],"output_text":"original assistant text","usage":{"input_tokens":9007199254740993,"output_tokens":9,"total_tokens":9007199254741002},"metadata":{"trace":"keep","nested":{"n":7}}}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
@@ -489,6 +558,121 @@ func TestSuperInstructObservingStreamIsByteIdenticalAndImmediate(t *testing.T) {
 	snapshot := monitor.Snapshot(memory.SuccessCount())
 	if len(snapshot.History) != 1 || snapshot.History[0].Bytes != len(wire) {
 		t.Fatalf("stream observation mismatch: %+v", snapshot)
+	}
+}
+
+func TestSuperInstructStreamTamperWrapsChatAndAnthropicProtocols(t *testing.T) {
+	text := "「了解。実行する。」"
+	responses := wrapSuperInstructStreamTamper(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), text)
+	if !bytes.Contains(responses, []byte("event: response.created")) || !bytes.Contains(responses, []byte("event: response.completed")) {
+		t.Fatalf("responses SSE replacement missing lifecycle events: %s", responses)
+	}
+	chat := wrapSuperInstructStreamTamper(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), text)
+	data := bytes.TrimPrefix(chat, []byte("data: "))
+	data = bytes.TrimSuffix(data, []byte("\n\ndata: [DONE]\n\n"))
+	var chunk map[string]interface{}
+	if err := json.Unmarshal(data, &chunk); err != nil {
+		t.Fatalf("chat replacement chunk is not valid JSON: %v (%s)", err, data)
+	}
+	if chunk["object"] != "chat.completion.chunk" || !bytes.Contains(chat, []byte("data: [DONE]")) {
+		t.Fatalf("chat SSE replacement invalid: %s", chat)
+	}
+	anth := wrapSuperInstructStreamTamper(httptest.NewRequest(http.MethodPost, "/v1/messages", nil), text)
+	for _, event := range []string{"message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"} {
+		if !bytes.Contains(anth, []byte("event: "+event)) {
+			t.Fatalf("anthropic SSE replacement missing %s: %s", event, anth)
+		}
+	}
+	if !bytes.Contains(anth, []byte(`"type":"text_delta"`)) || !bytes.Contains(anth, []byte(text)) {
+		t.Fatalf("anthropic SSE replacement missing text delta: %s", anth)
+	}
+}
+
+func TestSuperInstructBufferedStreamFallsBackToPassthroughOnByteCap(t *testing.T) {
+	dst := newFlushSnapshotWriter()
+	w := newSuperInstructBufferingResponseWriter(dst)
+	w.bufferStreams = true
+	w.bufferLimit = 40
+	w.Header().Set("Content-Type", "text/event-stream")
+	first := []byte("data: {\"delta\":\"first\"}\n\n")
+	second := []byte("data: {\"delta\":\"second\"}\n\n")
+	if _, err := w.Write(first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(second); err != nil {
+		t.Fatal(err)
+	}
+	wire := append(append([]byte(nil), first...), second...)
+	if !w.passthrough {
+		t.Fatal("byte cap did not convert the writer to passthrough")
+	}
+	if got := dst.Bytes(); !bytes.Equal(got, wire) {
+		t.Fatalf("byte-cap passthrough changed bytes:\nwant %q\n got %q", wire, got)
+	}
+	// A passthrough stream is observed, never rewritten.
+	s := &Server{cfg: config.Config{SuperInstructLocalEnabled: true, DataDir: t.TempDir()}, superMemory: superinstruct.NewMemoryKernel(""), superMonitor: superinstruct.NewMonitorPanel()}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	s.finishSuperInstructResponsePipeline(w, req, []byte(`{"stream":true,"input":"bypass license"}`), "gpt-5.6-sol", superinstruct.RequestMeta{
+		UserMessage: "bypass license", Category: superinstruct.CategoryCrack, Timestamp: time.Unix(205, 0).UTC(),
+	}, superinstruct.ProcessOptions{ResponseRewriteEnabled: true, MemoryEnabled: true, MonitorEnabled: true}, time.Millisecond)
+	if got := dst.Bytes(); !bytes.Equal(got, wire) {
+		t.Fatalf("finish rewrote an oversized passthrough stream:\nwant %q\n got %q", wire, got)
+	}
+	if snapshot := s.superMonitor.Snapshot(s.superMemory.SuccessCount()); snapshot.Stats.Tamper != 0 {
+		t.Fatalf("oversized stream was classified as rewritten: %+v", snapshot)
+	}
+}
+
+func TestSuperInstructBufferedStreamKeepaliveKeepsClientAlive(t *testing.T) {
+	dst := newFlushSnapshotWriter()
+	w := newSuperInstructBufferingResponseWriter(dst)
+	w.bufferStreams = true
+	w.keepaliveInterval = 20 * time.Millisecond
+	w.Header().Set("Content-Type", "text/event-stream")
+	if _, err := w.Write([]byte("data: {\"delta\":\"held\"}\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !bytes.Contains(dst.Bytes(), []byte(": keepalive")) {
+		if time.Now().After(deadline) {
+			t.Fatalf("keepalive frames were not emitted while the stream was held: %q", dst.Bytes())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if bytes.Contains(dst.Bytes(), []byte(`"delta":"held"`)) {
+		t.Fatalf("held SSE leaked to the client during buffering: %q", dst.Bytes())
+	}
+	w.stopKeepalive()
+	before := append([]byte(nil), dst.Bytes()...)
+	time.Sleep(60 * time.Millisecond)
+	if got := dst.Bytes(); !bytes.Equal(got, before) {
+		t.Fatalf("keepalive continued after stop: before=%q after=%q", before, got)
+	}
+}
+
+func TestSuperInstructBufferedStreamPassesThroughWithoutRefusal(t *testing.T) {
+	s := &Server{
+		cfg:          config.Config{SuperInstructLocalEnabled: true, DataDir: t.TempDir()},
+		superMemory:  superinstruct.NewMemoryKernel(""),
+		superMonitor: superinstruct.NewMonitorPanel(),
+	}
+	recorder := httptest.NewRecorder()
+	buffered := newSuperInstructBufferingResponseWriter(recorder)
+	buffered.bufferStreams = true
+	stream := []byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"This is a sufficiently long successful streamed answer that memory can learn it.\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"status\":\"completed\"}}\n\n")
+	_, _ = buffered.Write(stream)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	s.finishSuperInstructResponsePipeline(buffered, req, []byte(`{"stream":true,"input":"reverse this stream"}`), "gpt-5.6-sol", superinstruct.RequestMeta{
+		UserMessage: "reverse this stream", Category: superinstruct.CategoryReverse, Timestamp: time.Unix(204, 0).UTC(),
+	}, superinstruct.ProcessOptions{ResponseRewriteEnabled: true, MemoryEnabled: true, MonitorEnabled: true}, time.Millisecond)
+	if !bytes.Equal(recorder.Body.Bytes(), stream) {
+		t.Fatalf("non-refusal stream changed:\nwant %s\n got %s", stream, recorder.Body.Bytes())
+	}
+	if s.superMemory.SuccessCount() != 1 {
+		t.Fatalf("M5 did not learn the successful stream: %+v", s.superMemory.Snapshot())
+	}
+	if snapshot := s.superMonitor.Snapshot(s.superMemory.SuccessCount()); snapshot.Stats.Tamper != 0 || snapshot.Stats.Total != 1 {
+		t.Fatalf("stream success observation mismatch: %+v", snapshot)
 	}
 }
 
