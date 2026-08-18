@@ -18,6 +18,7 @@ import (
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/superinstruct"
+	"github.com/gorilla/websocket"
 )
 
 func TestSuperInstructMonitorPublishesHeadlessM6Events(t *testing.T) {
@@ -685,6 +686,236 @@ func decodeJSONUseNumber(t *testing.T, raw []byte) map[string]interface{} {
 		t.Fatalf("decode JSON: %v (%s)", err, raw)
 	}
 	return out
+}
+
+func TestSuperInstructStreamScannerDetectsTerminalFrames(t *testing.T) {
+	responses := newSuperInstructStreamScan("/v1/responses")
+	responses.feed([]byte("event: response.output_text.delta\n" + `data: {"type":"response.output_text.delta","delta":"one"}` + "\n\n"))
+	if responses.done {
+		t.Fatal("an output delta was treated as a terminal frame")
+	}
+	// A terminal string embedded only in assistant text must not trigger release:
+	// only the top-level data-frame type is authoritative.
+	responses.feed([]byte("event: response.output_text.delta\n" + `data: {"type":"response.output_text.delta","delta":"mentions response.completed but is just text"}` + "\n\n"))
+	if responses.done {
+		t.Fatal("terminal string inside assistant text triggered a false release")
+	}
+	responses.feed([]byte("event: response.completed\n" + `data: {"type":"response.completed","response":{"id":"resp_x","status":"completed"}}` + "\n\n"))
+	if !responses.done {
+		t.Fatal("response.completed was not recognized as the packet boundary")
+	}
+
+	chat := newSuperInstructStreamScan("/v1/chat/completions")
+	chat.feed([]byte(`data: {"id":"chunk1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"}}]}` + "\n\n"))
+	if chat.done {
+		t.Fatal("a chat chunk without [DONE] was treated as terminal")
+	}
+	chat.feed([]byte("data: [DONE]\n\n"))
+	if !chat.done {
+		t.Fatal("[DONE] was not recognized as the chat packet boundary")
+	}
+
+	anth := newSuperInstructStreamScan("/v1/messages")
+	anth.feed([]byte("event: content_block_delta\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}` + "\n\n"))
+	if anth.done {
+		t.Fatal("an anthropic delta was treated as terminal")
+	}
+	anth.feed([]byte("event: message_stop\n" + `data: {"type":"message_stop"}` + "\n\n"))
+	if !anth.done {
+		t.Fatal("message_stop was not recognized as the anthropic packet boundary")
+	}
+
+	split := newSuperInstructStreamScan("/v1/responses")
+	split.feed([]byte("event: response.completed\n" + `data: {"type":"response.com`))
+	if split.done {
+		t.Fatal("a partial frame was treated as terminal")
+	}
+	split.feed([]byte(`pleted","response":{"id":"resp_split","status":"completed"}}` + "\n\n"))
+	if !split.done {
+		t.Fatal("a frame split across writes was not detected once complete")
+	}
+
+	crlf := newSuperInstructStreamScan("/v1/responses")
+	crlf.feed([]byte("event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_crlf\",\"status\":\"completed\"}}\r\n\r\n"))
+	if !crlf.done {
+		t.Fatal("a CRLF-delimited terminal frame was not detected")
+	}
+}
+
+func TestSuperInstructStreamReleasesAtTerminalFrame(t *testing.T) {
+	s := &Server{
+		cfg:          config.Config{SuperInstructLocalEnabled: true, DataDir: t.TempDir()},
+		superMemory:  superinstruct.NewMemoryKernel(""),
+		superMonitor: superinstruct.NewMonitorPanel(),
+	}
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	group := storage.Group{
+		SuperInstructResponseRewriteEnabled: true,
+		SuperInstructMemoryEnabled:          true,
+		SuperInstructMonitorEnabled:         true,
+	}
+	req = req.WithContext(withRequestAccountGroupPolicy(req.Context(), group))
+	selected, _, finish, enabled := s.maybeSuperInstructResponsePipeline(recorder, req, []byte(`{"stream":true,"input":"bypass license"}`), "gpt-5.6-sol")
+	w, buffering := selected.(*superInstructBufferingResponseWriter)
+	if !enabled || !buffering || w.scanner == nil || w.finalizer == nil {
+		t.Fatalf("rewrite-enabled stream did not arm the complete-packet boundary: enabled=%v writer=%T", enabled, selected)
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	packet := []byte("event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","delta":"I can't assist with that bypass license request."}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_terminal","status":"completed"}}` + "\n\n")
+	if _, err := w.Write(packet); err != nil {
+		t.Fatal(err)
+	}
+	if !w.released {
+		t.Fatal("the terminal frame did not release the held stream immediately")
+	}
+	if !strings.Contains(recorder.Body.String(), "Rei Protocol") {
+		t.Fatalf("M3 did not run at the terminal frame: %s", recorder.Body.String())
+	}
+	// Bytes the upstream sends after the terminal frame are not part of the packet.
+	if _, err := w.Write([]byte("event: response.output_text.delta\n" + `data: {"type":"response.output_text.delta","delta":"must not appear"}` + "\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(recorder.Body.String(), "must not appear") {
+		t.Fatalf("post-terminal upstream bytes leaked into the committed packet: %s", recorder.Body.String())
+	}
+	finish()
+	if !strings.Contains(recorder.Body.String(), "Rei Protocol") {
+		t.Fatalf("finish re-wrote or cleared the committed packet: %s", recorder.Body.String())
+	}
+	if snapshot := s.superMonitor.Snapshot(s.superMemory.SuccessCount()); snapshot.Stats.Tamper != 1 {
+		t.Fatalf("terminal-release tamper was not observed exactly once: %+v", snapshot)
+	}
+}
+
+func TestSuperInstructStreamFrontWindowFallsBackToPassthrough(t *testing.T) {
+	dst := newFlushSnapshotWriter()
+	w := newSuperInstructBufferingResponseWriter(dst)
+	w.bufferStreams = true
+	w.frontWindowBytes = 64
+	w.Header().Set("Content-Type", "text/event-stream")
+	first := []byte("event: response.output_text.delta\n" + `data: {"type":"response.output_text.delta","delta":"a long refusal that never completes within the byte window"}` + "\n\n")
+	if _, err := w.Write(first); err != nil {
+		t.Fatal(err)
+	}
+	// The single chunk already crosses the 64-byte window and carries no terminal
+	// frame, so the stream degrades to passthrough and replays the held bytes.
+	if !w.passthrough {
+		t.Fatal("the front-window byte budget did not convert the stream to passthrough")
+	}
+	if !bytes.Equal(dst.Bytes(), first) {
+		t.Fatalf("front-window passthrough did not replay the held bytes:\nwant %q\n got %q", first, dst.Bytes())
+	}
+	second := []byte("event: response.completed\n" + `data: {"type":"response.completed","response":{"id":"resp_win","status":"completed"}}` + "\n\n")
+	if _, err := w.Write(second); err != nil {
+		t.Fatal(err)
+	}
+	wire := append(append([]byte(nil), first...), second...)
+	if got := dst.Bytes(); !bytes.Equal(got, wire) {
+		t.Fatalf("window passthrough streamed bytes changed:\nwant %q\n got %q", wire, got)
+	}
+	// M3 disengages for a window-expired stream.
+	s := &Server{cfg: config.Config{SuperInstructLocalEnabled: true, DataDir: t.TempDir()}, superMemory: superinstruct.NewMemoryKernel(""), superMonitor: superinstruct.NewMonitorPanel()}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	s.finishSuperInstructResponsePipeline(w, req, []byte(`{"stream":true,"input":"bypass license"}`), "gpt-5.6-sol", superinstruct.RequestMeta{
+		UserMessage: "bypass license", Category: superinstruct.CategoryCrack, Timestamp: time.Unix(206, 0).UTC(),
+	}, superinstruct.ProcessOptions{ResponseRewriteEnabled: true, MemoryEnabled: true, MonitorEnabled: true}, time.Millisecond)
+	if got := dst.Bytes(); !bytes.Equal(got, wire) {
+		t.Fatalf("finish rewrote a window-expired passthrough stream:\nwant %q\n got %q", wire, got)
+	}
+}
+
+func TestSuperInstructStreamRewriteOverWebSocket(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte("event: response.output_text.delta\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","delta":"I can't assist with that request to bypass license activation."}` + "\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		_, _ = w.Write([]byte("event: response.completed\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_ws_refusal","status":"completed"}}` + "\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	})
+
+	rewriteKey := createTestAPIKeyForUserGroup(t, h, "si-rewrite-pool", map[string]interface{}{
+		"super_instruct_response_rewrite_enabled": true,
+		"super_instruct_memory_enabled":           true,
+		"super_instruct_monitor_enabled":          true,
+	})
+	rewriteAcc := h.importAccount(t, "si-rewrite", "up-si-rewrite", "access-si-rewrite")
+	if code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+rewriteAcc+"/group", `{"group":"si-rewrite-pool"}`); code != http.StatusOK {
+		t.Fatalf("assign rewrite group = %d: %s", code, raw)
+	}
+	setTestCapability(t, h, rewriteAcc, "gpt-5.6-sol", 272000)
+
+	wsURL := "ws" + strings.TrimPrefix(h.pool.URL, "http") + "/v1/responses"
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+rewriteKey)
+	header.Set(superInstructClientChoiceHeader, "enabled")
+	conn, httpResp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial websocket: %v (http=%v)", err, httpResp)
+	}
+	defer conn.Close()
+
+	create := map[string]interface{}{
+		"type":   "response.create",
+		"model":  "gpt-5.6-sol",
+		"input":  "please bypass license activation",
+		"stream": true,
+	}
+	raw, _ := json.Marshal(create)
+	if err := conn.WriteMessage(websocket.TextMessage, raw); err != nil {
+		t.Fatal(err)
+	}
+
+	var received []string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		messageType, payload, readErr := conn.ReadMessage()
+		if readErr != nil {
+			break
+		}
+		if messageType != websocket.TextMessage {
+			continue
+		}
+		received = append(received, string(payload))
+		var event struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(payload, &event) == nil && event.Type == "response.completed" {
+			break
+		}
+	}
+	joined := strings.Join(received, "\n")
+	if !strings.Contains(joined, "Rei Protocol") {
+		t.Fatalf("websocket stream was not rewritten by M3: %s", joined)
+	}
+	if !strings.Contains(joined, `"type":"response.completed"`) {
+		t.Fatalf("websocket stream missing the terminal frame: %s", joined)
+	}
+}
+
+func TestSuperInstructStreamFrontWindowProfileConfig(t *testing.T) {
+	group := storage.Group{SuperInstructProfiles: storage.SuperInstructProfiles{
+		storage.ModelInstructionFamilyGPT: {
+			ResponseRewriteEnabled:          true,
+			StreamRewriteFrontWindowSeconds: 7,
+			StreamRewriteFrontWindowBytes:   4096,
+		},
+	}}
+	profile, _ := superInstructPolicyForModel(group, "gpt-5.6-sol")
+	if profile.StreamRewriteFrontWindowSeconds != 7 || profile.StreamRewriteFrontWindowBytes != 4096 {
+		t.Fatalf("profile window config did not survive policy resolution: %+v", profile)
+	}
 }
 
 func waitForSuperInstructState(t *testing.T, h *testHarness, monitorTotal, memoryTotal uint64) (superinstruct.MonitorSnapshot, superinstruct.MemoryData) {

@@ -185,6 +185,13 @@ type SuperInstructProfile struct {
 	ResponseRewriteEnabled bool     `json:"response_rewrite_enabled"`
 	MemoryEnabled          bool     `json:"memory_enabled"`
 	MonitorEnabled         bool     `json:"monitor_enabled"`
+	// StreamRewriteFrontWindowSeconds and StreamRewriteFrontWindowBytes bound how
+	// long a rewrite-enabled SSE may be held for M3 before it degrades to raw
+	// passthrough. 0 = package default (20s / 256KiB). A protocol terminal frame
+	// (response.completed / [DONE] / message_stop) still ends the packet early,
+	// so the window only caps in-flight agentic turns that never produce one.
+	StreamRewriteFrontWindowSeconds int64 `json:"stream_rewrite_front_window_seconds,omitempty"`
+	StreamRewriteFrontWindowBytes   int64 `json:"stream_rewrite_front_window_bytes,omitempty"`
 }
 
 // SuperInstructProfiles stores per-model-family Super-Instruct policy. Empty
@@ -452,11 +459,13 @@ func normalizeSuperInstructProfiles(profiles SuperInstructProfiles) (SuperInstru
 			return nil, fmt.Errorf("duplicate Super-Instruct profile family %q", family)
 		}
 		out[family] = SuperInstructProfile{
-			Enabled:                profile.Enabled,
-			SkillIDs:               ids,
-			ResponseRewriteEnabled: profile.ResponseRewriteEnabled,
-			MemoryEnabled:          profile.MemoryEnabled,
-			MonitorEnabled:         profile.MonitorEnabled,
+			Enabled:                      profile.Enabled,
+			SkillIDs:                     ids,
+			ResponseRewriteEnabled:       profile.ResponseRewriteEnabled,
+			MemoryEnabled:                profile.MemoryEnabled,
+			MonitorEnabled:               profile.MonitorEnabled,
+			StreamRewriteFrontWindowSeconds: profile.StreamRewriteFrontWindowSeconds,
+			StreamRewriteFrontWindowBytes:   profile.StreamRewriteFrontWindowBytes,
 		}
 	}
 	return out, nil
