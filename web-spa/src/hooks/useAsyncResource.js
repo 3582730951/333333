@@ -47,11 +47,18 @@ export default function useAsyncResource(loader, deps = [], options = {}) {
   const cancel = useCallback(() => queryClient.cancelQueries({ queryKey: ['legacy-resource', currentLoaderID] }), [queryClient, currentLoaderID]);
   const hasFreshData = query.dataUpdatedAt > 0;
   const data = query.error && !keepDataOnError ? initialData : query.data;
+  // initialData is only a shape placeholder; it must still show the first-load
+  // skeleton. A non-zero dataUpdatedAt proves that a real response is available.
+  const hasUsableData = hasFreshData;
 
   return {
     data,
     error: query.error,
-    loading: query.isFetching,
+    // A background refresh must not replace a usable table with skeleton rows.
+    // This compatibility hook now follows the same stale-while-revalidate
+    // contract as useQueryView.
+    loading: query.isFetching && !hasUsableData,
+    refreshing: query.isFetching && hasUsableData,
     lastRefresh: hasFreshData ? new Date(query.dataUpdatedAt) : null,
     reload,
     cancel,

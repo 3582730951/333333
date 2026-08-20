@@ -18,9 +18,10 @@ import useResponsiveLayout from '../hooks/useResponsiveLayout.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
 import { fmtInt, fmtRelative, fmtTokens, middleEllipsis } from '../lib/format.js';
 import { accountQueryKeys, useAccountsPage } from '../features/accounts/queries/accounts.ts';
-import { fetchAccountArchive, importAccountArchive } from '../features/accounts/api/accounts.ts';
+import { fetchAccountArchive, fetchAccountsPage, importAccountArchive } from '../features/accounts/api/accounts.ts';
 import { abortController, abortSignal, createAbortController } from '../lib/browserAbort.js';
 import { downloadBlob } from '../lib/browserDownload.js';
+import { clearBrowserTimeout, setBrowserTimeout } from '../lib/browserLifecycle.js';
 import {
   healthBatchPresentation, healthResultPresentation, healthTestRequestBody,
   isKiroSuspended, isProtectedProbeQuarantine, requiresPaidHealthTest, selectedHasPaidProbe,
@@ -35,6 +36,9 @@ function statusInfo(a) {
     || Boolean(a.egress_binding?.recheck_pending)
     || (a.egress_binding?.cooldown_until || 0) > n;
   if (ignoresRateLimitControls && hasIgnoredControlState) return { label: '例外调度', color: 'orange', hint: '已忽略此账号的 429、冷却与隔离状态' };
+  if (!ignoresRateLimitControls && (a.quarantine_reason === 'provider_api_key_inference_probe_pending' || a.quarantine_reason === 'kiro_import_validation_pending')) {
+    return { label: '后台验证中', color: 'blue', hint: '凭据已保存；验证完成前不参与调度' };
+  }
   if (!ignoresRateLimitControls && isKiroSuspended(a)) return { label: 'AWS User ID 已暂停', color: 'red', hint: '无限期隔离；需 AWS 支持处理后双层测活' };
   if (!ignoresRateLimitControls && (a.quarantine_until || 0) > n) return { label: '隔离中', color: 'red', hint: '暂不参与调度' };
   if (!ignoresRateLimitControls && a.egress_binding && a.egress_binding.recheck_pending) return { label: '待复测', color: 'orange', hint: '等待重新测活' };
@@ -65,6 +69,17 @@ const ACCOUNT_ACTION_LABEL = {
 
 function accountUsage(account) {
   return account?.usage || {};
+}
+
+export function accountCredentialPresentation(account) {
+  const method = String(account?.auth_method || account?.kiro_auth?.auth_method || '').trim().toLowerCase();
+  const apiKey = method === 'api_key' || Boolean(account?.api_key_present) || account?.billing_mode === 'pay_as_you_go';
+  if (apiKey) return { key: 'api_key', label: 'API Key', detail: '按密钥认证', color: 'violet' };
+  if (account?.credential_mode === 'agent_identity') {
+    return { key: 'account', label: '登录账号', detail: 'Agent Identity', color: 'cyan' };
+  }
+  const detail = method === 'access_token' ? '访问令牌' : method === 'cookie' ? '会话登录' : 'OAuth / 账号授权';
+  return { key: 'account', label: '登录账号', detail, color: 'blue' };
 }
 
 function quotaPercent(account) {
@@ -217,6 +232,7 @@ export default function Accounts() {
   const [importOpen, setImportOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [searchInput, setSearchInput] = useState('');
+  const [authType, setAuthType] = useState('all');
   const [selected, setSelected] = useState([]);
   const [selectedAccountMeta, setSelectedAccountMeta] = useState({});
   const [selectMode, setSelectMode] = useState(false);
@@ -227,10 +243,13 @@ export default function Accounts() {
   const [archiveImportOpen, setArchiveImportOpen] = useState(false);
   const [archiveFile, setArchiveFile] = useState(null);
   const accountArchiveAbortRef = useRef(null);
+  const importRefreshTimersRef = useRef([]);
 
   useEffect(() => () => {
     abortController(accountArchiveAbortRef.current);
     accountArchiveAbortRef.current = null;
+    importRefreshTimersRef.current.forEach(clearBrowserTimeout);
+    importRefreshTimersRef.current = [];
   }, []);
 
   const {
@@ -240,7 +259,7 @@ export default function Accounts() {
     error,
     lastRefresh,
     reload: load,
-  } = useAccountsPage({ page, pageSize, search });
+  } = useAccountsPage({ page, pageSize, search, authType });
   const rows = data.rows || [];
   const total = data.total || 0;
   const groups = data.groups || [];
@@ -258,6 +277,48 @@ export default function Accounts() {
 
   const doSearch = () => { setPage(1); setSearch(searchInput.trim()); };
   const onPageChange = (cur) => { setPage(cur); };
+
+  const refreshCurrentAccounts = useCallback(async () => {
+    const params = { page, pageSize, search, authType };
+    const next = await fetchAccountsPage(params);
+    queryClient.setQueryData(accountQueryKeys.list(params), (current) => ({
+      ...(current || { groups: [], error: null }),
+      ...next,
+    }));
+    return next;
+  }, [authType, page, pageSize, queryClient, search]);
+
+  const handleAccountImported = useCallback((result) => {
+    const candidate = result && typeof result === 'object' && result.id ? result : null;
+    if (candidate && page === 1 && !search) {
+      const credential = accountCredentialPresentation(candidate);
+      if (authType === 'all' || authType === credential.key) {
+        const params = { page, pageSize, search, authType };
+        queryClient.setQueryData(accountQueryKeys.list(params), (current) => {
+          if (!current || !Array.isArray(current.rows)) return current;
+          const exists = current.rows.some((row) => row.id === candidate.id);
+          return {
+            ...current,
+            rows: exists
+              ? current.rows.map((row) => row.id === candidate.id ? mergeAccountUpdate(row, candidate) : row)
+              : [candidate, ...current.rows].slice(0, pageSize),
+            total: exists ? current.total : Number(current.total || 0) + 1,
+          };
+        });
+      }
+    }
+
+    void refreshCurrentAccounts().catch(() => {});
+    if (!result?.validation_pending) return;
+
+    // Validation polling is deliberately bounded and coalesced: at most three
+    // lightweight account-list reads per add operation, even when the add button
+    // is used repeatedly. No upstream probe is triggered by these reads.
+    importRefreshTimersRef.current.forEach(clearBrowserTimeout);
+    importRefreshTimersRef.current = [2500, 10_000, 30_000].map((delay) => setBrowserTimeout(() => {
+      void refreshCurrentAccounts().catch(() => {});
+    }, delay));
+  }, [authType, page, pageSize, queryClient, refreshCurrentAccounts, search]);
 
   const updateCachedAccount = useCallback((id, patch) => {
     queryClient.setQueriesData({ queryKey: accountQueryKeys.all }, (current) => {
@@ -371,7 +432,7 @@ export default function Accounts() {
     try {
       await post('/admin/accounts/assign-group', { ids, group: moveGroup });
       const moved = new Set(ids);
-      queryClient.setQueryData(accountQueryKeys.list({ page, pageSize, search }), (current) => current ? {
+      queryClient.setQueryData(accountQueryKeys.list({ page, pageSize, search, authType }), (current) => current ? {
         ...current,
         rows: (current.rows || []).map((account) => moved.has(account.id) ? { ...account, group_name: moveGroup } : account),
       } : current);
@@ -534,7 +595,7 @@ export default function Accounts() {
     {
       title: '账号',
       dataIndex: 'label',
-      width: 330,
+      width: 300,
       sorter: (a, b) => String(a.label || a.id).localeCompare(String(b.label || b.id)),
       render: (_, r) => (
         <div className="pool-account-summary">
@@ -549,15 +610,26 @@ export default function Accounts() {
               {middleEllipsis(r.label || r.id, 30, 14)}
             </TextClamp>
             <Tag size="small">{r.provider || 'codex'}</Tag>
-            <Tag size="small" color={r.auth_method === 'api_key' ? 'violet' : r.credential_mode === 'agent_identity' ? 'cyan' : 'blue'}>
-              {r.credential_mode === 'agent_identity' ? 'agent identity' : (r.auth_method || 'oauth')}
-            </Tag>
           </div>
           <div className="pool-account-metaline">
             <TextClamp muted className="pool-account-email" title={r.email || r.id} ariaLabel={r.email || r.id}>{middleEllipsis(r.email || r.id)}</TextClamp>
           </div>
         </div>
       ),
+    },
+    {
+      title: '账号类型',
+      key: 'credential_type',
+      width: 142,
+      render: (_, r) => {
+        const credential = accountCredentialPresentation(r);
+        return (
+          <div className="pool-resource-summary">
+            <div><Tag size="small" color={credential.color}>{credential.label}</Tag></div>
+            <div className="pool-resource-summary__meta">{credential.detail}</div>
+          </div>
+        );
+      },
     },
     {
       title: '健康',
@@ -631,6 +703,7 @@ export default function Accounts() {
     const requests = usage.requests ?? r.requests;
     const tokens = usage.total_tokens ?? r.total_tokens;
     const accountName = r.label || r.id;
+    const credential = accountCredentialPresentation(r);
     const accountTitle = (
       <TextClamp strong title={accountName} ariaLabel={accountName}>
         {middleEllipsis(accountName, 20, 8)}
@@ -649,6 +722,7 @@ export default function Accounts() {
         badges={statusTag(r)}
         chips={<>
           <Tag size="small">{r.provider || 'codex'}</Tag>
+          <Tag size="small" color={credential.color}>{credential.label}</Tag>
           <Tag size="small" title={r.group_name || '默认'}>{middleEllipsis(r.group_name || '默认', 12, 6)}</Tag>
           {r.plan_type ? <Tag size="small">{r.plan_type}</Tag> : null}
           {r.billing_mode === 'pay_as_you_go' ? <Tag size="small" color="violet">按量计费</Tag> : null}
@@ -673,6 +747,16 @@ export default function Accounts() {
         actions={<>
           <Input prefix={<IconSearch />} value={searchInput} onChange={setSearchInput}
             onEnterPress={doSearch} style={{ width: responsive.isMobile ? 210 : 220 }} placeholder="搜索 标签/邮箱/分组" showClear onClear={doSearch} />
+          <Select
+            value={authType}
+            onChange={(value) => { setAuthType(value); setPage(1); }}
+            style={{ width: 132 }}
+            optionList={[
+              { label: '全部类型', value: 'all' },
+              { label: 'API Key', value: 'api_key' },
+              { label: '登录账号', value: 'account' },
+            ]}
+          />
           <Button icon={<IconSearch />} onClick={doSearch}>搜索</Button>
           <Button icon={<IconDownload />} onClick={exportCSV}>导出 CSV</Button>
           <Button icon={<IconDownload />} loading={accountExportRunning} disabled={accountImportRunning} onClick={() => exportAccountBackup([])}>一键导出全部</Button>
@@ -732,7 +816,7 @@ export default function Accounts() {
         rowSelection={!responsive.isMobile || selectMode ? { selectedRowKeys: selected, onChange: handleSelectionChange } : undefined}
         className="pool-mobile-table pool-accounts-table"
         density="account"
-        minScrollX={1162}
+        minScrollX={1274}
         rowHeight={72}
         mobileRenderer={mobileAccountCell}
         mobileListLabel="账号列表"
@@ -791,7 +875,7 @@ export default function Accounts() {
           </span>
         </div>
       </Modal>
-      <OAuthLoginModal open={importOpen} onClose={() => setImportOpen(false)} onSuccess={load} />
+      <OAuthLoginModal open={importOpen} onClose={() => setImportOpen(false)} onSuccess={handleAccountImported} />
     </div>
   );
 }

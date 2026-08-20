@@ -33,7 +33,8 @@ if (/egress_id:\s*values\.egress_id/.test(providers) || /field="egress_id"/.test
 }
 
 const groups = read('pages/Groups.jsx');
-if (!/\/admin\/egress-profiles/.test(groups)) {
+const groupAPI = read('features/groups/api/groups.ts');
+if (!/\/admin\/egress-profiles/.test(groups) && !/\/admin\/egress-profiles/.test(groupAPI)) {
   problems.push('Groups page must load /admin/egress-profiles.');
 }
 if (!/egress_ids:\s*selectedEgress\s*\?\s*\[selectedEgress\]\s*:\s*\[\]/.test(groups) || /OrderedEgressSelect/.test(groups)) {

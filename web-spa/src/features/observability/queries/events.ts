@@ -9,7 +9,12 @@ export const observabilityQueryKeys = {
 };
 
 export function useQuotaData() {
-  return useQueryView(useQuery({ queryKey: observabilityQueryKeys.quota, queryFn: ({ signal }) => fetchQuota(signal) }));
+  return useQueryView(useQuery({
+    queryKey: observabilityQueryKeys.quota,
+    queryFn: ({ signal }) => fetchQuota(signal),
+    staleTime: 30_000,
+    placeholderData: (previous) => previous,
+  }));
 }
 
 export function useCFEventsData() {

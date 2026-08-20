@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type CSSProperties, type LazyExoticComponent, type ReactNode } from 'react';
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router';
-import { useIsFetching } from '@tanstack/react-query';
+import { useQueryClient } from '@tanstack/react-query';
 import { Avatar, Button, Layout, Nav, Toast } from './components/pool/index.jsx';
 import {
   IconChevronDown, IconClose, IconExit, IconGlobe, IconHistogram, IconHome, IconKey, IconLanguage,
@@ -19,6 +19,7 @@ import { addDocumentListener, addWindowListener, cancelBrowserIdleCallback, requ
 import { prefersReducedNetworkData } from './lib/browserNetwork.js';
 import { resetDocumentOverlayLocks } from './lib/browserDocument.js';
 import type { RouteDefinition } from './model/contracts';
+import { warmAdminData } from './app/adminDataWarmup';
 
 const { Header, Sider, Content } = Layout;
 const SIDEBAR_EXPANDED_WIDTH = 248;
@@ -93,11 +94,6 @@ function RouteFallback() {
 }
 
 function StablePageReady({ routeKey, children }: { routeKey: string; children: ReactNode }) {
-  // Background stale-while-revalidate requests must not make an already rendered
-  // route "not ready". Only an active query with no usable data blocks readiness.
-  const fetching = useIsFetching({
-    predicate: (query) => query.queryKey[0] !== 'auth' && query.state.data === undefined,
-  });
   const [ready, setReady] = useState(false);
   const [contentBusy, setContentBusy] = useState(true);
   const contentRef = useRef<HTMLDivElement | null>(null);
@@ -120,12 +116,15 @@ function StablePageReady({ routeKey, children }: { routeKey: string; children: R
 
   useEffect(() => {
     setReady(false);
-    if (fetching > 0 || contentBusy) return undefined;
+    // Readiness belongs to the current route's rendered content. A query started
+    // by another route's bounded warm-up must never hold this page in a pending
+    // state, while visible route skeletons are still detected above.
+    if (contentBusy) return undefined;
     const frame = window.requestAnimationFrame(() => setReady(true));
     return () => {
       window.cancelAnimationFrame(frame);
     };
-  }, [routeKey, fetching, contentBusy]);
+  }, [routeKey, contentBusy]);
 
   return <div ref={contentRef} className="pool-route-content" data-page-ready={ready ? 'true' : 'false'}>{children}</div>;
 }
@@ -238,6 +237,7 @@ export default function App() {
   const responsive = useResponsiveLayout();
   const density = useAdminDensity(responsive.isMobile);
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const location = useLocation();
   const [locale, setLocaleState] = useState(() => getLocale());
   const [collapsed, setCollapsed] = useState(responsive.collapsedByWidth);
@@ -360,14 +360,28 @@ export default function App() {
   useEffect(() => {
     if (!auth.authed || prefersReducedNetworkData()) return undefined;
     const routes = (isAdmin ? adminRoutes : portalRoutes) as ReadonlyArray<RouteDefinition>;
-    // Preload at most the two highest-value routes. The previous eager+idle sweep
-    // downloaded nearly the entire admin application three seconds after login.
+    // The operator's five hot routes are warmed sequentially: this removes the
+    // first-navigation waterfall without creating a burst of parallel requests.
+    // TanStack Query deduplicates a route that is already loading or still fresh.
+    const hotAdminPaths = new Set(['/', '/accounts', '/groups', '/usage', '/quota']);
     const preloadRoutes = routes
-      .filter((route) => route.prefetch === 'eager' && route.path !== location.pathname)
-      .slice(0, 2);
-    const idle = requestBrowserIdleCallback(() => preloadRoutes.forEach((route) => route.lazyLoader().catch((error) => reportPrefetchError(error, route))), { timeout: 3000 });
-    return () => cancelBrowserIdleCallback(idle);
-  }, [auth.authed, isAdmin]);
+      .filter((route) => route.path !== location.pathname && (route.prefetch === 'eager' || (isAdmin && hotAdminPaths.has(route.path))))
+      .slice(0, isAdmin ? 4 : 2);
+    let cancelled = false;
+    const idle = requestBrowserIdleCallback(() => {
+      void (async () => {
+        for (const route of preloadRoutes) {
+          if (cancelled) return;
+          await route.lazyLoader().catch((error) => reportPrefetchError(error, route));
+        }
+      })();
+      if (isAdmin) void warmAdminData(queryClient, () => cancelled);
+    }, { timeout: 1200 });
+    return () => {
+      cancelled = true;
+      cancelBrowserIdleCallback(idle);
+    };
+  }, [auth.authed, isAdmin, queryClient]);
 
   const switchLocale = useCallback(() => {
     const next = locale === 'en' ? 'zh' : 'en';

@@ -2,14 +2,22 @@ import React, { useCallback, useId, useMemo, useState } from 'react';
 import * as PopoverPrimitive from '@radix-ui/react-popover';
 import { ActionMenu, Banner, Button, Card, Form, Modal, Select, Switch, Tabs, TabPane, Tag, Toast } from '../components/pool/index.jsx';
 import { IconPlus, IconRefresh } from '../components/pool/icons.jsx';
-import { del, get, patch, post, put } from '../api.js';
+import { del, patch, post, put } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import { MetricRail, TagList, TextClamp } from '../components/DisplayPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
-import useAsyncResource from '../hooks/useAsyncResource.js';
+import {
+  useAccountGroupsData,
+  useGroupEgressesData,
+  useGroupInstructionsData,
+  useGroupModelsData,
+  useGroupProvidersData,
+  useGroupSuperSkillsData,
+  useUserGroupsData,
+} from '../features/groups/queries/groups.ts';
 
 const TARGET_ACCOUNT_GROUP = 'account_pool_group';
 const TARGET_PROVIDER = 'model_provider';
@@ -20,12 +28,6 @@ const INSTRUCTION_FAMILIES = [
   { key: 'gemini', label: 'Gemini', help: '用于 Antigravity 等目标中的 Gemini 模型，并进入其 systemInstruction。' },
 ];
 const FALLBACK_FAMILIES = INSTRUCTION_FAMILIES.map(({ key, label }) => ({ key, label }));
-
-function rowsOf(value, keys = []) {
-  if (Array.isArray(value)) return value;
-  for (const key of keys) if (Array.isArray(value?.[key])) return value[key];
-  return [];
-}
 
 function uniqueStrings(values) {
   const seen = new Set();
@@ -1022,24 +1024,18 @@ export default function Groups() {
   const [instructionName, setInstructionName] = useState('');
   const [instructionContent, setInstructionContent] = useState('');
 
-  // Keep independent directories isolated: a failed optional endpoint must not
-  // erase valid account groups or providers from the user-group target picker.
-  const fetchGroups = useCallback(async ({ signal }) => rowsOf(await get('/admin/groups', undefined, { signal }), ['groups']), []);
-  const fetchInstructions = useCallback(async ({ signal }) => rowsOf(await get('/admin/model-instructions', undefined, { signal }), ['files']), []);
-  const fetchSuperSkills = useCallback(async ({ signal }) => rowsOf(await get('/admin/super-instruct/skills', undefined, { signal }), ['skills']), []);
-  const fetchEgresses = useCallback(async ({ signal }) => rowsOf(await get('/admin/egress-profiles', undefined, { signal }), ['profiles', 'egress_profiles']), []);
-  const fetchUserGroups = useCallback(async ({ signal }) => rowsOf(await get('/admin/user-groups', undefined, { signal }), ['user_groups']), []);
-  const fetchProviders = useCallback(async ({ signal }) => rowsOf(await get('/admin/providers', undefined, { signal }), ['providers']), []);
-  const fetchModels = useCallback(async ({ signal }) => rowsOf(await get('/admin/models', undefined, { signal }), ['models']), []);
-
-  const groupsResource = useAsyncResource(fetchGroups, [fetchGroups], { initialData: [] });
-  const instructionsResource = useAsyncResource(fetchInstructions, [fetchInstructions], { initialData: [] });
-  const superSkillsResource = useAsyncResource(fetchSuperSkills, [fetchSuperSkills], { initialData: [] });
-  const egressesResource = useAsyncResource(fetchEgresses, [fetchEgresses], { initialData: [] });
-  const userGroupsResource = useAsyncResource(fetchUserGroups, [fetchUserGroups], { initialData: [] });
-  const providersResource = useAsyncResource(fetchProviders, [fetchProviders], { initialData: [] });
-  const modelsResource = useAsyncResource(fetchModels, [fetchModels], { initialData: [] });
-  const resources = [groupsResource, instructionsResource, superSkillsResource, egressesResource, userGroupsResource, providersResource, modelsResource];
+  // Only the two lists belong to first paint. Egress/model/instruction/skill
+  // directories are editor dependencies and begin loading when that editor is
+  // opened, so a slow optional endpoint cannot delay the page itself.
+  const needsAccountEditorCatalog = Boolean(accountEditor);
+  const needsUserEditorCatalog = Boolean(userEditor);
+  const groupsResource = useAccountGroupsData();
+  const userGroupsResource = useUserGroupsData();
+  const instructionsResource = useGroupInstructionsData(needsUserEditorCatalog || instructionLibraryOpen);
+  const superSkillsResource = useGroupSuperSkillsData(needsUserEditorCatalog);
+  const egressesResource = useGroupEgressesData(needsAccountEditorCatalog);
+  const providersResource = useGroupProvidersData(needsUserEditorCatalog);
+  const modelsResource = useGroupModelsData(needsUserEditorCatalog);
   const data = {
     groups: groupsResource.data || [],
     instructions: instructionsResource.data || [],
@@ -1049,29 +1045,13 @@ export default function Groups() {
     providers: providersResource.data || [],
     models: modelsResource.data || [],
   };
-  const loading = resources.some((resource) => resource.loading);
-  const lastRefresh = resources.reduce((latest, resource) => {
-    if (!resource.lastRefresh) return latest;
-    return !latest || resource.lastRefresh > latest ? resource.lastRefresh : latest;
-  }, null);
   const load = useCallback(async () => {
-    await Promise.allSettled([
-      groupsResource.reload(),
-      instructionsResource.reload(),
-      superSkillsResource.reload(),
-      egressesResource.reload(),
-      userGroupsResource.reload(),
-      providersResource.reload(),
-      modelsResource.reload(),
-    ]);
+    if (activeTab === 'user') await userGroupsResource.reload();
+    else await groupsResource.reload();
   }, [
+    activeTab,
     groupsResource.reload,
-    instructionsResource.reload,
-    superSkillsResource.reload,
-    egressesResource.reload,
     userGroupsResource.reload,
-    providersResource.reload,
-    modelsResource.reload,
   ]);
   const refreshUserGroupCatalog = useCallback(() => {
     void Promise.allSettled([
@@ -1084,12 +1064,10 @@ export default function Groups() {
   }, [groupsResource.reload, providersResource.reload, instructionsResource.reload, superSkillsResource.reload, modelsResource.reload]);
   const openUserGroupEditor = useCallback((editor) => {
     setUserEditor(editor);
-    refreshUserGroupCatalog();
-  }, [refreshUserGroupCatalog]);
+  }, []);
   const openAccountGroupEditor = useCallback((editor) => {
     setAccountEditor(editor);
-    void egressesResource.reload();
-  }, [egressesResource.reload]);
+  }, []);
   const targetCatalogLoading = groupsResource.loading || providersResource.loading || instructionsResource.loading || superSkillsResource.loading || modelsResource.loading;
   const targetCatalogError = groupsResource.error || providersResource.error || instructionsResource.error;
 
@@ -1099,7 +1077,7 @@ export default function Groups() {
       else await post('/admin/groups', values);
       Toast.success(accountEditor?.mode === 'edit' ? '账号池分组已更新' : '账号池分组已创建');
       setAccountEditor(null);
-      void load();
+      void groupsResource.reload();
     } catch (saveError) { showErrorToast(saveError); }
   });
 
@@ -1109,7 +1087,7 @@ export default function Groups() {
       else await post('/admin/user-groups', payload);
       Toast.success(userEditor?.mode === 'edit' ? '用户分组已更新' : '用户分组已创建');
       setUserEditor(null);
-      void load();
+      void userGroupsResource.reload();
     } catch (saveError) { showErrorToast(saveError); }
   });
 
@@ -1120,7 +1098,7 @@ export default function Groups() {
       const payload = normalizedUserGroupPayload(draft, data.providers);
       await put(`/admin/user-groups/${encodeURIComponent(id)}`, payload);
       Toast.success(`Super-Instruct 已${enabled ? '开启' : '关闭'}`);
-      void load();
+      void userGroupsResource.reload();
     } catch (saveError) {
       showErrorToast(saveError);
     }
@@ -1130,7 +1108,7 @@ export default function Groups() {
     try {
       await del(`/admin/groups/${encodeURIComponent(name)}`);
       Toast.success('账号池分组已删除');
-      void load();
+      void groupsResource.reload();
     } catch (removeError) { showErrorToast(removeError); }
   });
 
@@ -1138,7 +1116,7 @@ export default function Groups() {
     try {
       await del(`/admin/user-groups/${encodeURIComponent(id)}`);
       Toast.success('用户分组已删除');
-      void load();
+      void userGroupsResource.reload();
     } catch (removeError) { showErrorToast(removeError); }
   });
 
@@ -1148,7 +1126,7 @@ export default function Groups() {
       Toast.success('指令文件已保存');
       setInstructionName('');
       setInstructionContent('');
-      void load();
+      void instructionsResource.reload();
     } catch (saveError) { showErrorToast(saveError); }
   });
 

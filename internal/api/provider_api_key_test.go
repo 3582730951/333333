@@ -7,8 +7,10 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/storage"
@@ -99,6 +101,80 @@ func TestProviderAPIKeyFreeAuthFailureDoesNotSaveOrInfer(t *testing.T) {
 	accounts, err := h.store.ListAccounts(context.Background())
 	if err != nil || len(accounts) != 0 {
 		t.Fatalf("failed authentication persisted accounts=%+v err=%v", accounts, err)
+	}
+}
+
+func TestProviderAPIKeyAsyncImportReturnsBeforeProbeAndCompletesOnce(t *testing.T) {
+	modelsStarted := make(chan struct{})
+	releaseModels := make(chan struct{})
+	var startOnce sync.Once
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseModels) })
+	var modelsCalls, inferenceCalls atomic.Int64
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
+			modelsCalls.Add(1)
+			startOnce.Do(func() { close(modelsStarted) })
+			<-releaseModels
+			_, _ = io.WriteString(w, `{"data":[{"id":"gpt-4o-mini","context_window":128000}]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
+			inferenceCalls.Add(1)
+			_, _ = io.WriteString(w, `{"id":"resp","model":"gpt-4o-mini","usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	response, body := postProviderKeyImport(t, h, map[string]interface{}{
+		"provider_id": "codex", "api_key": "sk-async", "confirm_cost": true, "async_probe": true,
+	})
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", response.StatusCode, body)
+	}
+	var accepted providerAPIKeyImportResponse
+	if err := json.Unmarshal(body, &accepted); err != nil {
+		t.Fatal(err)
+	}
+	if !accepted.ValidationPending || accepted.Ready || !accepted.Quarantined || accepted.QuarantineReason != providerAPIKeyInferenceProbePending {
+		t.Fatalf("accepted response=%+v", accepted)
+	}
+	account, err := h.store.GetAccount(context.Background(), accepted.ID)
+	if err != nil || account.QuarantineUntil <= storage.Now() || account.QuarantineReason != providerAPIKeyInferenceProbePending {
+		t.Fatalf("pending account=%+v err=%v", account, err)
+	}
+
+	select {
+	case <-modelsStarted:
+	case <-time.After(time.Second):
+		t.Fatal("background authentication probe did not start")
+	}
+	// A second click while validation is running is coalesced into the same flight.
+	response, secondBody := postProviderKeyImport(t, h, map[string]interface{}{
+		"provider_id": "codex", "api_key": "sk-async", "confirm_cost": true, "async_probe": true,
+	})
+	if response.StatusCode != http.StatusAccepted || !bytes.Contains(secondBody, []byte(`"state":"already_queued"`)) {
+		t.Fatalf("duplicate status=%d body=%s", response.StatusCode, secondBody)
+	}
+	if modelsCalls.Load() != 1 {
+		t.Fatalf("duplicate import launched %d model probes", modelsCalls.Load())
+	}
+
+	releaseOnce.Do(func() { close(releaseModels) })
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		account, err = h.store.GetAccount(context.Background(), accepted.ID)
+		if err == nil && account.QuarantineUntil == 0 && account.QuarantineReason == "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil || account.QuarantineUntil != 0 || account.QuarantineReason != "" {
+		t.Fatalf("background validation did not activate account=%+v err=%v", account, err)
+	}
+	if modelsCalls.Load() != 1 || inferenceCalls.Load() != 1 {
+		t.Fatalf("models=%d inference=%d, want one each", modelsCalls.Load(), inferenceCalls.Load())
 	}
 }
 

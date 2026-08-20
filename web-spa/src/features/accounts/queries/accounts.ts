@@ -1,7 +1,8 @@
 import { useQuery } from '@tanstack/react-query';
-import { fetchAccountsBundle } from '../api/accounts';
+import { fetchAccountsPage } from '../api/accounts';
 import type { AccountsPageParams } from '../model/types';
 import { queryKeys, useQueryView } from '../../shared/queries';
+import { useAccountGroupsData } from '../../groups/queries/groups';
 
 export const accountQueryKeys = {
   all: queryKeys.domain('accounts'),
@@ -9,10 +10,20 @@ export const accountQueryKeys = {
 };
 
 export function useAccountsPage(params: AccountsPageParams) {
-  const query = useQuery({
+  const accounts = useQueryView(useQuery({
     queryKey: accountQueryKeys.list(params),
-    queryFn: ({ signal }) => fetchAccountsBundle(params, signal),
+    queryFn: ({ signal }) => fetchAccountsPage(params, signal),
     placeholderData: (previous) => previous,
-  });
-  return useQueryView(query);
+  }));
+  const groups = useAccountGroupsData();
+  return {
+    ...accounts,
+    // Group options enhance move/edit actions but do not belong to the account
+    // table's critical path. The list paints as soon as /admin/accounts returns.
+    data: accounts.data ? {
+      ...accounts.data,
+      groups: groups.data || [],
+      error: groups.error || null,
+    } : undefined,
+  };
 }

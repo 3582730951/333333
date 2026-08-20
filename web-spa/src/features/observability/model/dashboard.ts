@@ -45,10 +45,14 @@ export interface DashboardCore {
 export interface DashboardSecondary {
   registration: RegistrationStats | null;
   system: SystemMetrics | null;
+  buckets: UsageBucket[];
+  modelSeries: UsageMetricRow[];
+  series: UsageSeriesDescriptor[];
   byModel: UsageMetricRow[];
   cache: UsageCacheReport | null;
   registrationAvailable: boolean;
   systemAvailable: boolean;
+  timeseriesAvailable: boolean;
   modelAvailable: boolean;
   cacheAvailable: boolean;
   error: ApiError | null;

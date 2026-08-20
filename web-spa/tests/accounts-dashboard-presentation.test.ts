@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { quotaPresentation } from '../src/pages/Accounts.jsx';
+import { accountCredentialPresentation, quotaPresentation } from '../src/pages/Accounts.jsx';
 import { compactIdentity } from '../src/pages/Dashboard';
 
 describe('account and dashboard presentation helpers', () => {
@@ -41,5 +41,12 @@ describe('account and dashboard presentation helpers', () => {
     expect(first).toMatch(/0001$/);
     expect(second).toMatch(/0002$/);
     expect(first).not.toBe(second);
+  });
+
+  it('separates API-key identities from login accounts, including Kiro metadata', () => {
+    expect(accountCredentialPresentation({ auth_method: 'api_key' })).toMatchObject({ key: 'api_key', label: 'API Key' });
+    expect(accountCredentialPresentation({ kiro_auth: { auth_method: 'api_key' } })).toMatchObject({ key: 'api_key', label: 'API Key' });
+    expect(accountCredentialPresentation({ auth_method: 'oauth' })).toMatchObject({ key: 'account', label: '登录账号' });
+    expect(accountCredentialPresentation({ credential_mode: 'agent_identity' })).toMatchObject({ key: 'account', detail: 'Agent Identity' });
   });
 });

@@ -459,11 +459,11 @@ func normalizeSuperInstructProfiles(profiles SuperInstructProfiles) (SuperInstru
 			return nil, fmt.Errorf("duplicate Super-Instruct profile family %q", family)
 		}
 		out[family] = SuperInstructProfile{
-			Enabled:                      profile.Enabled,
-			SkillIDs:                     ids,
-			ResponseRewriteEnabled:       profile.ResponseRewriteEnabled,
-			MemoryEnabled:                profile.MemoryEnabled,
-			MonitorEnabled:               profile.MonitorEnabled,
+			Enabled:                         profile.Enabled,
+			SkillIDs:                        ids,
+			ResponseRewriteEnabled:          profile.ResponseRewriteEnabled,
+			MemoryEnabled:                   profile.MemoryEnabled,
+			MonitorEnabled:                  profile.MonitorEnabled,
 			StreamRewriteFrontWindowSeconds: profile.StreamRewriteFrontWindowSeconds,
 			StreamRewriteFrontWindowBytes:   profile.StreamRewriteFrontWindowBytes,
 		}
@@ -5555,28 +5555,44 @@ func firstNonEmptyString(values ...string) string {
 // When search is empty, no LIKE filter is applied (the fast path for the default
 // "all accounts" view). Status filters are applied when non-empty.
 func (s *Store) ListAccountsPage(ctx context.Context, limit, offset int, search, status string) ([]Account, int, error) {
-	return s.listAccountsPage(ctx, limit, offset, search, status, "created_at, id DESC")
+	return s.listAccountsPage(ctx, limit, offset, search, status, "", "created_at, id DESC")
 }
 
 func (s *Store) ListAccountsPageDesc(ctx context.Context, limit, offset int, search, status string) ([]Account, int, error) {
-	return s.listAccountsPage(ctx, limit, offset, search, status, "created_at DESC, id DESC")
+	return s.listAccountsPage(ctx, limit, offset, search, status, "", "created_at DESC, id DESC")
 }
 
-func (s *Store) listAccountsPage(ctx context.Context, limit, offset int, search, status, orderBy string) ([]Account, int, error) {
+// ListAccountsPageByAuthType keeps pagination totals exact when the admin console
+// separates API-key identities from login/OAuth accounts. authType accepts
+// "api_key", "account", or an empty string for the original unfiltered view.
+func (s *Store) ListAccountsPageByAuthType(ctx context.Context, limit, offset int, search, status, authType string) ([]Account, int, error) {
+	return s.listAccountsPage(ctx, limit, offset, search, status, authType, "created_at, id DESC")
+}
+
+func (s *Store) listAccountsPage(ctx context.Context, limit, offset int, search, status, authType, orderBy string) ([]Account, int, error) {
 	where := ""
 	args := []interface{}{}
+	appendCondition := func(condition string, values ...interface{}) {
+		if where == "" {
+			where = " WHERE " + condition
+		} else {
+			where += " AND " + condition
+		}
+		args = append(args, values...)
+	}
 	if search != "" {
-		where = " WHERE (label LIKE ? OR email LIKE ? OR group_name LIKE ? OR id LIKE ?)"
 		s := "%" + search + "%"
-		args = append(args, s, s, s, s)
+		appendCondition("(label LIKE ? OR email LIKE ? OR group_name LIKE ? OR id LIKE ?)", s, s, s, s)
 	}
 	if status != "" {
-		if where == "" {
-			where = " WHERE status = ?"
-		} else {
-			where += " AND status = ?"
-		}
-		args = append(args, status)
+		appendCondition("status = ?", status)
+	}
+	apiKeyCredential := `(EXISTS (SELECT 1 FROM account_auth_tokens aat WHERE aat.account_id = accounts.id AND LOWER(aat.auth_method) = 'api_key') OR EXISTS (SELECT 1 FROM account_kiro_credentials akc WHERE akc.account_id = accounts.id AND LOWER(akc.auth_method) = 'api_key'))`
+	switch strings.ToLower(strings.TrimSpace(authType)) {
+	case "api_key":
+		appendCondition(apiKeyCredential)
+	case "account":
+		appendCondition("NOT " + apiKeyCredential)
 	}
 	var total int
 	countQuery := "SELECT COUNT(*) FROM accounts" + where

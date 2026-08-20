@@ -30,6 +30,7 @@ const accountSchema = z.object({
   group_name: optionalString,
   plan_type: optionalString,
   auth_method: optionalString,
+  credential_mode: optionalString,
   billing_mode: optionalString,
   api_key_present: optionalBoolean,
   ignore_rate_limit_controls: optionalBoolean,

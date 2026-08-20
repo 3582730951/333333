@@ -592,6 +592,49 @@ func TestAccountBatchExpansionHelpers(t *testing.T) {
 	}
 }
 
+func TestListAccountsPageByAuthTypeSeparatesAPIKeysAndLoginAccounts(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	for _, item := range []struct {
+		account Account
+		token   AccountToken
+	}{
+		{Account{ID: "platform-key", Label: "Platform key", GroupName: "cyber", Provider: "codex", Status: "active"}, AccountToken{AuthMethod: "api_key", AccessToken: "sk-test"}},
+		{Account{ID: "oauth-login", Label: "OAuth login", GroupName: "cyber", Provider: "codex", Status: "active"}, AccountToken{AuthMethod: "oauth", AccessToken: "access-test", RefreshToken: "refresh-test"}},
+		{Account{ID: "kiro-key", Label: "Kiro key", GroupName: "kiro", Provider: "kiro", Status: "active"}, AccountToken{}},
+	} {
+		if err := store.UpsertAccount(ctx, item.account, item.token); err != nil {
+			t.Fatalf("upsert %s: %v", item.account.ID, err)
+		}
+	}
+	if err := store.UpsertKiroCredentials(ctx, KiroCredentials{
+		AccountID: "kiro-key", AuthMethod: "api_key", AuthRegion: "us-east-1", APIRegion: "us-east-1", KiroAPIKey: "ksk_test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	apiKeys, total, err := store.ListAccountsPageByAuthType(ctx, 20, 0, "", "", "api_key")
+	if err != nil || total != 2 || len(apiKeys) != 2 {
+		t.Fatalf("api-key page total=%d rows=%+v err=%v", total, apiKeys, err)
+	}
+	apiKeyIDs := map[string]bool{}
+	for _, account := range apiKeys {
+		apiKeyIDs[account.ID] = true
+	}
+	if !apiKeyIDs["platform-key"] || !apiKeyIDs["kiro-key"] || apiKeyIDs["oauth-login"] {
+		t.Fatalf("api-key ids=%v", apiKeyIDs)
+	}
+
+	logins, total, err := store.ListAccountsPageByAuthType(ctx, 20, 0, "", "", "account")
+	if err != nil || total != 1 || len(logins) != 1 || logins[0].ID != "oauth-login" {
+		t.Fatalf("login page total=%d rows=%+v err=%v", total, logins, err)
+	}
+	searched, total, err := store.ListAccountsPageByAuthType(ctx, 20, 0, "Kiro", "", "api_key")
+	if err != nil || total != 1 || len(searched) != 1 || searched[0].ID != "kiro-key" {
+		t.Fatalf("searched api-key page total=%d rows=%+v err=%v", total, searched, err)
+	}
+}
+
 func TestAccountReadersNormalizeLegacyNullableIdentityFields(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

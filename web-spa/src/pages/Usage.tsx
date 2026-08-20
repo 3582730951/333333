@@ -140,7 +140,7 @@ export default function Usage() {
     error: modelAuditError,
     lastRefresh: modelAuditLastRefresh,
     reload: reloadModelAudit,
-  } = useModelAuditData(range);
+  } = useModelAuditData(range, Boolean(data));
   const diagnosticField = DIAGNOSTIC_FIELDS[activeDiagnostic] || null;
   const {
     data: diagnosticCache = {},

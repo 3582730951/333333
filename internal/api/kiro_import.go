@@ -39,6 +39,11 @@ type kiroImportResult struct {
 	Warnings   []string `json:"warnings,omitempty"`
 }
 
+const (
+	kiroImportValidationPending = "kiro_import_validation_pending"
+	kiroImportValidationFailed  = "kiro_import_validation_failed"
+)
+
 func (s *Server) adminImportKiroJSON(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
 		return
@@ -135,6 +140,7 @@ func (s *Server) adminImportKiroAPIKey(w http.ResponseWriter, r *http.Request) {
 		GroupName  string `json:"group_name"`
 		EgressID   string `json:"egress_id"`
 		APIRegion  string `json:"api_region"`
+		AsyncProbe bool   `json:"async_probe"`
 	}
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -184,6 +190,50 @@ func (s *Server) adminImportKiroAPIKey(w http.ResponseWriter, r *http.Request) {
 		AuthRegion: firstNonEmpty(kiroCfg.KiroDefaultAuthRegion, "us-east-1"),
 		KiroAPIKey: req.KiroAPIKey, CredentialHash: hash,
 	}
+	if req.AsyncProbe {
+		account.QuarantineUntil = kiroSuspensionQuarantineUntil
+		account.QuarantineReason = kiroImportValidationPending
+		if err := s.persistKiroAPIKeyPending(r.Context(), account, credential, req.EgressID); err != nil {
+			_ = s.store.DeleteAccount(r.Context(), accountID)
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		timeout := 3 * s.cfg.RequestTimeout()
+		if timeout <= 0 {
+			timeout = 3 * time.Minute
+		}
+		launched := s.launchRuntimeTask("kiro-api-key-import-validation", timeout, func(ctx context.Context) {
+			validationAccount := account
+			if err := s.importAndValidateKiro(ctx, validationAccount, storage.AccountToken{}, credential, req.EgressID); err != nil {
+				_ = s.store.SetAccountQuarantine(ctx, accountID, kiroSuspensionQuarantineUntil, kiroImportValidationFailed)
+				_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+					AccountID: accountID, AccountLabel: label, Action: "kiro_api_key_import", State: "quarantined", Reason: "background_validation_failed",
+				})
+			} else {
+				_ = s.store.SetAccountQuarantine(ctx, accountID, 0, "")
+				_ = s.store.ClearBindingRecheck(ctx, accountID)
+				_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+					AccountID: accountID, AccountLabel: label, Action: "kiro_api_key_import", State: "active", Reason: "background_validation_succeeded",
+				})
+			}
+			if s.scheduler != nil {
+				s.scheduler.InvalidateAccountCache()
+			}
+		})
+		if !launched {
+			account.QuarantineReason = kiroImportValidationFailed
+			_ = s.store.SetAccountQuarantine(r.Context(), accountID, account.QuarantineUntil, account.QuarantineReason)
+		}
+		if s.scheduler != nil {
+			s.scheduler.InvalidateAccountCache()
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"id": accountID, "label": label, "group_name": group,
+			"provider": "kiro", "auth_method": "api_key", "api_key_present": true, "billing_mode": "pay_as_you_go", "api_region": region,
+			"validation_pending": launched, "quarantine_until": account.QuarantineUntil, "quarantine_reason": account.QuarantineReason,
+		})
+		return
+	}
 	if err := s.importAndValidateKiro(r.Context(), account, storage.AccountToken{}, credential, req.EgressID); err != nil {
 		_ = s.store.DeleteAccount(r.Context(), accountID)
 		writeError(w, http.StatusBadRequest, errors.New(safeKiroImportError(err, item)))
@@ -194,6 +244,23 @@ func (s *Server) adminImportKiroAPIKey(w http.ResponseWriter, r *http.Request) {
 		"id": accountID, "label": label, "group_name": group,
 		"provider": "kiro", "auth_method": "api_key", "api_region": region,
 	})
+}
+
+func (s *Server) persistKiroAPIKeyPending(ctx context.Context, account storage.Account, credential storage.KiroCredentials, egressID string) error {
+	if err := s.store.UpsertAccount(ctx, account, storage.AccountToken{}); err != nil {
+		return err
+	}
+	if err := s.store.UpsertKiroCredentials(ctx, credential); err != nil {
+		return err
+	}
+	effectiveEgress := strings.TrimSpace(egressID)
+	if effectiveEgress == "" {
+		effectiveEgress = s.resolveKiroDefaultEgress(ctx, account.ID)
+	}
+	if err := s.bindImportedAccountPrimaryEgress(ctx, account.ID, effectiveEgress); err != nil {
+		return err
+	}
+	return s.store.UpsertCapabilities(ctx, capability.StaticKiroModels(account.ID))
 }
 
 func safeKiroImportError(err error, item kiroImportItem) string {

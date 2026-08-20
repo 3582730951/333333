@@ -179,10 +179,12 @@ type Server struct {
 	codexSessionGatesMu  sync.Mutex
 	codexSessionGates    map[string]*codexSessionGate
 
-	codexCacheMetricsMu   sync.Mutex
-	codexCacheMetrics     map[string]*codexCacheKeyMetric
-	codexCachePolicyMu    sync.Mutex
-	codexCachePolicyCache map[string]codexCachePolicySnapshot
+	codexCacheMetricsMu         sync.Mutex
+	codexCacheMetrics           map[string]*codexCacheKeyMetric
+	codexCachePolicyMu          sync.Mutex
+	codexCachePolicyCache       map[string]codexCachePolicySnapshot
+	providerAPIKeyImportMu      sync.Mutex
+	providerAPIKeyImportFlights map[string]struct{}
 
 	codexResetMu          sync.Mutex
 	codexResetLocks       map[string]*sync.Mutex

@@ -21,10 +21,11 @@ export function useUsageDashboardData(range: UsageRange) {
   }));
 }
 
-export function useModelAuditData(range: UsageRange) {
+export function useModelAuditData(range: UsageRange, enabled = true) {
   return useQueryView(useQuery({
     queryKey: usageQueryKeys.modelAudit(range),
     queryFn: ({ signal }) => fetchModelAudit(range, signal),
+    enabled,
     staleTime: 15_000,
   }));
 }

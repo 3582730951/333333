@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/capability"
@@ -24,16 +25,18 @@ type providerAPIKeyImportRequest struct {
 	GroupName   string
 	EgressID    string
 	ConfirmCost bool
+	AsyncProbe  bool
 }
 
 const (
 	providerAPIKeyInferenceProbePending       = "provider_api_key_inference_probe_pending"
 	providerAPIKeyInferenceProbeFailurePrefix = "provider_api_key_inference_probe_failed:"
+	providerAPIKeyAuthProbeFailurePrefix      = "provider_api_key_auth_probe_failed:"
 )
 
 func isProviderAPIKeyInferenceQuarantine(reason string) bool {
 	reason = strings.TrimSpace(reason)
-	return reason == providerAPIKeyInferenceProbePending || strings.HasPrefix(reason, providerAPIKeyInferenceProbeFailurePrefix)
+	return reason == providerAPIKeyInferenceProbePending || strings.HasPrefix(reason, providerAPIKeyInferenceProbeFailurePrefix) || strings.HasPrefix(reason, providerAPIKeyAuthProbeFailurePrefix)
 }
 
 type providerProbeStage struct {
@@ -44,14 +47,15 @@ type providerProbeStage struct {
 
 type providerAPIKeyImportResponse struct {
 	storage.Account
-	Ready            bool               `json:"ready"`
-	AuthProbe        providerProbeStage `json:"auth_probe"`
-	InferenceProbe   providerProbeStage `json:"inference_probe"`
-	AuthMethod       string             `json:"auth_method"`
-	BillingMode      string             `json:"billing_mode"`
-	APIKeyPresent    bool               `json:"api_key_present"`
-	Quarantined      bool               `json:"quarantined"`
-	QuarantineReason string             `json:"quarantine_reason,omitempty"`
+	Ready             bool               `json:"ready"`
+	AuthProbe         providerProbeStage `json:"auth_probe"`
+	InferenceProbe    providerProbeStage `json:"inference_probe"`
+	AuthMethod        string             `json:"auth_method"`
+	BillingMode       string             `json:"billing_mode"`
+	APIKeyPresent     bool               `json:"api_key_present"`
+	Quarantined       bool               `json:"quarantined"`
+	QuarantineReason  string             `json:"quarantine_reason,omitempty"`
+	ValidationPending bool               `json:"validation_pending,omitempty"`
 }
 
 func (s *Server) adminImportProviderAPIKey(w http.ResponseWriter, r *http.Request, req providerAPIKeyImportRequest) {
@@ -84,6 +88,67 @@ func (s *Server) adminImportProviderAPIKey(w http.ResponseWriter, r *http.Reques
 	egress, err := s.store.GetEgressProfile(r.Context(), egressID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if req.AsyncProbe {
+		// Persist an unroutable row first, acknowledge the operator immediately,
+		// then perform the paid two-stage verification as a bounded server task.
+		// The pending quarantine prevents the scheduler from observing an
+		// unverified key, and the per-account flight gate prevents duplicate probes.
+		if !s.reserveProviderAPIKeyImportFlight(account.ID) {
+			if current, currentErr := s.store.GetAccount(r.Context(), account.ID); currentErr == nil {
+				account = current
+			}
+			writeJSON(w, http.StatusAccepted, providerAPIKeyImportResponse{
+				Account: account, Ready: false,
+				AuthProbe:         providerProbeStage{healthProbeStage: healthProbeStage{Checked: false, State: "already_queued"}},
+				InferenceProbe:    providerProbeStage{healthProbeStage: healthProbeStage{Checked: false, State: "already_queued"}},
+				AuthMethod:        accountprovider.AuthMethodAPIKey,
+				BillingMode:       accountprovider.BillingModePayAsYouGo,
+				APIKeyPresent:     true,
+				Quarantined:       true,
+				QuarantineReason:  account.QuarantineReason,
+				ValidationPending: true,
+			})
+			return
+		}
+		account.QuarantineUntil = kiroSuspensionQuarantineUntil
+		account.QuarantineReason = providerAPIKeyInferenceProbePending
+		if err := s.store.UpsertAccount(r.Context(), account, token); err != nil {
+			s.releaseProviderAPIKeyImportFlight(account.ID)
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if err := s.bindImportedAccountPrimaryEgress(r.Context(), account.ID, egressID); err != nil {
+			s.releaseProviderAPIKeyImportFlight(account.ID)
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if err := s.seedImportedAccountCapabilities(r.Context(), account); err != nil {
+			s.releaseProviderAPIKeyImportFlight(account.ID)
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+			AccountID: account.ID, AccountLabel: account.Label, Action: "provider_api_key_import", State: "pending", Reason: "background_validation_queued",
+			Detail: fmt.Sprintf("provider=%s auth_method=api_key billing_mode=pay_as_you_go", provider),
+		})
+		probeState := s.launchProviderAPIKeyImportProbe(account, token, egress)
+		if probeState == "unavailable" {
+			account.QuarantineReason = providerAPIKeyAuthProbeFailurePrefix + "task_unavailable"
+			_ = s.store.SetAccountQuarantine(r.Context(), account.ID, account.QuarantineUntil, account.QuarantineReason)
+		}
+		if s.scheduler != nil {
+			s.scheduler.InvalidateAccountCache()
+		}
+		writeJSON(w, http.StatusAccepted, providerAPIKeyImportResponse{
+			Account: account, Ready: false,
+			AuthProbe:      providerProbeStage{healthProbeStage: healthProbeStage{Checked: false, State: probeState}},
+			InferenceProbe: providerProbeStage{healthProbeStage: healthProbeStage{Checked: false, State: probeState}},
+			AuthMethod:     accountprovider.AuthMethodAPIKey, BillingMode: accountprovider.BillingModePayAsYouGo,
+			APIKeyPresent: true, Quarantined: true, QuarantineReason: account.QuarantineReason,
+			ValidationPending: probeState != "unavailable",
+		})
 		return
 	}
 
@@ -150,6 +215,80 @@ func (s *Server) adminImportProviderAPIKey(w http.ResponseWriter, r *http.Reques
 		AuthMethod: accountprovider.AuthMethodAPIKey, BillingMode: accountprovider.BillingModePayAsYouGo, APIKeyPresent: true,
 		Quarantined: account.QuarantineUntil > storage.Now(), QuarantineReason: account.QuarantineReason,
 	})
+}
+
+func (s *Server) reserveProviderAPIKeyImportFlight(accountID string) bool {
+	s.providerAPIKeyImportMu.Lock()
+	defer s.providerAPIKeyImportMu.Unlock()
+	if s.providerAPIKeyImportFlights == nil {
+		s.providerAPIKeyImportFlights = make(map[string]struct{})
+	}
+	if _, exists := s.providerAPIKeyImportFlights[accountID]; exists {
+		return false
+	}
+	s.providerAPIKeyImportFlights[accountID] = struct{}{}
+	return true
+}
+
+func (s *Server) releaseProviderAPIKeyImportFlight(accountID string) {
+	s.providerAPIKeyImportMu.Lock()
+	delete(s.providerAPIKeyImportFlights, accountID)
+	s.providerAPIKeyImportMu.Unlock()
+}
+
+func (s *Server) launchProviderAPIKeyImportProbe(account storage.Account, token storage.AccountToken, egress storage.EgressProfile) string {
+	timeout := 3 * s.cfg.RequestTimeout()
+	if timeout <= 0 {
+		timeout = 3 * time.Minute
+	}
+	if !s.launchRuntimeTask("provider-api-key-import-probe", timeout, func(ctx context.Context) {
+		defer s.releaseProviderAPIKeyImportFlight(account.ID)
+		s.completeProviderAPIKeyImportProbe(ctx, account, token, egress)
+	}) {
+		s.releaseProviderAPIKeyImportFlight(account.ID)
+		return "unavailable"
+	}
+	return "queued"
+}
+
+func (s *Server) completeProviderAPIKeyImportProbe(ctx context.Context, account storage.Account, token storage.AccountToken, egress storage.EgressProfile) {
+	authProbe, caps := s.runProviderAPIKeyAuthProbe(ctx, account, token, egress)
+	s.auditProviderAPIKeyProbe(ctx, account, "provider_api_key_auth_probe", authProbe)
+	if !authProbe.Alive {
+		reason := providerAPIKeyAuthProbeFailurePrefix + firstNonEmpty(authProbe.ErrorCode, "unknown")
+		_ = s.store.SetAccountQuarantine(ctx, account.ID, kiroSuspensionQuarantineUntil, reason)
+		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+			AccountID: account.ID, AccountLabel: account.Label, Action: "provider_api_key_quarantined", State: "quarantined",
+			Reason: authProbe.ErrorCode, Detail: "provider=" + account.Provider + " stage=auth",
+		})
+		if s.scheduler != nil {
+			s.scheduler.InvalidateAccountCache()
+		}
+		return
+	}
+	if err := s.store.ReplaceCapabilities(ctx, account.ID, caps); err != nil {
+		_ = s.store.SetAccountQuarantine(ctx, account.ID, kiroSuspensionQuarantineUntil, providerAPIKeyAuthProbeFailurePrefix+"capability_persist_failed")
+		return
+	}
+	inference := s.runProviderAPIKeyInferenceProbe(ctx, account, token, egress, caps)
+	s.auditProviderAPIKeyProbe(ctx, account, "provider_api_key_inference_probe", inference)
+	if inference.Alive {
+		_ = s.store.SetAccountQuarantine(ctx, account.ID, 0, "")
+		_ = s.store.ClearBindingRecheck(ctx, account.ID)
+		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+			AccountID: account.ID, AccountLabel: account.Label, Action: "provider_api_key_recovered", State: "active", Reason: "background_inference_probe_succeeded",
+		})
+	} else {
+		reason := providerAPIKeyInferenceProbeFailurePrefix + firstNonEmpty(inference.ErrorCode, "unknown")
+		_ = s.store.SetAccountQuarantine(ctx, account.ID, kiroSuspensionQuarantineUntil, reason)
+		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+			AccountID: account.ID, AccountLabel: account.Label, Action: "provider_api_key_quarantined", State: "quarantined",
+			Reason: inference.ErrorCode, Detail: "provider=" + account.Provider + " stage=inference",
+		})
+	}
+	if s.scheduler != nil {
+		s.scheduler.InvalidateAccountCache()
+	}
 }
 
 func (s *Server) runProviderAPIKeyAuthProbe(ctx context.Context, account storage.Account, token storage.AccountToken, egress storage.EgressProfile) (providerProbeStage, []storage.ModelCapability) {

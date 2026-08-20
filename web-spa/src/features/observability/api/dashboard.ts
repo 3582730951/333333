@@ -176,25 +176,21 @@ async function fetchDashboardSystem(signal?: AbortSignal): Promise<SystemMetrics
 
 export async function fetchDashboardCore(signal?: AbortSignal): Promise<DashboardCore> {
   const results = await Promise.allSettled([
-    fetchHealth(signal), fetchAccountSummary(signal), fetchDashboardUsage(signal),
+    fetchHealth(signal), fetchAccountSummary(signal),
   ]);
   if (results[1].status === 'rejected') throw results[1].reason;
-  const usage = results[2].status === 'fulfilled' ? results[2].value : null;
-  const timeseriesAvailable = Boolean(usage?.timeseriesAvailable);
-  const failures = [
-    ...(results[0].status === 'rejected' ? [results[0].reason] : []),
-    ...(results[2].status === 'rejected'
-      ? [results[2].reason]
-      : usage?.timeseriesAvailable ? [] : [new Error('dashboard timeseries unavailable')]),
-  ];
+  const failures = results[0].status === 'rejected' ? [results[0].reason] : [];
   return {
     health: results[0].status === 'fulfilled' ? results[0].value : null,
     accountSummary: results[1].value,
-    buckets: timeseriesAvailable && usage ? usage.buckets : [],
-    modelSeries: timeseriesAvailable && usage ? usage.modelSeries : [],
-    series: timeseriesAvailable && usage ? usage.series : [],
+    // Usage aggregation is intentionally secondary. Account state now paints as
+    // soon as its small summary query finishes instead of waiting for telemetry
+    // flush and several aggregate scans.
+    buckets: [],
+    modelSeries: [],
+    series: [],
     healthAvailable: results[0].status === 'fulfilled',
-    timeseriesAvailable,
+    timeseriesAvailable: false,
     error: failures.length ? partialError('DASHBOARD_CORE_PARTIAL', '部分核心指标暂时不可用。', failures) : null,
   };
 }
@@ -209,6 +205,7 @@ export async function fetchDashboardSecondary(signal?: AbortSignal): Promise<Das
   // The aggregate usage snapshot supplies model and cache diagnostics together; its
   // failure surfaces while any successful registration/system result remains usable.
   const usage = results[2].status === 'fulfilled' ? results[2].value : null;
+  const timeseriesAvailable = Boolean(usage?.timeseriesAvailable);
   const modelAvailable = Boolean(usage?.modelAvailable);
   const cacheAvailable = Boolean(usage?.cacheAvailable);
   const diagnosticFailures = results[2].status === 'rejected'
@@ -221,10 +218,14 @@ export async function fetchDashboardSecondary(signal?: AbortSignal): Promise<Das
   return {
     registration: results[0].status === 'fulfilled' ? results[0].value : null,
     system: results[1].status === 'fulfilled' ? results[1].value : null,
+    buckets: timeseriesAvailable && usage ? usage.buckets : [],
+    modelSeries: timeseriesAvailable && usage ? usage.modelSeries : [],
+    series: timeseriesAvailable && usage ? usage.series : [],
     byModel: modelAvailable && usage ? usage.byModel : [],
     cache: cacheAvailable && usage ? usage.cache : null,
     registrationAvailable: results[0].status === 'fulfilled',
     systemAvailable: results[1].status === 'fulfilled',
+    timeseriesAvailable,
     modelAvailable,
     cacheAvailable,
     error: usageDiagnosticsUnavailable ? partialError('DASHBOARD_SECONDARY_UNAVAILABLE', '用量诊断暂时不可用。', diagnosticFailures) : null,

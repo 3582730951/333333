@@ -130,7 +130,8 @@ export default function Dashboard() {
     if (!loading && lastRefresh) setCountdown(DASHBOARD_REFRESH_MS / 1000);
   }, [loading, lastRefresh]);
 
-  const buckets = core?.buckets || [];
+  const buckets = secondary?.buckets || core?.buckets || [];
+  const timeseriesAvailable = secondary?.timeseriesAvailable || core?.timeseriesAvailable || false;
   const derived = useMemo(() => {
     const requestSeries = buckets.map((bucket) => Number(bucket.requests) || 0);
     const tokenSeries = buckets.map((bucket) => Number(bucket.total_tokens) || 0);
@@ -172,8 +173,8 @@ export default function Dashboard() {
   const codex = summary?.codex || 0;
   const claude = summary?.claude || 0;
   const other = summary?.other || 0;
-  const providerModelSeries = core?.modelSeries || [];
-  const providerModelDescriptors = core?.series || [];
+  const providerModelSeries = secondary?.modelSeries || core?.modelSeries || [];
+  const providerModelDescriptors = secondary?.series || core?.series || [];
   const { requests, tokens, requestSeries, tokenSeries, requestDelta, tokenDelta } = derived;
 
   const cacheByModel = secondary?.cache?.by_provider_model || secondary?.cache?.by_model || [];
@@ -366,16 +367,16 @@ export default function Dashboard() {
         />
         <KpiTile
           label={t('dashboard.requests_24h')}
-          value={core?.timeseriesAvailable ? fmtInt(requests) : '—'}
-          delta={core?.timeseriesAvailable ? requestDelta : undefined}
+          value={timeseriesAvailable ? fmtInt(requests) : '—'}
+          delta={timeseriesAvailable ? requestDelta : undefined}
           series={requestSeries}
           color={C.blue}
           caption={t('dashboard.vs_first_half')}
         />
         <KpiTile
           label={t('dashboard.tokens_24h')}
-          value={core?.timeseriesAvailable ? fmtTokens(tokens) : '—'}
-          delta={core?.timeseriesAvailable ? tokenDelta : undefined}
+          value={timeseriesAvailable ? fmtTokens(tokens) : '—'}
+          delta={timeseriesAvailable ? tokenDelta : undefined}
           series={tokenSeries}
           color={C.violet}
           caption={t('dashboard.vs_first_half')}
@@ -399,7 +400,7 @@ export default function Dashboard() {
       </section>
 
       <section className="pool-ops-split">
-        {core?.timeseriesAvailable ? (
+        {timeseriesAvailable ? (
           <div className="pool-chart-card pool-ops-split__trend">
             <div className="head"><div><div className="t">{t('dashboard.provider_model_trend')}</div><div className="s">{t('dashboard.provider_model_trend_desc')}</div></div></div>
             <div className="pool-ops-split__canvas">

@@ -10,8 +10,12 @@ export const queryClient = new QueryClient({
   mutationCache: new MutationCache(),
   defaultOptions: {
     queries: {
-      staleTime: 15_000,
-      gcTime: 5 * 60_000,
+      // Keep the last successful control-plane snapshot around for an operator's
+      // whole working session. Queries still revalidate after 30 seconds, but a
+      // return navigation paints from memory instead of falling back to a blank
+      // table while the network request is in flight.
+      staleTime: 30_000,
+      gcTime: 30 * 60_000,
       retry: shouldRetry,
       refetchOnWindowFocus: false,
     },

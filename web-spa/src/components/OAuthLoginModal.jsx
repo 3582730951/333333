@@ -321,8 +321,9 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       const result = await post('/admin/accounts/import-kiro-api-key', {
         kiro_api_key: kiroApiKey.trim(), label, group_name: 'kiro', // Kiro 自动使用 kiro 分组
         api_region: kiroApiRegion.trim(),
-      }, { timeout: 120000 });
-      Toast.success(`Kiro API Key 账号 ${result.label || result.id} 已导入并验活`);
+        async_probe: true,
+      });
+      Toast.success(`Kiro API Key 账号 ${result.label || result.id} 已保存，后台正在验证`);
       handleClose();
       if (onSuccess) onSuccess(result);
     } catch (e) { showErrorToast(e, { prefix: 'Kiro API Key 导入失败' }); }
@@ -339,9 +340,13 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         label,
         group_name: groupName,
         confirm_cost: true,
-      }, { timeout: 120000 });
+        async_probe: true,
+      });
       setProviderKeyResult(result);
-      if (result.ready) Toast.success('认证与最小推理均通过，API Key 账号已就绪');
+      if (result.validation_pending) {
+        Toast.success('API Key 已保存，后台正在验证；账号池会自动更新状态');
+        handleClose();
+      } else if (result.ready) Toast.success('认证与最小推理均通过，API Key 账号已就绪');
       else Toast.warning('认证已通过，但推理探针失败；账号已保存并无限期隔离');
       if (onSuccess) onSuccess(result);
     } catch (e) {

@@ -37,8 +37,16 @@ func (s *Server) adminAccounts(w http.ResponseWriter, r *http.Request) {
 	pageSize, _ := strconv.Atoi(r.URL.Query().Get("pageSize"))
 	search := strings.TrimSpace(r.URL.Query().Get("search"))
 	status := strings.TrimSpace(r.URL.Query().Get("status"))
+	authType := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("authType")))
+	if authType != "" && authType != "all" && authType != "api_key" && authType != "account" {
+		writeError(w, http.StatusBadRequest, errors.New("authType must be api_key, account, or all"))
+		return
+	}
+	if authType == "all" {
+		authType = ""
+	}
 	if page > 0 && pageSize > 0 {
-		accounts, total, err := s.store.ListAccountsPage(r.Context(), pageSize, (page-1)*pageSize, search, status)
+		accounts, total, err := s.store.ListAccountsPageByAuthType(r.Context(), pageSize, (page-1)*pageSize, search, status, authType)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -234,6 +242,16 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 		if providers[account.ID] == "kiro" {
 			if summary, ok := kiroSummaries[account.ID]; ok {
 				view.KiroAuth = &summary
+				// Kiro keeps its credential shape in a separate encrypted table. Surface
+				// that method through the common account contract so filtering and badges
+				// do not mislabel a ksk_ key as an OAuth account.
+				if view.AuthMethod == "" {
+					view.AuthMethod = strings.ToLower(strings.TrimSpace(summary.AuthMethod))
+				}
+				if view.AuthMethod == accountprovider.AuthMethodAPIKey {
+					view.APIKeyPresent = summary.HasAPIKey
+					view.BillingMode = accountprovider.BillingModePayAsYouGo
+				}
 			}
 		}
 		out = append(out, view)

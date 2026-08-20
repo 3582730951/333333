@@ -56,7 +56,7 @@ describe('Dashboard aggregate refresh', () => {
     vi.useRealTimers();
   });
 
-  it('maps one usage snapshot into unchanged core and secondary shapes with five total GETs', async () => {
+  it('keeps the core paint small and maps usage into the secondary shape with five total GETs', async () => {
     vi.mocked(get).mockImplementation(async (path) => standardResponse(path));
 
     const [core, secondary] = await Promise.all([
@@ -89,16 +89,20 @@ describe('Dashboard aggregate refresh', () => {
     expect(core).toMatchObject({
       accountSummary: { total: 9, active: 6, other: 1 },
       health: { ok: true },
-      buckets: [{ bucket: 1_999_998_000, requests: 4, total_tokens: 80 }],
-      modelSeries: [{ series_key: 'codex::gpt-test', total_tokens: 80 }],
-      series: [{ series_key: 'codex::gpt-test' }],
+      buckets: [],
+      modelSeries: [],
+      series: [],
       healthAvailable: true,
-      timeseriesAvailable: true,
+      timeseriesAvailable: false,
       error: null,
     });
     expect(secondary).toMatchObject({
       registration: { totals: { success_rate: 0.75 } },
       system: { supported: true },
+      buckets: [{ bucket: 1_999_998_000, requests: 4, total_tokens: 80 }],
+      modelSeries: [{ series_key: 'codex::gpt-test', total_tokens: 80 }],
+      series: [{ series_key: 'codex::gpt-test' }],
+      timeseriesAvailable: true,
       byModel: [{ dimension_key: 'codex::gpt-test', total_tokens: 560 }],
       cache: { summary: { cache_input_tokens: 100, cache_read_tokens: 70 } },
       registrationAvailable: true,
@@ -117,8 +121,9 @@ describe('Dashboard aggregate refresh', () => {
       fetchDashboardSecondary(),
     ]);
 
-    expect(core.timeseriesAvailable).toBe(true);
+    expect(core.timeseriesAvailable).toBe(false);
     expect(secondary).toMatchObject({
+      timeseriesAvailable: true,
       modelAvailable: true,
       cacheAvailable: false,
       cache: null,
@@ -161,7 +166,7 @@ describe('Dashboard aggregate refresh', () => {
     });
   });
 
-  it('does not abort the shared usage request when only one consumer is cancelled', async () => {
+  it('does not hold the core paint open while the secondary usage request is pending', async () => {
     let resolveUsage!: (value: ReturnType<typeof usagePayload>) => void;
     const pendingUsage = new Promise<ReturnType<typeof usagePayload>>((resolve) => {
       resolveUsage = resolve;
@@ -170,22 +175,19 @@ describe('Dashboard aggregate refresh', () => {
       if (path === '/admin/usage/dashboard') return pendingUsage;
       return standardResponse(path);
     });
-    const coreController = new AbortController();
-    const secondaryController = new AbortController();
-
-    const corePromise = fetchDashboardCore(coreController.signal);
-    const secondaryPromise = fetchDashboardSecondary(secondaryController.signal);
+    const corePromise = fetchDashboardCore();
+    const secondaryPromise = fetchDashboardSecondary();
     const usageCall = vi.mocked(get).mock.calls.find(([path]) => path === '/admin/usage/dashboard');
     expect(usageCall).toBeDefined();
     const sharedSignal = (usageCall![2] as { signal: AbortSignal }).signal;
 
-    coreController.abort();
     const core = await corePromise;
     expect(core.timeseriesAvailable).toBe(false);
     expect(sharedSignal.aborted).toBe(false);
 
     resolveUsage(usagePayload());
     const secondary = await secondaryPromise;
+    expect(secondary.timeseriesAvailable).toBe(true);
     expect(secondary.modelAvailable).toBe(true);
     expect(secondary.cacheAvailable).toBe(true);
     expect(sharedSignal.aborted).toBe(false);

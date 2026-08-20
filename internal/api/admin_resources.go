@@ -8,6 +8,7 @@ import (
 	"codex-account-pool/internal/proxyparse"
 	cliproxyproxy "codex-account-pool/internal/registration/provider/proxy"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
 	"context"
 	"database/sql"
@@ -18,6 +19,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -1351,17 +1353,47 @@ func (s *Server) quotaViewsForAccounts(ctx context.Context, accounts []storage.A
 	for _, account := range accounts {
 		accountIDs = append(accountIDs, account.ID)
 	}
-	labels, err := s.store.AccountLabelsByID(ctx, accountIDs)
-	if err != nil {
-		return nil, err
+	// These are independent WAL reads. Running them together shortens the quota
+	// page's cold path without adding upstream traffic or changing its snapshot.
+	var (
+		labels     map[string]string
+		tokensByID map[string]storage.AccountToken
+		snapsByID  map[string][]storage.AccountRateLimit
+		labelsErr  error
+		tokensErr  error
+		snapsErr   error
+		loads      sync.WaitGroup
+	)
+	loads.Add(3)
+	runLoad := func(name string, target *error, load func() error) {
+		go func() {
+			defer loads.Done()
+			defer func() {
+				if panicValue := recover(); panicValue != nil {
+					supervisor.LogPanic(name, panicValue)
+					*target = fmt.Errorf("%s panic: %v", name, panicValue)
+				}
+			}()
+			*target = load()
+		}()
 	}
-	tokensByID, err := s.store.ListTokensByAccountIDs(ctx, accountIDs)
-	if err != nil {
-		return nil, err
-	}
-	snapsByID, err := s.store.ListAccountRateLimitsByAccountIDs(ctx, accountIDs)
-	if err != nil {
-		return nil, err
+	runLoad("quota-label-load", &labelsErr, func() (err error) {
+		labels, err = s.store.AccountLabelsByID(ctx, accountIDs)
+		return err
+	})
+	runLoad("quota-token-load", &tokensErr, func() (err error) {
+		tokensByID, err = s.store.ListTokensByAccountIDs(ctx, accountIDs)
+		return err
+	})
+	runLoad("quota-snapshot-load", &snapsErr, func() (err error) {
+		snapsByID, err = s.store.ListAccountRateLimitsByAccountIDs(ctx, accountIDs)
+		return err
+	})
+	loads.Wait()
+	for _, loadErr := range []error{labelsErr, tokensErr, snapsErr} {
+		if loadErr != nil {
+			return nil, loadErr
+		}
 	}
 	now := storage.Now()
 	out := make([]quotaView, 0, len(accounts))

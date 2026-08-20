@@ -27,6 +27,7 @@ export interface AccountRow {
   group_name?: string;
   plan_type?: string;
   auth_method?: 'oauth' | 'access_token' | 'api_key' | string;
+  credential_mode?: 'agent_identity' | string;
   billing_mode?: 'subscription' | 'pay_as_you_go' | string;
   api_key_present?: boolean;
   ignore_rate_limit_controls?: boolean;
@@ -48,6 +49,7 @@ export interface AccountsPageParams {
   page: number;
   pageSize: number;
   search: string;
+  authType?: 'all' | 'api_key' | 'account';
 }
 
 export interface AccountsBundle {

@@ -186,6 +186,22 @@ async function installMocks(page) {
       req.respond(json({ authed: true, via: 'session', role: 'admin', email: 'admin@example.com', name: 'Admin Operator' }));
       return;
     }
+    if (requestPath === '/healthz') {
+      req.respond(json({ ok: true }));
+      return;
+    }
+    if (requestPath === '/admin/accounts/summary') {
+      req.respond(json({ total: accountRows.length, active: accountRows.length, quarantined: 0, cooling: 0, recheck: 0, codex: accountRows.length, claude: 0, other: 0 }));
+      return;
+    }
+    if (requestPath === '/admin/quota') {
+      req.respond(json({ rows: [], total: 0 }));
+      return;
+    }
+    if (requestPath === '/admin/usage/dashboard') {
+      req.respond(json({ accounts: [], timeseries: [], models: [], model_series: [], series: [], cache: { summary: {} } }));
+      return;
+    }
     if (requestPath === '/admin/api-keys') {
       req.respond(json({ keys: apiKeyRows }));
       return;

@@ -315,6 +315,7 @@ func (s *Server) adminImportKey(w http.ResponseWriter, r *http.Request) {
 		EgressID        string `json:"egress_id"`
 		PrimaryEgressID string `json:"primary_egress_id"`
 		ConfirmCost     bool   `json:"confirm_cost"`
+		AsyncProbe      bool   `json:"async_probe"`
 	}
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -330,6 +331,7 @@ func (s *Server) adminImportKey(w http.ResponseWriter, r *http.Request) {
 		s.adminImportProviderAPIKey(w, r, providerAPIKeyImportRequest{
 			ProviderID: providerID, APIKey: apiKey, Label: req.Label, GroupName: req.GroupName,
 			EgressID: requestedImportEgressID(req.EgressID, req.PrimaryEgressID), ConfirmCost: req.ConfirmCost,
+			AsyncProbe: req.AsyncProbe,
 		})
 		return
 	}
