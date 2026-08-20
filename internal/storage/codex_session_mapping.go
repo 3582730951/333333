@@ -1036,10 +1036,34 @@ func (s *Store) CodexDiagnosticTreePrefix(treeID string) string {
 }
 
 func (s *Store) ListCodexSessionMappingDiagnostics(ctx context.Context) ([]CodexSessionMappingDiagnostic, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT b.tree_id,b.namespace_hash,b.account_id,b.egress_id,b.epoch,b.state,
+	return s.listCodexSessionMappingDiagnostics(ctx, 0)
+}
+
+// ListRecentCodexSessionMappingDiagnostics bounds support-export memory and read
+// time independently of retention cleanup. Rows are newest-first when a limit is
+// supplied; the unbounded compatibility method above preserves its historical
+// ordering for existing callers.
+func (s *Store) ListRecentCodexSessionMappingDiagnostics(ctx context.Context, limit int) ([]CodexSessionMappingDiagnostic, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	return s.listCodexSessionMappingDiagnostics(ctx, limit)
+}
+
+func (s *Store) listCodexSessionMappingDiagnostics(ctx context.Context, limit int) ([]CodexSessionMappingDiagnostic, error) {
+	query := `SELECT b.tree_id,b.namespace_hash,b.account_id,b.egress_id,b.epoch,b.state,
 CASE WHEN i.tree_id IS NULL THEN 0 ELSE 1 END,b.created_at,b.updated_at,b.expires_at
 FROM codex_session_binding b LEFT JOIN codex_instruction_snapshot i ON i.tree_id=b.tree_id
-ORDER BY b.created_at,b.id`)
+	ORDER BY b.created_at,b.id`
+	args := []interface{}(nil)
+	if limit > 0 {
+		query = `SELECT b.tree_id,b.namespace_hash,b.account_id,b.egress_id,b.epoch,b.state,
+CASE WHEN i.tree_id IS NULL THEN 0 ELSE 1 END,b.created_at,b.updated_at,b.expires_at
+FROM codex_session_binding b LEFT JOIN codex_instruction_snapshot i ON i.tree_id=b.tree_id
+ORDER BY b.updated_at DESC,b.id DESC LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1061,7 +1085,24 @@ ORDER BY b.created_at,b.id`)
 }
 
 func (s *Store) ListCodexInstructionSnapshotDiagnostics(ctx context.Context) ([]CodexInstructionSnapshotDiagnostic, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT tree_id,revision_hmac,created_at,updated_at,expires_at FROM codex_instruction_snapshot ORDER BY created_at,tree_id`)
+	return s.listCodexInstructionSnapshotDiagnostics(ctx, 0)
+}
+
+func (s *Store) ListRecentCodexInstructionSnapshotDiagnostics(ctx context.Context, limit int) ([]CodexInstructionSnapshotDiagnostic, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	return s.listCodexInstructionSnapshotDiagnostics(ctx, limit)
+}
+
+func (s *Store) listCodexInstructionSnapshotDiagnostics(ctx context.Context, limit int) ([]CodexInstructionSnapshotDiagnostic, error) {
+	query := `SELECT tree_id,revision_hmac,created_at,updated_at,expires_at FROM codex_instruction_snapshot ORDER BY created_at,tree_id`
+	args := []interface{}(nil)
+	if limit > 0 {
+		query = `SELECT tree_id,revision_hmac,created_at,updated_at,expires_at FROM codex_instruction_snapshot ORDER BY updated_at DESC,tree_id DESC LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

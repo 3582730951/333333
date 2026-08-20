@@ -50,6 +50,22 @@ func TestInitMigratesLegacyAffinityBindingExpiryBeforeCreatingIndex(t *testing.T
 	if indexCount != 1 {
 		t.Fatalf("expiry index count = %d, want 1", indexCount)
 	}
+	for _, name := range []string{
+		"idx_affinity_bindings_source_expiry",
+		"idx_affinity_bindings_updated",
+		"idx_affinity_aliases_updated",
+		"idx_billing_holds_created",
+		"idx_audit_log_action_time",
+		"idx_audit_log_state_time",
+		"idx_goal_session_updated",
+	} {
+		if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?`, name).Scan(&indexCount); err != nil {
+			t.Fatalf("inspect diagnostic/retention index %s: %v", name, err)
+		}
+		if indexCount != 1 {
+			t.Fatalf("diagnostic/retention index %s count=%d, want 1", name, indexCount)
+		}
+	}
 
 	if err := store.Init(ctx); err != nil {
 		t.Fatalf("second init should remain idempotent: %v", err)

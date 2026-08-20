@@ -381,29 +381,34 @@ FROM rows`, insertRows, storage.Now()); err != nil {
 	raw := awaitLegacyDiagnosticExport(t, h)
 	files := readZipFiles(t, raw)
 	var manifest struct {
-		Rows       map[string]int64 `json:"row_counts"`
-		SourceRows map[string]int64 `json:"source_row_counts"`
-		Truncated  map[string]struct {
-			SourceRows   int64  `json:"source_rows"`
-			ExportedRows int64  `json:"exported_rows"`
-			OmittedRows  int64  `json:"omitted_rows"`
-			Selection    string `json:"selection"`
+		Rows            map[string]int64 `json:"row_counts"`
+		SourceRows      map[string]int64 `json:"source_row_counts"`
+		SourceRowsExact map[string]bool  `json:"source_row_counts_exact"`
+		Truncated       map[string]struct {
+			SourceRows       int64  `json:"source_rows"`
+			SourceRowsExact  bool   `json:"source_rows_exact"`
+			ExportedRows     int64  `json:"exported_rows"`
+			OmittedRows      int64  `json:"omitted_rows"`
+			OmittedRowsExact bool   `json:"omitted_rows_exact"`
+			Selection        string `json:"selection"`
 		} `json:"truncated_tables"`
 		RowLimit int64 `json:"large_table_row_limit"`
 	}
 	if err := json.Unmarshal([]byte(files["manifest.json"]), &manifest); err != nil {
 		t.Fatal(err)
 	}
-	wantSource := beforeRows + insertRows
 	if manifest.RowLimit != diagnosticExportRowLimit ||
 		manifest.Rows["audit_log.csv"] != diagnosticExportRowLimit ||
-		manifest.SourceRows["audit_log.csv"] != wantSource {
+		manifest.SourceRows["audit_log.csv"] != diagnosticExportRowLimit+1 ||
+		manifest.SourceRowsExact["audit_log.csv"] {
 		t.Fatalf("manifest cap metadata=%+v", manifest)
 	}
 	truncated := manifest.Truncated["audit_log.csv"]
-	if truncated.SourceRows != wantSource ||
+	if truncated.SourceRows != diagnosticExportRowLimit+1 ||
+		truncated.SourceRowsExact ||
 		truncated.ExportedRows != diagnosticExportRowLimit ||
-		truncated.OmittedRows != wantSource-diagnosticExportRowLimit ||
+		truncated.OmittedRows != 1 ||
+		truncated.OmittedRowsExact ||
 		truncated.Selection != "most_recent" {
 		t.Fatalf("audit truncation metadata=%+v", truncated)
 	}
@@ -424,6 +429,37 @@ FROM rows`, insertRows, storage.Now()); err != nil {
 	}
 	if firstID != beforeMaxID+extraRows+1 || lastID != beforeMaxID+insertRows {
 		t.Fatalf("export did not keep newest rows: first=%d last=%d before=%d inserted=%d", firstID, lastID, beforeMaxID, insertRows)
+	}
+}
+
+func TestDiagnosticGoalContinuityCountsLiveRunStates(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	ctx := context.Background()
+	goal, err := h.store.CommitGoalTurn(ctx, storage.GoalTurn{
+		Protocol:          "codex",
+		DownstreamKeyHash: "diagnostic-live-run-key",
+		WorkspaceHash:     "diagnostic-live-run-workspace",
+		InitialGoalHash:   "diagnostic-live-run-initial",
+		ResponseID:        "diagnostic-live-run-response",
+		Aliases: []storage.GoalAlias{{
+			Type: "codex_root_thread", Value: "diagnostic-live-run-root",
+		}},
+		CheckpointPayload: `{"model":"gpt-test","input":[]}`,
+		SegmentPayload:    `{"input":"work","output":"pending"}`,
+		ExpiresAt:         storage.Now() + 3600,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h.store.AcquireGoalRun(ctx, goal.ID, "diagnostic-live-run-owner", "running", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := diagnosticGoalContinuityRows(ctx, h.store.ReadDB(), []byte("diagnostic-alias-key"), storage.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || len(rows[0]) <= 15 || rows[0][15] != "1" {
+		t.Fatalf("goal continuity active run count = %#v", rows)
 	}
 }
 

@@ -371,3 +371,44 @@ func TestRunSafeDiskCleanupCreatesGoalStorageHeadroomBeforeHardLimit(t *testing.
 		t.Fatalf("cleanup left storage=%d above maintenance target=%d", remaining, target)
 	}
 }
+
+func TestRunSafeDiskCleanupCompletesExpiredGoalReclamationInOnePass(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	goal, err := store.CommitGoalTurn(ctx, storage.GoalTurn{
+		Protocol:          "codex",
+		DownstreamKeyHash: "expired-maintenance-key",
+		WorkspaceHash:     "expired-maintenance-workspace",
+		InitialGoalHash:   "expired-maintenance-goal",
+		ResponseID:        "expired-maintenance-response",
+		Aliases: []storage.GoalAlias{{
+			Type: "codex_root_thread", Value: "expired-maintenance-root",
+		}},
+		CheckpointPayload: `{"model":"gpt-test","input":[]}`,
+		SegmentPayload:    `{"input":"expired","output":"complete"}`,
+		ExpiresAt:         storage.Now() + 3600,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.DB().ExecContext(ctx, `UPDATE goal_session SET expires_at=? WHERE id=?`, storage.Now()-1, goal.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{cfg: config.Default(), store: store}
+	snap := DiskGuardSnapshot{}
+	s.runSafeDiskCleanup(ctx, &snap)
+	if _, err = store.GetGoalSession(ctx, goal.ID); !errors.Is(err, storage.ErrGoalNotFound) {
+		t.Fatalf("expired goal survived one maintenance pass: %v", err)
+	}
+	if snap.GoalsDeleted != 1 || snap.GoalBytesReclaimed <= 0 || snap.CleanupFailureEvents != 0 {
+		t.Fatalf("expired maintenance snapshot=%+v", snap)
+	}
+}

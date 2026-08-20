@@ -2796,6 +2796,18 @@ ON CONFLICT(account_id) DO NOTHING`,
 		`ALTER TABLE affinity_bindings ADD COLUMN egress_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE affinity_bindings ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_affinity_bindings_expiry ON affinity_bindings(expires_at, egress_id)`,
+		// Retention runs in a short background budget. Keep both legacy
+		// previous_response_id expiry and generic idle-binding selection on an
+		// ordered index so cleanup does not scan the complete routing history while
+		// holding the single SQLite writer.
+		`CREATE INDEX IF NOT EXISTS idx_affinity_bindings_source_expiry ON affinity_bindings(source, expires_at, route_key_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_affinity_bindings_updated ON affinity_bindings(updated_at, route_key_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_affinity_aliases_updated ON affinity_aliases(updated_at, route_key_hash)`,
+		// Emergency diagnostics and bounded support exports select the newest hold
+		// window. The status-leading operational index cannot satisfy that order.
+		`CREATE INDEX IF NOT EXISTS idx_billing_holds_created ON billing_holds(created_at, id)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_log_action_time ON audit_log(action, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_log_state_time ON audit_log(state, created_at)`,
 		// Multi-user portal: end-user credentials/roles, key ownership, and per-user
 		// usage attribution (older DBs created before the portal existed).
 		`ALTER TABLE users ADD COLUMN name TEXT NOT NULL DEFAULT ''`,
@@ -2870,6 +2882,7 @@ ON CONFLICT(account_id) DO NOTHING`,
 		`ALTER TABLE goal_session ADD COLUMN storage_bytes INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE goal_checkpoint ADD COLUMN format_version INTEGER NOT NULL DEFAULT 1`,
 		`ALTER TABLE goal_segment ADD COLUMN format_version INTEGER NOT NULL DEFAULT 1`,
+		`CREATE INDEX IF NOT EXISTS idx_goal_session_updated ON goal_session(updated_at, id)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_records_event_id ON usage_records(usage_event_id) WHERE usage_event_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_records_created_model ON usage_records(created_at, model)`,
 		// Startup billing recovery resolves historical holds through this column.
@@ -3031,6 +3044,14 @@ ON CONFLICT(account_id) DO NOTHING`,
 		`ALTER TABLE codex_upstream_attempt ADD COLUMN event_id TEXT NOT NULL DEFAULT ''`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_codex_upstream_attempt_event ON codex_upstream_attempt(event_id) WHERE event_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_codex_upstream_attempt_recent_egress ON codex_upstream_attempt(state, created_at, expires_at, egress_id)`,
+		// These indexes deliberately live in the additive surface: the base Codex
+		// schema is checksum-pinned on PostgreSQL. They bound the two slow paths
+		// observed in emergency-v3 diagnostics: expired alias cleanup and newest
+		// attempt export.
+		`CREATE INDEX IF NOT EXISTS idx_codex_session_alias_expiry ON codex_session_alias(expires_at, alias_hash, binding_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_codex_session_binding_updated ON codex_session_binding(updated_at, id)`,
+		`CREATE INDEX IF NOT EXISTS idx_codex_instruction_snapshot_updated ON codex_instruction_snapshot(updated_at, tree_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_codex_upstream_attempt_created ON codex_upstream_attempt(created_at, id)`,
 		`CREATE TABLE IF NOT EXISTS codex_reset_credit_consumptions(
   account_id TEXT NOT NULL,
   seven_day_reset_at INTEGER NOT NULL,

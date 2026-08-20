@@ -2267,35 +2267,44 @@ func (s *Store) DeleteGoalSafely(ctx context.Context, goalID string) error {
 	return tx.Commit()
 }
 
-// CleanupGoalContinuity marks at most one expired inactive goal and advances one
-// bounded physical-reclamation phase. Existing reclaiming work is always resumed,
-// including work originally claimed by the budget or admin paths.
-func (s *Store) CleanupGoalContinuity(ctx context.Context) (int64, error) {
+// CleanupGoalContinuityStep marks at most one expired inactive goal and advances
+// one bounded physical-reclamation phase. Existing reclaiming work is always
+// resumed, including work originally claimed by the budget or admin paths. The
+// progress bit matters for large, chunked goals: removing one bounded child batch
+// is useful work even though the parent row is not deleted until a later step.
+func (s *Store) CleanupGoalContinuityStep(ctx context.Context) (GoalStorageReclaimStep, error) {
 	now := Now()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, err
+		return GoalStorageReclaimStep{}, err
 	}
 	defer tx.Rollback()
 	goalID, err := s.findReclaimingGoal(ctx, tx, now)
 	if err != nil {
-		return 0, err
+		return GoalStorageReclaimStep{}, err
 	}
 	if goalID == "" {
 		goalID, err = s.markNextExpiredGoalReclaiming(ctx, tx, now)
 		if err != nil {
-			return 0, err
+			return GoalStorageReclaimStep{}, err
 		}
 		if goalID == "" {
-			return 0, nil
+			return GoalStorageReclaimStep{}, nil
 		}
 	}
-	_, deleted, _, err := s.reclaimGoalStep(ctx, tx, goalID, now)
+	freed, deleted, progressed, err := s.reclaimGoalStep(ctx, tx, goalID, now)
 	if err != nil {
-		return 0, err
+		return GoalStorageReclaimStep{BytesFreed: freed, Goals: deleted, Progressed: progressed}, err
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, err
+		return GoalStorageReclaimStep{BytesFreed: freed, Goals: deleted, Progressed: progressed}, err
 	}
-	return deleted, nil
+	return GoalStorageReclaimStep{BytesFreed: freed, Goals: deleted, Progressed: progressed}, nil
+}
+
+// CleanupGoalContinuity preserves the historical count-only API for callers that
+// need only completed parent deletions.
+func (s *Store) CleanupGoalContinuity(ctx context.Context) (int64, error) {
+	step, err := s.CleanupGoalContinuityStep(ctx)
+	return step.Goals, err
 }

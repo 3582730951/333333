@@ -73,6 +73,10 @@ func (s *Server) buildEmergencyDiagnosticsArchive(fullExportErr error) ([]byte, 
 	var auditErr error
 	var goalRows [][]string
 	var goalErr error
+	var httpRows []diagnosticHTTPRequest
+	var routeRows []diagnosticRouteAttempt
+	var providerRows []diagnosticProviderAttempt
+	var sidecarRows [][]string
 
 	// These reads are intentionally independent and short. A write-locked SQLite
 	// database often still serves WAL readers, allowing the rescue package to keep
@@ -84,11 +88,19 @@ func (s *Server) buildEmergencyDiagnosticsArchive(fullExportErr error) ([]byte, 
 		cancel()
 
 		goalCtx, goalCancel := context.WithTimeout(context.Background(), emergencyDiagnosticReadTimeout)
-		goalRows, goalErr = diagnosticGoalContinuityRows(goalCtx, s.store.ReadDB(), s.cfg.RuntimeDiagnosticAliasKey)
+		goalRows, goalErr = diagnosticGoalContinuityRows(goalCtx, s.store.ReadDB(), s.cfg.RuntimeDiagnosticAliasKey, storage.Now())
 		goalCancel()
 	} else {
 		auditErr = errors.New("diagnostic store unavailable")
 		goalErr = auditErr
+	}
+	if s != nil {
+		httpRows = s.diagnosticHTTPRequests()
+		routeRows = s.diagnosticRouteAttempts()
+		providerRows = s.diagnosticProviderAttempts()
+		if s.upstream != nil {
+			sidecarRows = sidecarStatusRows(nil, nil, s.upstream.SidecarAdaptiveStatuses())
+		}
 	}
 
 	aliasKey := []byte(nil)
@@ -115,8 +127,31 @@ func (s *Server) buildEmergencyDiagnosticsArchive(fullExportErr error) ([]byte, 
 	if goalErr == nil {
 		files["goal_continuity.csv"] = codebook.sanitize(csvString(goalHeader, goalRows))
 	}
+	files["http_requests.csv"] = codebook.sanitize(csvString(
+		[]string{"request_id", "method", "route", "status", "request_bytes", "response_bytes", "duration_ms", "created_at"},
+		httpRequestRows(httpRows),
+	))
+	files["route_attempts.csv"] = codebook.sanitize(csvString(
+		[]string{"request_id", "tier", "target", "selection_type", "status_class", "fallback_target", "terminal_error_class", "effective_status", "super_instruct_client_choice", "super_instruct_effective_modules", "user_group_alias", "created_at"},
+		routeAttemptRows(routeRows, codebook),
+	))
+	files["provider_attempts.csv"] = codebook.sanitize(csvString(
+		[]string{"request_id", "account_code", "provider", "phase", "status", "error_class", "body_hash", "retry_after", "created_at"},
+		providerAttemptRows(providerRows, codebook),
+	))
+	files["sidecar_status.csv"] = codebook.sanitize(csvString(
+		[]string{"sidecar_egress_id", "real_egress_id", "health", "profile_max_concurrency", "adaptive_limit", "inflight", "queue_depth", "recent_failures", "circuit_state", "circuit_until", "bypass_until", "cooldown_until", "bound_account_count", "created_at", "updated_at"},
+		sidecarRows,
+	))
+	passiveHealth := interface{}(map[string]interface{}{"series_count": 0, "source": "runtime_unconfigured"})
+	if s != nil && s.passiveHealth != nil {
+		passiveHealth = s.passiveHealth.Snapshot()
+	}
+	if err := setEmergencyDiagnosticJSON(files, "passive_provider_health.json", passiveHealth, codebook); err != nil {
+		return nil, causeCode, err
+	}
 
-	gaps := make([]string, 0, 3)
+	gaps := make([]string, 0, 4)
 	readStatus := map[string]interface{}{}
 	if auditErr == nil {
 		readStatus["audit_log"] = map[string]interface{}{"status": "included", "rows": len(auditRows)}
@@ -134,7 +169,47 @@ func (s *Server) buildEmergencyDiagnosticsArchive(fullExportErr error) ([]byte, 
 			"status": "unavailable", "error_code": emergencyDiagnosticFailureCode(goalErr),
 		}
 	}
-	gaps = append(gaps, "snapshot_consistency")
+	readStatus["http_requests"] = map[string]interface{}{"status": "included_memory", "rows": len(httpRows)}
+	readStatus["route_attempts"] = map[string]interface{}{"status": "included_memory", "rows": len(routeRows)}
+	readStatus["provider_attempts"] = map[string]interface{}{"status": "included_memory", "rows": len(providerRows)}
+	readStatus["sidecar_status"] = map[string]interface{}{
+		"status": "included_memory_partial", "rows": len(sidecarRows),
+		"limitations": "durable profile and binding metadata unavailable",
+	}
+	readStatus["passive_provider_health"] = map[string]interface{}{"status": "included_memory", "rows": 1}
+	for _, name := range []string{"manifest", "diagnostic_summary", "runtime_storage"} {
+		readStatus[name] = map[string]interface{}{"status": "synthesized", "rows": 1}
+	}
+
+	included := map[string]bool{
+		"manifest.json": true, "diagnostic_summary.json": true, "runtime_storage.json": true,
+		"passive_provider_health.json": true, "audit_log.csv": true, "goal_continuity.csv": true,
+		"http_requests.csv": true, "route_attempts.csv": true, "provider_attempts.csv": true,
+		"sidecar_status.csv": true,
+	}
+	if auditErr != nil {
+		included["audit_log.csv"] = false
+	}
+	if goalErr != nil {
+		included["goal_continuity.csv"] = false
+	}
+	omittedFiles := make([]string, 0, len(diagnosticFileOrder()))
+	for _, name := range diagnosticFileOrder() {
+		if included[name] {
+			continue
+		}
+		omittedFiles = append(omittedFiles, name)
+		statusKey := strings.TrimSuffix(strings.TrimSuffix(name, ".csv"), ".json")
+		if _, exists := readStatus[statusKey]; !exists {
+			readStatus[statusKey] = map[string]interface{}{
+				"status": "omitted", "error_code": "emergency_bounded_mode",
+			}
+		}
+	}
+	// The archive intentionally contains header-only placeholders for database
+	// tables it did not read. Declare that distinction explicitly; zero rows must
+	// never be interpreted as an exact empty production table.
+	gaps = append(gaps, "database_snapshot", "snapshot_consistency")
 
 	emergency := map[string]interface{}{
 		"mode":                   "emergency_memory",
@@ -143,6 +218,7 @@ func (s *Server) buildEmergencyDiagnosticsArchive(fullExportErr error) ([]byte, 
 		"snapshot_consistency":   "bounded_best_effort_reads",
 		"read_status":            readStatus,
 		"data_gaps":              gaps,
+		"omitted_files":          omittedFiles,
 	}
 
 	var summary map[string]interface{}
@@ -172,11 +248,25 @@ func (s *Server) buildEmergencyDiagnosticsArchive(fullExportErr error) ([]byte, 
 	}
 	manifest["format"] = "codex-pool-diagnostics-v3"
 	manifest["files"] = diagnosticFileOrder()
+	manifest["account_count"] = nil
+	manifest["current_account_count"] = nil
+	manifest["account_count_status"] = "unavailable_in_emergency_mode"
 	if rowCounts, ok := manifest["row_counts"].(map[string]interface{}); ok {
-		rowCounts["audit_log.csv"] = len(auditRows)
+		for _, name := range omittedFiles {
+			delete(rowCounts, name)
+		}
+		if auditErr == nil {
+			rowCounts["audit_log.csv"] = len(auditRows)
+		}
 		if goalErr == nil {
 			rowCounts["goal_continuity.csv"] = len(goalRows)
 		}
+		rowCounts["http_requests.csv"] = len(httpRows)
+		rowCounts["route_attempts.csv"] = len(routeRows)
+		rowCounts["provider_attempts.csv"] = len(providerRows)
+		rowCounts["sidecar_status.csv"] = len(sidecarRows)
+		rowCounts["passive_provider_health.json"] = 1
+		rowCounts["runtime_storage.json"] = 1
 	}
 	if err := setEmergencyDiagnosticJSON(files, "manifest.json", manifest, codebook); err != nil {
 		return nil, causeCode, err

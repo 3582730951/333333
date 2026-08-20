@@ -30,6 +30,11 @@ const (
 	diskGuardProbeInterval            = 15 * time.Second
 	diskGuardNormalCleanupInterval    = 5 * time.Minute
 	diskGuardCleanupTimeout           = 10 * time.Second
+	diskGuardContextCleanupTimeout    = 1500 * time.Millisecond
+	diskGuardMappingCleanupTimeout    = 2500 * time.Millisecond
+	diskGuardRouteCleanupTimeout      = 1500 * time.Millisecond
+	diskGuardGoalCleanupTimeout       = 3 * time.Second
+	diskGuardGoalBudgetTimeout        = 3 * time.Second
 	// Headroom maintenance leaves below the new-goal admission ceiling, so a fresh
 	// session is admitted without a foreground reclaim. Bounded on both sides: large
 	// enough for several ordinary turns, small enough to stay a rounding-scale slice
@@ -248,40 +253,76 @@ func diskGuardCleanupDue(now, lastMaintenance int64, level string, force bool) b
 }
 
 func (s *Server) runSafeDiskCleanup(ctx context.Context, snap *DiskGuardSnapshot) {
-	cleanupCtx, cancel := context.WithTimeout(ctx, diskGuardCleanupTimeout)
-	defer cancel()
-	if deleted, err := s.store.CleanupContextJournal(cleanupCtx); err != nil {
+	maintenanceCtx, maintenanceCancel := context.WithTimeout(ctx, diskGuardCleanupTimeout)
+	defer maintenanceCancel()
+
+	contextCtx, contextCancel := context.WithTimeout(maintenanceCtx, diskGuardContextCleanupTimeout)
+	deleted, err := s.store.CleanupContextJournal(contextCtx)
+	contextCancel()
+	if err != nil {
 		noteDiskCleanupFailure(snap, "context_cleanup", "context_cleanup_failed", err)
 		return
-	} else {
-		snap.ContextsDeleted += deleted
 	}
-	if !diskCleanupBudgetAvailable(cleanupCtx, snap) {
+	snap.ContextsDeleted += deleted
+
+	// Session/affinity retention used to run after as many as sixteen Goal
+	// reclamation transactions under one shared deadline. A busy continuity store
+	// therefore consumed the entire maintenance budget before mapping cleanup could
+	// start. Run small metadata retention first and give every stage its own cap.
+	mappingCtx, mappingCancel := context.WithTimeout(maintenanceCtx, diskGuardMappingCleanupTimeout)
+	mappings, err := s.store.CleanupCodexSessionMappings(mappingCtx)
+	mappingCancel()
+	if err != nil {
+		noteDiskCleanupFailure(snap, "mapping_cleanup", "mapping_cleanup_failed", err)
 		return
 	}
-	if goals, err := s.store.CleanupGoalContinuity(cleanupCtx); err != nil {
-		noteDiskCleanupFailure(snap, "goal_cleanup", "goal_cleanup_failed", err)
+	snap.CodexMappingsDeleted += mappings
+
+	routeCtx, routeCancel := context.WithTimeout(maintenanceCtx, diskGuardRouteCleanupTimeout)
+	bindings, err := s.store.CleanupInactiveRouteBindings(routeCtx, 256)
+	routeCancel()
+	if err != nil {
+		noteDiskCleanupFailure(snap, "route_binding_cleanup", "route_binding_cleanup_failed", err)
 		return
-	} else {
-		snap.GoalsDeleted += goals
 	}
-	if !diskCleanupBudgetAvailable(cleanupCtx, snap) {
-		return
+	snap.RouteBindingsDeleted += bindings.Total()
+
+	// Advance multiple bounded phases for expired goals. One step removes at most
+	// 64 rows/8 MiB, so a single step every five minutes left large abandoned tool
+	// sessions visible for hours after expiry.
+	goalCtx, goalCancel := context.WithTimeout(maintenanceCtx, diskGuardGoalCleanupTimeout)
+	for step := 0; step < goalStorageMaintenanceStepsPerRun && goalCtx.Err() == nil; step++ {
+		reclaimed, reclaimErr := s.store.CleanupGoalContinuityStep(goalCtx)
+		if reclaimErr != nil {
+			goalCancel()
+			noteDiskCleanupFailure(snap, "goal_cleanup", "goal_cleanup_failed", reclaimErr)
+			return
+		}
+		snap.GoalBytesReclaimed += reclaimed.BytesFreed
+		snap.GoalsDeleted += reclaimed.Goals
+		if !reclaimed.Progressed {
+			break
+		}
 	}
+	goalCancel()
+
 	// Converge below the target, not to it. See goalStorageMaintenanceFloor: the
 	// target doubles as CommitGoalTurn's admission ceiling for a new goal.
-	maintenanceFloor := goalStorageMaintenanceFloor(s.goalStorageMaxBytes(ctx))
-	for step := 0; step < goalStorageMaintenanceStepsPerRun; step++ {
-		used, err := s.store.GoalStorageBytes(cleanupCtx)
+	maintenanceFloor := goalStorageMaintenanceFloor(s.goalStorageMaxBytes(maintenanceCtx))
+	budgetCtx, budgetCancel := context.WithTimeout(maintenanceCtx, diskGuardGoalBudgetTimeout)
+	for step := 0; step < goalStorageMaintenanceStepsPerRun && budgetCtx.Err() == nil; step++ {
+		used, err := s.store.GoalStorageBytes(budgetCtx)
 		if err != nil {
+			budgetCancel()
 			noteDiskCleanupFailure(snap, "goal_budget_measure", "goal_budget_measure_failed", err)
 			return
 		}
 		if used <= maintenanceFloor {
 			break
 		}
-		reclaimed, err := s.store.EnforceGoalStorageBudgetStep(cleanupCtx, maintenanceFloor)
+		reclaimed, err := s.store.EnforceGoalStorageBudgetStep(budgetCtx, maintenanceFloor)
 		if err != nil {
+			budgetCancel()
 			noteDiskCleanupFailure(snap, "goal_budget_cleanup", "goal_budget_cleanup_failed", err)
 			return
 		}
@@ -290,36 +331,11 @@ func (s *Server) runSafeDiskCleanup(ctx context.Context, snap *DiskGuardSnapshot
 		if !reclaimed.Progressed {
 			break
 		}
-		if !diskCleanupBudgetAvailable(cleanupCtx, snap) {
-			return
-		}
 	}
-	if mappings, err := s.store.CleanupCodexSessionMappings(cleanupCtx); err != nil {
-		noteDiskCleanupFailure(snap, "mapping_cleanup", "mapping_cleanup_failed", err)
-		return
-	} else {
-		snap.CodexMappingsDeleted += mappings
+	budgetCancel()
+	if maintenanceCtx.Err() == nil {
+		s.cleanupExpiredDiagnosticJobs(maintenanceCtx)
 	}
-	if !diskCleanupBudgetAvailable(cleanupCtx, snap) {
-		return
-	}
-	if bindings, err := s.store.CleanupInactiveRouteBindings(cleanupCtx, 256); err != nil {
-		noteDiskCleanupFailure(snap, "route_binding_cleanup", "route_binding_cleanup_failed", err)
-		return
-	} else {
-		snap.RouteBindingsDeleted += bindings.Total()
-	}
-	if diskCleanupBudgetAvailable(cleanupCtx, snap) {
-		s.cleanupExpiredDiagnosticJobs(cleanupCtx)
-	}
-}
-
-func diskCleanupBudgetAvailable(ctx context.Context, snap *DiskGuardSnapshot) bool {
-	if err := ctx.Err(); err != nil {
-		noteDiskCleanupFailure(snap, "maintenance", "cleanup_budget_exhausted", err)
-		return false
-	}
-	return true
 }
 
 func noteDiskCleanupFailure(snap *DiskGuardSnapshot, operation, code string, err error) {

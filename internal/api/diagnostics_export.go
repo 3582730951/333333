@@ -206,10 +206,11 @@ func diagnosticFileOrder() []string {
 }
 
 type diagnosticExportStat struct {
-	Rows       int64
-	SourceRows int64
-	Min        int64
-	Max        int64
+	Rows            int64
+	SourceRows      int64
+	SourceRowsExact bool
+	Min             int64
+	Max             int64
 }
 
 // diagnosticGoalContinuityRows exports only aggregate, HMAC-aliased continuity
@@ -217,7 +218,7 @@ type diagnosticExportStat struct {
 // working state never enter a support bundle. These counts are sufficient to
 // distinguish "context was never checkpointed" from "checkpoint existed but the
 // resume path failed before using it", which an audit CSV alone cannot prove.
-func diagnosticGoalContinuityRows(ctx context.Context, db storage.ReadQuerier, aliasKey []byte) ([][]string, error) {
+func diagnosticGoalContinuityRows(ctx context.Context, db storage.ReadQuerier, aliasKey []byte, snapshotNow int64) ([][]string, error) {
 	rows, err := db.QueryContext(ctx, `
 SELECT s.id,s.parent_goal_id,s.protocol,
        CASE WHEN s.branch_hash<>'' THEN 1 ELSE 0 END,
@@ -230,10 +231,11 @@ SELECT s.id,s.parent_goal_id,s.protocol,
        (SELECT COUNT(*) FROM goal_segment g WHERE g.goal_id=s.id),
        COALESCE((SELECT MAX(g.sequence) FROM goal_segment g WHERE g.goal_id=s.id),0),
        (SELECT COUNT(*) FROM goal_alias a WHERE a.goal_id=s.id),
-       (SELECT COUNT(*) FROM goal_run r WHERE r.goal_id=s.id AND r.state='active'),
-       (SELECT COUNT(*) FROM goal_run r WHERE r.goal_id=s.id AND r.state='failed'),
-       s.expires_at,s.created_at,s.updated_at
-FROM goal_session s ORDER BY s.updated_at DESC,s.id DESC LIMIT ?`, diagnosticExportRowLimit)
+	       (SELECT COUNT(*) FROM goal_run r WHERE r.goal_id=s.id
+	        AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?),
+	       (SELECT COUNT(*) FROM goal_run r WHERE r.goal_id=s.id AND r.state='failed'),
+	       s.expires_at,s.created_at,s.updated_at
+FROM goal_session s ORDER BY s.updated_at DESC,s.id DESC LIMIT ?`, snapshotNow, diagnosticExportRowLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -367,17 +369,47 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 	if err != nil {
 		return err
 	}
-	codexMappings, err := snapshotStore.ListCodexSessionMappingDiagnostics(ctx)
+	codexMappings, err := snapshotStore.ListRecentCodexSessionMappingDiagnostics(ctx, int(diagnosticExportRowLimit+1))
 	if err != nil {
 		return err
 	}
-	goalContinuity, err := diagnosticGoalContinuityRows(ctx, snapshotStore.ReadDB(), s.cfg.RuntimeDiagnosticAliasKey)
+	codexMappingStat := diagnosticExportStat{
+		SourceRows: int64(len(codexMappings)), SourceRowsExact: int64(len(codexMappings)) <= diagnosticExportRowLimit,
+	}
+	if len(codexMappings) > int(diagnosticExportRowLimit) {
+		codexMappings = codexMappings[:diagnosticExportRowLimit]
+	}
+	codexMappingStat.Rows = int64(len(codexMappings))
+	for _, row := range codexMappings {
+		if row.CreatedAt > 0 && (codexMappingStat.Min == 0 || row.CreatedAt < codexMappingStat.Min) {
+			codexMappingStat.Min = row.CreatedAt
+		}
+		if row.CreatedAt > codexMappingStat.Max {
+			codexMappingStat.Max = row.CreatedAt
+		}
+	}
+	goalContinuity, err := diagnosticGoalContinuityRows(ctx, snapshotStore.ReadDB(), s.cfg.RuntimeDiagnosticAliasKey, snapshotNow)
 	if err != nil {
 		return err
 	}
-	codexInstructionSnapshots, err := snapshotStore.ListCodexInstructionSnapshotDiagnostics(ctx)
+	codexInstructionSnapshots, err := snapshotStore.ListRecentCodexInstructionSnapshotDiagnostics(ctx, int(diagnosticExportRowLimit+1))
 	if err != nil {
 		return err
+	}
+	codexInstructionStat := diagnosticExportStat{
+		SourceRows: int64(len(codexInstructionSnapshots)), SourceRowsExact: int64(len(codexInstructionSnapshots)) <= diagnosticExportRowLimit,
+	}
+	if len(codexInstructionSnapshots) > int(diagnosticExportRowLimit) {
+		codexInstructionSnapshots = codexInstructionSnapshots[:diagnosticExportRowLimit]
+	}
+	codexInstructionStat.Rows = int64(len(codexInstructionSnapshots))
+	for _, row := range codexInstructionSnapshots {
+		if row.CreatedAt > 0 && (codexInstructionStat.Min == 0 || row.CreatedAt < codexInstructionStat.Min) {
+			codexInstructionStat.Min = row.CreatedAt
+		}
+		if row.CreatedAt > codexInstructionStat.Max {
+			codexInstructionStat.Max = row.CreatedAt
+		}
 	}
 	settings, err := listDiagnosticSettings(ctx, snapshotStore.ReadDB())
 	if err != nil {
@@ -442,6 +474,8 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 	if err != nil {
 		return err
 	}
+	stats["codex_session_mappings.csv"] = codexMappingStat
+	stats["codex_instruction_snapshots.csv"] = codexInstructionStat
 
 	small := map[string]string{}
 	rowCounts := map[string]int64{}
@@ -504,16 +538,20 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 		return err
 	}
 	sourceRowCounts := make(map[string]int64, len(stats))
+	sourceRowCountsExact := make(map[string]bool, len(stats))
 	truncatedTables := map[string]map[string]interface{}{}
 	for name, stat := range stats {
 		rowCounts[name] = stat.Rows
 		sourceRowCounts[name] = stat.SourceRows
+		sourceRowCountsExact[name] = stat.SourceRowsExact
 		if stat.SourceRows > stat.Rows {
 			truncatedTables[name] = map[string]interface{}{
-				"source_rows":   stat.SourceRows,
-				"exported_rows": stat.Rows,
-				"omitted_rows":  stat.SourceRows - stat.Rows,
-				"selection":     "most_recent",
+				"source_rows":        stat.SourceRows,
+				"source_rows_exact":  stat.SourceRowsExact,
+				"exported_rows":      stat.Rows,
+				"omitted_rows":       stat.SourceRows - stat.Rows,
+				"omitted_rows_exact": stat.SourceRowsExact,
+				"selection":          "most_recent",
 			}
 		}
 	}
@@ -645,11 +683,13 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 		"historical_reference_account_count": len(codebook.byID),
 		"files":                              diagnosticFileOrder(), "row_counts": rowCounts,
 		"source_row_counts":             sourceRowCounts,
+		"source_row_counts_exact":       sourceRowCountsExact,
+		"source_row_count_semantics":    "exact when source_row_counts_exact[file] is true; otherwise the value is a lower bound obtained from a bounded row_limit+1 probe",
 		"truncated_tables":              truncatedTables,
 		"large_table_row_limit":         diagnosticExportRowLimit,
 		"build":                         diagnosticBuildInfo(),
 		"table_time_ranges":             timeRanges,
-		"table_time_ranges_scope":       "source_snapshot",
+		"table_time_ranges_scope":       "exported_recent_window",
 		"account_redaction":             "all entity identifiers use type-isolated stable HMAC aliases; no reverse map or alias key is included",
 		"account_code_format":           "ACC-Base32(HMAC-SHA256(alias_key,domain||entity_type||raw_id)[:16])",
 		"public_request_ids":            "server-generated REQ- plus 16 hexadecimal request IDs are retained for support correlation; upstream request IDs remain aliased",
@@ -690,6 +730,7 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 			writer, err = zw.Create(name)
 			if err == nil {
 				_, err = io.WriteString(writer, content)
+				written = rowCounts[name]
 			}
 		}
 		if err != nil {
@@ -964,32 +1005,71 @@ func diagnosticLargeTableStats(ctx context.Context, db storage.ReadQuerier, snap
 		sql  string
 		args []interface{}
 	}{
-		"audit_log.csv":     {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM audit_log`},
-		"cf_events.csv":     {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM cf_events`},
-		"usage_records.csv": {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM usage_records`},
-		"billing_holds.csv": {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM billing_holds`},
-		"diagnostic_events.csv": {
-			sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM diagnostic_events`,
+		// Each probe is intentionally capped at row_limit+1. The old COUNT/MIN/MAX
+		// queries scanned complete append-only histories before writing a single ZIP
+		// entry; a large installation could therefore consume the rescue deadline in
+		// metadata collection alone. Two columns describe the exported time range;
+		// they are equal for tables with one created_at field.
+		"audit_log.csv": {sql: `SELECT created_at,created_at FROM audit_log ORDER BY id DESC LIMIT ?`},
+		"cf_events.csv": {sql: `SELECT created_at,created_at FROM cf_events ORDER BY id DESC LIMIT ?`},
+		"usage_records.csv": {
+			sql: `SELECT created_at,created_at FROM usage_records ORDER BY id DESC LIMIT ?`,
 		},
-		"affinity_bindings.csv": {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM (
-SELECT created_at FROM affinity_aliases WHERE expires_at>?
+		"billing_holds.csv": {
+			sql: `SELECT created_at,created_at FROM billing_holds ORDER BY created_at DESC,id DESC LIMIT ?`,
+		},
+		"diagnostic_events.csv": {
+			sql: `SELECT created_at,created_at FROM diagnostic_events ORDER BY created_at DESC,id DESC LIMIT ?`,
+		},
+		"affinity_bindings.csv": {sql: `SELECT created_at,created_at FROM (
+SELECT route_key_hash,created_at,updated_at FROM affinity_aliases WHERE expires_at>?
 UNION ALL
-SELECT b.created_at FROM affinity_bindings b WHERE (b.expires_at=0 OR b.expires_at>?)
+SELECT b.route_key_hash,b.created_at,b.updated_at FROM affinity_bindings b WHERE (b.expires_at=0 OR b.expires_at>?)
 AND NOT EXISTS (SELECT 1 FROM affinity_aliases a WHERE a.route_key_hash=b.route_key_hash AND a.expires_at>?)
-)`, args: []interface{}{snapshotNow, snapshotNow, snapshotNow}},
-		"codex_upstream_attempts.csv":       {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM codex_upstream_attempt WHERE expires_at>?`, args: []interface{}{snapshotNow}},
-		"codex_upstream_attempts_daily.csv": {sql: `SELECT COUNT(*), COALESCE(MIN(first_created_at),0), COALESCE(MAX(last_created_at),0) FROM codex_upstream_attempt_daily WHERE expires_at>?`, args: []interface{}{snapshotNow}},
+) active ORDER BY updated_at DESC,route_key_hash DESC LIMIT ?`, args: []interface{}{snapshotNow, snapshotNow, snapshotNow}},
+		"codex_upstream_attempts.csv": {
+			sql:  `SELECT created_at,created_at FROM codex_upstream_attempt WHERE expires_at>? ORDER BY created_at DESC,id DESC LIMIT ?`,
+			args: []interface{}{snapshotNow},
+		},
+		"codex_upstream_attempts_daily.csv": {
+			sql:  `SELECT first_created_at,last_created_at FROM codex_upstream_attempt_daily WHERE expires_at>? ORDER BY day_start DESC,account_id DESC,egress_id DESC,state DESC,status_code DESC LIMIT ?`,
+			args: []interface{}{snapshotNow},
+		},
 	}
 	out := map[string]diagnosticExportStat{}
 	for file, query := range queries {
 		var stat diagnosticExportStat
-		if err := db.QueryRowContext(ctx, query.sql, query.args...).Scan(&stat.SourceRows, &stat.Min, &stat.Max); err != nil {
+		args := append(append([]interface{}(nil), query.args...), diagnosticExportRowLimit+1)
+		rows, err := db.QueryContext(ctx, query.sql, args...)
+		if err != nil {
 			return nil, err
 		}
-		stat.Rows = stat.SourceRows
-		if stat.Rows > diagnosticExportRowLimit {
-			stat.Rows = diagnosticExportRowLimit
+		for rows.Next() {
+			var rowMin, rowMax int64
+			if err := rows.Scan(&rowMin, &rowMax); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			stat.SourceRows++
+			if stat.SourceRows > diagnosticExportRowLimit {
+				continue
+			}
+			stat.Rows++
+			if rowMin > 0 && (stat.Min == 0 || rowMin < stat.Min) {
+				stat.Min = rowMin
+			}
+			if rowMax > stat.Max {
+				stat.Max = rowMax
+			}
 		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+		stat.SourceRowsExact = stat.SourceRows <= diagnosticExportRowLimit
 		out[file] = stat
 	}
 	return out, nil
@@ -2050,10 +2130,18 @@ func diagnosticAlias(aliasKey []byte, prefix, entityType, rawID string) string {
 }
 
 func (b diagnosticCodebook) code(accountID string) string {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return ""
+	}
 	if info, ok := b.byID[accountID]; ok {
 		return info.Code
 	}
-	return ""
+	// Emergency exports can include process-local provider attempts even when the
+	// database account snapshot is unavailable. The alias key is sufficient to
+	// produce the same stable, type-isolated code without first enumerating every
+	// historical account row.
+	return diagnosticAlias(b.aliasKey, "ACC", "account", accountID)
 }
 
 func (b diagnosticCodebook) sanitize(text string) string {

@@ -293,6 +293,13 @@ func TestDiagnosticRescueExportDoesNotRequireBackgroundWorker(t *testing.T) {
 
 func TestDiagnosticRescueFallsBackToValidatedMemoryArchive(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	const requestID = "REQ-0123456789abcdef"
+	h.app.recordHTTPRequest(requestID, http.MethodPost, "v1.responses", http.StatusServiceUnavailable, 1024, 256, 25*time.Millisecond)
+	h.app.recordRouteAttempt(requestID, 1, "primary", "affinity", "http_status_5xx", "fallback")
+	h.app.recordProviderAttempt(
+		requestID, "emergency-runtime-account", "openai", "response",
+		http.StatusServiceUnavailable, "transient", diagnosticBodyHash([]byte("runtime-request")), "1",
+	)
 	if err := h.store.InsertAuditLog(context.Background(), storage.AuditLogRow{
 		Action: "diagnostic_export_repro", State: "failed",
 		Reason: "database_not_writable", Detail: "context_cleanup_failed,goal_cleanup_failed",
@@ -327,7 +334,11 @@ func TestDiagnosticRescueFallsBackToValidatedMemoryArchive(t *testing.T) {
 		t.Fatalf("memory archive validation failed: %v", err)
 	}
 	files := readZipFiles(t, raw)
-	for _, name := range []string{"manifest.json", "diagnostic_summary.json", "runtime_storage.json", "goal_continuity.csv", "audit_log.csv"} {
+	for _, name := range []string{
+		"manifest.json", "diagnostic_summary.json", "runtime_storage.json",
+		"goal_continuity.csv", "audit_log.csv", "http_requests.csv",
+		"route_attempts.csv", "provider_attempts.csv",
+	} {
 		if _, ok := files[name]; !ok {
 			t.Fatalf("memory archive missing %s: %v", name, zipFileNames(files))
 		}
@@ -343,6 +354,40 @@ func TestDiagnosticRescueFallsBackToValidatedMemoryArchive(t *testing.T) {
 	if manifest["mode"] != "emergency_memory" || manifest["degraded"] != true {
 		t.Fatalf("emergency manifest = %#v", manifest)
 	}
+	if manifest["account_count"] != nil || manifest["current_account_count"] != nil ||
+		manifest["account_count_status"] != "unavailable_in_emergency_mode" {
+		t.Fatalf("emergency account count must be explicitly unavailable: %#v", manifest)
+	}
+	rowCounts, ok := manifest["row_counts"].(map[string]interface{})
+	if !ok || rowCounts["http_requests.csv"] != float64(1) ||
+		rowCounts["route_attempts.csv"] != float64(1) ||
+		rowCounts["provider_attempts.csv"] != float64(1) {
+		t.Fatalf("emergency memory row counts = %#v", manifest["row_counts"])
+	}
+	if _, falselyExact := rowCounts["usage_records.csv"]; falselyExact {
+		t.Fatalf("omitted database table reported as exact zero: %#v", rowCounts)
+	}
+	readStatus, ok := manifest["read_status"].(map[string]interface{})
+	usageStatus, usageOK := readStatus["usage_records"].(map[string]interface{})
+	if !ok || !usageOK || usageStatus["status"] != "omitted" ||
+		usageStatus["error_code"] != "emergency_bounded_mode" {
+		t.Fatalf("emergency read status = %#v", manifest["read_status"])
+	}
+	gaps, ok := manifest["data_gaps"].([]interface{})
+	if !ok || !diagnosticStringListContains(gaps, "database_snapshot") ||
+		!diagnosticStringListContains(gaps, "snapshot_consistency") {
+		t.Fatalf("emergency gaps = %#v", manifest["data_gaps"])
+	}
+	exportedRequestID := strings.ToUpper(requestID)
+	if !strings.Contains(files["http_requests.csv"], exportedRequestID) ||
+		!strings.Contains(files["route_attempts.csv"], exportedRequestID) ||
+		!strings.Contains(files["provider_attempts.csv"], exportedRequestID) {
+		t.Fatalf("runtime failure evidence missing: http=%s route=%s provider=%s",
+			files["http_requests.csv"], files["route_attempts.csv"], files["provider_attempts.csv"])
+	}
+	if strings.Contains(files["provider_attempts.csv"], "emergency-runtime-account") {
+		t.Fatalf("runtime account identity leaked: %s", files["provider_attempts.csv"])
+	}
 	var runtimeStorage map[string]interface{}
 	if err := json.Unmarshal([]byte(files["runtime_storage.json"]), &runtimeStorage); err != nil {
 		t.Fatal(err)
@@ -350,6 +395,15 @@ func TestDiagnosticRescueFallsBackToValidatedMemoryArchive(t *testing.T) {
 	if _, ok := runtimeStorage["supervisor"]; !ok {
 		t.Fatalf("emergency runtime omitted supervisor state: %#v", runtimeStorage)
 	}
+}
+
+func diagnosticStringListContains(values []interface{}, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestEmergencyDiagnosticArchiveSurvivesClosedDatabase(t *testing.T) {

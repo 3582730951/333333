@@ -485,6 +485,61 @@ func TestCodexInstructionSnapshotSurvivesStoreRestart(t *testing.T) {
 	}
 }
 
+func TestRecentCodexDiagnosticListingsAreBoundedAndNewestFirst(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	store.SetTokenEncryptionKey([]byte("recent-codex-diagnostics-test-key"))
+	for index := 0; index < 3; index++ {
+		treeID := fmt.Sprintf("tree-recent-diagnostic-%d", index)
+		_, err := store.CommitCodexSessionBinding(ctx, CodexSessionCommit{
+			Namespace: "recent-diagnostic-namespace",
+			Binding: CodexSessionBinding{
+				ID: treeID, TreeID: treeID, AccountID: fmt.Sprintf("account-%d", index),
+				EgressID: DefaultDirectEgressID, State: "active",
+				RootSessionID: treeID, ThreadID: treeID,
+			},
+			Aliases:   []CodexSessionAlias{{Type: "root", Value: treeID}},
+			ExpiresAt: Now() + 3600,
+			InstructionSnapshot: &CodexInstructionSnapshot{
+				TreeID: treeID, Instructions: fmt.Sprintf("stable instructions %d", index),
+				ExpiresAt: Now() + 3600,
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		updatedAt := int64(100 + index)
+		if _, err = store.DB().ExecContext(ctx, `UPDATE codex_session_binding SET updated_at=? WHERE tree_id=?`, updatedAt, treeID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = store.DB().ExecContext(ctx, `UPDATE codex_instruction_snapshot SET updated_at=? WHERE tree_id=?`, updatedAt, treeID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mappings, err := store.ListRecentCodexSessionMappingDiagnostics(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots, err := store.ListRecentCodexInstructionSnapshotDiagnostics(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPrefixes := []string{
+		store.CodexDiagnosticTreePrefix("tree-recent-diagnostic-2"),
+		store.CodexDiagnosticTreePrefix("tree-recent-diagnostic-1"),
+	}
+	if len(mappings) != 2 || mappings[0].TreeHMACPrefix != wantPrefixes[0] || mappings[1].TreeHMACPrefix != wantPrefixes[1] {
+		t.Fatalf("recent mapping diagnostics=%+v want prefixes=%v", mappings, wantPrefixes)
+	}
+	if len(snapshots) != 2 || snapshots[0].TreeHMACPrefix != wantPrefixes[0] || snapshots[1].TreeHMACPrefix != wantPrefixes[1] {
+		t.Fatalf("recent snapshot diagnostics=%+v want prefixes=%v", snapshots, wantPrefixes)
+	}
+	if rows, err := store.ListRecentCodexSessionMappingDiagnostics(ctx, 0); err != nil || len(rows) != 0 {
+		t.Fatalf("zero-limit mapping diagnostics=%+v err=%v", rows, err)
+	}
+}
+
 func TestCodexUpstreamAttemptDiagnosticsRedactTreeID(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
@@ -564,17 +619,28 @@ func TestListRecentCodexEgressOutcomesCountsOnlyExitAttributableResults(t *testi
 	}
 }
 
-func TestRecentCodexEgressOutcomeIndexUsesAdditiveMigration(t *testing.T) {
-	if strings.Contains(codexSessionMappingSchemaSQL, "idx_codex_upstream_attempt_recent_egress") {
-		t.Fatal("additive index changed immutable PostgreSQL base schema checksum")
+func TestCodexOperationalIndexesUseAdditiveMigration(t *testing.T) {
+	indexNames := []string{
+		"idx_codex_upstream_attempt_recent_egress",
+		"idx_codex_session_alias_expiry",
+		"idx_codex_session_binding_updated",
+		"idx_codex_instruction_snapshot_updated",
+		"idx_codex_upstream_attempt_created",
+	}
+	for _, name := range indexNames {
+		if strings.Contains(codexSessionMappingSchemaSQL, name) {
+			t.Fatalf("additive index %s changed immutable PostgreSQL base schema checksum", name)
+		}
 	}
 	store := newTestStore(t)
-	var count int
-	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_codex_upstream_attempt_recent_egress'`).Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 1 {
-		t.Fatalf("recent outcome migration index count=%d, want 1", count)
+	for _, name := range indexNames {
+		var count int
+		if err := store.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?`, name).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("additive migration index %s count=%d, want 1", name, count)
+		}
 	}
 }
 
