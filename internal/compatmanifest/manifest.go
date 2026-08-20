@@ -29,16 +29,20 @@ import (
 )
 
 const (
-	SchemaVersion       = 1
-	SnapshotVersion     = 1
-	maxManifestBytes    = 2 << 20
-	maxManifestModels   = 256
-	maxContextWindow    = int64(4_000_000)
-	officialCodexURL    = "https://api.github.com/repos/openai/codex/releases/latest"
-	officialClaudeURL   = "https://registry.npmjs.org/@anthropic-ai/claude-code/latest"
-	officialUserAgent   = "codex-account-pool-compatibility-manifest/1"
-	defaultHTTPTimeout  = 20 * time.Second
-	maximumManifestLife = 180 * 24 * time.Hour
+	SchemaVersion     = 1
+	SnapshotVersion   = 1
+	maxManifestBytes  = 2 << 20
+	maxManifestModels = 256
+	maxContextWindow  = int64(4_000_000)
+	// The official Codex CLI is distributed as @openai/codex. Prefer the small npm
+	// dist-tag document: unauthenticated GitHub API calls are commonly rate-limited
+	// with HTTP 403. GitHub remains a one-shot fallback when the registry is down.
+	officialCodexNPMURL    = "https://registry.npmjs.org/@openai/codex/latest"
+	officialCodexGitHubURL = "https://api.github.com/repos/openai/codex/releases/latest"
+	officialClaudeURL      = "https://registry.npmjs.org/@anthropic-ai/claude-code/latest"
+	officialUserAgent      = "codex-account-pool-compatibility-manifest/1"
+	defaultHTTPTimeout     = 20 * time.Second
+	maximumManifestLife    = 180 * 24 * time.Hour
 )
 
 var dottedVersionRE = regexp.MustCompile(`(?i)(?:^|[^0-9])v?([0-9]+\.[0-9]+\.[0-9]+)(?:[-+][0-9a-z.-]+)?(?:$|[^0-9])`)
@@ -119,10 +123,60 @@ type fetchedManifest struct {
 	signature string
 }
 
+type sourceHTTPError struct {
+	status     int
+	retryAfter time.Duration
+}
+
+func (e *sourceHTTPError) Error() string {
+	return fmt.Sprintf("source returned HTTP %d", e.status)
+}
+
+// SuggestedRetryDelay returns the longest bounded Retry-After/rate-limit reset
+// advertised anywhere in a wrapped multi-source refresh error. Callers can combine
+// it with their own exponential backoff so outages and 403/429 rate limits never
+// turn into an aggressive poll loop.
+func SuggestedRetryDelay(err error) time.Duration {
+	var longest time.Duration
+	var visit func(error)
+	visit = func(candidate error) {
+		if candidate == nil {
+			return
+		}
+		if sourceErr, ok := candidate.(*sourceHTTPError); ok && sourceErr.retryAfter > longest {
+			longest = sourceErr.retryAfter
+		}
+		switch wrapped := candidate.(type) {
+		case interface{ Unwrap() []error }:
+			for _, child := range wrapped.Unwrap() {
+				visit(child)
+			}
+		case interface{ Unwrap() error }:
+			visit(wrapped.Unwrap())
+		}
+	}
+	visit(err)
+	const maximumRetryDelay = 24 * time.Hour
+	if longest > maximumRetryDelay {
+		return maximumRetryDelay
+	}
+	return longest
+}
+
+type refreshFlight struct {
+	key     string
+	done    chan struct{}
+	payload Payload
+	changed bool
+	err     error
+}
+
 // Manager owns the active immutable profile and A/B snapshots. Callers may use
 // Active and Status concurrently with refreshes.
 type Manager struct {
 	mu       sync.RWMutex
+	flightMu sync.Mutex
+	flight   *refreshFlight
 	dataDir  string
 	client   *http.Client
 	now      func() time.Time
@@ -239,11 +293,54 @@ func (m *Manager) Load(cfg Config) (Payload, bool, error) {
 	return clonePayload(payload), true, nil
 }
 
-// Refresh fetches and validates a candidate, optionally runs a caller-supplied
-// non-billable canary, commits an fsync'd A/B snapshot, then atomically publishes
-// it. Failed candidates never replace the active profile.
+// Refresh coalesces concurrent refreshes for the same trust configuration. This is
+// both a local singleflight and an upstream-load guard: a burst of settings writes
+// or callers produces one registry/release lookup, and all followers receive the
+// leader's result. A trust-source change waits for the current flight before starting
+// its own refresh, so differently trusted candidates are never mixed.
 func (m *Manager) Refresh(ctx context.Context, cfg Config, accept func(context.Context, Payload) error) (Payload, bool, error) {
 	cfg = normalizeConfig(cfg)
+	key := refreshConfigKey(cfg)
+	for {
+		m.flightMu.Lock()
+		if m.flight == nil {
+			flight := &refreshFlight{key: key, done: make(chan struct{})}
+			m.flight = flight
+			m.flightMu.Unlock()
+
+			flight.payload, flight.changed, flight.err = m.refreshOnce(ctx, cfg, accept)
+			m.flightMu.Lock()
+			m.flight = nil
+			close(flight.done)
+			m.flightMu.Unlock()
+			return clonePayload(flight.payload), flight.changed, flight.err
+		}
+		flight := m.flight
+		m.flightMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return Payload{}, false, ctx.Err()
+		case <-flight.done:
+		}
+		if flight.key == key {
+			return clonePayload(flight.payload), flight.changed, flight.err
+		}
+		// A different trust configuration led the completed flight. Re-check the
+		// slot and start this configuration's refresh only after it has finished.
+	}
+}
+
+func refreshConfigKey(cfg Config) string {
+	return strings.Join([]string{
+		strconv.FormatBool(cfg.Enabled), cfg.Source, cfg.URL, cfg.PublicKey,
+		strconv.FormatInt(int64(cfg.MaxStale), 10), strconv.FormatInt(int64(cfg.RefreshEvery), 10),
+	}, "\x00")
+}
+
+// refreshOnce fetches and validates a candidate, optionally runs a caller-supplied
+// non-billable canary, commits an fsync'd A/B snapshot, then atomically publishes
+// it. Failed candidates never replace the active profile.
+func (m *Manager) refreshOnce(ctx context.Context, cfg Config, accept func(context.Context, Payload) error) (Payload, bool, error) {
 	now := m.now()
 	m.mu.Lock()
 	m.status.Enabled = cfg.Enabled
@@ -364,12 +461,9 @@ func (m *Manager) fetch(ctx context.Context, cfg Config, now time.Time) (fetched
 }
 
 func (m *Manager) fetchOfficial(ctx context.Context, now time.Time) (fetchedManifest, error) {
-	var release struct {
-		TagName     string `json:"tag_name"`
-		PublishedAt string `json:"published_at"`
-	}
-	if err := m.getJSON(ctx, officialCodexURL, "official", &release); err != nil {
-		return fetchedManifest{}, fmt.Errorf("fetch official Codex release: %w", err)
+	codexVersion, codexPublishedAt, err := m.fetchOfficialCodexVersion(ctx)
+	if err != nil {
+		return fetchedManifest{}, err
 	}
 	var npm struct {
 		Version string `json:"version"`
@@ -377,13 +471,12 @@ func (m *Manager) fetchOfficial(ctx context.Context, now time.Time) (fetchedMani
 	if err := m.getJSON(ctx, officialClaudeURL, "official", &npm); err != nil {
 		return fetchedManifest{}, fmt.Errorf("fetch official Claude release: %w", err)
 	}
-	codexVersion := extractDottedVersion(release.TagName)
 	claudeVersion := extractDottedVersion(npm.Version)
-	if codexVersion == "" || claudeVersion == "" {
-		return fetchedManifest{}, fmt.Errorf("official release returned invalid versions codex=%q claude=%q", release.TagName, npm.Version)
+	if claudeVersion == "" {
+		return fetchedManifest{}, fmt.Errorf("official Claude release returned invalid version %q", npm.Version)
 	}
 	issuedAt := now.Unix()
-	if published, err := time.Parse(time.RFC3339, release.PublishedAt); err == nil && !published.After(now.Add(24*time.Hour)) {
+	if published, err := time.Parse(time.RFC3339, codexPublishedAt); err == nil && !published.After(now.Add(24*time.Hour)) {
 		issuedAt = published.Unix()
 	}
 	payload := Payload{
@@ -397,6 +490,40 @@ func (m *Manager) fetchOfficial(ctx context.Context, now time.Time) (fetchedMani
 	}
 	raw, err := json.Marshal(payload)
 	return fetchedManifest{payload: payload, raw: raw}, err
+}
+
+// fetchOfficialCodexVersion uses the package actually installed by the official
+// CLI distribution as its primary version source. The GitHub release API is queried
+// only once, and only when npm fails or returns a malformed version; this removes the
+// recurring unauthenticated-API 403 while preserving availability during a registry
+// outage without retry loops inside a refresh.
+func (m *Manager) fetchOfficialCodexVersion(ctx context.Context) (version, publishedAt string, err error) {
+	var npm struct {
+		Version string `json:"version"`
+	}
+	npmErr := m.getJSON(ctx, officialCodexNPMURL, "official", &npm)
+	if npmErr == nil {
+		if version = extractDottedVersion(npm.Version); version != "" {
+			return version, "", nil
+		}
+		npmErr = fmt.Errorf("source returned invalid version %q", npm.Version)
+	}
+
+	var release struct {
+		TagName     string `json:"tag_name"`
+		PublishedAt string `json:"published_at"`
+	}
+	githubErr := m.getJSON(ctx, officialCodexGitHubURL, "official", &release)
+	if githubErr == nil {
+		if version = extractDottedVersion(release.TagName); version != "" {
+			return version, release.PublishedAt, nil
+		}
+		githubErr = fmt.Errorf("source returned invalid version %q", release.TagName)
+	}
+	return "", "", fmt.Errorf("fetch official Codex release: %w", errors.Join(
+		fmt.Errorf("npm: %w", npmErr),
+		fmt.Errorf("GitHub fallback: %w", githubErr),
+	))
 }
 
 func (m *Manager) fetchSignedCustom(ctx context.Context, cfg Config) (fetchedManifest, error) {
@@ -456,7 +583,7 @@ func (m *Manager) getJSON(ctx context.Context, rawURL, source string, dst interf
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
-		return fmt.Errorf("source returned HTTP %d", resp.StatusCode)
+		return &sourceHTTPError{status: resp.StatusCode, retryAfter: sourceRetryDelay(resp.Header, m.now())}
 	}
 	limited := io.LimitReader(resp.Body, maxManifestBytes+1)
 	raw, err := io.ReadAll(limited)
@@ -477,6 +604,33 @@ func (m *Manager) getJSON(ctx context.Context, rawURL, source string, dst interf
 		return errors.New("manifest contains trailing JSON")
 	}
 	return nil
+}
+
+func sourceRetryDelay(header http.Header, now time.Time) time.Duration {
+	const maximumRetryDelay = 24 * time.Hour
+	var retryAt time.Time
+	if raw := strings.TrimSpace(header.Get("Retry-After")); raw != "" {
+		if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds > 0 {
+			if seconds > int64(maximumRetryDelay/time.Second) {
+				seconds = int64(maximumRetryDelay / time.Second)
+			}
+			retryAt = now.Add(time.Duration(seconds) * time.Second)
+		} else if parsed, err := http.ParseTime(raw); err == nil {
+			retryAt = parsed
+		}
+	}
+	if raw := strings.TrimSpace(header.Get("X-RateLimit-Reset")); raw != "" {
+		if epoch, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			reset := time.Unix(epoch, 0)
+			if reset.After(retryAt) {
+				retryAt = reset
+			}
+		}
+	}
+	if retryAt.After(now) {
+		return retryAt.Sub(now)
+	}
+	return 0
 }
 
 // Validate applies the same bounded schema rules to network and persisted data.
@@ -692,7 +846,7 @@ func validateSourceURL(rawURL, source string) error {
 	}
 	source = normalizeSource(source)
 	if source == "official" {
-		if u.String() != officialCodexURL && u.String() != officialClaudeURL {
+		if u.String() != officialCodexNPMURL && u.String() != officialCodexGitHubURL && u.String() != officialClaudeURL {
 			return errors.New("official compatibility URL is outside the allowlist")
 		}
 		return nil

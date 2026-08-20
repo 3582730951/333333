@@ -9,6 +9,7 @@ import (
 	authparse "codex-account-pool/internal/auth"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/supervisor"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 func (s *Server) adminAccounts(w http.ResponseWriter, r *http.Request) {
@@ -104,25 +106,79 @@ type authJSONImportRequest struct {
 }
 
 func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) ([]accountView, error) {
+	if len(accounts) == 0 {
+		return []accountView{}, nil
+	}
 	accountIDs := make([]string, 0, len(accounts))
 	for _, account := range accounts {
 		accountIDs = append(accountIDs, account.ID)
 	}
-	providers, err := s.store.ResolveAccountProviders(ctx, accounts)
-	if err != nil {
-		return nil, err
+	var (
+		providers      map[string]string
+		capabilities   map[string][]storage.ModelCapability
+		bindings       map[string]storage.AccountEgressBinding
+		groups         []storage.Group
+		usages         map[string]storage.UsageSummaryRow
+		tokens         map[string]storage.AccountToken
+		quotaSnapshots map[string][]storage.AccountRateLimit
+		reauthConfigs  map[string]storage.AccountCodexReauthConfig
+		kiroSummaries  map[string]storage.KiroAuthSummary
+	)
+	loadCtx, cancelLoads := context.WithCancel(ctx)
+	defer cancelLoads()
+	loads := []func() error{
+		func() (err error) { providers, err = s.store.ResolveAccountProviders(loadCtx, accounts); return err },
+		func() (err error) {
+			capabilities, err = s.store.ListCapabilitiesSummaryByAccountIDs(loadCtx, accountIDs)
+			return err
+		},
+		func() (err error) {
+			bindings, err = s.store.ListEgressBindingsByAccountIDs(loadCtx, accountIDs)
+			return err
+		},
+		func() (err error) { groups, err = s.store.ListGroups(loadCtx); return err },
+		func() (err error) { usages, err = s.store.UsageSummaryByAccountIDs(loadCtx, accountIDs); return err },
+		func() (err error) { tokens, err = s.store.ListTokensByAccountIDs(loadCtx, accountIDs); return err },
+		func() (err error) {
+			quotaSnapshots, err = s.store.ListAccountRateLimitsByAccountIDs(loadCtx, accountIDs)
+			return err
+		},
+		func() (err error) {
+			reauthConfigs, err = s.store.ListCodexReauthConfigPublicByAccountIDs(loadCtx, accountIDs)
+			return err
+		},
+		func() (err error) {
+			kiroSummaries, err = s.store.KiroAuthSummariesByAccountIDs(loadCtx, accountIDs)
+			return err
+		},
 	}
-	capabilities, err := s.store.ListCapabilitiesSummaryByAccountIDs(ctx, accountIDs)
-	if err != nil {
-		return nil, err
+	var loadWG sync.WaitGroup
+	var loadErr error
+	var loadErrOnce sync.Once
+	loadWG.Add(len(loads))
+	for _, load := range loads {
+		go func() {
+			defer loadWG.Done()
+			defer func() {
+				if panicValue := recover(); panicValue != nil {
+					supervisor.LogPanic("admin-account-view-load", panicValue)
+					loadErrOnce.Do(func() {
+						loadErr = fmt.Errorf("account view load panic: %v", panicValue)
+						cancelLoads()
+					})
+				}
+			}()
+			if err := load(); err != nil {
+				loadErrOnce.Do(func() {
+					loadErr = err
+					cancelLoads()
+				})
+			}
+		}()
 	}
-	bindings, err := s.store.ListEgressBindingsByAccountIDs(ctx, accountIDs)
-	if err != nil {
-		return nil, err
-	}
-	groups, err := s.store.ListGroups(ctx)
-	if err != nil {
-		return nil, err
+	loadWG.Wait()
+	if loadErr != nil {
+		return nil, loadErr
 	}
 	groupEgresses := make(map[string]string, len(groups))
 	for _, group := range groups {
@@ -137,26 +193,6 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 			id = storage.DefaultDirectEgressID
 		}
 		groupEgresses[group.Name] = id
-	}
-	usages, err := s.store.UsageSummaryByAccountIDs(ctx, accountIDs)
-	if err != nil {
-		return nil, err
-	}
-	tokens, err := s.store.ListTokensByAccountIDs(ctx, accountIDs)
-	if err != nil {
-		return nil, err
-	}
-	quotaSnapshots, err := s.store.ListAccountRateLimitsByAccountIDs(ctx, accountIDs)
-	if err != nil {
-		return nil, err
-	}
-	reauthConfigs, err := s.store.ListCodexReauthConfigPublicByAccountIDs(ctx, accountIDs)
-	if err != nil {
-		return nil, err
-	}
-	kiroSummaries, err := s.store.KiroAuthSummariesByAccountIDs(ctx, accountIDs)
-	if err != nil {
-		return nil, err
 	}
 	now := storage.Now()
 	out := make([]accountView, 0, len(accounts))

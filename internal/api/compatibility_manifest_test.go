@@ -32,6 +32,15 @@ func TestCompatibilityManifestCannotDowngradeBundledOrPinnedClient(t *testing.T)
 		t.Fatalf("manifest replaced operator pin: %+v", got)
 	}
 
+	// An official release can move ahead of the wire fingerprints compiled into
+	// this build. Discovery may report it, but automatic request shaping must stay
+	// on an exact verified profile until that version joins the fingerprint library.
+	cfg = config.Default()
+	got = applyCompatibilityManifestConfig(cfg, compatmanifest.Payload{Codex: compatmanifest.ClientProfile{Version: "0.149.0"}})
+	if got.ClientVersion != config.DefaultClientVersion || got.CodexCLIVersionOverride != "" {
+		t.Fatalf("unknown future release bypassed the verified fingerprint library: %+v", got)
+	}
+
 	server := &Server{compatibilityManifest: compatmanifest.New(t.TempDir(), nil)}
 	if err := server.canaryCompatibilityManifest(context.Background(), downgrade); err == nil {
 		t.Fatal("canary accepted a version older than the bundled client")

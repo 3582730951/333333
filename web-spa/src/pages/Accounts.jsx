@@ -236,6 +236,7 @@ export default function Accounts() {
   const {
     data = EMPTY_ACCOUNT_DATA,
     loading,
+    refreshing,
     error,
     lastRefresh,
     reload: load,
@@ -677,7 +678,7 @@ export default function Accounts() {
           <Button icon={<IconDownload />} loading={accountExportRunning} disabled={accountImportRunning} onClick={() => exportAccountBackup([])}>一键导出全部</Button>
           <Button icon={<IconDownload />} loading={accountExportRunning} disabled={!selected.length || accountImportRunning} onClick={() => exportAccountBackup([...selected])}>一键导出所选{selected.length ? `(${selected.length})` : ''}</Button>
           <Button icon={<IconFile />} disabled={accountExportRunning || accountImportRunning} onClick={() => setArchiveImportOpen(true)}>一键导入账号池</Button>
-          <Button icon={<IconRefresh />} onClick={() => load()}>刷新</Button>
+          <Button icon={<IconRefresh />} loading={refreshing} onClick={() => load()}>刷新</Button>
           {responsive.isMobile ? (
             <Button onClick={() => { setSelectMode((value) => !value); if (selectMode) setSelected([]); }}>
               {selectMode ? '完成' : '选择'}

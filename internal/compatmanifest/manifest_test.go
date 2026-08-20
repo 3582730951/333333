@@ -6,14 +6,33 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func manifestJSONResponse(request *http.Request, status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    request,
+	}
+}
 
 type signedManifestFixture struct {
 	mu      sync.Mutex
@@ -136,5 +155,141 @@ func TestSignedManifestRequiresStrictPayloadAndMatchingTrustSource(t *testing.T)
 	if _, _, err := manager.Refresh(context.Background(), Config{Enabled: true, Source: "signed_custom", URL: server.URL,
 		PublicKey: base64.StdEncoding.EncodeToString(public)}, nil); err == nil {
 		t.Fatal("payload source mismatch was accepted")
+	}
+}
+
+func TestOfficialCodexPrefersNPMAndAvoidsGitHubAPI(t *testing.T) {
+	var npmCalls, githubCalls, claudeCalls atomic.Int64
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.String() {
+		case officialCodexNPMURL:
+			npmCalls.Add(1)
+			return manifestJSONResponse(request, http.StatusOK, `{"version":"0.148.0"}`), nil
+		case officialCodexGitHubURL:
+			githubCalls.Add(1)
+			return manifestJSONResponse(request, http.StatusForbidden, `{}`), nil
+		case officialClaudeURL:
+			claudeCalls.Add(1)
+			return manifestJSONResponse(request, http.StatusOK, `{"version":"2.1.0"}`), nil
+		default:
+			return manifestJSONResponse(request, http.StatusNotFound, `{}`), nil
+		}
+	})}
+	manager := New(t.TempDir(), client)
+	manager.now = func() time.Time { return time.Unix(1_800_000_000, 0) }
+	payload, changed, err := manager.Refresh(context.Background(), Config{Enabled: true, Source: "official"}, nil)
+	if err != nil || !changed || payload.Codex.Version != "0.148.0" || payload.Claude.CLIVersion != "2.1.0" {
+		t.Fatalf("official refresh payload=%+v changed=%v err=%v", payload, changed, err)
+	}
+	if npmCalls.Load() != 1 || githubCalls.Load() != 0 || claudeCalls.Load() != 1 {
+		t.Fatalf("source calls npm=%d github=%d claude=%d", npmCalls.Load(), githubCalls.Load(), claudeCalls.Load())
+	}
+}
+
+func TestOfficialCodexFallsBackOnceWhenNPMIsUnavailable(t *testing.T) {
+	var npmCalls, githubCalls atomic.Int64
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.String() {
+		case officialCodexNPMURL:
+			npmCalls.Add(1)
+			return manifestJSONResponse(request, http.StatusForbidden, `{}`), nil
+		case officialCodexGitHubURL:
+			githubCalls.Add(1)
+			return manifestJSONResponse(request, http.StatusOK, `{"tag_name":"rust-v0.148.0","published_at":"2027-01-14T08:00:00Z"}`), nil
+		case officialClaudeURL:
+			return manifestJSONResponse(request, http.StatusOK, `{"version":"2.1.0"}`), nil
+		default:
+			return manifestJSONResponse(request, http.StatusNotFound, `{}`), nil
+		}
+	})}
+	manager := New(t.TempDir(), client)
+	manager.now = func() time.Time { return time.Unix(1_800_000_000, 0) }
+	payload, _, err := manager.Refresh(context.Background(), Config{Enabled: true, Source: "official"}, nil)
+	if err != nil || payload.Codex.Version != "0.148.0" {
+		t.Fatalf("GitHub fallback payload=%+v err=%v", payload, err)
+	}
+	if npmCalls.Load() != 1 || githubCalls.Load() != 1 {
+		t.Fatalf("fallback retried a source: npm=%d github=%d", npmCalls.Load(), githubCalls.Load())
+	}
+}
+
+func TestConcurrentOfficialRefreshesShareOneUpstreamFlight(t *testing.T) {
+	var npmCalls, claudeCalls atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.String() {
+		case officialCodexNPMURL:
+			npmCalls.Add(1)
+			startedOnce.Do(func() { close(started) })
+			<-release
+			return manifestJSONResponse(request, http.StatusOK, `{"version":"0.148.0"}`), nil
+		case officialClaudeURL:
+			claudeCalls.Add(1)
+			return manifestJSONResponse(request, http.StatusOK, `{"version":"2.1.0"}`), nil
+		default:
+			return manifestJSONResponse(request, http.StatusNotFound, `{}`), nil
+		}
+	})}
+	manager := New(t.TempDir(), client)
+	manager.now = func() time.Time { return time.Unix(1_800_000_000, 0) }
+	cfg := Config{Enabled: true, Source: "official"}
+
+	const callers = 8
+	ready := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	wg.Add(callers)
+	for range callers {
+		go func() {
+			defer wg.Done()
+			<-ready
+			payload, _, err := manager.Refresh(context.Background(), cfg, nil)
+			if err == nil && payload.Codex.Version != "0.148.0" {
+				err = fmt.Errorf("Codex version = %q", payload.Codex.Version)
+			}
+			errs <- err
+		}()
+	}
+	close(ready)
+	<-started
+	// Give the other ready callers a scheduling turn while the leader's transport
+	// is deliberately blocked. They should all join the existing refresh flight.
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if npmCalls.Load() != 1 || claudeCalls.Load() != 1 {
+		t.Fatalf("concurrent refresh was not coalesced: npm=%d claude=%d", npmCalls.Load(), claudeCalls.Load())
+	}
+}
+
+func TestOfficialRefreshExposesLongestServerRetryDelay(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		response := manifestJSONResponse(request, http.StatusTooManyRequests, `{}`)
+		switch request.URL.String() {
+		case officialCodexNPMURL:
+			response.Header.Set("Retry-After", "3600")
+		case officialCodexGitHubURL:
+			response.StatusCode = http.StatusForbidden
+			response.Header.Set("X-RateLimit-Reset", fmt.Sprintf("%d", now.Add(2*time.Hour).Unix()))
+		}
+		return response, nil
+	})}
+	manager := New(t.TempDir(), client)
+	manager.now = func() time.Time { return now }
+	_, _, err := manager.Refresh(context.Background(), Config{Enabled: true, Source: "official"}, nil)
+	if err == nil {
+		t.Fatal("all failed official sources unexpectedly refreshed")
+	}
+	if delay := SuggestedRetryDelay(err); delay != 2*time.Hour {
+		t.Fatalf("SuggestedRetryDelay = %s, want 2h", delay)
 	}
 }

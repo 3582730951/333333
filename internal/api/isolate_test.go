@@ -130,7 +130,7 @@ func TestBenchOnLimitSurvivesCanceledRequestContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if binding.CooldownUntil <= time.Now().Unix() || !binding.RecheckPending {
-		t.Fatalf("canceled request did not persist cooldown and recheck: %+v", binding)
+	if binding.CooldownUntil <= time.Now().Unix() || binding.RecheckPending {
+		t.Fatalf("canceled request did not persist a capacity-only cooldown: %+v", binding)
 	}
 }

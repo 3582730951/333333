@@ -72,3 +72,21 @@ ok  codex-account-pool/internal/storage   34.431s
 ```
 
 历史样本本身保持不变；修复面向下一次运行、维护周期和诊断导出。旧样本中缺失的 route/provider 事件没有可逆来源，因此报告仅记录已证明的 503 时间窗和分类，不推测具体账户或上游根因。
+
+## 运行期后续复现与整改
+
+在上述诊断修复完成后，对管理端复测、版本刷新和页面交互继续做了端到端复现：
+
+| ID | 级别 | 复现结果 | 整改 |
+|---|---|---|---|
+| R-01 | 高 | 普通 402/429/额度错误会调用 `BenchBindingForRecheck`；账号凭据仍 alive，却在首个下游额度响应后显示“待复测” | 将容量错误改成只写权威 reset/cooldown；额度包装成 5xx 时也不累计服务故障 streak；只有连续未分类 5xx、CF 故障或显式 `cooldown_recheck` 规则进入复测 |
+| R-02 | 高 | 手工模型测活返回 `ready=true` 时只清隔离，不清既有 `recheck_pending`；API-key 的付费推理测活同样遗漏 | 成功模型/推理探针原子清除 cooldown 与 recheck gate，并立即通知调度器；认证-only 结果不清推理门禁 |
+| V-01 | 高 | Codex 官方版本只请求未认证 GitHub Releases API，HTTP 403 直接使整次兼容清单刷新失败 | 以实际 CLI 分发包 `@openai/codex/latest` 的 npm 元数据为主源；仅在主源失败/畸形时单次查询 GitHub fallback |
+| V-02 | 中 | 并发刷新和进程重启可重复访问发布源；失败退避没有使用服务端 reset 时间 | 同配置刷新 singleflight；重启复用持久化 last-success 的下次刷新期限；失败采用节点抖动指数退避，并遵守最长 24 小时的 `Retry-After`/`X-RateLimit-Reset` |
+| V-03 | 中 | 远端已发布版本可能领先本构建已验证的请求指纹，直接套用会形成混合 wire profile | 自动生效仅接受 `CodexCLIFingerprintForVersion` 精确命中的版本；未知未来版本可被发现，但保持当前已验证指纹，等待代码库适配 |
+| U-01 | 高 | 账号列表每页依次执行 provider、capability、egress、group、usage、token、quota、reauth、Kiro 九组读取 | 在现有 SQLite WAL 多连接只读池上并发执行独立聚合，任一失败取消其余读取；空页零查询返回 |
+| U-02 | 中 | React Query 后台刷新仍把 `loading=isFetching` 传给整张表，缓存数据被 skeleton 替换；路由就绪还人为等待 180 ms | 初始无数据才显示 loading；有缓存时保持交互并单独暴露 refreshing；后台 revalidate 不再撤销 page-ready，并移除固定 180 ms 延迟 |
+
+版本拉取的回归使用内存 HTTP transport，不访问外部发布源：验证 npm 成功时 GitHub 调用为 0、npm 失败时 fallback 各调用 1 次、8 个并发刷新合并为各源 1 次，以及服务端最长退避时间被保留。账号状态回归覆盖取消请求后的容量冷却、5xx 包装额度、成功测活清门禁及显式复测规则；账户聚合通过 race 检查。
+
+后续验证使用 Go 1.25.12：`internal/api` 全套 281.130 秒通过，`internal/compatmanifest`、`internal/supervisor` 及账户聚合 race 回归通过，`go vet ./...` 通过。前端既有 39 个测试文件/224 项测试全绿，新增后台刷新交互测试单独通过；静态 UI 合约、124 条路由布局探测、TypeScript 检查、生产构建和嵌入式 console release 校验均通过。

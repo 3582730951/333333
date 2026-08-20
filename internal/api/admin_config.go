@@ -351,6 +351,15 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 		if alive && s.cfg.HealthTestClearsQuarantine {
 			_ = s.store.SetAccountQuarantine(r.Context(), accountID, 0, "")
 		}
+		// A clean provider-correct model probe is stronger evidence than the
+		// background recheck. Publish that recovery immediately instead of returning
+		// ready=true while leaving the account labelled and gated as recheck_pending.
+		if res.Ready {
+			_ = s.store.ClearBindingRecheck(r.Context(), accountID)
+			if s.scheduler != nil {
+				s.scheduler.NotifyStateChanged()
+			}
+		}
 	}
 	quarantined := false
 	quarantineReason := ""

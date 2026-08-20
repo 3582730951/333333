@@ -93,7 +93,11 @@ function RouteFallback() {
 }
 
 function StablePageReady({ routeKey, children }: { routeKey: string; children: ReactNode }) {
-  const fetching = useIsFetching({ predicate: (query) => query.queryKey[0] !== 'auth' });
+  // Background stale-while-revalidate requests must not make an already rendered
+  // route "not ready". Only an active query with no usable data blocks readiness.
+  const fetching = useIsFetching({
+    predicate: (query) => query.queryKey[0] !== 'auth' && query.state.data === undefined,
+  });
   const [ready, setReady] = useState(false);
   const [contentBusy, setContentBusy] = useState(true);
   const contentRef = useRef<HTMLDivElement | null>(null);
@@ -117,13 +121,9 @@ function StablePageReady({ routeKey, children }: { routeKey: string; children: R
   useEffect(() => {
     setReady(false);
     if (fetching > 0 || contentBusy) return undefined;
-    let frame = 0;
-    const timer = window.setTimeout(() => {
-      frame = window.requestAnimationFrame(() => setReady(true));
-    }, 180);
+    const frame = window.requestAnimationFrame(() => setReady(true));
     return () => {
-      window.clearTimeout(timer);
-      if (frame) window.cancelAnimationFrame(frame);
+      window.cancelAnimationFrame(frame);
     };
   }, [routeKey, fetching, contentBusy]);
 

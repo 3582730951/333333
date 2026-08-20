@@ -24,6 +24,9 @@ func TestHealthTestClearsQuarantine(t *testing.T) {
 	if err := h.store.SetAccountQuarantine(ctx, accID, now+7200, "test quarantine"); err != nil {
 		t.Fatal(err)
 	}
+	if err := h.store.BenchBindingForRecheck(ctx, accID, now+7200); err != nil {
+		t.Fatal(err)
+	}
 	acc, _ := h.store.GetAccount(ctx, accID)
 	if acc.QuarantineUntil <= now {
 		t.Fatalf("quarantine_until not set: %d", acc.QuarantineUntil)
@@ -41,6 +44,13 @@ func TestHealthTestClearsQuarantine(t *testing.T) {
 	acc, _ = h.store.GetAccount(ctx, accID)
 	if acc.QuarantineUntil != 0 {
 		t.Fatalf("health-test did not clear quarantine: quarantine_until=%d, want 0", acc.QuarantineUntil)
+	}
+	binding, err := h.store.GetEgressBinding(ctx, accID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.RecheckPending || binding.CooldownUntil != 0 {
+		t.Fatalf("ready health-test did not clear recheck gate: %+v", binding)
 	}
 }
 

@@ -321,7 +321,13 @@ func (s *Server) onUpstreamError(ctx context.Context, account storage.Account, s
 		s.auditCodexGoalQuotaDecision(ctx, account.ID, "held", "non_authoritative_quota_signal", status)
 		return v
 	}
-	s.benchOnLimitForAccount(ctx, account, status, header, body)
+	if s.benchOnLimitForAccount(ctx, account, status, header, body) {
+		// A quota response is a classified, reachable capacity outcome even when a
+		// provider wraps it in HTTP 5xx. It owns the plain cooldown path and must not
+		// accumulate toward the transport/server-health recheck breaker.
+		s.noteUpstreamSuccess(account.ID)
+		return v
+	}
 	// Plain server errors reach here with no remediation of their own:
 	// usageLimitCooldown returns 0 for anything that is not a 429 or a quota signal,
 	// so an upstream returning 503 to every request stayed a first-choice candidate
@@ -554,12 +560,14 @@ func ignoresRateLimitControls(status int, header http.Header, body []byte) bool 
 
 // benchOnLimit cools the account's egress binding when the upstream signals a
 // usage/rate limit, so movable conversations fail over to a fresh account while
-// requests carrying server-side state remain pinned and wait for recovery. When a
-// Retry-After / rate-limit reset is present it is honored over the heuristic window.
-func (s *Server) benchOnLimit(ctx context.Context, accountID string, status int, header http.Header, body []byte) {
+// requests carrying server-side state remain pinned and wait for recovery. A limit
+// is a capacity condition, not failed account health, so it deliberately does not
+// set recheck_pending. When a Retry-After / rate-limit reset is present it is
+// honored over the heuristic window.
+func (s *Server) benchOnLimit(ctx context.Context, accountID string, status int, header http.Header, body []byte) bool {
 	cd := usageLimitCooldown(status, body)
 	if cd == 0 {
-		return
+		return false
 	}
 	// A downstream disconnect may cancel the request while reset-credit recovery is
 	// finishing. The upstream 429 is already authoritative, so persist its account
@@ -570,21 +578,24 @@ func (s *Server) benchOnLimit(ctx context.Context, accountID string, status int,
 		cd = limitCooldownSeconds(header, storage.Now(), cd)
 	}
 	log.Printf("[RATE-LIMIT] COOLDOWN: account=%s, status=%d, duration=%ds, reason=usage_limit", accountID, status, cd)
-	// Bench-for-recheck (not a plain cooldown): a rate-/usage-limited account must
-	// pass a liveness probe before it re-enters the pool, so it can never silently
-	// resurface still-limited the instant its cooldown elapses.
-	if err := s.store.BenchBindingForRecheck(stateCtx, accountID, storage.Now()+cd); err != nil {
+	// A normal 402/429/quota response proves the account and its egress are reachable.
+	// Marking it recheck-pending made an otherwise alive account appear as "待复测"
+	// after ordinary downstream traffic and forced a second synthetic model request.
+	// The authoritative reset/cooldown is sufficient: if capacity is still exhausted
+	// after expiry, the next real request refreshes the cooldown again.
+	if err := s.store.SetBindingCooldown(stateCtx, accountID, storage.Now()+cd); err != nil {
 		log.Printf("[RATE-LIMIT] cooldown persistence failed: account=%s: %v", accountID, err)
-		return
+		return true
 	}
 	if s.scheduler != nil {
 		s.scheduler.NotifyStateChanged()
 	}
+	return true
 }
 
-func (s *Server) benchOnLimitForAccount(ctx context.Context, account storage.Account, status int, header http.Header, body []byte) {
+func (s *Server) benchOnLimitForAccount(ctx context.Context, account storage.Account, status int, header http.Header, body []byte) bool {
 	if account.IgnoreRateLimitControls {
-		return
+		return false
 	}
-	s.benchOnLimit(ctx, account.ID, status, header, body)
+	return s.benchOnLimit(ctx, account.ID, status, header, body)
 }

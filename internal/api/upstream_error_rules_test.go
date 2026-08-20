@@ -821,8 +821,8 @@ func TestCodexUpstreamErrorRuleFailoverOnWebSocketSSEUsageLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !binding.RecheckPending || binding.CooldownUntil < storage.Now()+3500 {
-		t.Fatalf("embedded Codex reset window was not applied: %+v", binding)
+	if binding.RecheckPending || binding.CooldownUntil < storage.Now()+3500 {
+		t.Fatalf("embedded Codex reset window was not applied as a capacity-only cooldown: %+v", binding)
 	}
 }
 

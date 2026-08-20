@@ -446,9 +446,15 @@ func (s *Server) adminProviderAPIKeyHealthTest(w http.ResponseWriter, r *http.Re
 		_ = s.store.ReplaceCapabilities(r.Context(), account.ID, caps)
 		inference = s.runProviderAPIKeyInferenceProbe(r.Context(), account, token, egress, caps)
 		s.auditProviderAPIKeyProbe(r.Context(), account, "provider_api_key_inference_probe", inference)
-		if inference.Alive && isProviderAPIKeyInferenceQuarantine(account.QuarantineReason) {
-			_ = s.store.SetAccountQuarantine(r.Context(), account.ID, 0, "")
-			_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{AccountID: account.ID, AccountLabel: account.Label, Action: "provider_api_key_recovered", State: "active", Reason: "manual_health_test"})
+		if inference.Alive {
+			// The billable inference stage exercises the same serving path as downstream
+			// traffic. Clear a stale recheck gate on success just as the background
+			// recheck loop does; the free auth-only stage is intentionally insufficient.
+			_ = s.store.ClearBindingRecheck(r.Context(), account.ID)
+			if isProviderAPIKeyInferenceQuarantine(account.QuarantineReason) {
+				_ = s.store.SetAccountQuarantine(r.Context(), account.ID, 0, "")
+				_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{AccountID: account.ID, AccountLabel: account.Label, Action: "provider_api_key_recovered", State: "active", Reason: "manual_health_test"})
+			}
 		} else if !inference.Alive {
 			reason := providerAPIKeyInferenceProbeFailurePrefix + firstNonEmpty(inference.ErrorCode, "unknown")
 			_ = s.store.SetAccountQuarantine(r.Context(), account.ID, kiroSuspensionQuarantineUntil, reason)

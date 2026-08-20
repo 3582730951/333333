@@ -72,6 +72,7 @@ func applyCompatibilityManifestConfig(cfg config.Config, payload compatmanifest.
 	// A config/DB override always wins. ClientVersion is an older boot-only alias;
 	// a non-default value is also treated as an explicit operator pin.
 	if version := strings.TrimSpace(payload.Codex.Version); version != "" &&
+		config.IsSupportedCodexCLIVersion(version) &&
 		strings.TrimSpace(cfg.CodexCLIVersionOverride) == "" &&
 		(strings.TrimSpace(cfg.ClientVersion) == "" || cfg.ClientVersion == config.DefaultClientVersion) &&
 		compatmanifest.CompareDottedVersions(version, firstNonEmpty(cfg.ClientVersion, config.DefaultClientVersion)) >= 0 {
@@ -146,6 +147,22 @@ func (s *Server) runCompatibilityManifest(ctx context.Context) {
 				s.publishEffectiveUpstreamConfig(context.WithoutCancel(ctx))
 			}
 		}
+		// A persisted last-known-good snapshot carries its fetch time. Honor the same
+		// jittered refresh deadline after a process restart instead of immediately
+		// polling both official registries again; this prevents deploy/restart fleets
+		// from becoming an upstream request burst.
+		if _, active = s.compatibilityManifest.Active(); active {
+			status := s.compatibilityManifest.Status()
+			if status.LastSuccessAt > 0 {
+				nextRefresh := time.Unix(status.LastSuccessAt, 0).Add(jitterCompatibilityInterval(cfg.RefreshEvery, s.cfg.NodeID))
+				if delay := time.Until(nextRefresh); delay > 0 {
+					if !s.waitCompatibilityManifest(ctx, delay) {
+						return
+					}
+					continue
+				}
+			}
+		}
 		if s.diskGuardPausesBackground() {
 			if !s.waitCompatibilityManifest(ctx, 5*time.Minute) {
 				return
@@ -158,7 +175,10 @@ func (s *Server) runCompatibilityManifest(ctx context.Context) {
 		delay := jitterCompatibilityInterval(cfg.RefreshEvery, s.cfg.NodeID)
 		if err != nil {
 			log.Printf("compatibility manifest refresh: %v", err)
-			delay = backoff
+			delay = jitterCompatibilityBackoff(backoff, s.cfg.NodeID)
+			if advertised := compatmanifest.SuggestedRetryDelay(err); advertised > delay {
+				delay = advertised
+			}
 			backoff *= 2
 			if backoff > time.Hour {
 				backoff = time.Hour
@@ -244,6 +264,22 @@ func jitterCompatibilityInterval(base time.Duration, nodeID string) time.Duratio
 		hash *= 16777619
 	}
 	permille := int64(900 + hash%201)
+	return time.Duration(int64(base) * permille / 1000)
+}
+
+func jitterCompatibilityBackoff(base time.Duration, nodeID string) time.Duration {
+	if base <= 0 {
+		base = time.Minute
+	}
+	// Stable 80–120% failure jitter spreads rate-limit and outage retries across a
+	// fleet. The exponential cap in runCompatibilityManifest still bounds this at
+	// approximately one hour, and each refresh itself has no internal retry loop.
+	var hash uint32 = 2166136261
+	for _, value := range []byte(nodeID + "\x00compatibility-manifest-backoff") {
+		hash ^= uint32(value)
+		hash *= 16777619
+	}
+	permille := int64(800 + hash%401)
 	return time.Duration(int64(base) * permille / 1000)
 }
 

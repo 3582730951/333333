@@ -24,7 +24,11 @@ export function useQueryView<T>(query: UseQueryResult<T, Error>) {
   }, [refetch]);
   return {
     data: query.data,
-    loading: query.isFetching,
+    // Keep already-rendered data interactive while React Query revalidates it. Using
+    // isFetching here replaced whole tables with skeletons for every poll, page
+    // prefetch, and manual refresh even though usable cached data was present.
+    loading: query.isFetching && query.data === undefined,
+    refreshing: query.isFetching && query.data !== undefined,
     error: query.error,
     lastRefresh: query.dataUpdatedAt ? new Date(query.dataUpdatedAt) : null,
     stale: Boolean(query.error && query.dataUpdatedAt),

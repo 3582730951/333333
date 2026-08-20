@@ -109,6 +109,25 @@ func TestNon5xxResetsFailureStreak(t *testing.T) {
 	}
 }
 
+func TestQuotaWrappedIn5xxDoesNotTripFailureStreak(t *testing.T) {
+	s := failureStreakTestServer(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "acc-quota-5xx", GroupName: "cyber", Provider: "custom", Status: "active"}
+	if err := s.store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	for range s.cfg.AccountFailureStreakThreshold * 2 {
+		s.onUpstreamError(ctx, account, http.StatusServiceUnavailable, nil, []byte(`{"error":"quota exceeded"}`))
+	}
+	binding, err := s.store.GetEgressBinding(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.RecheckPending || binding.CooldownUntil <= storage.Now() {
+		t.Fatalf("quota-wrapped 5xx should have only a live cooldown: %+v", binding)
+	}
+}
+
 // The per-account operator override opts out of every automatic bench, including
 // this one.
 func TestIgnoreRateLimitControlsSkipsFailureStreakBench(t *testing.T) {
