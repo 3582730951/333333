@@ -271,6 +271,63 @@ func TestCodexHTTPAPIKeyPreservesMaxOutputTokens(t *testing.T) {
 	}
 }
 
+func TestCodexHTTPPromptCacheControlsFollowTransportCapability(t *testing.T) {
+	baseBody := `{"model":"gpt-5.6-sol","instructions":"API request","store":false,"stream":false,"prompt_cache_key":"stable","prompt_cache_options":{"mode":"explicit"},"input":[{"role":"developer","content":[{"type":"input_text","text":"stable","prompt_cache_breakpoint":{"mode":"explicit"}}]},{"role":"user","content":[{"type":"input_text","text":"question"}]}]}`
+	tests := []struct {
+		name       string
+		token      storage.AccountToken
+		mode       string
+		capable    bool
+		profitable bool
+		wantMode   string
+		autoBody   bool
+	}{
+		{name: "chatgpt strips", token: storage.AccountToken{AccessToken: "oauth"}, mode: "auto", capable: true, profitable: true},
+		{name: "unprobed api key strips", token: storage.AccountToken{AccessToken: "sk-test", OpenAIAPIKey: "sk-test"}, mode: "observe"},
+		{name: "probed api key preserves client explicit", token: storage.AccountToken{AccessToken: "sk-test", OpenAIAPIKey: "sk-test"}, mode: "observe", capable: true, wantMode: "explicit"},
+		{name: "profitable auto marks implicit", token: storage.AccountToken{AccessToken: "sk-test", OpenAIAPIKey: "sk-test"}, mode: "auto", capable: true, profitable: true, wantMode: "implicit", autoBody: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotBody []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotBody, _ = io.ReadAll(r.Body)
+				_, _ = io.WriteString(w, `{"id":"resp","status":"completed"}`)
+			}))
+			defer server.Close()
+			cfg := config.Default()
+			cfg.UpstreamBaseURL = server.URL
+			cfg.OpenAIAPIUpstreamBaseURL = server.URL + "/v1"
+			client := NewClient(cfg)
+			requestBody := baseBody
+			if tt.autoBody {
+				requestBody = `{"model":"gpt-5.6-sol","instructions":"API request","store":false,"stream":false,"prompt_cache_key":"stable","input":[{"role":"developer","content":[{"type":"input_text","text":"stable"}]},{"role":"user","content":[{"type":"input_text","text":"question"}]}]}`
+			}
+			resp, err := client.Do(context.Background(), Request{
+				DownstreamPath: "/v1/responses", Model: "gpt-5.6-sol", Body: testBody([]byte(requestBody)),
+				Account: storage.Account{ID: "acc"}, Token: tt.token, Egress: storage.EgressProfile{Type: "direct", Health: "healthy"},
+				CodexExplicitCacheMode: tt.mode, CodexExplicitCacheCapable: tt.capable, CodexAutomaticCacheProfitable: tt.profitable,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			var payload map[string]interface{}
+			if err := json.Unmarshal(gotBody, &payload); err != nil {
+				t.Fatal(err)
+			}
+			options, _ := payload["prompt_cache_options"].(map[string]interface{})
+			if tt.wantMode == "" {
+				if options != nil || bytes.Contains(gotBody, []byte(`"prompt_cache_breakpoint"`)) {
+					t.Fatalf("unsupported controls survived: %s", gotBody)
+				}
+			} else if options["mode"] != tt.wantMode || !bytes.Contains(gotBody, []byte(`"prompt_cache_breakpoint":{"mode":"`+tt.wantMode+`"}`)) {
+				t.Fatalf("cache mode %q not forwarded: %s", tt.wantMode, gotBody)
+			}
+		})
+	}
+}
+
 func TestCodexPrewarmOmitsTurnIDAndStartTimestamp(t *testing.T) {
 	client := NewClient(config.Default())
 	metadata := client.newCodexRequestMetadata(Request{
@@ -395,14 +452,14 @@ func TestCodexHTTPBridgeStripsGenerateAfterClassifyingPrewarm(t *testing.T) {
 }
 
 func TestStripCodexTopLevelTransportCorrelatorsPreservesContext(t *testing.T) {
-	original := []byte(`{"model":"gpt-5.6-sol","thread_id":"thread-downstream","session_id":"session-downstream","conversation_id":"conversation-downstream","instructions":"keep","previous_response_id":"resp_keep","tools":[{"schema":{"const":900719925474099312345}}],"input":[{"exact_id":900719925474099312345}]}`)
+	original := []byte(`{"model":"gpt-5.6-sol","thread_id":"thread-downstream","session_id":"session-downstream","conversation_id":"conversation-downstream","client_version":"0.148.0","instructions":"keep","previous_response_id":"resp_keep","tools":[{"schema":{"const":900719925474099312345}}],"input":[{"exact_id":900719925474099312345}]}`)
 	got := stripCodexTopLevelTransportCorrelators(original)
 	assertCodexContextFieldsUnchanged(t, original, got)
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(got, &root); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"thread_id", "session_id", "conversation_id"} {
+	for _, key := range []string{"thread_id", "session_id", "conversation_id", "client_version"} {
 		if _, present := root[key]; present {
 			t.Fatalf("unsupported top-level field %q survived: %s", key, got)
 		}

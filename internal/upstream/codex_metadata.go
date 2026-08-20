@@ -388,6 +388,7 @@ func stripCodexTopLevelTransportCorrelatorsWithFields(raw []byte, fields map[str
 		"forked_from_thread_id",
 		"turn_metadata",
 		"turn_state",
+		"client_version",
 	} {
 		if _, present := fields[key]; !present {
 			continue

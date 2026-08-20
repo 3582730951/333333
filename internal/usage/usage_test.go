@@ -16,6 +16,23 @@ func TestParseCachedTokens(t *testing.T) {
 	}
 }
 
+func TestParseOpenAICacheWriteTokens(t *testing.T) {
+	parsed := ParseResponse([]byte(`{"model":"gpt-5.6","usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":40,"cache_write_tokens":55}}}`))
+	if parsed.CacheReadTokens != 40 || parsed.CacheCreationTokens != 55 {
+		t.Fatalf("openai cache read/write not normalized: %+v", parsed)
+	}
+	if parsed.CacheMissTokens != 60 || parsed.CacheTotalInputTokens != 100 {
+		t.Fatalf("openai cache input breakdown changed: %+v", parsed)
+	}
+}
+
+func TestParseOpenAIChatCacheWriteTokens(t *testing.T) {
+	parsed := ParseResponse([]byte(`{"model":"gpt-5.6","usage":{"prompt_tokens":80,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":32,"cache_write_tokens":17}}}`))
+	if parsed.CacheReadTokens != 32 || parsed.CacheCreationTokens != 17 {
+		t.Fatalf("chat cache read/write not normalized: %+v", parsed)
+	}
+}
+
 func TestParseAnthropicUsage(t *testing.T) {
 	parsed := ParseResponse([]byte(`{"model":"claude-x","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":40,"cache_creation_input_tokens":75,"cache_creation":{"ephemeral_5m_input_tokens":25,"ephemeral_1h_input_tokens":50}}}`))
 	if parsed.PromptTokens != 100 || parsed.CompletionTokens != 20 {
@@ -112,6 +129,22 @@ func TestStreamScannerCodexResponses(t *testing.T) {
 	}
 	if p.Model != "gpt-5.5" || p.PromptTokens != 100 || p.CompletionTokens != 42 || p.TotalTokens != 142 || p.CachedTokens != 60 {
 		t.Fatalf("codex stream usage = %+v", p)
+	}
+}
+
+func TestStreamScannerCodexCacheWriteTokens(t *testing.T) {
+	transcript := "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.6\",\"usage\":{\"input_tokens\":100,\"output_tokens\":4,\"total_tokens\":104,\"input_tokens_details\":{\"cached_tokens\":25,\"cache_write_tokens\":70}}}}\n\n"
+	p, ok := feedStream(t, "codex", transcript)
+	if !ok || p.CacheReadTokens != 25 || p.CacheCreationTokens != 70 {
+		t.Fatalf("codex stream cache read/write = %+v, ok=%v", p, ok)
+	}
+}
+
+func TestStreamScannerOpenAIChatCacheWriteTokens(t *testing.T) {
+	transcript := "data: {\"model\":\"gpt-5.6\",\"usage\":{\"prompt_tokens\":90,\"completion_tokens\":4,\"total_tokens\":94,\"prompt_tokens_details\":{\"cached_tokens\":30,\"cache_write_tokens\":50}}}\n\n"
+	p, ok := feedStream(t, "openai_chat", transcript)
+	if !ok || p.CacheReadTokens != 30 || p.CacheCreationTokens != 50 {
+		t.Fatalf("chat stream cache read/write = %+v, ok=%v", p, ok)
 	}
 }
 

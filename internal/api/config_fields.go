@@ -172,7 +172,7 @@ func configFields() []configField {
 			Options: []string{"inprocess", "sidecar"},
 			Help:    "inprocess(默认)=进程内 Go tls-client(uTLS+fhttp)复现分供应商线级指纹（Claude=捕获的 Bun ClientHello，浏览器链路=Chrome_120），无独立进程/本地回环跳/双倍套接字；sidecar=外部 Python curl_cffi 边车兜底。两引擎使用同一供应商指纹；部署后用 /admin/egress-fingerprint-check 校验。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.EgressFingerprintEngine, "inprocess") }},
 		{Key: "codex_cli_version", Label: "Codex CLI 版本覆盖", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
-			Help: "留空=最新 0.147.0；已验证兼容 0.144.6 / 0.145.0 / 0.146.0 / 0.146.1 / 0.147.0。", boot: func(c config.Config) interface{} { return c.CodexCLIVersionOverride }},
+			Help: "留空=最新 0.148.0；自动分析下游版本并匹配 0.145.0 / 0.146.0 / 0.146.1 / 0.147.0 / 0.148.0 指纹。", boot: func(c config.Config) interface{} { return c.CodexCLIVersionOverride }},
 		{Key: "claude_cli_version", Label: "Claude CLI 版本覆盖", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
 			Help: "留空=内置默认。覆盖上游 claude-cli 版本指纹。", boot: func(c config.Config) interface{} { return c.ClaudeCLIVersionOverride }},
 		{Key: "claude_node_version", Label: "Claude Node 版本", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
@@ -239,7 +239,11 @@ func configFields() []configField {
 		{Key: "claude_cache_singleflight_enabled", Label: "Claude 缓存 Singleflight", Category: catBehavior, Type: fieldBool, Effect: effectHot,
 			Help: "开=同前缀并发请求等待首个写缓存请求开始返回，减少并发冷启动 miss。", boot: func(c config.Config) interface{} { return c.ClaudeCacheSingleflightEnabled }},
 		{Key: "codex_cache_singleflight_enabled", Label: "Codex 缓存 Singleflight", Category: catBehavior, Type: fieldBool, Effect: effectHot,
-			Help: "开(默认)=同账号、模型和 prompt_cache_key 的并发冷请求等待 leader 返回响应头；超时后独立执行。", boot: func(c config.Config) interface{} { return c.CodexCacheSingleflightEnabled }},
+			Help: "开(默认)=仅同账号、模型、prompt_cache_key 和精确缓存前缀的并发冷请求等待 leader 首个响应头；超时后独立执行。", boot: func(c config.Config) interface{} { return c.CodexCacheSingleflightEnabled }},
+		{Key: "codex_prompt_cache_key_shards", Label: "Codex 缓存 Key 分片", Category: catBehavior, Type: fieldInt, Effect: effectHot,
+			Help: "官方 CLI UUID key 按稳定会话种子确定性分片；默认 4，允许 1–16，1=旧行为。", boot: func(c config.Config) interface{} { return c.CodexPromptCacheKeyShards }},
+		{Key: "codex_gpt56_explicit_cache_mode", Label: "GPT-5.6 显式缓存断点", Category: catBehavior, Type: fieldSelect, Effect: effectHot,
+			Options: []string{"observe", "auto", "off"}, Help: "observe=仅观测/透传已验证能力的客户端断点；auto=在稳定 developer/system input_text 上自动标记；off=关闭。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.CodexGPT56ExplicitCacheMode, "observe") }},
 		{Key: "claude_cache_lossless_block_split", Label: "Claude 无损块拆分", Category: catBehavior, Type: fieldBool, Effect: effectHot,
 			Help: "开=仅在拼接后逐字节一致时拆分巨型 text block，便于标记稳定上下文。", boot: func(c config.Config) interface{} { return c.ClaudeCacheLosslessBlockSplit }},
 		{Key: "claude_cch_signing", Label: "Claude CCH 签名（已弃用）", Category: catBehavior, Type: fieldBool, Effect: effectUpstream,
@@ -846,6 +850,16 @@ func validateSettingValue(f configField, v interface{}) (string, error) {
 		n, _ := strconv.Atoi(raw)
 		if n < 1 || n > 60 {
 			return "", fmt.Errorf("must be between 1 and 60")
+		}
+		return raw, nil
+	case "codex_prompt_cache_key_shards":
+		raw, err := validateIntegerSetting(v)
+		if err != nil {
+			return "", err
+		}
+		n, _ := strconv.Atoi(raw)
+		if n < 1 || n > 16 {
+			return "", fmt.Errorf("must be between 1 and 16")
 		}
 		return raw, nil
 	case "compatibility_manifest_refresh_hours":

@@ -2607,6 +2607,57 @@ func uaCodexVersion(ua string) string {
 	return rest
 }
 
+func TestGatewayAutomaticallyUsesMatchingDownstreamCodexFingerprint(t *testing.T) {
+	var gotHeaders http.Header
+	var gotBody []byte
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		gotBody, _ = io.ReadAll(r.Body)
+		if versionHint := r.URL.Query().Get("client_version"); versionHint != "" {
+			t.Errorf("client-only query hint leaked upstream: %q", versionHint)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp_fingerprint","output_text":"ok"}`))
+	})
+	h.importAccount(t, "fingerprint", "acct-fingerprint", "access-fingerprint")
+
+	req, err := http.NewRequest(
+		http.MethodPost,
+		h.pool.URL+"/v1/responses?client_version=0.145.0",
+		strings.NewReader(`{"model":"gpt-5.2","instructions":"keep","input":"hi","client_version":"0.145.0"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("version", "0.145.0")
+	req.Header.Set("User-Agent", "codex_exec/0.145.0 (Linux 6.8.0; x86_64) terminal")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, raw)
+	}
+	if version := gotHeaders.Get("version"); version != "0.145.0" {
+		t.Fatalf("upstream version=%q headers=%v", version, gotHeaders)
+	}
+	if ua := gotHeaders.Get("User-Agent"); !strings.HasPrefix(ua, "codex_exec/0.145.0 ") {
+		t.Fatalf("upstream User-Agent=%q", ua)
+	}
+	if beta := gotHeaders.Get("x-codex-beta-features"); beta != "remote_compaction_v2" {
+		t.Fatalf("upstream beta fingerprint=%q", beta)
+	}
+	var forwarded map[string]json.RawMessage
+	if err := json.Unmarshal(gotBody, &forwarded); err != nil {
+		t.Fatalf("upstream body: %v: %s", err, gotBody)
+	}
+	if _, present := forwarded["client_version"]; present {
+		t.Fatalf("client-only version hint leaked upstream: %s", gotBody)
+	}
+}
+
 func TestGatewayRetriesWithCurrentCodexVersionOnVersionGate(t *testing.T) {
 	var mu sync.Mutex
 	var versions []string

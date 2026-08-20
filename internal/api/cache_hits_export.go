@@ -119,20 +119,22 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 		format = "codex-pool-cache-hits-v1"
 	}
 	manifest := map[string]interface{}{
-		"generated_at":        generatedAt.Unix(),
-		"format":              format,
-		"window_mode":         win.WindowMode,
-		"effective_start_at":  win.EffectiveStartAt,
-		"effective_until_at":  win.EffectiveUntilAt,
-		"timezone":            win.Window.Timezone,
-		"utc_offset_seconds":  win.Window.UTCOffsetSeconds,
-		"files":               order,
-		"account_redaction":   "business files use stable type-separated HMAC aliases; raw account IDs and reverse maps are omitted",
-		"api_key_redaction":   "api key hashes are truncated to 12-character prefixes",
-		"hit_tokens_formula":  "cache_read_tokens",
-		"token_hit_rate":      "clamp(hit_tokens / cache_input_tokens)",
-		"eligible_hit_rate":   "cache_read_tokens / (cache_read_tokens + cache_creation_tokens)",
-		"cache_input_formula": "cache_total_input_tokens with prompt_tokens fallback",
+		"generated_at":                  generatedAt.Unix(),
+		"format":                        format,
+		"window_mode":                   win.WindowMode,
+		"effective_start_at":            win.EffectiveStartAt,
+		"effective_until_at":            win.EffectiveUntilAt,
+		"timezone":                      win.Window.Timezone,
+		"utc_offset_seconds":            win.Window.UTCOffsetSeconds,
+		"files":                         order,
+		"account_redaction":             "business files use stable type-separated HMAC aliases; raw account IDs and reverse maps are omitted",
+		"api_key_redaction":             "api key hashes are truncated to 12-character prefixes",
+		"hit_tokens_formula":            "cache_read_tokens",
+		"token_hit_rate":                "clamp(hit_tokens / cache_input_tokens)",
+		"eligible_hit_rate":             "cache_read_tokens / (cache_read_tokens + cache_creation_tokens)",
+		"cache_input_formula":           "cache_total_input_tokens with prompt_tokens fallback",
+		"cache_creation_tokens_mapping": "OpenAI usage.input_tokens_details.cache_write_tokens (and prompt_tokens_details.cache_write_tokens for chat-compatible responses) is normalized to cache_creation_tokens; Anthropic cache_creation_input_tokens remains supported",
+		"prompt_cache_key_redaction":    "cache-key diagnostics use a deployment-keyed, account/model-separated truncated HMAC; raw prompt_cache_key values are not exported",
 	}
 	if !legacyV1 {
 		manifest["kiro_unreported_policy"] = "Kiro requests without upstream cache fields are excluded from calculable hit-rate denominators; they are not cache misses"

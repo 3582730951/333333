@@ -73,7 +73,7 @@ type BodyMeta struct {
 }
 
 var trackedJSONFields = map[string]struct{}{
-	"type": {}, "id": {}, "model": {}, "status": {}, "response": {}, "stream": {}, "prompt_cache_key": {}, "previous_response_id": {}, "conversation_id": {}, "session_id": {}, "thread_id": {},
+	"type": {}, "id": {}, "model": {}, "status": {}, "response": {}, "stream": {}, "prompt_cache_key": {}, "previous_response_id": {}, "conversation_id": {}, "session_id": {}, "thread_id": {}, "client_version": {},
 	"instructions": {}, "system": {}, "tools": {}, "input": {}, "messages": {}, "max_output_tokens": {}, "max_tokens": {}, "reasoning": {}, "thinking": {},
 	"store": {}, "tool_choice": {}, "parallel_tool_calls": {}, "prompt_cache_retention": {}, "prompt_cache_options": {}, "client_metadata": {}, "generate": {}, "include": {},
 	"object": {}, "output": {}, "output_text": {}, "delta": {}, "item": {}, "usage": {}, "headers": {},

@@ -754,6 +754,16 @@ type KiroRuntimeCapability struct {
 	UpdatedAt                 int64   `json:"updated_at"`
 }
 
+type CodexCacheCapability struct {
+	AccountID               string `json:"account_id"`
+	Model                   string `json:"model"`
+	ExplicitBreakpointState string `json:"explicit_breakpoint_state"`
+	FirstWriteTokens        int64  `json:"first_write_tokens"`
+	SecondReadTokens        int64  `json:"second_read_tokens"`
+	ProbedAt                int64  `json:"probed_at"`
+	UpdatedAt               int64  `json:"updated_at"`
+}
+
 type KiroCapabilityObservation struct {
 	ModelSucceeded         bool
 	ThinkingRequested      bool
@@ -2812,6 +2822,10 @@ ON CONFLICT(account_id) DO NOTHING`,
 		`ALTER TABLE usage_records ADD COLUMN affinity_source TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN prompt_cache_key_present INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN prompt_cache_key_source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN prompt_cache_key_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN prompt_cache_key_shard INTEGER NOT NULL DEFAULT -1`,
+		`ALTER TABLE usage_records ADD COLUMN prompt_cache_key_minute_rpm INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN prompt_cache_key_concurrency_peak INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN stable_prefix_source TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN stable_prefix_reason TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN stable_prefix_bytes INTEGER NOT NULL DEFAULT 0`,
@@ -2825,11 +2839,15 @@ ON CONFLICT(account_id) DO NOTHING`,
 		`ALTER TABLE usage_records ADD COLUMN max_possible_cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN cache_hit_after_prewarm INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN singleflight_waited_requests INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN coordination_prefix_source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN singleflight_wait_reason TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN singleflight_release_reason TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE kiro_runtime_capabilities ADD COLUMN cache_point_state TEXT NOT NULL DEFAULT 'unknown'`,
 		`ALTER TABLE kiro_runtime_capabilities ADD COLUMN cache_reuse_state TEXT NOT NULL DEFAULT 'unknown'`,
 		`ALTER TABLE kiro_runtime_capabilities ADD COLUMN cache_reuse_evidence TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE kiro_runtime_capabilities ADD COLUMN cache_reuse_credit_reduction_percent REAL NOT NULL DEFAULT 0`,
 		`ALTER TABLE kiro_runtime_capabilities ADD COLUMN cache_reuse_probed_at INTEGER NOT NULL DEFAULT 0`,
+		`CREATE TABLE IF NOT EXISTS codex_cache_capabilities(account_id TEXT NOT NULL, model TEXT NOT NULL, explicit_breakpoint_state TEXT NOT NULL DEFAULT 'unknown', first_write_tokens INTEGER NOT NULL DEFAULT 0, second_read_tokens INTEGER NOT NULL DEFAULT 0, probed_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, PRIMARY KEY(account_id, model), FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE)`,
 		`ALTER TABLE usage_records ADD COLUMN diagnostics_miss_reason TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN latest_user_cache_control INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN latest_user_auto_context_cache_control INTEGER NOT NULL DEFAULT 0`,
@@ -7254,6 +7272,34 @@ ON CONFLICT(account_id, endpoint_hash, model) DO UPDATE SET updated_at=excluded.
 	return tx.Commit()
 }
 
+func (s *Store) SetCodexCacheCapability(ctx context.Context, capability CodexCacheCapability) error {
+	capability.AccountID = strings.TrimSpace(capability.AccountID)
+	capability.Model = strings.ToLower(strings.TrimSpace(capability.Model))
+	capability.ExplicitBreakpointState = strings.ToLower(strings.TrimSpace(capability.ExplicitBreakpointState))
+	if capability.ExplicitBreakpointState == "" {
+		capability.ExplicitBreakpointState = "unknown"
+	}
+	if capability.ProbedAt == 0 {
+		capability.ProbedAt = Now()
+	}
+	if capability.UpdatedAt == 0 {
+		capability.UpdatedAt = Now()
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO codex_cache_capabilities(account_id, model, explicit_breakpoint_state, first_write_tokens, second_read_tokens, probed_at, updated_at)
+VALUES(?,?,?,?,?,?,?) ON CONFLICT(account_id,model) DO UPDATE SET explicit_breakpoint_state=excluded.explicit_breakpoint_state,
+first_write_tokens=excluded.first_write_tokens, second_read_tokens=excluded.second_read_tokens, probed_at=excluded.probed_at, updated_at=excluded.updated_at`,
+		capability.AccountID, capability.Model, capability.ExplicitBreakpointState, capability.FirstWriteTokens, capability.SecondReadTokens, capability.ProbedAt, capability.UpdatedAt)
+	return err
+}
+
+func (s *Store) GetCodexCacheCapability(ctx context.Context, accountID, model string) (CodexCacheCapability, error) {
+	var capability CodexCacheCapability
+	err := s.rdb.QueryRowContext(ctx, `SELECT account_id, model, explicit_breakpoint_state, first_write_tokens, second_read_tokens, probed_at, updated_at
+FROM codex_cache_capabilities WHERE account_id=? AND model=?`, strings.TrimSpace(accountID), strings.ToLower(strings.TrimSpace(model))).Scan(
+		&capability.AccountID, &capability.Model, &capability.ExplicitBreakpointState, &capability.FirstWriteTokens, &capability.SecondReadTokens, &capability.ProbedAt, &capability.UpdatedAt)
+	return capability, err
+}
+
 func (s *Store) GetKiroRuntimeCapability(ctx context.Context, accountID, endpointHash, model string) (KiroRuntimeCapability, error) {
 	var capability KiroRuntimeCapability
 	err := s.rdb.QueryRowContext(ctx, `SELECT account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, cache_point_state,
@@ -9374,6 +9420,10 @@ type UsageDiagnostics struct {
 	AffinitySource                    string
 	PromptCacheKeyPresent             bool
 	PromptCacheKeySource              string
+	PromptCacheKeyHash                string
+	PromptCacheKeyShard               int
+	PromptCacheKeyMinuteRPM           int64
+	PromptCacheKeyConcurrencyPeak     int64
 	StablePrefixSource                string
 	StablePrefixReason                string
 	StablePrefixBytes                 int
@@ -9388,6 +9438,9 @@ type UsageDiagnostics struct {
 	CachePrewarmAttempted             bool
 	CacheHitAfterPrewarm              bool
 	SingleflightWaitedRequests        int64
+	CoordinationPrefixSource          string
+	SingleflightWaitReason            string
+	SingleflightReleaseReason         string
 	DiagnosticsMissReason             string
 	LatestUserCacheControl            bool
 	LatestUserAutoContextCacheControl bool
@@ -9635,13 +9688,13 @@ ON CONFLICT(event_id) DO UPDATE SET hold_id=CASE WHEN excluded.hold_id<>'' THEN 
 usage_event_id, account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens,
 usage_provider, usage_source, cache_read_present, cache_creation_present, compatibility_losses_json, cache_capability,
 estimated, cache_miss_tokens, cache_total_input_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens,
-affinity_source, prompt_cache_key_present, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, stable_prefix_bytes,
+affinity_source, prompt_cache_key_present, prompt_cache_key_source, prompt_cache_key_hash, prompt_cache_key_shard, prompt_cache_key_minute_rpm, prompt_cache_key_concurrency_peak, stable_prefix_source, stable_prefix_reason, stable_prefix_bytes,
 retention_effective, retention_source, claude_cache_ttl, cache_control_injected, cache_breakpoint_count,
-cache_breakpoints_json, unwritten_tail_tokens, max_possible_cache_read_tokens, cache_hit_after_prewarm, singleflight_waited_requests, diagnostics_miss_reason,
+cache_breakpoints_json, unwritten_tail_tokens, max_possible_cache_read_tokens, cache_hit_after_prewarm, singleflight_waited_requests, coordination_prefix_source, singleflight_wait_reason, singleflight_release_reason, diagnostics_miss_reason,
 latest_user_cache_control, latest_user_auto_context_cache_control, latest_user_tail_cache_control, latest_user_tool_result_cache_control, route_epoch,
 	kiro_credits, kiro_credits_present, billing_hold_id, requested_model, resolved_model, model_override_source, actual_model, model_mismatch, model_mismatch_reason,
 raw_usage_json, created_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(usage_event_id) WHERE usage_event_id <> '' DO UPDATE SET
 	 account_id=excluded.account_id, route_key_hash=excluded.route_key_hash, api_key_hash=excluded.api_key_hash, user_id=excluded.user_id,
 	 model=excluded.model, prompt_tokens=excluded.prompt_tokens, completion_tokens=excluded.completion_tokens, total_tokens=excluded.total_tokens,
@@ -9651,11 +9704,15 @@ ON CONFLICT(usage_event_id) WHERE usage_event_id <> '' DO UPDATE SET
 	 estimated=excluded.estimated, cache_miss_tokens=excluded.cache_miss_tokens, cache_total_input_tokens=excluded.cache_total_input_tokens,
 	 cache_creation_5m_tokens=excluded.cache_creation_5m_tokens, cache_creation_1h_tokens=excluded.cache_creation_1h_tokens,
 	 affinity_source=excluded.affinity_source, prompt_cache_key_present=excluded.prompt_cache_key_present, prompt_cache_key_source=excluded.prompt_cache_key_source,
+	 prompt_cache_key_hash=excluded.prompt_cache_key_hash, prompt_cache_key_shard=excluded.prompt_cache_key_shard,
+	 prompt_cache_key_minute_rpm=excluded.prompt_cache_key_minute_rpm, prompt_cache_key_concurrency_peak=excluded.prompt_cache_key_concurrency_peak,
 	 stable_prefix_source=excluded.stable_prefix_source, stable_prefix_reason=excluded.stable_prefix_reason, stable_prefix_bytes=excluded.stable_prefix_bytes,
 	 retention_effective=excluded.retention_effective, retention_source=excluded.retention_source, claude_cache_ttl=excluded.claude_cache_ttl,
 	 cache_control_injected=excluded.cache_control_injected, cache_breakpoint_count=excluded.cache_breakpoint_count, cache_breakpoints_json=excluded.cache_breakpoints_json,
 	 unwritten_tail_tokens=excluded.unwritten_tail_tokens, max_possible_cache_read_tokens=excluded.max_possible_cache_read_tokens,
 	 cache_hit_after_prewarm=excluded.cache_hit_after_prewarm, singleflight_waited_requests=excluded.singleflight_waited_requests,
+	 coordination_prefix_source=excluded.coordination_prefix_source, singleflight_wait_reason=excluded.singleflight_wait_reason,
+	 singleflight_release_reason=excluded.singleflight_release_reason,
 	 diagnostics_miss_reason=excluded.diagnostics_miss_reason, latest_user_cache_control=excluded.latest_user_cache_control,
 	 latest_user_auto_context_cache_control=excluded.latest_user_auto_context_cache_control, latest_user_tail_cache_control=excluded.latest_user_tail_cache_control,
 	 latest_user_tool_result_cache_control=excluded.latest_user_tool_result_cache_control, route_epoch=excluded.route_epoch, kiro_credits=excluded.kiro_credits,
@@ -9667,9 +9724,9 @@ WHERE usage_records.estimated > 0 AND excluded.estimated = 0`,
 		diag.UsageEventID, accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, cacheRead, cacheCreation,
 		diag.UsageProvider, diag.UsageSource, boolInt(diag.CacheReadPresent), boolInt(diag.CacheCreationPresent), diag.CompatibilityLossesJSON, diag.CacheCapability,
 		boolInt(diag.Estimated), diag.CacheMissTokens, diag.CacheTotalInputTokens, diag.CacheCreation5mTokens, diag.CacheCreation1hTokens,
-		diag.AffinitySource, boolInt(diag.PromptCacheKeyPresent), diag.PromptCacheKeySource, diag.StablePrefixSource, diag.StablePrefixReason, diag.StablePrefixBytes,
+		diag.AffinitySource, boolInt(diag.PromptCacheKeyPresent), diag.PromptCacheKeySource, diag.PromptCacheKeyHash, diag.PromptCacheKeyShard, diag.PromptCacheKeyMinuteRPM, diag.PromptCacheKeyConcurrencyPeak, diag.StablePrefixSource, diag.StablePrefixReason, diag.StablePrefixBytes,
 		diag.RetentionEffective, diag.RetentionSource, diag.ClaudeCacheTTL, boolInt(diag.CacheControlInjected), diag.CacheBreakpointCount,
-		diag.CacheBreakpointsJSON, diag.UnwrittenTailTokens, diag.MaxPossibleCacheReadTokens, boolInt(diag.CacheHitAfterPrewarm), diag.SingleflightWaitedRequests, diag.DiagnosticsMissReason,
+		diag.CacheBreakpointsJSON, diag.UnwrittenTailTokens, diag.MaxPossibleCacheReadTokens, boolInt(diag.CacheHitAfterPrewarm), diag.SingleflightWaitedRequests, diag.CoordinationPrefixSource, diag.SingleflightWaitReason, diag.SingleflightReleaseReason, diag.DiagnosticsMissReason,
 		boolInt(diag.LatestUserCacheControl),
 		boolInt(diag.LatestUserAutoContextCacheControl), boolInt(diag.LatestUserTailCacheControl), boolInt(diag.LatestUserToolResultCacheControl), diag.RouteEpoch,
 		diag.KiroCredits, boolInt(diag.KiroCreditsPresent), diag.BillingHoldID, diag.RequestedModel, diag.ResolvedModel, firstNonEmptyStorage(diag.ModelOverrideSource, "none"),
@@ -9706,6 +9763,9 @@ func firstNonEmptyStorage(values ...string) string {
 
 func finalizeUsageDiagnostics(model string, prompt, cached, cacheRead, cacheCreation int64, raw json.RawMessage, diag UsageDiagnostics) UsageDiagnostics {
 	usageMap := rawUsageMap(raw)
+	if strings.TrimSpace(diag.PromptCacheKeyHash) == "" {
+		diag.PromptCacheKeyShard = -1
+	}
 	if strings.TrimSpace(diag.ActualModel) == "" {
 		diag.ActualModel = strings.TrimSpace(model)
 	}
@@ -9749,6 +9809,15 @@ func finalizeUsageDiagnostics(model string, prompt, cached, cacheRead, cacheCrea
 		diag.CacheReadPresent = true
 	}
 	if _, ok := usageMap["cache_creation_input_tokens"]; ok {
+		diag.CacheCreationPresent = true
+	}
+	// OpenAI Responses/Chat-compatible usage reports cache writes in the same
+	// details object as cache reads. Presence (including an explicit zero) is
+	// meaningful for diagnostics, so do not gate this on the parsed value.
+	if _, present := nestedUsageIntPresent(usageMap, "input_tokens_details", "cache_write_tokens"); present {
+		diag.CacheCreationPresent = true
+	}
+	if _, present := nestedUsageIntPresent(usageMap, "prompt_tokens_details", "cache_write_tokens"); present {
 		diag.CacheCreationPresent = true
 	}
 	if cacheCreation > 0 {
@@ -9880,6 +9949,16 @@ func usageProvider(model string, usageMap map[string]interface{}, cacheCreation 
 }
 
 func isAnthropicUsageMap(usageMap map[string]interface{}, cacheCreation int64) bool {
+	// A parsed cacheCreation value historically identified the Anthropic
+	// ephemeral-write shape.  OpenAI now uses the same destination field, so
+	// prefer the explicit nested spelling when it is present and only then fall
+	// back to the legacy numeric discriminator.
+	if _, present := nestedUsageIntPresent(usageMap, "input_tokens_details", "cache_write_tokens"); present {
+		return false
+	}
+	if _, present := nestedUsageIntPresent(usageMap, "prompt_tokens_details", "cache_write_tokens"); present {
+		return false
+	}
 	if cacheCreation > 0 {
 		return true
 	}

@@ -50,10 +50,11 @@ func (c *Client) prepareOpenAICompatCodexRequest(spec *Request) error {
 	if spec == nil || !customCodexResponsesProfile(*spec) {
 		return nil
 	}
-	spec.codexResolvedClientVersion = c.resolveCodexClientVersion(*spec)
 	if err := spec.loadBody(); err != nil {
 		return err
 	}
+	spec.codexResolvedClientVersion = c.resolveCodexClientVersion(*spec)
+	spec.DownstreamPath = stripCodexResponsesClientVersionQuery(spec.DownstreamPath)
 	isCompact := strings.Contains(strings.ToLower(spec.DownstreamPath), "/responses/compact")
 	responsesLite := CodexRequestUsesResponsesLite(spec.bodyBytes)
 	if isCompact && responsesLite {
@@ -255,11 +256,12 @@ func (c *Client) applyOpenAICompatCodexIdentity(dst http.Header, spec Request) {
 	id := c.identityForOS(spec.Account.ID, spec.OSHint)
 	threadOriginator := codexThreadOriginator(spec.Headers)
 	processOriginator := codexProcessOriginator(spec.Headers, threadOriginator)
-	version := c.codexClientVersionForRequest(spec)
+	profile := c.codexProtocolProfileForRequest(spec)
+	version := profile.version
 	dst.Set("User-Agent", id.CodexUserAgentForOriginator(processOriginator, version))
 	setHeaderPreserveCase(dst, "Originator", threadOriginator)
 	setHeaderPreserveCase(dst, "version", version)
-	if beta := mergeCodexBetaFeatures(getHeaderFold(spec.Headers, "x-codex-beta-features")); beta != "" {
+	if beta := mergeCodexBetaFeatures(getHeaderFold(spec.Headers, "x-codex-beta-features"), profile.requiredBetaFeatures); beta != "" {
 		setHeaderPreserveCase(dst, "x-codex-beta-features", beta)
 	}
 	if strings.Contains(strings.ToLower(spec.DownstreamPath), "responses") {

@@ -213,7 +213,7 @@ func TestLoadKeepsNewerCodexClientVersions(t *testing.T) {
 }
 
 func TestLoadKeepsFiveSupportedCodexCLIVersions(t *testing.T) {
-	wantVersions := []string{"0.147.0", "0.146.1", "0.146.0", "0.145.0", "0.144.6"}
+	wantVersions := []string{"0.148.0", "0.147.0", "0.146.1", "0.146.0", "0.145.0"}
 	if got := SupportedCodexCLIVersions(); !reflect.DeepEqual(got, wantVersions) {
 		t.Fatalf("SupportedCodexCLIVersions() = %v, want %v", got, wantVersions)
 	}
@@ -232,6 +232,25 @@ func TestLoadKeepsFiveSupportedCodexCLIVersions(t *testing.T) {
 				t.Fatalf("CodexCLIVersionOverride = %q, want supported %q", cfg.CodexCLIVersionOverride, version)
 			}
 		})
+	}
+}
+
+func TestCodexCLIFingerprintLibraryMatchesDefaultAndReturnsCopies(t *testing.T) {
+	versions := SupportedCodexCLIVersions()
+	if len(versions) != 5 || versions[0] != DefaultClientVersion {
+		t.Fatalf("fingerprint versions=%v default=%q", versions, DefaultClientVersion)
+	}
+	versions[0] = "mutated"
+	if got := SupportedCodexCLIVersions()[0]; got != DefaultClientVersion {
+		t.Fatalf("caller mutated fingerprint library head: %q", got)
+	}
+	latest, ok := CodexCLIFingerprintForVersion("v" + DefaultClientVersion)
+	if !ok || latest.Version != DefaultClientVersion || latest.RequiredBetaFeatures != "remote_compaction_v2" ||
+		!latest.CodeModeToolNames || !latest.ParentTurnID || !latest.PromptCacheKeyBySession {
+		t.Fatalf("latest fingerprint=%+v ok=%v", latest, ok)
+	}
+	if _, ok := CodexCLIFingerprintForVersion("0.149.0"); ok {
+		t.Fatal("unknown future version matched the verified fingerprint library")
 	}
 }
 
@@ -337,6 +356,8 @@ func TestExampleConfigKeepsOptimizedCacheDefaults(t *testing.T) {
 		"codex_stateless_passthrough":           false,
 		"codex_prefer_sidecar_ja3_over_ws":      true,
 		"codex_prompt_cache_retention":          "",
+		"codex_prompt_cache_key_shards":         float64(4),
+		"codex_gpt56_explicit_cache_mode":       "observe",
 		"claude_cache_control_inject":           true,
 		"claude_cache_mode":                     "max_hit",
 		"claude_cache_affinity_policy":          "balanced",
@@ -378,6 +399,9 @@ func TestExampleConfigKeepsOptimizedCacheDefaults(t *testing.T) {
 	}
 	if cfg.CodexPromptCacheRetention != "" {
 		t.Fatalf("CodexPromptCacheRetention = %q, want empty for Codex 0.144.x", cfg.CodexPromptCacheRetention)
+	}
+	if cfg.CodexPromptCacheKeyShards != 4 || cfg.CodexGPT56ExplicitCacheMode != "observe" {
+		t.Fatalf("Codex cache defaults shards=%d mode=%q", cfg.CodexPromptCacheKeyShards, cfg.CodexGPT56ExplicitCacheMode)
 	}
 	if cfg.TokenSaveEnabled {
 		t.Fatal("TokenSaveEnabled must stay false by default because it rewrites request content")

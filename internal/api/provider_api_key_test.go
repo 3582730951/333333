@@ -173,6 +173,84 @@ func TestOpenAIPlatformAPIKeyImportUsesBoundMinimalProbeAndUsage(t *testing.T) {
 	}
 }
 
+func TestGPT56APIKeyImportRunsTwoRequestCacheCapabilityProbe(t *testing.T) {
+	var inferenceCalls atomic.Int64
+	var cacheKey string
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
+			_, _ = io.WriteString(w, `{"data":[{"id":"gpt-5.6-sol","context_window":262144}]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
+			raw, _ := io.ReadAll(r.Body)
+			if bytes.Contains(raw, []byte("application turn")) {
+				if !bytes.Contains(raw, []byte(`"prompt_cache_options":{"mode":"implicit"}`)) || !bytes.Contains(raw, []byte(`"prompt_cache_breakpoint":{"mode":"implicit"}`)) {
+					t.Errorf("application request missing automatic implicit breakpoint: %s", raw)
+				}
+				_, _ = io.WriteString(w, `{"id":"app","model":"gpt-5.6-sol","usage":{"input_tokens":120,"output_tokens":2,"total_tokens":122,"input_tokens_details":{"cached_tokens":100,"cache_write_tokens":0}}}`)
+				return
+			}
+			call := inferenceCalls.Add(1)
+			if !bytes.Contains(raw, []byte(`"prompt_cache_options":{"mode":"explicit"}`)) || !bytes.Contains(raw, []byte(`"prompt_cache_breakpoint":{"mode":"explicit"}`)) {
+				t.Errorf("probe %d missing explicit cache controls: %s", call, raw)
+			}
+			var request map[string]interface{}
+			_ = json.Unmarshal(raw, &request)
+			key, _ := request["prompt_cache_key"].(string)
+			if call == 1 {
+				cacheKey = key
+			} else if key == "" || key != cacheKey {
+				t.Errorf("probe cache key changed: first=%q second=%q", cacheKey, key)
+			}
+			if call == 1 {
+				_, _ = io.WriteString(w, `{"id":"one","model":"gpt-5.6-sol","usage":{"input_tokens":1800,"output_tokens":1,"total_tokens":1801,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":1000}}}`)
+			} else {
+				_, _ = io.WriteString(w, `{"id":"two","model":"gpt-5.6-sol","usage":{"input_tokens":1800,"output_tokens":1,"total_tokens":1801,"input_tokens_details":{"cached_tokens":1600,"cache_write_tokens":0}}}`)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	response, body := postProviderKeyImport(t, h, map[string]interface{}{
+		"provider_id": "codex", "api_key": "sk-gpt56", "confirm_cost": true,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.StatusCode, body)
+	}
+	if inferenceCalls.Load() != 2 {
+		t.Fatalf("inference calls=%d, want 2", inferenceCalls.Load())
+	}
+	accountID := customAccountID("codex", "sk-gpt56")
+	capability, err := h.store.GetCodexCacheCapability(context.Background(), accountID, "gpt-5.6-sol")
+	if err != nil || capability.ExplicitBreakpointState != "supported" || capability.FirstWriteTokens != 1000 || capability.SecondReadTokens != 1600 {
+		t.Fatalf("capability=%+v err=%v", capability, err)
+	}
+	if !h.app.codexExplicitCacheCapable(context.Background(), accountID, "gpt-5.6-sol") || !h.app.codexAutomaticCacheProfitable(context.Background(), accountID, "gpt-5.6-sol") {
+		t.Fatalf("persisted capability did not enable profitable cache mode: %+v", capability)
+	}
+	restartedPolicyReader := &Server{store: h.store, codexCachePolicyCache: map[string]codexCachePolicySnapshot{}}
+	if capable, profitable := restartedPolicyReader.codexExplicitCachePolicy(context.Background(), accountID, "gpt-5.6-sol"); !capable || !profitable {
+		t.Fatalf("restarted policy reader lost persisted capability: capable=%v profitable=%v", capable, profitable)
+	}
+	patchConfig(t, h, `{"codex_gpt56_explicit_cache_mode":"auto"}`)
+	requestBody := `{"model":"gpt-5.6-sol","stream":false,"prompt_cache_key":"operator-key","input":[{"role":"developer","content":[{"type":"input_text","text":"stable application prefix"}]},{"role":"user","content":[{"type":"input_text","text":"application turn"}]}]}`
+	appResponse, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(requestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	appBody, _ := io.ReadAll(appResponse.Body)
+	appResponse.Body.Close()
+	if appResponse.StatusCode != http.StatusOK {
+		t.Fatalf("application status=%d body=%s", appResponse.StatusCode, appBody)
+	}
+	h.app.FlushWrites()
+	var injected, breakpoints int64
+	var prefixSource string
+	if err := h.store.DB().QueryRow(`SELECT cache_control_injected, cache_breakpoint_count, coordination_prefix_source FROM usage_records ORDER BY id DESC LIMIT 1`).Scan(&injected, &breakpoints, &prefixSource); err != nil || injected != 1 || breakpoints != 1 || prefixSource != "explicit_breakpoint" {
+		t.Fatalf("application cache diagnostics injected=%d breakpoints=%d prefix=%q err=%v", injected, breakpoints, prefixSource, err)
+	}
+}
+
 func TestAnthropicAPIKeyInferenceFailureQuarantinesUntilConfirmedRecovery(t *testing.T) {
 	var failInference atomic.Bool
 	failInference.Store(true)

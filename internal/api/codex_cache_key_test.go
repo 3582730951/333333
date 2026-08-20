@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
@@ -140,7 +141,24 @@ func TestPromptCacheHintChangesOnlyPromptCacheKey(t *testing.T) {
 	assertOnlyTopLevelJSONFieldChanged(t, withoutKey, injected, "prompt_cache_key")
 }
 
-func TestOfficialCodexSubagentsShareBaseCacheHintWithoutChangingTasks(t *testing.T) {
+func TestOfficialCodexBasePrefixHashPreservesToolNumbersAndOrder(t *testing.T) {
+	instructions := strings.Repeat("immutable official Codex instructions ", 100)
+	build := func(number string, tools string) []byte {
+		return []byte(`{"instructions":` + jsonString(instructions) + `,"tools":` + tools + `,"input":[{"role":"user","content":"task"}],"future_id":` + number + `}`)
+	}
+	one := build("900719925474099312345", `[{"name":"first","schema":{"const":900719925474099312345}},{"name":"second"}]`)
+	two := build("900719925474099312346", `[{"name":"first","schema":{"const":900719925474099312346}},{"name":"second"}]`)
+	reordered := build("900719925474099312345", `[{"name":"second"},{"name":"first","schema":{"const":900719925474099312345}}]`)
+	oneHash := officialCodexBasePromptCacheHash(one)
+	if oneHash == "" || oneHash == officialCodexBasePromptCacheHash(two) {
+		t.Fatal("byte-distinct large tool integers collapsed into one cache prefix")
+	}
+	if oneHash == officialCodexBasePromptCacheHash(reordered) {
+		t.Fatal("tool order was omitted from the cache prefix")
+	}
+}
+
+func TestOfficialCodexSubagentsDistributeStableCacheShardsWithoutChangingTasks(t *testing.T) {
 	developerPrefix := strings.Repeat("shared child agent tools and developer rules ", 160)
 	buildChild := func(cacheKey, turnID, task string) []byte {
 		return []byte(`{"model":"gpt-5.6-luna","reasoning":{"effort":"xhigh","context":"all_turns"},"input":[` +
@@ -152,18 +170,56 @@ func TestOfficialCodexSubagentsShareBaseCacheHintWithoutChangingTasks(t *testing
 	}
 	req, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
 	req.Header.Set("originator", "codex_exec")
-	mathBody := buildChild("019f4b2a-1111-7aaa-8aaa-111111111111", "019f4b2a-aaaa-7aaa-8aaa-aaaaaaaaaaaa", "solve math")
-	orderBody := buildChild("019f4b2a-2222-7bbb-8bbb-222222222222", "019f4b2a-bbbb-7bbb-8bbb-bbbbbbbbbbbb", "solve ordering")
-	mathOut, mathChanged := normalizeOfficialCodexPromptCacheKey(req, mathBody, "gpt-5.6-luna")
-	orderOut, orderChanged := normalizeOfficialCodexPromptCacheKey(req, orderBody, "gpt-5.6-luna")
-	if !mathChanged || !orderChanged {
-		t.Fatal("subagent UUID keys were not normalized")
+	seen := map[string]bool{}
+	for i := 0; i < 16; i++ {
+		task := fmt.Sprintf("child task %d", i)
+		body := buildChild(fmt.Sprintf("019f4b2a-%04x-7aaa-8aaa-%012x", i, i), fmt.Sprintf("019f4b2a-%04x-7aaa-8aaa-%012x", i+32, i+32), task)
+		out, changed := normalizeOfficialCodexPromptCacheKey(req, body, "gpt-5.6-luna", 4)
+		if !changed || !strings.Contains(string(out), task) {
+			t.Fatalf("subagent %d was not normalized losslessly", i)
+		}
+		seen[routing.PromptCacheKey(out)] = true
 	}
-	if mathKey, orderKey := routing.PromptCacheKey(mathOut), routing.PromptCacheKey(orderOut); mathKey == "" || mathKey != orderKey {
-		t.Fatalf("sibling subagents received different base cache hints: %q vs %q", mathKey, orderKey)
+	if len(seen) < 2 || len(seen) > 4 {
+		t.Fatalf("16 sibling agents used %d deterministic shards, want 2..4: %#v", len(seen), seen)
 	}
-	if !strings.Contains(string(mathOut), "solve math") || !strings.Contains(string(orderOut), "solve ordering") {
-		t.Fatal("cache-hint normalization changed a child task")
+}
+
+func TestOfficialCodexPromptCacheShardUsesThreadThenAnchorThenUUID(t *testing.T) {
+	original := "019f4b1a-1111-7aaa-8aaa-111111111111"
+	request, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	request.Header.Set("thread-id", "header-child-7")
+	if got := officialCodexPromptCacheShardSeedWithRequest(request, []byte(`{"input":[{"role":"user","content":"hello"}]}`), original); got != "thread:header-child-7" {
+		t.Fatalf("header thread seed = %q", got)
+	}
+	withThread := []byte(`{"thread_id":"child-7","input":[{"role":"user","content":"hello"}]}`)
+	if got := officialCodexPromptCacheShardSeed(withThread, original); got != "thread:child-7" {
+		t.Fatalf("thread seed = %q", got)
+	}
+	withAnchor := []byte(`{"input":[{"role":"user","content":"hello"}]}`)
+	if got := officialCodexPromptCacheShardSeed(withAnchor, original); !strings.HasPrefix(got, "anchor:") {
+		t.Fatalf("anchor seed = %q", got)
+	}
+	anchorWithVolatileTurn := []byte(`{"input":[{"role":"user","content":"hello","internal_chat_message_metadata_passthrough":{"turn_id":"volatile"}}]}`)
+	if got, want := officialCodexPromptCacheShardSeed(anchorWithVolatileTurn, original), officialCodexPromptCacheShardSeed(withAnchor, original); got != want {
+		t.Fatalf("volatile turn metadata changed anchor: got=%q want=%q", got, want)
+	}
+	if got := officialCodexPromptCacheShardSeed([]byte(`{"input":[]}`), original); got != "uuid:"+original {
+		t.Fatalf("uuid seed = %q", got)
+	}
+	if got := officialCodexPromptCacheShardSeed([]byte(`{"input":[{"role":"developer","content":"preamble"}]}`), original); got != "uuid:"+original {
+		t.Fatalf("developer-only seed = %q", got)
+	}
+}
+
+func TestOfficialCodexPromptCacheOneShardRestoresLegacyKey(t *testing.T) {
+	instructions := strings.Repeat("stable official prefix ", 180)
+	body := []byte(`{"instructions":` + jsonString(instructions) + `,"input":[{"role":"user","content":"task"}],"prompt_cache_key":"019f4b1a-1111-7aaa-8aaa-111111111111"}`)
+	req, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("originator", "codex_exec")
+	got, changed := normalizeOfficialCodexPromptCacheKey(req, body, "gpt-5.6-sol", 1)
+	if !changed || strings.Contains(routing.PromptCacheKey(got), "_s") {
+		t.Fatalf("legacy one-shard key = %q, changed=%v", routing.PromptCacheKey(got), changed)
 	}
 }
 

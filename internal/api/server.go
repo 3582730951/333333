@@ -171,13 +171,18 @@ type Server struct {
 	claudeCacheFlightsMu sync.Mutex
 	claudeCacheFlights   map[string]chan struct{}
 	codexCacheFlightsMu  sync.Mutex
-	codexCacheFlights    map[string]chan struct{}
+	codexCacheFlights    map[string]*codexCacheFlight
 	claudeCacheDiagMu    sync.Mutex
 	claudeCacheDiagPrev  map[string]string
 	kiroCacheFlightsMu   sync.Mutex
 	kiroCacheFlights     map[string]chan struct{}
 	codexSessionGatesMu  sync.Mutex
 	codexSessionGates    map[string]*codexSessionGate
+
+	codexCacheMetricsMu   sync.Mutex
+	codexCacheMetrics     map[string]*codexCacheKeyMetric
+	codexCachePolicyMu    sync.Mutex
+	codexCachePolicyCache map[string]codexCachePolicySnapshot
 
 	codexResetMu          sync.Mutex
 	codexResetLocks       map[string]*sync.Mutex
@@ -263,7 +268,7 @@ func NewServer(dep Dependencies) *Server {
 		passiveHealth:         passivehealth.New(passivehealth.DefaultMaxSeries, passivehealth.DefaultRetention),
 		usageDashboardCache:   newUsageDashboardResponseCache(),
 		claudeCacheFlights:    map[string]chan struct{}{},
-		codexCacheFlights:     map[string]chan struct{}{},
+		codexCacheFlights:     map[string]*codexCacheFlight{},
 		claudeCacheDiagPrev:   map[string]string{},
 		kiroCacheFlights:      map[string]chan struct{}{},
 		codexSessionGates:     map[string]*codexSessionGate{},
@@ -274,6 +279,9 @@ func NewServer(dep Dependencies) *Server {
 		publicChatLimiter:     map[string]publicChatRateWindow{},
 		compatibilityManifest: compatmanifest.New(dep.Config.DataDir, nil),
 		compatibilityWake:     make(chan struct{}, 1),
+
+		codexCacheMetrics:     map[string]*codexCacheKeyMetric{},
+		codexCachePolicyCache: map[string]codexCachePolicySnapshot{},
 	}
 	if dep.Store != nil {
 		connector := dep.TeamLifecycleConnector
@@ -1930,7 +1938,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// do not inject one here or report an unsupported 24h policy as effective. Cache
 	// reuse is driven by the supported prompt_cache_key + stable account affinity.
 	if !prepared && !strictNativeCPA {
-		if updated, normalized := normalizeOfficialCodexPromptCacheKey(r, body, model); normalized {
+		if updated, normalized := normalizeOfficialCodexPromptCacheKey(r, body, model, s.codexPromptCacheKeyShards(r.Context())); normalized {
 			body = updated
 			promptCacheKeySource = "official_codex_stable_prefix"
 		}
@@ -1957,11 +1965,31 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			}
 		}
 	}
+	codexExplicitCacheMode := s.codexGPT56ExplicitCacheMode(r.Context())
+	codexExplicitCacheCapable, codexAutomaticCacheProfitable := false, false
+	if upstream.AccountUsesAPIKey(token) {
+		codexExplicitCacheCapable, codexAutomaticCacheProfitable = s.codexExplicitCachePolicy(r.Context(), lease.Account.ID, resolvedModel)
+	}
+	autoCacheBreakpointInjected := false
+	if upstream.AccountUsesAPIKey(token) && codexExplicitCacheCapable && codexAutomaticCacheProfitable && codexExplicitCacheMode == "auto" &&
+		(strings.EqualFold(resolvedModel, "gpt-5.6") || strings.HasPrefix(strings.ToLower(resolvedModel), "gpt-5.6-")) {
+		if updated := upstream.ApplyCodexGPT56AutomaticCacheBreakpoint(body); !bytes.Equal(updated, body) {
+			body = updated
+			autoCacheBreakpointInjected = true
+		}
+	}
 	var usageMeta *bodysource.BodyMeta
 	if replayMeta != nil && len(body) == len(sourceRaw) && (len(body) == 0 || &body[0] == &sourceRaw[0]) {
 		usageMeta = replayMeta
 	}
-	logicalUsageDiag := codexRequestUsageDiagnostics(body, usageMeta, affinity, promptCacheKeySource, retentionEffective, retentionSource)
+	// Account isolation namespaces prompt_cache_key below. Keep the deterministic
+	// pre-isolation shard as a diagnostic hint, while hashing/recording the exact
+	// namespaced key that the selected account will actually send upstream.
+	codexCacheShardCount := s.codexPromptCacheKeyShards(r.Context())
+	codexCacheShardHint := -1
+	if promptCacheKeySource == "official_codex_stable_prefix" {
+		codexCacheShardHint = codexPromptCacheKeyShardFromKey(promptCacheKeyWithMeta(body, usageMeta), codexCacheShardCount)
+	}
 
 	// Resolve the persistent identity only after the exact account and egress are
 	// selected. A transport/auth retry below reuses this snapshot and therefore the
@@ -2000,6 +2028,17 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		body = scrub.Body
 		codexScrubber = scrub.Scrubber
 	}
+	logicalUsageDiag := codexRequestUsageDiagnostics(body, usageMeta, affinity, promptCacheKeySource, retentionEffective, retentionSource)
+	logicalUsageDiag.CacheControlInjected = autoCacheBreakpointInjected
+	cacheKeyObservation := s.observeCodexPromptCacheKey(lease.Account.ID, resolvedModel, promptCacheKeyWithMeta(body, usageMeta), codexCacheShardCount, time.Now())
+	defer cacheKeyObservation.Done()
+	if cacheKeyObservation.Shard < 0 {
+		cacheKeyObservation.Shard = codexCacheShardHint
+	}
+	logicalUsageDiag.PromptCacheKeyHash = cacheKeyObservation.Hash
+	logicalUsageDiag.PromptCacheKeyShard = cacheKeyObservation.Shard
+	logicalUsageDiag.PromptCacheKeyMinuteRPM = cacheKeyObservation.MinuteRPM
+	logicalUsageDiag.PromptCacheKeyConcurrencyPeak = cacheKeyObservation.ConcurrencyPeak
 
 	codexClientVersion := s.codexClientVersionForModel(model)
 	webSocketSession := codexResponsesWebSocketSession(r.Context())
@@ -2054,19 +2093,23 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			requestOSHint = requestIdentity.DeviceOSHint
 		}
 		return upstream.Request{
-			Method:                  http.MethodPost,
-			DownstreamPath:          pathWithQuery(path, r.URL.RawQuery),
-			Headers:                 requestHeaders,
-			Body:                    bodysource.Bytes(requestBody),
-			Account:                 lease.Account,
-			Token:                   t,
-			Egress:                  lease.Egress,
-			CookieJarKey:            lease.Binding.CookieJarKey,
-			OSHint:                  requestOSHint,
-			CodexClientVersion:      codexClientVersion,
-			CodexResponsesWebSocket: codexUseWebSocket,
-			CodexWebSocketSession:   webSocketSession,
-			CodexIdentity:           requestIdentity,
+			Method:                        http.MethodPost,
+			Model:                         resolvedModel,
+			DownstreamPath:                pathWithQuery(path, r.URL.RawQuery),
+			Headers:                       requestHeaders,
+			Body:                          bodysource.Bytes(requestBody),
+			Account:                       lease.Account,
+			Token:                         t,
+			Egress:                        lease.Egress,
+			CookieJarKey:                  lease.Binding.CookieJarKey,
+			OSHint:                        requestOSHint,
+			CodexClientVersion:            codexClientVersion,
+			CodexResponsesWebSocket:       codexUseWebSocket,
+			CodexWebSocketSession:         webSocketSession,
+			CodexIdentity:                 requestIdentity,
+			CodexExplicitCacheMode:        codexExplicitCacheMode,
+			CodexExplicitCacheCapable:     codexExplicitCacheCapable,
+			CodexAutomaticCacheProfitable: codexAutomaticCacheProfitable,
 		}
 	}
 	forwardSource, forwardMeta := bodysource.BodySource(nil), (*bodysource.BodyMeta)(nil)
@@ -2120,11 +2163,14 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	}
 
 	logicalUsageDiag.RouteEpoch = lease.RouteEpoch
-	releaseCacheFlight, waitedForCacheFlight := s.enterCodexCacheSingleflight(r.Context(), s.codexCacheSingleflightEnabled(r.Context()), lease.Account.ID, resolvedModel, body, affinity, forwardMeta)
-	if waitedForCacheFlight {
+	cacheFlight := s.enterCodexCacheSingleflight(r.Context(), s.codexCacheSingleflightEnabled(r.Context()), lease.Account.ID, resolvedModel, body, forwardMeta)
+	if cacheFlight.Waited {
 		logicalUsageDiag.SingleflightWaitedRequests = 1
 	}
-	defer releaseCacheFlight()
+	logicalUsageDiag.CoordinationPrefixSource = cacheFlight.PrefixSource
+	logicalUsageDiag.SingleflightWaitReason = cacheFlight.WaitReason
+	logicalUsageDiag.SingleflightReleaseReason = cacheFlight.ReleaseReason
+	defer cacheFlight.Release("request_complete")
 	holdID := s.createBillingHold(r.Context(), affinity.Hash, lease.Account.ID, lease.RouteEpoch, codexEstimatedTokensWithMeta(resolvedModel, body, forwardMeta))
 	// Backstop: settle-if-held on return so a cancelled/streaming disconnect can't leak
 	// the hold; an explicit settle below always wins (WHERE status='held' no longer matches).
@@ -2190,7 +2236,13 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	}
 	attemptedWebSocket := codexUseWebSocket
 	resp, finalEgress, err := s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
-	releaseCacheFlight()
+	if resp != nil {
+		cacheFlight.Release("response_headers")
+	} else {
+		cacheFlight.Release("transport_returned")
+	}
+	logicalUsageDiag.SingleflightReleaseReason = cacheFlight.ReleaseReason
+	withCodexUsageContext()
 	if err != nil && attemptedWebSocket {
 		s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "websocket_transport_error", 0)
 		resp, finalEgress, err = fallbackToHTTPS("transport_error")
@@ -3962,7 +4014,7 @@ func (s *Server) verifySolvedClearance(ctx context.Context, account storage.Acco
 		// A promoted jar is shared by the account+egress+host, while the live Codex
 		// profile follows any of the supported downstream versions. Prove that the
 		// clearance survives every UA/version tuple before making it global; one
-		// successful latest-version probe is not evidence for a 0.144.6 client.
+		// successful latest-version probe is not evidence for a 0.145.0 client.
 		versions = config.SupportedCodexCLIVersions()
 	}
 	for _, clientVersion := range versions {

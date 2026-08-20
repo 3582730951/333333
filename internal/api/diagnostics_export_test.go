@@ -195,9 +195,13 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		HistoricalAccounts int                    `json:"historical_reference_account_count"`
 		Build              map[string]interface{} `json:"build"`
 		TableTimeRanges    map[string]interface{} `json:"table_time_ranges"`
+		CacheCreationMap   string                 `json:"cache_creation_tokens_mapping"`
 	}
 	if err := json.Unmarshal([]byte(files["manifest.json"]), &manifest); err != nil {
 		t.Fatalf("manifest json: %v\n%s", err, files["manifest.json"])
+	}
+	if !strings.Contains(manifest.CacheCreationMap, "cache_write_tokens") {
+		t.Fatalf("manifest cache creation mapping = %q", manifest.CacheCreationMap)
 	}
 	if manifest.Format != "codex-pool-diagnostics-v3" || !strings.HasPrefix(manifest.SnapshotID, "diag_") {
 		t.Fatalf("manifest format/snapshot = %q/%q", manifest.Format, manifest.SnapshotID)
@@ -302,7 +306,7 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		}
 	}
 	usageCSV := files["usage_records.csv"]
-	for _, want := range []string{"usage_source", "cache_read_present", "cache_creation_present", "compatibility_losses_json", "cache_capability", "affinity_source", "route_class", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_bytes", "retention_effective", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch"} {
+	for _, want := range []string{"usage_source", "cache_read_present", "cache_creation_present", "compatibility_losses_json", "cache_capability", "affinity_source", "route_class", "prompt_cache_key_source", "prompt_cache_key_hash", "prompt_cache_key_shard", "prompt_cache_key_minute_rpm", "prompt_cache_key_concurrency_peak", "stable_prefix_source", "stable_prefix_bytes", "retention_effective", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "coordination_prefix_source", "singleflight_wait_reason", "singleflight_release_reason", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch"} {
 		if !strings.Contains(usageCSV, want) {
 			t.Fatalf("usage_records.csv missing diagnostic column %q:\n%s", want, usageCSV)
 		}

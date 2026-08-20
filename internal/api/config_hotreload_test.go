@@ -124,6 +124,26 @@ func getAdminSettings(t *testing.T, h *testHarness) map[string]interface{} {
 	return body
 }
 
+func TestCodexCacheOptimizationSettingsHotReloadAndValidate(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"id":"resp"}`)) })
+	rows := adminConfigRows(t, h)
+	if row := findConfigRow(rows, "codex_prompt_cache_key_shards"); row == nil || row["value"] != float64(4) || row["effect"] != "hot" {
+		t.Fatalf("shard config row = %#v", row)
+	}
+	patchConfig(t, h, `{"codex_prompt_cache_key_shards":1,"codex_gpt56_explicit_cache_mode":"auto"}`)
+	if got := h.app.codexPromptCacheKeyShards(context.Background()); got != 1 {
+		t.Fatalf("hot shard value = %d", got)
+	}
+	if got := h.app.codexGPT56ExplicitCacheMode(context.Background()); got != "auto" {
+		t.Fatalf("hot explicit mode = %q", got)
+	}
+	for _, body := range []string{`{"codex_prompt_cache_key_shards":0}`, `{"codex_prompt_cache_key_shards":17}`, `{"codex_gpt56_explicit_cache_mode":"invalid"}`} {
+		if status, _ := patchConfigStatus(t, h, body); status != http.StatusBadRequest {
+			t.Fatalf("invalid config %s status=%d", body, status)
+		}
+	}
+}
+
 func TestSettingsCenterAppliesKiroNoDegradationTemplate(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"id":"resp"}`))

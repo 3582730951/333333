@@ -149,6 +149,73 @@ func (s *Server) codexCacheSingleflightEnabled(ctx context.Context) bool {
 	return s.flagEnabled(ctx, "codex_cache_singleflight_enabled", s.cfg.CodexCacheSingleflightEnabled)
 }
 
+func (s *Server) codexPromptCacheKeyShards(ctx context.Context) int {
+	n := s.settingInt(ctx, "codex_prompt_cache_key_shards", s.cfg.CodexPromptCacheKeyShards)
+	if n < 1 || n > 16 {
+		return 4
+	}
+	return n
+}
+
+func (s *Server) codexGPT56ExplicitCacheMode(ctx context.Context) string {
+	switch strings.ToLower(strings.TrimSpace(s.settingString(ctx, "codex_gpt56_explicit_cache_mode", s.cfg.CodexGPT56ExplicitCacheMode))) {
+	case "auto":
+		return "auto"
+	case "off":
+		return "off"
+	default:
+		return "observe"
+	}
+}
+
+func (s *Server) codexExplicitCacheCapable(ctx context.Context, accountID, model string) bool {
+	capable, _ := s.codexExplicitCachePolicy(ctx, accountID, model)
+	return capable
+}
+
+func (s *Server) codexExplicitCachePolicy(ctx context.Context, accountID, model string) (bool, bool) {
+	if s == nil || s.store == nil {
+		return false, false
+	}
+	key := strings.TrimSpace(accountID) + "\x00" + strings.ToLower(strings.TrimSpace(model))
+	s.codexCachePolicyMu.Lock()
+	if cached, ok := s.codexCachePolicyCache[key]; ok && time.Now().Before(cached.expiresAt) {
+		s.codexCachePolicyMu.Unlock()
+		return cached.capable, cached.profitable
+	}
+	s.codexCachePolicyMu.Unlock()
+	capability, err := s.store.GetCodexCacheCapability(ctx, accountID, model)
+	if err != nil || capability.ExplicitBreakpointState != "supported" {
+		s.rememberCodexExplicitCachePolicy(accountID, model, false, false)
+		return false, false
+	}
+	// A zero write counter can mean the provider omitted cache-write accounting,
+	// not that writing the prefix was free. Require both sides of the probe before
+	// enabling automatic metadata so observe mode remains the safe default when
+	// cost evidence is incomplete.
+	profitable := capability.FirstWriteTokens > 0 && capability.SecondReadTokens > 0 && capability.SecondReadTokens*4 > capability.FirstWriteTokens*5
+	s.rememberCodexExplicitCachePolicy(accountID, model, true, profitable)
+	return true, profitable
+}
+
+func (s *Server) rememberCodexExplicitCachePolicy(accountID, model string, capable, profitable bool) {
+	if s == nil {
+		return
+	}
+	key := strings.TrimSpace(accountID) + "\x00" + strings.ToLower(strings.TrimSpace(model))
+	s.codexCachePolicyMu.Lock()
+	if s.codexCachePolicyCache == nil {
+		s.codexCachePolicyCache = map[string]codexCachePolicySnapshot{}
+	}
+	s.codexCachePolicyCache[key] = codexCachePolicySnapshot{capable: capable, profitable: profitable, expiresAt: time.Now().Add(5 * time.Minute)}
+	s.codexCachePolicyMu.Unlock()
+}
+
+func (s *Server) codexAutomaticCacheProfitable(ctx context.Context, accountID, model string) bool {
+	_, profitable := s.codexExplicitCachePolicy(ctx, accountID, model)
+	return profitable
+}
+
 // leakScrubEnabled reports whether pool-internal upstream signals (quota/limit
 // headers, rate-limit SSE frames, limit/quota/overload error bodies, model-switch
 // suggestions) are hidden from the downstream client.

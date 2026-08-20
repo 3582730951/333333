@@ -560,7 +560,7 @@ func TestAdminCacheHitsExportZip(t *testing.T) {
 	if _, ok := files["account_map.csv"]; ok {
 		t.Fatal("cache hit zip must not contain a reversible account map")
 	}
-	if !strings.Contains(files["manifest.json"], "codex-pool-cache-hits-v2") || !strings.Contains(files["manifest.json"], "excluded from calculable hit-rate denominators") {
+	if !strings.Contains(files["manifest.json"], "codex-pool-cache-hits-v2") || !strings.Contains(files["manifest.json"], "excluded from calculable hit-rate denominators") || !strings.Contains(files["manifest.json"], "cache_write_tokens") {
 		t.Fatalf("manifest format missing:\n%s", files["manifest.json"])
 	}
 	legacyCode, legacyRaw := grpReq(t, h, http.MethodGet, "/admin/export/cache-hits?since=0&version=v1", "")

@@ -60,6 +60,10 @@ type diagnosticUsageRecord struct {
 	AffinitySource                    string
 	PromptCacheKeyPresent             int64
 	PromptCacheKeySource              string
+	PromptCacheKeyHash                string
+	PromptCacheKeyShard               int64
+	PromptCacheKeyMinuteRPM           int64
+	PromptCacheKeyConcurrencyPeak     int64
 	StablePrefixSource                string
 	StablePrefixReason                string
 	StablePrefixBytes                 int64
@@ -73,6 +77,9 @@ type diagnosticUsageRecord struct {
 	MaxPossibleCacheReadTokens        int64
 	CacheHitAfterPrewarm              int64
 	SingleflightWaitedRequests        int64
+	CoordinationPrefixSource          string
+	SingleflightWaitReason            string
+	SingleflightReleaseReason         string
 	DiagnosticsMissReason             string
 	LatestUserCacheControl            int64
 	LatestUserAutoContextCacheControl int64
@@ -637,15 +644,17 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 		"account_count": len(accounts), "current_account_count": len(accounts),
 		"historical_reference_account_count": len(codebook.byID),
 		"files":                              diagnosticFileOrder(), "row_counts": rowCounts,
-		"source_row_counts":       sourceRowCounts,
-		"truncated_tables":        truncatedTables,
-		"large_table_row_limit":   diagnosticExportRowLimit,
-		"build":                   diagnosticBuildInfo(),
-		"table_time_ranges":       timeRanges,
-		"table_time_ranges_scope": "source_snapshot",
-		"account_redaction":       "all entity identifiers use type-isolated stable HMAC aliases; no reverse map or alias key is included",
-		"account_code_format":     "ACC-Base32(HMAC-SHA256(alias_key,domain||entity_type||raw_id)[:16])",
-		"public_request_ids":      "server-generated REQ- plus 16 hexadecimal request IDs are retained for support correlation; upstream request IDs remain aliased",
+		"source_row_counts":             sourceRowCounts,
+		"truncated_tables":              truncatedTables,
+		"large_table_row_limit":         diagnosticExportRowLimit,
+		"build":                         diagnosticBuildInfo(),
+		"table_time_ranges":             timeRanges,
+		"table_time_ranges_scope":       "source_snapshot",
+		"account_redaction":             "all entity identifiers use type-isolated stable HMAC aliases; no reverse map or alias key is included",
+		"account_code_format":           "ACC-Base32(HMAC-SHA256(alias_key,domain||entity_type||raw_id)[:16])",
+		"public_request_ids":            "server-generated REQ- plus 16 hexadecimal request IDs are retained for support correlation; upstream request IDs remain aliased",
+		"cache_creation_tokens_mapping": "OpenAI usage.input_tokens_details.cache_write_tokens (and prompt_tokens_details.cache_write_tokens for chat-compatible responses) is normalized to cache_creation_tokens; Anthropic cache_creation_input_tokens remains supported",
+		"prompt_cache_key_redaction":    "cache-key diagnostics use a deployment-keyed, account/model-separated truncated HMAC; raw prompt_cache_key values are not exported",
 	}
 	if err := addJSON("manifest.json", manifest); err != nil {
 		return err
@@ -1239,7 +1248,7 @@ func streamDiagnosticCFCSV(ctx context.Context, db storage.ReadQuerier, zw *zip.
 }
 
 func streamDiagnosticUsageCSV(ctx context.Context, db storage.ReadQuerier, zw *zip.Writer, codebook diagnosticCodebook) (int64, error) {
-	header := []string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "usage_provider", "usage_source", "cache_read_present", "cache_creation_present", "compatibility_losses_json", "cache_capability", "estimated", "cache_miss_tokens", "cache_total_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "affinity_source", "route_class", "prompt_cache_key_present", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch", "raw_usage_json", "kiro_credits", "kiro_credits_present", "billing_hold_id", "requested_model", "resolved_model", "model_override_source", "actual_model", "model_mismatch", "model_mismatch_reason"}
+	header := diagnosticUsageCSVHeader()
 	return streamDiagnosticCSV(zw, "usage_records.csv", header, func(cw *csv.Writer) (int64, error) {
 		rows, err := db.QueryContext(ctx, `SELECT * FROM (`+diagnosticUsageRecordSelectSQL()+`
  ORDER BY id DESC LIMIT ?) recent ORDER BY id`, diagnosticExportRowLimit)
@@ -1260,6 +1269,10 @@ func streamDiagnosticUsageCSV(ctx context.Context, db storage.ReadQuerier, zw *z
 		}
 		return written, rows.Err()
 	})
+}
+
+func diagnosticUsageCSVHeader() []string {
+	return []string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "usage_provider", "usage_source", "cache_read_present", "cache_creation_present", "compatibility_losses_json", "cache_capability", "estimated", "cache_miss_tokens", "cache_total_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "affinity_source", "route_class", "prompt_cache_key_present", "prompt_cache_key_source", "prompt_cache_key_hash", "prompt_cache_key_shard", "prompt_cache_key_minute_rpm", "prompt_cache_key_concurrency_peak", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "coordination_prefix_source", "singleflight_wait_reason", "singleflight_release_reason", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch", "raw_usage_json", "kiro_credits", "kiro_credits_present", "billing_hold_id", "requested_model", "resolved_model", "model_override_source", "actual_model", "model_mismatch", "model_mismatch_reason"}
 }
 
 func streamDiagnosticBillingHoldsCSV(ctx context.Context, db storage.ReadQuerier, zw *zip.Writer, codebook diagnosticCodebook) (int64, error) {
@@ -1426,7 +1439,7 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	addCSV("codex_reauth_jobs.csv", []string{"id", "account_code", "status", "reason", "last_error", "created_at", "updated_at", "started_at", "finished_at"}, codexReauthJobRows(reauthJobs, codebook))
 	addCSV("audit_log.csv", []string{"id", "created_at", "account_code", "action", "state", "reason", "detail"}, auditLogRows(auditRows, codebook))
 	addCSV("cf_events.csv", []string{"id", "created_at", "account_code", "egress_id", "status", "cf_ray", "category", "message"}, cfEventRows(cfRows, codebook))
-	addCSV("usage_records.csv", []string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "usage_provider", "usage_source", "cache_read_present", "cache_creation_present", "compatibility_losses_json", "cache_capability", "estimated", "cache_miss_tokens", "cache_total_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "affinity_source", "route_class", "prompt_cache_key_present", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch", "raw_usage_json", "kiro_credits", "kiro_credits_present", "billing_hold_id", "requested_model", "resolved_model", "model_override_source", "actual_model", "model_mismatch", "model_mismatch_reason"}, usageRecordRows(usageRows, codebook))
+	addCSV("usage_records.csv", diagnosticUsageCSVHeader(), usageRecordRows(usageRows, codebook))
 	addCSV("billing_holds.csv", []string{"id", "created_at", "updated_at", "account_code", "route_key_hash", "estimated_tokens", "status", "usage_expected", "usage_recorded_at"}, billingHoldRows(holds, codebook))
 	addCSV("accounts_snapshot.csv", []string{"account_code", "group_name", "declared_provider", "effective_provider", "status", "plan_type", "is_fedramp", "ignore_rate_limit_controls", "routing_weight", "retry_max_attempts", "quarantine_until", "quarantine_reason", "created_at", "updated_at", "primary_egress_id", "standby_egress_ids", "sidecar_egress_id", "cooldown_until", "recheck_pending"}, accountSnapshotRows(accounts, tokensByID, bindings, codebook))
 	addCSV("egress_snapshot.csv", []string{"egress_id", "name", "type", "region", "exit_ip", "stream_capable", "health", "latency_millis", "cf_score", "last_cf_ray", "cooldown_until", "max_concurrency", "created_at", "updated_at", "bound_account_codes"}, egressSnapshotRows(egressProfiles, bindings, codebook))
@@ -1458,6 +1471,8 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 		"account_redaction":                  "all entity identifiers use type-isolated stable HMAC aliases; no reverse map or alias key is included",
 		"account_code_format":                "ACC-Base32(HMAC-SHA256(alias_key,domain||entity_type||raw_id)[:16])",
 		"public_request_ids":                 "server-generated REQ- plus 16 hexadecimal request IDs are retained for support correlation; upstream request IDs remain aliased",
+		"cache_creation_tokens_mapping":      "OpenAI usage.input_tokens_details.cache_write_tokens (and prompt_tokens_details.cache_write_tokens for chat-compatible responses) is normalized to cache_creation_tokens; Anthropic cache_creation_input_tokens remains supported",
+		"prompt_cache_key_redaction":         "cache-key diagnostics use a deployment-keyed, account/model-separated truncated HMAC; raw prompt_cache_key values are not exported",
 	}
 	rawManifest, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -1593,9 +1608,9 @@ func diagnosticUsageRecordSelectSQL() string {
 	return `SELECT id, account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens,
 usage_provider, usage_source, cache_read_present, cache_creation_present, compatibility_losses_json, cache_capability,
 estimated, cache_miss_tokens, cache_total_input_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens,
-affinity_source, prompt_cache_key_present, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, stable_prefix_bytes,
+affinity_source, prompt_cache_key_present, prompt_cache_key_source, prompt_cache_key_hash, prompt_cache_key_shard, prompt_cache_key_minute_rpm, prompt_cache_key_concurrency_peak, stable_prefix_source, stable_prefix_reason, stable_prefix_bytes,
 retention_effective, retention_source, claude_cache_ttl, cache_control_injected, cache_breakpoint_count,
-cache_breakpoints_json, unwritten_tail_tokens, max_possible_cache_read_tokens, cache_hit_after_prewarm, singleflight_waited_requests, diagnostics_miss_reason,
+cache_breakpoints_json, unwritten_tail_tokens, max_possible_cache_read_tokens, cache_hit_after_prewarm, singleflight_waited_requests, coordination_prefix_source, singleflight_wait_reason, singleflight_release_reason, diagnostics_miss_reason,
 latest_user_cache_control, latest_user_auto_context_cache_control, latest_user_tail_cache_control, latest_user_tool_result_cache_control, route_epoch,
 raw_usage_json, created_at, kiro_credits, kiro_credits_present, billing_hold_id, requested_model, resolved_model, model_override_source,
 actual_model, model_mismatch, model_mismatch_reason FROM usage_records`
@@ -1609,9 +1624,9 @@ func scanDiagnosticUsageRecord(rows usageRecordScanner, r *diagnosticUsageRecord
 	return rows.Scan(&r.ID, &r.AccountID, &r.RouteKeyHash, &r.APIKeyHash, &r.UserID, &r.Model, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens,
 		&r.UsageProvider, &r.UsageSource, &r.CacheReadPresent, &r.CacheCreationPresent, &r.CompatibilityLossesJSON, &r.CacheCapability,
 		&r.Estimated, &r.CacheMissTokens, &r.CacheTotalInputTokens, &r.CacheCreation5mTokens, &r.CacheCreation1hTokens,
-		&r.AffinitySource, &r.PromptCacheKeyPresent, &r.PromptCacheKeySource, &r.StablePrefixSource, &r.StablePrefixReason, &r.StablePrefixBytes,
+		&r.AffinitySource, &r.PromptCacheKeyPresent, &r.PromptCacheKeySource, &r.PromptCacheKeyHash, &r.PromptCacheKeyShard, &r.PromptCacheKeyMinuteRPM, &r.PromptCacheKeyConcurrencyPeak, &r.StablePrefixSource, &r.StablePrefixReason, &r.StablePrefixBytes,
 		&r.RetentionEffective, &r.RetentionSource, &r.ClaudeCacheTTL, &r.CacheControlInjected, &r.CacheBreakpointCount,
-		&r.CacheBreakpointsJSON, &r.UnwrittenTailTokens, &r.MaxPossibleCacheReadTokens, &r.CacheHitAfterPrewarm, &r.SingleflightWaitedRequests, &r.DiagnosticsMissReason,
+		&r.CacheBreakpointsJSON, &r.UnwrittenTailTokens, &r.MaxPossibleCacheReadTokens, &r.CacheHitAfterPrewarm, &r.SingleflightWaitedRequests, &r.CoordinationPrefixSource, &r.SingleflightWaitReason, &r.SingleflightReleaseReason, &r.DiagnosticsMissReason,
 		&r.LatestUserCacheControl, &r.LatestUserAutoContextCacheControl, &r.LatestUserTailCacheControl, &r.LatestUserToolResultCacheControl, &r.RouteEpoch,
 		&r.RawUsageJSON, &r.CreatedAt, &r.KiroCredits, &r.KiroCreditsPresent, &r.BillingHoldID, &r.RequestedModel, &r.ResolvedModel, &r.ModelOverrideSource,
 		&r.ActualModel, &r.ModelMismatch, &r.ModelMismatchReason)
@@ -2822,6 +2837,10 @@ func usageRecordRows(rows []diagnosticUsageRecord, codebook diagnosticCodebook) 
 			storage.RouteClassForAffinitySource(row.AffinitySource),
 			itoa64(row.PromptCacheKeyPresent),
 			row.PromptCacheKeySource,
+			row.PromptCacheKeyHash,
+			itoa64(row.PromptCacheKeyShard),
+			itoa64(row.PromptCacheKeyMinuteRPM),
+			itoa64(row.PromptCacheKeyConcurrencyPeak),
 			row.StablePrefixSource,
 			row.StablePrefixReason,
 			itoa64(row.StablePrefixBytes),
@@ -2835,6 +2854,9 @@ func usageRecordRows(rows []diagnosticUsageRecord, codebook diagnosticCodebook) 
 			itoa64(row.MaxPossibleCacheReadTokens),
 			itoa64(row.CacheHitAfterPrewarm),
 			itoa64(row.SingleflightWaitedRequests),
+			row.CoordinationPrefixSource,
+			row.SingleflightWaitReason,
+			row.SingleflightReleaseReason,
 			row.DiagnosticsMissReason,
 			itoa64(row.LatestUserCacheControl),
 			itoa64(row.LatestUserAutoContextCacheControl),

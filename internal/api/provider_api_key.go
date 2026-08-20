@@ -56,7 +56,7 @@ type providerAPIKeyImportResponse struct {
 
 func (s *Server) adminImportProviderAPIKey(w http.ResponseWriter, r *http.Request, req providerAPIKeyImportRequest) {
 	if !req.ConfirmCost {
-		writePoolCodeError(w, http.StatusBadRequest, "cost_confirmation_required", "confirm_cost:true is required because API-key import runs one billable minimal inference after the free authentication check")
+		writePoolCodeError(w, http.StatusBadRequest, "cost_confirmation_required", "confirm_cost:true is required because API-key import runs a billable inference after the free authentication check; GPT-5.6 uses two requests to verify cache capability")
 		return
 	}
 	provider := strings.ToLower(strings.TrimSpace(req.ProviderID))
@@ -201,6 +201,9 @@ func (s *Server) runProviderAPIKeyInferenceProbe(ctx context.Context, account st
 		stage.ErrorCode = "probe_model_unavailable"
 		return stage
 	}
+	if provider == "codex" && (strings.EqualFold(model, "gpt-5.6") || strings.HasPrefix(strings.ToLower(model), "gpt-5.6-")) {
+		return s.runCodexExplicitCacheCapabilityProbe(ctx, account, token, egress, model)
+	}
 	req := upstream.Request{Method: http.MethodPost, Provider: provider, Account: account, Token: token, Egress: egress, CookieJarKey: account.ID + ":" + egress.ID, MinimalProbe: true}
 	if provider == "claude" {
 		req.DownstreamPath = "/v1/messages"
@@ -242,6 +245,98 @@ func (s *Server) runProviderAPIKeyInferenceProbe(ctx context.Context, account st
 	return stage
 }
 
+func (s *Server) runCodexExplicitCacheCapabilityProbe(ctx context.Context, account storage.Account, token storage.AccountToken, egress storage.EgressProfile, model string) providerProbeStage {
+	stage := providerProbeStage{healthProbeStage: healthProbeStage{Checked: true, State: "unreachable"}, Model: model}
+	stablePrefix := strings.Repeat("stable native responses cache capability prefix ", 180)
+	build := func(turn string) []byte {
+		body, _ := json.Marshal(map[string]interface{}{
+			"model": model, "stream": false, "max_output_tokens": 8,
+			"prompt_cache_key":     automaticPromptCacheKey(model, "api-key-capability:"+account.ID),
+			"prompt_cache_options": map[string]interface{}{"mode": "explicit"},
+			"input": []interface{}{
+				map[string]interface{}{"role": "developer", "content": []interface{}{map[string]interface{}{"type": "input_text", "text": stablePrefix, "prompt_cache_breakpoint": map[string]interface{}{"mode": "explicit"}}}},
+				map[string]interface{}{"role": "user", "content": []interface{}{map[string]interface{}{"type": "input_text", "text": turn}}},
+			},
+		})
+		return body
+	}
+	type probeResult struct {
+		parsed usage.Parsed
+		status int
+		raw    []byte
+		err    error
+	}
+	send := func(turn string) probeResult {
+		req := upstream.Request{Method: http.MethodPost, Provider: "codex", DownstreamPath: "/v1/responses", Account: account, Token: token, Egress: egress, CookieJarKey: account.ID + ":" + egress.ID, MinimalProbe: true}
+		req.SetBodyBytes(build(turn))
+		resp, err := s.upstream.Do(ctx, req)
+		if err != nil {
+			return probeResult{err: err}
+		}
+		raw, readErr := upstream.DrainAndClose(resp.Body)
+		result := probeResult{status: resp.StatusCode, raw: raw, err: readErr}
+		if readErr == nil {
+			result.parsed = usage.ParseResponse(raw)
+			if result.parsed.Model == "" {
+				result.parsed.Model = model
+			}
+		}
+		return result
+	}
+	first := send("Reply exactly CACHE_PROBE_ONE")
+	second := probeResult{}
+	if first.err == nil && first.status >= 200 && first.status < 300 {
+		second = send("Reply exactly CACHE_PROBE_TWO")
+	}
+	state := "transport_error"
+	if first.err == nil && first.status >= 200 && first.status < 300 {
+		state = "second_request_failed"
+		if second.err == nil && second.status >= 200 && second.status < 300 {
+			state = "supported"
+		}
+	} else if first.err == nil {
+		state = "rejected"
+	}
+	_ = s.store.SetCodexCacheCapability(ctx, storage.CodexCacheCapability{
+		AccountID: account.ID, Model: model, ExplicitBreakpointState: state,
+		FirstWriteTokens: first.parsed.CacheCreationTokens, SecondReadTokens: second.parsed.CacheReadTokens, ProbedAt: storage.Now(),
+	})
+	profitable := state == "supported" && first.parsed.CacheCreationTokens > 0 && second.parsed.CacheReadTokens > 0 && second.parsed.CacheReadTokens*4 > first.parsed.CacheCreationTokens*5
+	s.rememberCodexExplicitCachePolicy(account.ID, model, state == "supported", profitable)
+	_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+		AccountID: account.ID, AccountLabel: account.Label, Action: "codex_explicit_cache_capability_probe", State: state,
+		Reason: "two_request_native_responses_probe",
+		Detail: fmt.Sprintf("model=%s first_write_tokens=%d second_read_tokens=%d profitable=%t", model, first.parsed.CacheCreationTokens, second.parsed.CacheReadTokens, profitable),
+	})
+	for index, result := range []probeResult{first, second} {
+		if result.parsed.RawUsage == nil {
+			continue
+		}
+		_ = s.store.InsertUsageRecordWithDiagnostics(ctx, account.ID, "", "", "", result.parsed.Model,
+			result.parsed.PromptTokens, result.parsed.CompletionTokens, result.parsed.TotalTokens, result.parsed.CachedTokens, result.parsed.CacheReadTokens, result.parsed.CacheCreationTokens,
+			result.parsed.RawUsage, storage.UsageDiagnostics{UsageProvider: "codex", UsageSource: fmt.Sprintf("provider_api_key_cache_probe_%d", index+1)})
+	}
+	final := first
+	if second.status != 0 || second.err != nil {
+		final = second
+	}
+	stage.HTTPStatus = final.status
+	stage.Usage = final.parsed.RawUsage
+	if final.err != nil {
+		stage.ErrorCode = "transport_error"
+		return stage
+	}
+	if final.status < 200 || final.status >= 300 {
+		stage.State = "inference_failed"
+		stage.ErrorCode = providerProbeErrorCode(final.status, final.raw, nil)
+		return stage
+	}
+	stage.Alive = true
+	stage.State = "alive"
+	s.verifyAccountModel(ctx, account, model, "")
+	return stage
+}
+
 func providerAPIKeyProbeModel(provider string, caps []storage.ModelCapability) string {
 	models := make([]string, 0, len(caps))
 	for _, c := range caps {
@@ -273,6 +368,11 @@ func providerAPIKeyProbeModel(provider string, caps []storage.ModelCapability) s
 			}
 		}
 		return ""
+	}
+	if provider == "codex" {
+		if preferred := find("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6"); preferred != "" {
+			return preferred
+		}
 	}
 	if preferred := find("gpt-5-nano", "gpt-4.1-nano", "gpt-4o-mini", "gpt-5-mini"); preferred != "" {
 		return preferred
@@ -321,7 +421,7 @@ func (s *Server) adminProviderAPIKeyHealthTest(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if !confirmed {
-		writePoolCodeError(w, http.StatusBadRequest, "cost_confirmation_required", "confirm_cost:true is required because this health test runs one billable minimal inference after the free authentication check")
+		writePoolCodeError(w, http.StatusBadRequest, "cost_confirmation_required", "confirm_cost:true is required because this health test runs a billable inference after the free authentication check; GPT-5.6 uses two requests to verify cache capability")
 		return
 	}
 	binding, err := s.store.GetEgressBinding(r.Context(), account.ID)

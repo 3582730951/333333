@@ -3,6 +3,8 @@ package upstream
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/tidwall/sjson"
@@ -555,6 +557,164 @@ func stripCodexUnsupportedPromptCacheControls(raw []byte) []byte {
 		return raw
 	}
 	return updated
+}
+
+func codexExplicitCacheControlsAllowed(spec Request) bool {
+	return AccountUsesAPIKey(spec.Token) && spec.CodexExplicitCacheCapable &&
+		!strings.EqualFold(strings.TrimSpace(spec.CodexExplicitCacheMode), "off")
+}
+
+func codexGPT56Model(model string, raw []byte) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" && len(raw) > 0 {
+		var root map[string]json.RawMessage
+		if json.Unmarshal(raw, &root) == nil {
+			_ = json.Unmarshal(root["model"], &model)
+			model = strings.ToLower(strings.TrimSpace(model))
+		}
+	}
+	return model == "gpt-5.6" || strings.HasPrefix(model, "gpt-5.6-")
+}
+
+// applyCodexGPT56AutomaticCacheBreakpoint marks an already-existing stable
+// developer/system input_text block before the first user item. It never creates,
+// moves, or converts messages, instructions, tools, history, or reasoning fields.
+func applyCodexGPT56AutomaticCacheBreakpoint(raw []byte) []byte {
+	var root map[string]json.RawMessage
+	if json.Unmarshal(raw, &root) != nil {
+		return raw
+	}
+	// A client-authored breakpoint is authoritative; auto mode supplements only
+	// requests that do not already select an explicit prefix. Inspect JSON keys,
+	// rather than searching bytes, so a user message that merely mentions the
+	// feature name does not suppress the automatic marker.
+	if _, exists := root["prompt_cache_options"]; exists || jsonRawContainsKey(root["input"], "prompt_cache_breakpoint") {
+		return raw
+	}
+	var input []json.RawMessage
+	if json.Unmarshal(root["input"], &input) != nil {
+		return raw
+	}
+	itemIndex, blockIndex := -1, -1
+	for i, itemRaw := range input {
+		var item map[string]json.RawMessage
+		if json.Unmarshal(itemRaw, &item) != nil {
+			continue
+		}
+		var role string
+		_ = json.Unmarshal(item["role"], &role)
+		role = strings.ToLower(strings.TrimSpace(role))
+		if role == "user" {
+			break
+		}
+		if role != "developer" && role != "system" {
+			continue
+		}
+		var blocks []json.RawMessage
+		if json.Unmarshal(item["content"], &blocks) != nil {
+			continue
+		}
+		for j, blockRaw := range blocks {
+			var block map[string]json.RawMessage
+			var blockType string
+			if json.Unmarshal(blockRaw, &block) == nil && json.Unmarshal(block["type"], &blockType) == nil && blockType == "input_text" {
+				itemIndex, blockIndex = i, j
+			}
+		}
+	}
+	if itemIndex < 0 {
+		return raw
+	}
+	out, err := sjson.SetBytes(raw, fmt.Sprintf("input.%d.content.%d.prompt_cache_breakpoint.mode", itemIndex, blockIndex), "implicit")
+	if err != nil {
+		return raw
+	}
+	out, err = sjson.SetBytes(out, "prompt_cache_options.mode", "implicit")
+	if err != nil || !codexCacheOnlyMutation(raw, out) {
+		return raw
+	}
+	return out
+}
+
+func jsonRawContainsKey(raw json.RawMessage, want string) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var value interface{}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if dec.Decode(&value) != nil {
+		return false
+	}
+	var visit func(interface{}) bool
+	visit = func(current interface{}) bool {
+		switch typed := current.(type) {
+		case map[string]interface{}:
+			if _, ok := typed[want]; ok {
+				return true
+			}
+			for _, child := range typed {
+				if visit(child) {
+					return true
+				}
+			}
+		case []interface{}:
+			for _, child := range typed {
+				if visit(child) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return visit(value)
+}
+
+// ApplyCodexGPT56AutomaticCacheBreakpoint exposes the lossless cache-metadata
+// mutation to the gateway layer so diagnostics and singleflight fingerprint the
+// exact body that the native API-key transport will send.
+func ApplyCodexGPT56AutomaticCacheBreakpoint(raw []byte) []byte {
+	return applyCodexGPT56AutomaticCacheBreakpoint(raw)
+}
+
+func codexCacheOnlyMutation(before, after []byte) bool {
+	clean := func(raw []byte) (interface{}, bool) {
+		var value interface{}
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		if dec.Decode(&value) != nil {
+			return nil, false
+		}
+		var strip func(interface{}) interface{}
+		strip = func(current interface{}) interface{} {
+			switch typed := current.(type) {
+			case map[string]interface{}:
+				cleaned := make(map[string]interface{}, len(typed))
+				for key, child := range typed {
+					if key == "prompt_cache_options" || key == "prompt_cache_breakpoint" {
+						continue
+					}
+					cleaned[key] = strip(child)
+				}
+				return cleaned
+			case []interface{}:
+				cleaned := make([]interface{}, len(typed))
+				for i, child := range typed {
+					cleaned[i] = strip(child)
+				}
+				return cleaned
+			default:
+				return current
+			}
+		}
+		return strip(value), true
+	}
+	want, ok := clean(before)
+	if !ok {
+		return false
+	}
+	got, ok := clean(after)
+	return ok && reflect.DeepEqual(want, got)
 }
 
 // stripCodexResponsesMaxOutputTokens removes the public Responses API output limit

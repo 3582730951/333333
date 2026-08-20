@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"testing"
+
+	"codex-account-pool/internal/storage"
 )
 
 const whamBaseURL = "https://chatgpt.com/backend-api/codex"
@@ -227,6 +229,61 @@ func TestStripCodexUnsupportedPromptCacheControlsIsNarrowAndExact(t *testing.T) 
 	}
 	if second := stripCodexUnsupportedPromptCacheControls(got); !bytes.Equal(second, got) {
 		t.Fatalf("sanitizer is not idempotent: first=%s second=%s", got, second)
+	}
+}
+
+func TestCodexExplicitCacheControlsRequireAPIKeyProbeAndMode(t *testing.T) {
+	base := Request{Token: storage.AccountToken{OpenAIAPIKey: "sk-test"}, CodexExplicitCacheMode: "observe"}
+	if codexExplicitCacheControlsAllowed(base) {
+		t.Fatal("unprobed API-key transport accepted explicit cache controls")
+	}
+	base.CodexExplicitCacheCapable = true
+	if !codexExplicitCacheControlsAllowed(base) {
+		t.Fatal("probed API-key transport did not accept explicit cache controls")
+	}
+	base.CodexExplicitCacheMode = "off"
+	if codexExplicitCacheControlsAllowed(base) {
+		t.Fatal("off mode accepted explicit cache controls")
+	}
+	base.Token = storage.AccountToken{AccessToken: "oauth"}
+	base.CodexExplicitCacheMode = "auto"
+	if codexExplicitCacheControlsAllowed(base) {
+		t.Fatal("ChatGPT OAuth transport accepted public cache controls")
+	}
+}
+
+func TestApplyCodexGPT56AutomaticCacheBreakpointIsLosslessMetadataOnly(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.6-sol","instructions":"keep top-level","previous_response_id":"resp_keep","reasoning":{"effort":"xhigh","context":"all_turns"},"tools":[{"name":"first","schema":{"const":900719925474099312345}},{"name":"second"}],"max_output_tokens":4096,"verbosity":"high","temperature":0.2,"input":[{"role":"developer","content":[{"type":"input_text","text":"stable developer prefix","future":true}]},{"role":"user","content":[{"type":"input_text","text":"keep user"}]},{"role":"assistant","content":[{"type":"output_text","text":"assistant output item"}]},{"type":"function_call","call_id":"call_keep","name":"tool","arguments":"{}"},{"type":"function_call_output","call_id":"call_keep","output":"tool result"},{"type":"reasoning","encrypted_content":"ciphertext"}]}`)
+	got := applyCodexGPT56AutomaticCacheBreakpoint(raw)
+	if bytes.Equal(got, raw) || !bytes.Contains(got, []byte(`"prompt_cache_options":{"mode":"implicit"}`)) || !bytes.Contains(got, []byte(`"prompt_cache_breakpoint":{"mode":"implicit"}`)) {
+		t.Fatalf("automatic breakpoint missing: %s", got)
+	}
+	if !codexCacheOnlyMutation(raw, got) {
+		t.Fatalf("automatic breakpoint changed non-cache fields: %s", got)
+	}
+	for _, preserved := range []string{`"previous_response_id":"resp_keep"`, `"effort":"xhigh"`, `"context":"all_turns"`, `900719925474099312345`, `"call_id":"call_keep"`, `"encrypted_content":"ciphertext"`, `"assistant output item"`, `"max_output_tokens":4096`, `"verbosity":"high"`} {
+		if !bytes.Contains(got, []byte(preserved)) {
+			t.Fatalf("lost %s: %s", preserved, got)
+		}
+	}
+}
+
+func TestApplyCodexGPT56AutomaticCacheBreakpointRequiresExistingStableBlock(t *testing.T) {
+	for _, raw := range [][]byte{
+		[]byte(`{"model":"gpt-5.6-sol","input":[{"role":"user","content":[{"type":"input_text","text":"only user"}]}]}`),
+		[]byte(`{"model":"gpt-5.6-sol","instructions":"top only","input":"plain"}`),
+	} {
+		if got := applyCodexGPT56AutomaticCacheBreakpoint(raw); !bytes.Equal(got, raw) {
+			t.Fatalf("ineligible request changed: before=%s after=%s", raw, got)
+		}
+	}
+}
+
+func TestApplyCodexGPT56AutomaticCacheBreakpointIgnoresMentionInText(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.6-sol","input":[{"role":"developer","content":[{"type":"input_text","text":"do not literally mention prompt_cache_breakpoint in metadata"}]},{"role":"user","content":[{"type":"input_text","text":"question"}]}]}`)
+	got := applyCodexGPT56AutomaticCacheBreakpoint(raw)
+	if bytes.Equal(got, raw) || !bytes.Contains(got, []byte(`"prompt_cache_options":{"mode":"implicit"}`)) {
+		t.Fatalf("text mention suppressed automatic marker: %s", got)
 	}
 }
 

@@ -38,7 +38,7 @@ func ParseResponse(raw []byte) Parsed {
 	}
 	rawUsage, _ := json.Marshal(usageMap)
 	cached := cachedTokens(usageMap)
-	cacheCreation := intField(usageMap, "cache_creation_input_tokens")
+	cacheCreation := cacheCreationTokens(usageMap)
 	parsed := Parsed{
 		Model:                 model,
 		PromptTokens:          promptTokens(usageMap),
@@ -132,6 +132,24 @@ func cachedTokens(m map[string]interface{}) int64 {
 	for _, key := range []string{"input_tokens_details", "prompt_tokens_details"} {
 		if detail, ok := m[key].(map[string]interface{}); ok {
 			if v := intField(detail, "cached_tokens"); v > 0 {
+				return v
+			}
+		}
+	}
+	return 0
+}
+
+// cacheCreationTokens normalizes provider cache-write counters without changing
+// the provider's raw usage payload. Anthropic exposes a top-level counter while
+// OpenAI Responses and Chat Completions expose cache_write_tokens in the same
+// details object that carries cached_tokens.
+func cacheCreationTokens(m map[string]interface{}) int64 {
+	if v := intField(m, "cache_creation_input_tokens"); v > 0 {
+		return v
+	}
+	for _, key := range []string{"input_tokens_details", "prompt_tokens_details"} {
+		if detail, ok := m[key].(map[string]interface{}); ok {
+			if v := intField(detail, "cache_write_tokens"); v > 0 {
 				return v
 			}
 		}
@@ -268,7 +286,7 @@ func (s *StreamScanner) observeOpenAIChat(ev map[string]interface{}) {
 	s.totalTokens = intField(um, "total_tokens")
 	s.cachedTokens = cachedTokens(um)
 	s.cacheReadTokens = s.cachedTokens
-	s.cacheCreationTokens = intField(um, "cache_creation_input_tokens")
+	s.cacheCreationTokens = cacheCreationTokens(um)
 	s.cacheCreation5mTokens = nestedIntField(um, "cache_creation", "ephemeral_5m_input_tokens")
 	s.cacheCreation1hTokens = nestedIntField(um, "cache_creation", "ephemeral_1h_input_tokens")
 	s.fillCacheInputBreakdown(um)
@@ -293,7 +311,7 @@ func (s *StreamScanner) observeCodex(ev map[string]interface{}) {
 	s.totalTokens = intField(um, "total_tokens")
 	s.cachedTokens = cachedTokens(um)
 	s.cacheReadTokens = s.cachedTokens
-	s.cacheCreationTokens = intField(um, "cache_creation_input_tokens")
+	s.cacheCreationTokens = cacheCreationTokens(um)
 	s.cacheCreation5mTokens = nestedIntField(um, "cache_creation", "ephemeral_5m_input_tokens")
 	s.cacheCreation1hTokens = nestedIntField(um, "cache_creation", "ephemeral_1h_input_tokens")
 	s.fillCacheInputBreakdown(um)

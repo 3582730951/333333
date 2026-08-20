@@ -1006,6 +1006,44 @@ func TestKiroUnreportedUsageIsNotCacheMiss(t *testing.T) {
 	}
 }
 
+func TestCodexCacheCapabilityPersistsProbeEvidence(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	account := Account{ID: "codex-capability", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, AccountToken{OpenAIAPIKey: "sk-test"}); err != nil {
+		t.Fatal(err)
+	}
+	want := CodexCacheCapability{AccountID: account.ID, Model: "gpt-5.6-sol", ExplicitBreakpointState: "supported", FirstWriteTokens: 1000, SecondReadTokens: 2000, ProbedAt: 1234}
+	if err := store.SetCodexCacheCapability(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetCodexCacheCapability(ctx, account.ID, "GPT-5.6-SOL")
+	if err != nil || got.ExplicitBreakpointState != "supported" || got.FirstWriteTokens != 1000 || got.SecondReadTokens != 2000 || got.ProbedAt != 1234 {
+		t.Fatalf("capability=%+v err=%v", got, err)
+	}
+}
+
+func TestOpenAICacheWritePresenceAndRoutingDiagnosticsPersist(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	diag := UsageDiagnostics{
+		UsageProvider: "codex", UsageSource: "upstream", PromptCacheKeyPresent: true,
+		PromptCacheKeyHash: "0123456789abcdef", PromptCacheKeyShard: 3, PromptCacheKeyMinuteRPM: 14, PromptCacheKeyConcurrencyPeak: 5,
+		CoordinationPrefixSource: "explicit_breakpoint", SingleflightWaitReason: "matching_cold_prefix", SingleflightReleaseReason: "response_headers",
+	}
+	raw := json.RawMessage(`{"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}`)
+	if err := store.InsertUsageRecordWithDiagnostics(ctx, "acc", "route", "", "", "gpt-5.6-sol", 100, 1, 101, 0, 0, 0, raw, diag); err != nil {
+		t.Fatal(err)
+	}
+	var creationPresent, shard, rpm, peak int64
+	var hash, prefix, waitReason, releaseReason string
+	err := store.DB().QueryRowContext(ctx, `SELECT cache_creation_present, prompt_cache_key_hash, prompt_cache_key_shard, prompt_cache_key_minute_rpm, prompt_cache_key_concurrency_peak, coordination_prefix_source, singleflight_wait_reason, singleflight_release_reason FROM usage_records WHERE route_key_hash='route'`).Scan(
+		&creationPresent, &hash, &shard, &rpm, &peak, &prefix, &waitReason, &releaseReason)
+	if err != nil || creationPresent != 1 || hash != diag.PromptCacheKeyHash || shard != 3 || rpm != 14 || peak != 5 || prefix != diag.CoordinationPrefixSource || waitReason != diag.SingleflightWaitReason || releaseReason != diag.SingleflightReleaseReason {
+		t.Fatalf("persisted diagnostics present=%d hash=%q shard=%d rpm=%d peak=%d prefix=%q wait=%q release=%q err=%v", creationPresent, hash, shard, rpm, peak, prefix, waitReason, releaseReason, err)
+	}
+}
+
 func TestKiroHistoricalZeroUsageBackfillAndModelAggregation(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

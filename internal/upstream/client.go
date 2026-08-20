@@ -308,6 +308,12 @@ type Request struct {
 	// consume the same snapshot below. Nil keeps the legacy standalone-client
 	// fallback used by focused upstream tests and non-gateway callers.
 	CodexIdentity *CodexIdentitySnapshot
+	// CodexExplicitCacheMode and CodexExplicitCacheCapable are set by the gateway
+	// after a persisted two-request capability probe for native API-key Responses.
+	// OAuth/ChatGPT Codex transports ignore these fields and strip public controls.
+	CodexExplicitCacheMode        string
+	CodexExplicitCacheCapable     bool
+	CodexAutomaticCacheProfitable bool
 	// codexMetadata is an immutable, request-scoped snapshot generated at the Do
 	// choke point. HTTP headers, HTTP client_metadata and the WS handshake/body all
 	// consume the same snapshot so account-virtualized identifiers cannot drift.
@@ -795,7 +801,16 @@ func (c *Client) Do(ctx context.Context, req Request) (resp *Response, err error
 		}
 		return c.doOpenAICompatible(ctx, req)
 	}
+	// A materialized Responses body may carry the optional client_version hint.
+	// Load it before freezing the request profile; replayable BodyMeta requests keep
+	// the zero-copy path and expose the same scalar through the scanner instead.
+	if strings.Contains(req.DownstreamPath, "/responses") && !req.MinimalProbe && req.BodyMeta == nil {
+		if err := req.loadBody(); err != nil {
+			return nil, err
+		}
+	}
 	req.codexResolvedClientVersion = c.resolveCodexClientVersion(req)
+	req.DownstreamPath = stripCodexResponsesClientVersionQuery(req.DownstreamPath)
 	// Codex /responses: normalize the two fields the WHAM backend hard-validates so
 	// every transport (WS/sidecar/HTTP) sends the real-client shape. (1) "instructions"
 	// must be a non-empty string — else 400 {"detail":"Instructions are required"}; the
@@ -846,7 +861,13 @@ func (c *Client) Do(ctx context.Context, req Request) (resp *Response, err error
 		// HTTP or Responses-over-WebSocket. Keep prompt_cache_key (the supported
 		// cache-affinity control), but strip this obsolete extension consistently.
 		setRequestBody(&req, stripCodexResponsesPromptCacheRetentionWithFields(req.bodyBytes, codexFields))
-		setRequestBody(&req, stripCodexUnsupportedPromptCacheControls(req.bodyBytes))
+		if codexExplicitCacheControlsAllowed(req) {
+			if req.CodexAutomaticCacheProfitable && strings.EqualFold(strings.TrimSpace(req.CodexExplicitCacheMode), "auto") && codexGPT56Model(req.Model, req.bodyBytes) {
+				setRequestBody(&req, applyCodexGPT56AutomaticCacheBreakpoint(req.bodyBytes))
+			}
+		} else {
+			setRequestBody(&req, stripCodexUnsupportedPromptCacheControls(req.bodyBytes))
+		}
 		if !usesAPIKey {
 			// The ChatGPT Codex/WHAM contract does not accept the public Responses API's
 			// max_output_tokens field. Claude Code always sends Anthropic max_tokens;
@@ -1912,7 +1933,8 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) error {
 	// interactive CLI when the downstream sent nothing recognizable.
 	threadOriginator := codexThreadOriginator(spec.Headers)
 	processOriginator := codexProcessOriginator(spec.Headers, threadOriginator)
-	version := c.codexClientVersionForRequest(spec)
+	profile := c.codexProtocolProfileForRequest(spec)
+	version := profile.version
 	if dst.Get("User-Agent") == "" {
 		dst.Set("User-Agent", id.CodexUserAgentForOriginator(processOriginator, version))
 	}
@@ -1924,7 +1946,9 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) error {
 		setHeaderPreserveCase(dst, "version", version)
 	}
 	if spec.DownstreamPath == "" || strings.Contains(spec.DownstreamPath, "/responses") {
-		setHeaderPreserveCase(dst, "x-codex-beta-features", mergeCodexBetaFeatures(getHeaderFold(spec.Headers, "x-codex-beta-features")))
+		setHeaderPreserveCase(dst, "x-codex-beta-features", mergeCodexBetaFeatures(
+			getHeaderFold(spec.Headers, "x-codex-beta-features"), profile.requiredBetaFeatures,
+		))
 	}
 	// Session identity and compatibility projections come from one canonical
 	// request snapshot, matching CodexResponsesMetadata in codex-rs. /models is not
@@ -2032,23 +2056,11 @@ func codexUserAgentVersion(value string) string {
 	return strings.TrimSpace(version)
 }
 
-// codexSupportedClientVersion resolves the downstream's application version only
-// inside the five-release compatibility window. If both official version-bearing
-// fields are present they must agree; a mismatched pair is discarded rather than
-// synthesizing another impossible fingerprint.
+// codexSupportedClientVersion is the header-only compatibility wrapper retained
+// for focused callers. Live requests use analyzeCodexDownstreamVersion so query
+// and already-scanned body evidence participate in the same consensus decision.
 func codexSupportedClientVersion(h http.Header) string {
-	headerVersion := strings.TrimSpace(getHeaderFold(h, "version"))
-	if !config.IsSupportedCodexCLIVersion(headerVersion) {
-		headerVersion = ""
-	}
-	userAgentVersion := codexUserAgentVersion(getHeaderFold(h, "User-Agent"))
-	if !config.IsSupportedCodexCLIVersion(userAgentVersion) {
-		userAgentVersion = ""
-	}
-	if headerVersion != "" && userAgentVersion != "" && headerVersion != userAgentVersion {
-		return ""
-	}
-	return firstNonEmpty(headerVersion, userAgentVersion)
+	return analyzeCodexDownstreamVersion(Request{Headers: h}).version
 }
 
 func isRecognizedCodexOriginator(value string) bool {
@@ -2080,7 +2092,7 @@ func validCodexSemanticHeader(name, value string, websocket bool) bool {
 	}
 }
 
-func mergeCodexBetaFeatures(downstream string) string {
+func mergeCodexBetaFeatures(downstream string, requiredOverride ...string) string {
 	allowed := map[string]bool{
 		"memories":             true,
 		"network_proxy":        true,
@@ -2097,7 +2109,11 @@ func mergeCodexBetaFeatures(downstream string) string {
 		seen[feature] = true
 		features = append(features, feature)
 	}
-	for _, required := range strings.Split(codexBetaFeaturesHeader, ",") {
+	requiredFeatures := codexBetaFeaturesHeader
+	if len(requiredOverride) > 0 {
+		requiredFeatures = strings.TrimSpace(requiredOverride[0])
+	}
+	for _, required := range strings.Split(requiredFeatures, ",") {
 		required = strings.TrimSpace(required)
 		if required != "" && !seen[required] {
 			seen[required] = true

@@ -575,16 +575,27 @@ func ensureResponsesPromptCacheKey(raw []byte, key string) []byte {
 // shards and lose nearly every hit. prompt_cache_key is a routing hint, not context;
 // the input/instructions/tools/history bytes remain untouched, and explicit custom
 // keys from other clients are preserved verbatim.
-func normalizeOfficialCodexPromptCacheKey(r *http.Request, raw []byte, model string) ([]byte, bool) {
+func normalizeOfficialCodexPromptCacheKey(r *http.Request, raw []byte, model string, shardCounts ...int) ([]byte, bool) {
 	existing := routing.PromptCacheKey(raw)
 	if !looksLikeUUID(existing) || !isOfficialCodexCLIRequest(r) {
 		return raw, false
+	}
+	shards := 4
+	if len(shardCounts) > 0 {
+		shards = shardCounts[0]
+	}
+	if shards < 1 || shards > 16 {
+		shards = 4
 	}
 	prefixHash := officialCodexBasePromptCacheHash(raw)
 	if prefixHash == "" {
 		prefixHash = automaticPromptCachePrefixHash(raw)
 	}
 	stable := automaticPromptCacheKey(model, prefixHash)
+	if stable != "" && shards > 1 {
+		seed := officialCodexPromptCacheShardSeedWithRequest(r, raw, existing)
+		stable = fmt.Sprintf("%s_s%02d", stable, codexPromptCacheShard(seed, shards))
+	}
 	if stable == "" || stable == existing {
 		return raw, false
 	}
@@ -595,6 +606,92 @@ func normalizeOfficialCodexPromptCacheKey(r *http.Request, raw []byte, model str
 	return out, true
 }
 
+// officialCodexPromptCacheShardSeed keeps one conversation on one shard while
+// distributing sibling agents that share the large immutable base prefix. A body
+// thread_id is the strongest child-session identity; otherwise the first user turn
+// anchors the session, with the CLI UUID as the final deterministic fallback.
+func officialCodexPromptCacheShardSeed(raw []byte, originalUUID string) string {
+	return officialCodexPromptCacheShardSeedWithRequest(nil, raw, originalUUID)
+}
+
+func officialCodexPromptCacheShardSeedWithRequest(r *http.Request, raw []byte, originalUUID string) string {
+	if r != nil {
+		// The official CLI carries child-thread identity in headers on some
+		// Responses paths, while other paths put the same value in the body.
+		// Prefer the direct child id before considering a root/parent hint.
+		for _, header := range []string{"thread-id", "x-codex-thread-id"} {
+			if value := strings.TrimSpace(r.Header.Get(header)); value != "" {
+				return "thread:" + value
+			}
+		}
+		if metadata := strings.TrimSpace(r.Header.Get("x-codex-turn-metadata")); metadata != "" {
+			if value := routing.JSONStringField([]byte(metadata), "thread_id"); value != "" {
+				return "thread:" + value
+			}
+		}
+	}
+	var root map[string]json.RawMessage
+	if json.Unmarshal(raw, &root) == nil {
+		var threadID string
+		if json.Unmarshal(root["thread_id"], &threadID) == nil && strings.TrimSpace(threadID) != "" {
+			return "thread:" + threadID
+		}
+	}
+	if anchor := officialCodexFirstUserAnchor(raw); anchor != "" {
+		return "anchor:" + anchor
+	}
+	return "uuid:" + strings.TrimSpace(originalUUID)
+}
+
+// officialCodexFirstUserAnchor hashes only the first user turn. The generic
+// routing anchor intentionally falls back to the first item when a role is
+// absent; sharding must not accidentally bind a developer-only preamble to a
+// session shard that was meant for a user conversation.
+func officialCodexFirstUserAnchor(raw []byte) string {
+	root, err := decodeJSONMapUseNumber(raw)
+	if err != nil {
+		return ""
+	}
+	sequence := root["input"]
+	if sequence == nil {
+		sequence = root["messages"]
+	}
+	if text, ok := sequence.(string); ok && strings.TrimSpace(text) != "" {
+		sum := sha256.Sum256([]byte(text))
+		return hex.EncodeToString(sum[:])[:16]
+	}
+	items, ok := sequence.([]interface{})
+	if !ok {
+		return ""
+	}
+	for _, item := range items {
+		object, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		role, _ := object["role"].(string)
+		if !strings.EqualFold(strings.TrimSpace(role), "user") {
+			continue
+		}
+		encoded, err := json.Marshal(stripCodexVolatileCacheMetadata(item))
+		if err != nil {
+			return ""
+		}
+		sum := sha256.Sum256(encoded)
+		return hex.EncodeToString(sum[:])[:16]
+	}
+	return ""
+}
+
+func codexPromptCacheShard(seed string, shards int) int {
+	if shards <= 1 {
+		return 0
+	}
+	sum := sha256.Sum256([]byte(seed))
+	value := uint32(sum[0])<<24 | uint32(sum[1])<<16 | uint32(sum[2])<<8 | uint32(sum[3])
+	return int(value % uint32(shards))
+}
+
 // officialCodexBasePromptCacheHash fingerprints the large immutable prefix shared by
 // independent Codex roots and sibling sub-agents: tool schemas, developer messages,
 // instructions, and reasoning configuration before the first user item. Per-turn
@@ -602,8 +699,8 @@ func normalizeOfficialCodexPromptCacheKey(r *http.Request, raw []byte, model str
 // on every process/thread. This function never edits the request; the upstream still
 // validates the exact prompt bytes before serving a cached prefix.
 func officialCodexBasePromptCacheHash(raw []byte) string {
-	var root map[string]interface{}
-	if json.Unmarshal(raw, &root) != nil {
+	root, err := decodeJSONMapUseNumber(raw)
+	if err != nil {
 		return ""
 	}
 	stable := map[string]interface{}{}
@@ -771,6 +868,7 @@ func codexRequestUsageDiagnostics(body []byte, meta *bodysource.BodyMeta, affini
 		fp := routing.StablePromptPrefixFingerprint(body)
 		stableSource, stableReason, stableBytes = fp.Source, fp.Reason, fp.PrefixBytes
 	}
+	breakpointCount, breakpointsJSON := codexCacheBreakpointDiagnostics(body)
 	return storage.UsageDiagnostics{
 		UsageProvider:         "codex",
 		AffinitySource:        affinity.Source,
@@ -781,7 +879,53 @@ func codexRequestUsageDiagnostics(body []byte, meta *bodysource.BodyMeta, affini
 		StablePrefixBytes:     stableBytes,
 		RetentionEffective:    retentionEffective,
 		RetentionSource:       retentionSource,
+		CacheBreakpointCount:  breakpointCount,
+		CacheBreakpointsJSON:  breakpointsJSON,
 	}
+}
+
+func codexCacheBreakpointDiagnostics(body []byte) (int, string) {
+	var root map[string]json.RawMessage
+	if json.Unmarshal(body, &root) != nil {
+		return 0, ""
+	}
+	var input []json.RawMessage
+	if json.Unmarshal(root["input"], &input) != nil {
+		return 0, ""
+	}
+	type breakpoint struct {
+		Item  int    `json:"item"`
+		Block int    `json:"block"`
+		Mode  string `json:"mode"`
+	}
+	breakpoints := make([]breakpoint, 0, 2)
+	for itemIndex, itemRaw := range input {
+		var item map[string]json.RawMessage
+		if json.Unmarshal(itemRaw, &item) != nil {
+			continue
+		}
+		var blocks []json.RawMessage
+		if json.Unmarshal(item["content"], &blocks) != nil {
+			continue
+		}
+		for blockIndex, blockRaw := range blocks {
+			var block map[string]json.RawMessage
+			if json.Unmarshal(blockRaw, &block) != nil {
+				continue
+			}
+			var marker struct {
+				Mode string `json:"mode"`
+			}
+			if raw, ok := block["prompt_cache_breakpoint"]; ok && json.Unmarshal(raw, &marker) == nil {
+				breakpoints = append(breakpoints, breakpoint{Item: itemIndex, Block: blockIndex, Mode: marker.Mode})
+			}
+		}
+	}
+	if len(breakpoints) == 0 {
+		return 0, ""
+	}
+	raw, _ := json.Marshal(breakpoints)
+	return len(breakpoints), string(raw)
 }
 
 func codexRetentionDiagnosticsForTransport(diag storage.UsageDiagnostics, responsesWebSocket bool) storage.UsageDiagnostics {

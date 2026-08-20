@@ -22,9 +22,10 @@ const (
 	// discovery and on version-gated live Codex requests. ChatGPT gates the returned
 	// model catalog and some live models by this value, so old preserved config
 	// values are floored to this default during normalization.
-	// Refreshed 2026-08-09 from the official Codex rust-v0.147.0 release and
-	// matching source tree.
-	DefaultClientVersion                  = "0.147.0"
+	// Refreshed 2026-08-20 from the official Codex CLI 0.148.0 release published
+	// 2026-08-18. The application-level protocol traits for every accepted
+	// downstream version live in codexCLIFingerprints below.
+	DefaultClientVersion                  = "0.148.0"
 	DefaultStickyWaitMillis               = 100
 	DefaultStrictStickyMaxCooldownSeconds = 60
 	DefaultCooldownWaitMaxSeconds         = 30
@@ -122,36 +123,59 @@ const (
 	legacyClaudeOAuthAuthorizeScope = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 )
 
-// supportedCodexCLIVersions is the five-release compatibility window verified
-// against the matching official openai/codex tags. Keep latest first: callers use
-// the head as the default while accepting an exact downstream/configured version
-// from this window so User-Agent and the `version` header remain coherent.
-var supportedCodexCLIVersions = [...]string{
-	"0.147.0",
-	"0.146.1",
-	"0.146.0",
-	"0.145.0",
-	"0.144.6",
+// CodexCLIFingerprint is the application-level wire contract emitted by one
+// verified Codex CLI release. Keeping these traits beside the accepted version
+// window prevents a detected downstream version from changing only User-Agent
+// while retaining a different release's body/header shape.
+type CodexCLIFingerprint struct {
+	Version                 string
+	RequiredBetaFeatures    string
+	CodeModeToolNames       bool
+	ParentTurnID            bool
+	PromptCacheKeyBySession bool
+}
+
+// codexCLIFingerprints is the five-release fingerprint library verified against
+// the corresponding official Codex releases. Keep newest first. Codex 0.148.0
+// retains the 0.147.0 Responses metadata contract while adding client-side CLI
+// features that do not alter these upstream fields.
+var codexCLIFingerprints = [...]CodexCLIFingerprint{
+	{Version: "0.148.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
+	{Version: "0.147.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
+	{Version: "0.146.1", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, PromptCacheKeyBySession: true},
+	{Version: "0.146.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, PromptCacheKeyBySession: true},
+	{Version: "0.145.0", RequiredBetaFeatures: "remote_compaction_v2", PromptCacheKeyBySession: true},
 }
 
 // SupportedCodexCLIVersions returns a copy so callers cannot mutate the process-
 // wide compatibility contract.
 func SupportedCodexCLIVersions() []string {
-	versions := make([]string, len(supportedCodexCLIVersions))
-	copy(versions, supportedCodexCLIVersions[:])
+	versions := make([]string, len(codexCLIFingerprints))
+	for i, fingerprint := range codexCLIFingerprints {
+		versions[i] = fingerprint.Version
+	}
 	return versions
 }
 
 // IsSupportedCodexCLIVersion reports whether value is one of the five official
 // stable versions covered by this build.
 func IsSupportedCodexCLIVersion(value string) bool {
-	value = strings.TrimSpace(value)
-	for _, version := range supportedCodexCLIVersions {
-		if value == version {
-			return true
+	_, ok := CodexCLIFingerprintForVersion(value)
+	return ok
+}
+
+// CodexCLIFingerprintForVersion returns an immutable copy of the exact profile
+// carried by this build. Callers deliberately receive no nearest/future match:
+// automatic downstream selection is allowed only when every version-bearing
+// signal names a fingerprint we have actually verified.
+func CodexCLIFingerprintForVersion(value string) (CodexCLIFingerprint, bool) {
+	value = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "v"))
+	for _, fingerprint := range codexCLIFingerprints {
+		if value == fingerprint.Version {
+			return fingerprint, true
 		}
 	}
-	return false
+	return CodexCLIFingerprint{}, false
 }
 
 var (
@@ -534,6 +558,12 @@ type Config struct {
 	// CodexCacheSingleflightEnabled coordinates concurrent cold writes for the same
 	// account, model and prompt_cache_key until the leader returns response headers.
 	CodexCacheSingleflightEnabled bool `json:"codex_cache_singleflight_enabled"`
+	// CodexPromptCacheKeyShards deterministically fans generated Codex CLI UUID
+	// cache keys across stable session shards. One preserves the legacy single key.
+	CodexPromptCacheKeyShards int `json:"codex_prompt_cache_key_shards"`
+	// CodexGPT56ExplicitCacheMode controls GPT-5.6 explicit cache breakpoints on
+	// native OpenAI API-key transports: observe, auto, or off.
+	CodexGPT56ExplicitCacheMode string `json:"codex_gpt56_explicit_cache_mode"`
 	// ClaudeCacheLosslessBlockSplit enables byte-preserving text-block splitting in
 	// max-hit mode when the split can be round-tripped exactly.
 	ClaudeCacheLosslessBlockSplit bool `json:"claude_cache_lossless_block_split"`
@@ -994,6 +1024,8 @@ func Default() Config {
 		ClaudeCacheDiagnosticsEnabled:     false,
 		ClaudeCacheSingleflightEnabled:    true,
 		CodexCacheSingleflightEnabled:     true,
+		CodexPromptCacheKeyShards:         4,
+		CodexGPT56ExplicitCacheMode:       "observe",
 		ClaudeCacheLosslessBlockSplit:     false,
 		ClaudeCacheTTL:                    "1h",
 		ClaudeCCHSigning:                  false,

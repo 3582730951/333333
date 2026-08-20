@@ -124,6 +124,12 @@ Codex/Claude 应用指纹的模型探测（Codex 会覆盖全部五个兼容版�
 正式 jar/sidecar/数据库并清 cooldown；浏览器 UA 与 CLI UA 不可复用时会继续执行 WARP
 换 IP，避免把浏览器 UA 混进 Codex/Claude 请求。
 
+当前内置 Codex CLI `0.145.0`–`0.148.0` 五版本指纹库。请求入口会综合
+`version`、官方 Codex `User-Agent`、`client_version` 查询参数及已扫描的同名 body
+提示；所有信号一致且命中指纹库时，User-Agent、版本头、beta、会话元数据和缓存
+key 规则统一切换到对应版本。未知或冲突版本继续使用部署指纹，避免拼出不存在的
+跨版本请求形状。
+
 **手动操作（无 install.sh）：**
 ```bash
 # 预置 8 个出口（需出网到 Cloudflare 注册 WARP）

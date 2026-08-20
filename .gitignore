@@ -37,7 +37,10 @@ web-spa/dist/
 /cmd/pool-server/pool-server
 /wsl-list.txt
 /other_new_gpt_register
-/docs
+/docs/*
+!/docs/operations/
+/docs/operations/*
+!/docs/operations/codex-cache-hit-rollout.md
 /other
 /example_zip
 

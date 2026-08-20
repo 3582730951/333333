@@ -21,6 +21,12 @@ func normalizeCodexSource(client *Client, spec *Request, upstreamBaseURL string,
 		return false, nil
 	}
 	usesAPIKey := AccountUsesAPIKey(spec.Token)
+	cacheControlsAllowed := codexExplicitCacheControlsAllowed(*spec)
+	if cacheControlsAllowed && spec.CodexAutomaticCacheProfitable && strings.EqualFold(strings.TrimSpace(spec.CodexExplicitCacheMode), "auto") && codexGPT56Model(spec.Model, nil) {
+		// Nested breakpoint insertion is intentionally handled by the targeted
+		// materialized path; top-level composite patches cannot express it.
+		return false, nil
+	}
 	// The nested client-only cache breakpoint cannot be expressed as a top-level
 	// composite patch. Select the targeted RawMessage sanitizer only for bodies the
 	// single-pass metadata scanner positively marked; all ordinary large requests
@@ -191,7 +197,7 @@ func normalizeCodexSource(client *Client, spec *Request, upstreamBaseURL string,
 	if kind, present := meta.Kinds["prompt_cache_retention"]; present && kind != 'n' {
 		patches = append(patches, bodysource.JSONFieldPatch{Name: "prompt_cache_retention", Delete: true})
 	}
-	if _, present := meta.Fields["prompt_cache_options"]; present {
+	if _, present := meta.Fields["prompt_cache_options"]; present && !cacheControlsAllowed {
 		patches = append(patches, bodysource.JSONFieldPatch{Name: "prompt_cache_options", Delete: true})
 	}
 	if !usesAPIKey {
@@ -230,7 +236,7 @@ func normalizeCodexSource(client *Client, spec *Request, upstreamBaseURL string,
 			patches = append(patches, bodysource.JSONFieldPatch{Name: "generate", Delete: true})
 		}
 	}
-	for _, name := range []string{"thread_id", "session_id", "conversation_id", "window_id", "parent_thread_id", "parent_turn_id", "forked_from_thread_id", "turn_metadata", "turn_state"} {
+	for _, name := range []string{"thread_id", "session_id", "conversation_id", "window_id", "parent_thread_id", "parent_turn_id", "forked_from_thread_id", "turn_metadata", "turn_state", "client_version"} {
 		if _, present := meta.Fields[name]; present {
 			patches = append(patches, bodysource.JSONFieldPatch{Name: name, Delete: true})
 		}
