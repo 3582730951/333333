@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"codex-account-pool/internal/accountprovider"
+	"codex-account-pool/internal/cursorproxy"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 )
@@ -124,6 +125,12 @@ func BuildQuotaSummary(account storage.Account, token *storage.AccountToken, sna
 			return out
 		}
 	case "kiro":
+	case "cursor":
+		if !strings.EqualFold(strings.TrimSpace(token.CredentialMode), cursorproxy.CredentialBrowser) {
+			out.SyncReason = "unsupported_cursor_api_key_billing"
+			out.Supported = false
+			return out
+		}
 	default:
 		out.SyncReason = "unsupported_provider"
 		out.Supported = false
@@ -172,6 +179,8 @@ func selectQuotaPrimary(provider string, snapshots []storage.AccountRateLimit) *
 		preferred = []string{"5h_oauth_usage", "unified"}
 	} else if provider == "kiro" {
 		preferred = []string{"kiro_usage", "unified"}
+	} else if provider == "cursor" {
+		preferred = []string{"cursor_monthly", "unified"}
 	}
 	for _, limiter := range preferred {
 		if snap := latestSnapshotWithLimiter(snapshots, limiter); snap != nil {

@@ -10,8 +10,12 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"codex-account-pool/internal/cursorproxy"
 	"codex-account-pool/internal/storage"
 )
 
@@ -75,6 +79,42 @@ func TestKiroQuotaPollTargetsAreReachableAndStateFiltered(t *testing.T) {
 	}
 	if want := []string{"kiro-active", "kiro-case"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Kiro quota targets=%v, want %v", got, want)
+	}
+}
+
+func TestCursorQuotaTargetsBrowserAccountsAndAggregatesLimitingPool(t *testing.T) {
+	now := int64(1_700_000_000)
+	accounts := []storage.Account{
+		{ID: "browser", Provider: "cursor", Status: "active"},
+		{ID: "api-key", Provider: "cursor", Status: "active"},
+		{ID: "disabled", Provider: "cursor", Status: "disabled"},
+	}
+	targets := cursorQuotaPollTargets(accounts, map[string]storage.AccountToken{
+		"browser":  {AccountID: "browser", CredentialMode: cursorproxy.CredentialBrowser, AccessToken: "bridge"},
+		"api-key":  {AccountID: "api-key", AuthMethod: "api_key", OpenAIAPIKey: "key"},
+		"disabled": {AccountID: "disabled", CredentialMode: cursorproxy.CredentialBrowser, AccessToken: "bridge"},
+	}, now)
+	if len(targets) != 1 || targets[0].Account.ID != "browser" {
+		t.Fatalf("Cursor quota targets = %+v", targets)
+	}
+	requestLimit := int64(100)
+	tokenLimit := int64(1000)
+	snapshots := cursorUsageSnapshots("browser", cursorproxy.Usage{
+		StartOfMonth: "2026-08-01T00:00:00Z",
+		Models: map[string]cursorproxy.ModelUsage{
+			"requests": {NumRequests: 75, MaxRequestUsage: &requestLimit},
+			"tokens":   {NumTokens: 900, MaxTokenUsage: &tokenLimit},
+		},
+	}, now)
+	if len(snapshots) != 3 {
+		t.Fatalf("Cursor snapshots = %+v", snapshots)
+	}
+	aggregate := snapshots[0]
+	if aggregate.LimiterType != "cursor_monthly" || aggregate.UsedPercent != 90 || aggregate.LimitTokens != 1000 || aggregate.RemainingTokens != 100 || aggregate.ResetAt != 1788220800 {
+		t.Fatalf("Cursor aggregate = %+v", aggregate)
+	}
+	if snapshots[1].LimiterType != "cursor_model_monthly" || snapshots[2].LimiterType != "cursor_model_monthly" {
+		t.Fatalf("Cursor model diagnostics = %+v", snapshots[1:])
 	}
 }
 
@@ -224,6 +264,73 @@ func TestQuotaPollerUsesBatchTokenLookup(t *testing.T) {
 		if strings.Contains(pollOne, forbidden) {
 			t.Fatalf("pollOneCodexQuota must receive preloaded egress data instead of calling %s", forbidden)
 		}
+	}
+}
+
+func TestManualQuotaRefreshCoalescesConcurrentRequests(t *testing.T) {
+	var calls atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		startedOnce.Do(func() { close(started) })
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"pro","rate_limit":{"limit_reached":false,"primary_window":{"used_percent":12,"limit_window_seconds":18000,"reset_after_seconds":60,"status":"allowed"}}}`))
+	}))
+	defer upstream.Close()
+	oldURL := whamUsageURL
+	whamUsageURL = upstream.URL
+	t.Cleanup(func() { whamUsageURL = oldURL })
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	if err := h.store.UpsertAccount(t.Context(), storage.Account{ID: "quota-flight", Provider: "codex", Status: "active"}, storage.AccountToken{
+		AuthMethod: "oauth", AccessToken: "access-token",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := func(result chan<- error) {
+		response, err := http.Post(h.pool.URL+"/admin/quota/refresh", "application/json", strings.NewReader(`{}`))
+		if err == nil {
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				err = errors.New(response.Status)
+			}
+		}
+		result <- err
+	}
+	results := make(chan error, 2)
+	go request(results)
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first quota refresh did not reach upstream")
+	}
+	go request(results)
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	response, err := http.Post(h.pool.URL+"/admin/quota/refresh", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reused quotaRefreshResult
+	if decodeErr := json.NewDecoder(response.Body).Decode(&reused); decodeErr != nil {
+		_ = response.Body.Close()
+		t.Fatal(decodeErr)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !reused.Reused {
+		t.Fatalf("sequential quota refresh status=%d result=%+v", response.StatusCode, reused)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("upstream quota calls = %d, want one coalesced and recently reused request", got)
 	}
 }
 

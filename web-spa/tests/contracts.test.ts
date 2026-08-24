@@ -369,7 +369,18 @@ describe('API contracts', () => {
   it('normalizes dashboard summaries, registration trends, and portal usage', () => {
     expect(parseApiResponse(accountPoolSummarySchema, {
       total: '4', active: '2', quarantined: 1, cooling: 1, recheck: 0, codex: 3, claude: 1,
-    })).toEqual({ total: 4, active: 2, quarantined: 1, cooling: 1, recheck: 0, codex: 3, claude: 1, other: 0 });
+    })).toEqual({
+      total: 4,
+      active: 2,
+      quarantined: 1,
+      cooling: 1,
+      recheck: 0,
+      codex: 3,
+      claude: 1,
+      kiro: 0,
+      cursor: 0,
+      other: 0,
+    });
     expect(parseApiResponse(dashboardHealthSchema, { ok: true, version: 'future' })).toEqual({ ok: true, version: 'future' });
     expect(parseApiResponse(registrationStatsSchema, {
       totals: { success_rate: '0.75', succeeded: '3', failed: 1 },

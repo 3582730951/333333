@@ -50,6 +50,7 @@ export interface AccountsPageParams {
   pageSize: number;
   search: string;
   authType?: 'all' | 'api_key' | 'account';
+  group?: string;
 }
 
 export interface AccountsBundle {

@@ -10,6 +10,8 @@ export interface AccountPoolSummary {
   recheck: number;
   codex: number;
   claude: number;
+  kiro: number;
+  cursor: number;
   other: number;
 }
 

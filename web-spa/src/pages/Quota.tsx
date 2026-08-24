@@ -7,6 +7,8 @@ import MobileResourceCell from '../components/MobileResourceCell.jsx';
 import { TextClamp } from '../components/DisplayPrimitives.jsx';
 import * as MicroCharts from '../components/MicroCharts.jsx';
 import { useQuotaData } from '../features/observability/queries/events.ts';
+import { refreshQuota } from '../features/observability/api/events.ts';
+import useAsyncAction from '../hooks/useAsyncAction.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
 import { fmtTokens, fmtRelative, fmtInt, middleEllipsis } from '../lib/format.js';
 import { COLORS } from '../lib/chartTheme.js';
@@ -79,6 +81,22 @@ export default function Quota() {
     lastRefresh,
     reload: load,
   } = useQuotaData();
+
+  const { run: refreshUpstreamQuota, running: refreshingUpstream } = useAsyncAction(async () => {
+    try {
+		const result = await refreshQuota();
+		await load();
+		if (result.reused) {
+			Toast.info('最近两分钟已刷新，已直接显示最新额度');
+		} else if (result.failed > 0) {
+        Toast.warning(`额度已更新 ${result.updated} 个，失败 ${result.failed} 个`);
+      } else {
+        Toast.success(`额度已更新 ${result.updated} 个账号`);
+      }
+    } catch (error: any) {
+      Toast.error(error?.userMessage || error?.message || '额度刷新失败');
+    }
+  });
 
   const bar = (p: number | null | undefined) => {
     if (p == null || p < 0) return <span className="pool-muted">{t('common.unknown')}</span>;
@@ -215,7 +233,7 @@ export default function Quota() {
       <PageHeader title={t('quota.title')} subtitle={t('quota.subtitle')}
         actions={<>
           <Button icon={<IconDownload />} onClick={exportCSV}>{t('common.export')}</Button>
-          <Button icon={<IconRefresh />} onClick={load}>{t('common.refresh')}</Button>
+          <Button icon={<IconRefresh />} loading={refreshingUpstream} onClick={refreshUpstreamQuota}>刷新上游额度</Button>
         </>} />
 
       {overview.measured ? (

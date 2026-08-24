@@ -17,7 +17,7 @@ list_candidates() {
   # Source archives intentionally have no .git directory. Keep `npm run build`
   # usable there by deriving the same bounded release candidates from disk.
   local root
-  for root in cmd internal services sidecar scripts deploy web-spa/src web-spa/scripts workers/node-registrar/src super-instruct; do
+  for root in cmd internal services sidecar modules scripts deploy web-spa/src web-spa/scripts workers/node-registrar/src super-instruct; do
     [[ -d "$root" ]] || continue
     find "$root" \( -type f -o -type l \) -print
   done
@@ -27,7 +27,7 @@ list_candidates | awk '
   /(^|\/)passwd\.txt$/ { next }
   /^super-instruct\/LICENSE$/ { print; next }
   /^internal\/console\/dist\// { print; next }
-  /^(cmd|internal|services|sidecar|scripts|deploy|web-spa\/src|web-spa\/scripts|workers\/node-registrar\/src|super-instruct)\// &&
+  /^(cmd|internal|services|sidecar|modules|scripts|deploy|web-spa\/src|web-spa\/scripts|workers\/node-registrar\/src|super-instruct)\// &&
   /\.(go|py|sh|js|jsx|ts|tsx|css|json|jsonc|mjs|sql|md|txt)$/ { print }
 ' | LC_ALL=C sort -u | while IFS= read -r candidate; do
   # `git ls-files --cached` still reports paths deleted in an uncommitted

@@ -145,7 +145,7 @@ export function Sparkline({
         {fill ? (
           <defs>
             <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={color} stopOpacity="0.28" />
+              <stop offset="0%" stopColor={color} stopOpacity="0.14" />
               <stop offset="100%" stopColor={color} stopOpacity="0.02" />
             </linearGradient>
           </defs>
@@ -155,7 +155,7 @@ export function Sparkline({
           d={line}
           fill="none"
           stroke={color}
-          strokeWidth="2"
+          strokeWidth="1.5"
           strokeLinecap="round"
           strokeLinejoin="round"
           vectorEffect="non-scaling-stroke"
@@ -331,7 +331,7 @@ export function HeatStrip({
               style={{
                 // Floor the alpha so empty buckets still read as a track, not a gap.
                 background: ratio === 0 ? 'var(--pool-gray-soft)' : color,
-                opacity: ratio === 0 ? 1 : 0.24 + ratio * 0.76,
+                opacity: ratio === 0 ? 1 : 0.12 + ratio * 0.62,
               }}
             />
           );

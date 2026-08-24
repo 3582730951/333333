@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"testing"
 
+	"codex-account-pool/internal/cursorproxy"
 	"codex-account-pool/internal/storage"
 )
 
@@ -73,6 +74,8 @@ func TestBuildQuotaSummarySelectsProviderPrimarySecondaryAndReasons(t *testing.T
 		{name: "expired token", account: codex, token: &storage.AccountToken{AccountID: "acc", AccessToken: "access", ExpiresAt: now - 1}, snaps: nil, want: "token_expired"},
 		{name: "unsupported provider", account: storage.Account{ID: "deep", Provider: "deepseek", Status: "active"}, token: &token, snaps: nil, want: "unsupported_provider"},
 		{name: "claude non oauth", account: claude, token: &storage.AccountToken{AccountID: "claude", AccessToken: "sk-ant-api"}, snaps: nil, want: "unsupported_claude_non_oauth"},
+		{name: "cursor user api key", account: storage.Account{ID: "cursor", Provider: "cursor", Status: "active"}, token: &storage.AccountToken{AccountID: "cursor", AuthMethod: "api_key", OpenAIAPIKey: "key"}, snaps: nil, want: "unsupported_cursor_api_key_billing"},
+		{name: "cursor browser never polled", account: storage.Account{ID: "cursor-browser", Provider: "cursor", Status: "active"}, token: &storage.AccountToken{AccountID: "cursor-browser", CredentialMode: cursorproxy.CredentialBrowser, AccessToken: "bridge"}, snaps: nil, want: "never_polled"},
 		{name: "never polled", account: codex, token: &token, snaps: nil, want: "never_polled"},
 		{name: "stale", account: codex, token: &token, snaps: []storage.AccountRateLimit{{AccountID: "acc", Provider: "codex", LimiterType: "5h_polled", Source: "5h_polled", UsedPercent: 10, UpdatedAt: now - 901}}, want: "stale"},
 		{name: "partial", account: codex, token: &token, snaps: []storage.AccountRateLimit{{AccountID: "acc", Provider: "codex", LimiterType: "5h_polled", Source: "5h_polled", UsedPercent: -1, UpdatedAt: now - 10}}, want: "partial"},

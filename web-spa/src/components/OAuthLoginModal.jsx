@@ -67,6 +67,10 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [kiroApiKey, setKiroApiKey] = useState('');
   const [kiroApiRegion, setKiroApiRegion] = useState('us-east-1');
   const [kiroResult, setKiroResult] = useState(null);
+  const [cursorImportMode, setCursorImportMode] = useState('api_key');
+  const [cursorApiKey, setCursorApiKey] = useState('');
+  const [cursorAccountName, setCursorAccountName] = useState('');
+  const [cursorModule, setCursorModule] = useState(null);
   const [authMode, setAuthMode] = useState('oauth');
   const [providerApiKey, setProviderApiKey] = useState('');
   const [confirmProviderCost, setConfirmProviderCost] = useState(false);
@@ -108,6 +112,17 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       });
     return () => { cancelled = true; };
   }, [isVisible]);
+
+  useEffect(() => {
+    if (!isVisible || tab !== 'cursor' || cursorModule) return undefined;
+    let cancelled = false;
+    get('/admin/cursor').then((result) => {
+      if (!cancelled) setCursorModule(result);
+    }).catch((error) => {
+      if (!cancelled) showErrorToast(error, { prefix: 'Cursor 模块状态读取失败' });
+    });
+    return () => { cancelled = true; };
+  }, [cursorModule, isVisible, tab]);
 
   // Cleanup on close
   useEffect(() => {
@@ -154,6 +169,9 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     setKiroApiKey('');
     setKiroApiRegion('us-east-1');
     setKiroResult(null);
+    setCursorImportMode('api_key');
+    setCursorApiKey('');
+    setCursorAccountName('');
     setAuthMode('oauth');
     setProviderApiKey('');
     setConfirmProviderCost(false);
@@ -329,6 +347,31 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     } catch (e) { showErrorToast(e, { prefix: 'Kiro API Key 导入失败' }); }
   });
 
+  const { run: handleCursorImport, running: cursorLoading } = useAsyncAction(async () => {
+    if (cursorImportMode === 'api_key' && !cursorApiKey.trim()) {
+      Toast.warning('请输入 Cursor API Key');
+      return;
+    }
+    if (cursorImportMode === 'browser_account' && !cursorAccountName.trim()) {
+      Toast.warning('请输入已完成浏览器登录的账号名称');
+      return;
+    }
+    try {
+      const result = await post('/admin/accounts/import-cursor', {
+        auth_method: cursorImportMode,
+        api_key: cursorApiKey.trim(),
+        account_name: cursorAccountName.trim(),
+        label,
+        group_name: groupName || 'cursor',
+      });
+      Toast.success(`Cursor 账号 ${result.label || result.id} 已加入账号池`);
+      handleClose();
+      if (onSuccess) onSuccess(result);
+    } catch (error) {
+      showErrorToast(error, { prefix: 'Cursor 导入失败' });
+    }
+  });
+
   const { run: handleProviderApiKeyImport, running: providerApiKeyLoading } = useAsyncAction(async () => {
     if (!providerApiKey.trim()) { Toast.warning('请输入上游 API Key'); return; }
     if (!confirmProviderCost) { Toast.warning('请确认将执行一次可能计费的最小推理探针'); return; }
@@ -373,6 +416,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       vendor: 'google',
     },
     kiro: { name: 'Kiro', desc: '导入 API Key 或 Kiro IDE / KAM 凭证', vendor: 'kiro' },
+    cursor: { name: 'Cursor', desc: '独立 Cursor Agent 反向代理模块', vendor: 'cursor' },
   };
 
   const currentInfo = providerInfo[tab] || providerInfo.chatgpt;
@@ -556,6 +600,65 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       ) : null}
       </>
       )}
+    </div>
+  );
+
+  const cursorTabContent = (
+    <div className="pool-oauth-tab">
+      <div className="pool-oauth-identity pool-oauth-identity--provider">
+        <VendorLogo vendor="cursor" label="Cursor" size={40} />
+        <div className="pool-oauth-identity__copy">
+          <Text strong className="pool-oauth-identity__name">Cursor 账号导入</Text>
+          <Text type="tertiary" className="pool-oauth-identity__desc">每个账号使用独立、按需启动的本地 Cursor Agent 代理</Text>
+        </div>
+      </div>
+      {cursorModule && !cursorModule.installed ? (
+        <div style={{ padding: 12, border: '1px solid var(--pool-warning)', borderRadius: 6, marginBottom: 14 }}>
+          <Text type="warning">Cursor 模块未安装：{cursorModule.install_error}</Text>
+        </div>
+      ) : null}
+      <Form>
+        <Form.Slot label="标签 (可选)"><Input value={label} onChange={setLabel} placeholder="例如：Cursor 主账号" /></Form.Slot>
+        <Form.Slot label="账号池分组 (可选)">
+          <Select placeholder="默认使用 cursor 分组" value={groupName} onChange={setGroupName} optionList={groupOptions} />
+        </Form.Slot>
+      </Form>
+      <div style={{ display: 'flex', gap: 8, margin: '14px 0' }}>
+        <Button type={cursorImportMode === 'api_key' ? 'primary' : 'tertiary'} onClick={() => setCursorImportMode('api_key')}>API Key</Button>
+        <Button type={cursorImportMode === 'browser_account' ? 'primary' : 'tertiary'} onClick={() => setCursorImportMode('browser_account')}>账号 / 密码登录</Button>
+      </div>
+      {cursorImportMode === 'api_key' ? (
+        <Form>
+          <Form.Slot label="Cursor API Key">
+            <Input type="password" value={cursorApiKey} onChange={setCursorApiKey} placeholder="Cursor User API Key" />
+          </Form.Slot>
+          <Text type="tertiary" as="p">请使用 Dashboard → Integrations → User API Keys 创建的密钥。密钥加密保存，仅传给该账号的 loopback sidecar；导入不会发送推理请求。</Text>
+        </Form>
+      ) : (
+        <div style={{ display: 'grid', gap: 12 }}>
+          <div style={{ padding: 12, borderRadius: 6, background: 'var(--pool-bg-surface-2)' }}>
+            <Text strong>先完成 Cursor 官方浏览器登录</Text>
+            <Text type="tertiary" as="p" style={{ margin: '6px 0' }}>在服务器执行以下命令，浏览器页面中输入 Cursor 账号与密码：</Text>
+            <Text code>{`cursor-api-proxy account login ${cursorAccountName.trim() || '<account-name>'}`}</Text>
+            <Text type="tertiary" as="p" style={{ margin: '8px 0 0' }}>密码只提交给 Cursor 官方页面，本项目不会接收或保存明文密码。</Text>
+          </div>
+          <Form>
+            <Form.Slot label="已登录账号名称">
+              <Input value={cursorAccountName} onChange={setCursorAccountName} placeholder="例如：cursor-main" />
+            </Form.Slot>
+          </Form>
+        </div>
+      )}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
+        <Button type="primary" theme="solid" loading={cursorLoading}
+          disabled={cursorModule && !cursorModule.installed}
+          onClick={handleCursorImport}>加入 Cursor 账号池</Button>
+      </div>
+      {cursorModule ? (
+        <Text type="tertiary" as="p" style={{ marginTop: 12 }}>
+          模块 v{cursorModule.reference_version} · 固定提交 {String(cursorModule.reference_commit || '').slice(0, 12)} · ACP 工具透传
+        </Text>
+      ) : null}
     </div>
   );
 
@@ -859,6 +962,12 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
           itemKey="kiro"
         >
           {kiroTabContent}
+        </TabPane>
+        <TabPane
+          tab={(<span className="pool-vendor-tab"><VendorLogo vendor="cursor" label="Cursor" size={18} /><span>Cursor</span></span>)}
+          itemKey="cursor"
+        >
+          {cursorTabContent}
         </TabPane>
         <TabPane
           tab={(

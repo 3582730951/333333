@@ -24,7 +24,7 @@ export async function warmAdminData(client: QueryClient, cancelled: Cancelled = 
         import('../features/accounts/queries/accounts'),
         import('../features/accounts/api/accounts'),
       ]);
-      const params = { page: 1, pageSize: 50, search: '', authType: 'all' as const };
+		const params = { page: 1, pageSize: 50, search: '', authType: 'all' as const, group: '' };
       await client.prefetchQuery({
         queryKey: accountQueryKeys.list(params),
         queryFn: ({ signal }) => fetchAccountsPage(params, signal),

@@ -21,6 +21,8 @@ func TestAdminAccountsSummaryUsesAggregatedCounts(t *testing.T) {
 		{storage.Account{ID: "claude-legacy", GroupName: "cyber", Status: "active"}, storage.AccountToken{AccessToken: "sk-ant-oat-test"}},
 		{storage.Account{ID: "custom-disabled", GroupName: "cyber", Provider: "deepseek", Status: "disabled"}, storage.AccountToken{OpenAIAPIKey: "sk-custom"}},
 		{storage.Account{ID: "codex-quarantined", GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "codex-token-2"}},
+		{storage.Account{ID: "kiro-active", GroupName: "kiro", Provider: "kiro", Status: "active"}, storage.AccountToken{AccessToken: "kiro-token"}},
+		{storage.Account{ID: "cursor-active", GroupName: "cursor", Provider: "cursor", Status: "active"}, storage.AccountToken{AccessToken: "cursor-token"}},
 	}
 	for _, row := range rows {
 		if err := h.store.UpsertAccount(ctx, row.account, row.token); err != nil {
@@ -46,13 +48,15 @@ func TestAdminAccountsSummaryUsesAggregatedCounts(t *testing.T) {
 		t.Fatalf("decode summary: %v\n%s", err, raw)
 	}
 	want := storage.AccountPoolSummary{
-		Total:       4,
-		Active:      2,
+		Total:       6,
+		Active:      4,
 		Quarantined: 1,
 		Cooling:     1,
 		Recheck:     1,
 		Codex:       2,
 		Claude:      1,
+		Kiro:        1,
+		Cursor:      1,
 		Other:       1,
 	}
 	if got != want {

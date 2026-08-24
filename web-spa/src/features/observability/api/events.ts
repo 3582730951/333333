@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { get } from '../../../api.js';
+import { get, post } from '../../../api.js';
 import { parseApiResponse } from '../../../api/contracts';
 import type { AuditRow, CFEventRow, QuotaRow } from '../model/types';
 
@@ -33,6 +33,19 @@ export const auditResponseSchema = rowsResponseSchema(auditRowSchema, ['rows', '
 export async function fetchQuota(signal?: AbortSignal): Promise<QuotaRow[]> {
   const value = await get('/admin/quota', { include_missing: 1, page: 1, pageSize: 500 }, { signal });
   return parseApiResponse(quotaResponseSchema, value) as QuotaRow[];
+}
+
+export interface QuotaRefreshResult {
+  updated: number;
+  failed: number;
+  candidates: number;
+	coalesced?: boolean;
+	reused?: boolean;
+	completed_at?: number;
+}
+
+export async function refreshQuota(): Promise<QuotaRefreshResult> {
+  return post('/admin/quota/refresh', {}, { timeout: 10 * 60 * 1_000 }) as Promise<QuotaRefreshResult>;
 }
 
 export async function fetchCFEvents(signal?: AbortSignal): Promise<CFEventRow[]> {

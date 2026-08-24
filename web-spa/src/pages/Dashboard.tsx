@@ -172,6 +172,8 @@ export default function Dashboard() {
   const recheck = summary?.recheck || 0;
   const codex = summary?.codex || 0;
   const claude = summary?.claude || 0;
+  const kiro = summary?.kiro || 0;
+  const cursor = summary?.cursor || 0;
   const other = summary?.other || 0;
   const providerModelSeries = secondary?.modelSeries || core?.modelSeries || [];
   const providerModelDescriptors = secondary?.series || core?.series || [];
@@ -221,6 +223,8 @@ export default function Dashboard() {
   const providerDonut = [
     { name: 'Codex', value: codex, color: C.blue },
     { name: 'Claude', value: claude, color: C.violet },
+    { name: 'Kiro', value: kiro, color: C.cyan },
+    { name: 'Cursor', value: cursor, color: C.amber },
     { name: t('dashboard.other'), value: other, color: COLORS.grey },
   ];
   const registrationDays = (secondary?.registration?.by_day || []).map((row) => ({

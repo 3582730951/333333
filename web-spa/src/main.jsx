@@ -20,16 +20,17 @@ import './styles/dataviz.css';
 import './styles/portal.css';
 import './styles/pages.css';
 import './styles/utilities.css';
+import './styles/atmosphere.css';
 
 try {
-  const preference = getLocalItem('pool_theme', 'light') || 'light';
+  const preference = getLocalItem('pool_theme', 'dark') || 'dark';
   const resolved = preference === 'auto'
     ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
     : preference;
-  document.documentElement.dataset.theme = resolved === 'dark' ? 'dark' : 'light';
+  document.documentElement.dataset.theme = resolved === 'light' ? 'light' : 'dark';
   document.documentElement.dataset.themePreference = preference;
 } catch {
-  document.documentElement.dataset.theme = 'light';
+  document.documentElement.dataset.theme = 'dark';
 }
 
 await loadLocale(getLocale());

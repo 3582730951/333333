@@ -1,3 +1,29 @@
+FROM node:22.23.1-trixie-slim AS cursor-proxy-node
+
+WORKDIR /opt/cursor-proxy
+COPY modules/cursor-proxy/package.json modules/cursor-proxy/package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund && \
+    node -e 'const p=require("./node_modules/cursor-api-proxy/package.json"); if(p.version!=="1.4.0") process.exit(1)' && \
+    chown -R root:root /opt/cursor-proxy && \
+    chmod -R u=rwX,g=rX,o= /opt/cursor-proxy
+
+FROM debian:13.6-slim AS cursor-agent
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tar bash && \
+    rm -rf /var/lib/apt/lists/*
+ENV HOME=/opt/cursor-agent-home
+RUN mkdir -p "$HOME" && \
+    curl --fail --silent --show-error --location \
+      --connect-timeout 10 --max-time 45 \
+      --retry 1 --retry-delay 10 --retry-max-time 20 \
+      --user-agent 'codex-pool-cursor-module/1.0 (+https://cursor.com/docs/cli/installation)' \
+      --output /tmp/cursor-install.sh https://cursor.com/install && \
+    grep -q '^#!/usr/bin/env bash' /tmp/cursor-install.sh && \
+    grep -q 'DOWNLOAD_URL="https://downloads.cursor.com/' /tmp/cursor-install.sh && \
+    sed -i "s/curl -fSL --progress-bar/curl -fSL --progress-bar --connect-timeout 10 --max-time 300 --retry 2 --retry-delay 10 --retry-max-time 60 --user-agent 'codex-pool-cursor-module\/1.0'/" /tmp/cursor-install.sh && \
+    NO_COLOR=1 bash /tmp/cursor-install.sh && \
+    "$HOME/.local/bin/cursor-agent" --version
+
 FROM node:22.23.1-trixie-slim AS web
 
 WORKDIR /src/web-spa
@@ -68,6 +94,8 @@ COPY --from=build /out/codex-pool-handoff /usr/local/bin/codex-pool-handoff
 COPY --from=build /out/gateway-bin /usr/local/lib/codex-pool/bin
 COPY --from=registrar-node /usr/local/bin/node /usr/local/bin/node
 COPY --from=registrar-node /opt/registrar-node /usr/local/lib/codex-pool/releases/docker/registrar-node
+COPY --from=cursor-proxy-node /opt/cursor-proxy /usr/local/lib/codex-pool/releases/docker/cursor-proxy
+COPY --from=cursor-agent /opt/cursor-agent-home/.local/share/cursor-agent /usr/local/lib/codex-pool/releases/docker/cursor-agent
 COPY services/codex_register/requirements.txt /usr/local/lib/codex-pool/releases/docker/registrar-python/requirements.txt
 RUN python3 -m venv /usr/local/lib/codex-pool/releases/docker/registrar-python-venv && \
     /usr/local/lib/codex-pool/releases/docker/registrar-python-venv/bin/pip \
@@ -90,15 +118,24 @@ RUN PYTHONDONTWRITEBYTECODE=1 \
       'import curl_cffi, playwright, playwright_stealth, requests, urllib3' && \
     chown -R root:codex-pool \
       /usr/local/lib/codex-pool/releases/docker/registrar-node \
+      /usr/local/lib/codex-pool/releases/docker/cursor-proxy \
+      /usr/local/lib/codex-pool/releases/docker/cursor-agent \
       /usr/local/lib/codex-pool/releases/docker/registrar-python \
       /usr/local/lib/codex-pool/releases/docker/registrar-python-venv \
       /usr/local/lib/codex-pool/releases/docker/super-instruct && \
     chmod -R u=rwX,g=rX,o= \
       /usr/local/lib/codex-pool/releases/docker/registrar-node \
+      /usr/local/lib/codex-pool/releases/docker/cursor-proxy \
+      /usr/local/lib/codex-pool/releases/docker/cursor-agent \
       /usr/local/lib/codex-pool/releases/docker/registrar-python \
       /usr/local/lib/codex-pool/releases/docker/registrar-python-venv \
       /usr/local/lib/codex-pool/releases/docker/super-instruct && \
-    chmod 0755 /usr/local/bin/codex-pool-entrypoint
+    chmod 0755 /usr/local/bin/codex-pool-entrypoint && \
+    ln -s /usr/local/lib/codex-pool/releases/docker/cursor-proxy/node_modules/.bin/cursor-api-proxy /usr/local/bin/cursor-api-proxy && \
+    cursor_agent_path="$(find /usr/local/lib/codex-pool/releases/docker/cursor-agent/versions -mindepth 2 -maxdepth 2 -type f -name cursor-agent | sort | tail -n 1)" && \
+    [ -n "$cursor_agent_path" ] && \
+    ln -s "$cursor_agent_path" /usr/local/bin/cursor-agent && \
+    ln -s "$cursor_agent_path" /usr/local/bin/agent
 
 USER codex-pool
 WORKDIR /var/lib/codex-pool
@@ -111,6 +148,8 @@ ENV CODEX_REG_SCRIPT=/usr/local/lib/codex-pool/releases/docker/registrar-python/
 ENV CODEX_POOL_SUPER_INSTRUCT_DIR=/usr/local/lib/codex-pool/releases/docker/super-instruct/codex-skills
 ENV CODEX_REG_V3_SCRIPT=/usr/local/lib/codex-pool/releases/docker/registrar-python/reg_v3.py
 ENV CODEX_REG_CHROME=/usr/bin/chromium
+ENV CODEX_CURSOR_PROXY_BIN=/usr/local/lib/codex-pool/releases/docker/cursor-proxy/node_modules/.bin/cursor-api-proxy
+ENV CODEX_CURSOR_ACCOUNTS_DIR=/var/lib/codex-pool/.cursor-api-proxy/accounts
 ENV CHROME_PATH=/usr/bin/chromium
 VOLUME ["/var/lib/codex-pool"]
 EXPOSE 8787

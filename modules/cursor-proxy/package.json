@@ -1,0 +1,9 @@
+{
+  "name": "codex-pool-cursor-proxy-module",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Pinned independent Cursor Agent proxy runtime for Codex Pool",
+  "dependencies": {
+    "cursor-api-proxy": "1.4.0"
+  }
+}

@@ -60,127 +60,41 @@
 }
 
 :root,
-html[data-theme='light'] {
-  color-scheme: light;
-  --pool-bg-page: #f6f5f1;
-  --pool-bg-grouped: #eeefe9;
-  --pool-bg-surface: #fffefb;
-  --pool-bg-surface-2: #f7f8f4;
-  --pool-bg-surface-3: #e7eae5;
-  --pool-bg-elevated: #ffffff;
-  --pool-bg-material: #fffefb;
-  --pool-bg-material-strong: #ffffff;
-  --pool-bg-overlay: rgb(25 32 29 / 36%);
-  --pool-bg-hover: rgb(30 102 84 / 7%);
-  --pool-bg-pressed: rgb(30 102 84 / 12%);
-  --pool-bg-selected: #e3f0eb;
-
-  --pool-text: #19201d;
-  --pool-text-1: #19201d;
-  --pool-text-2: #56615c;
-  --pool-text-3: #65706b;
-  --pool-text-disabled: #8b958f;
-  --pool-border: #d9ded9;
-  --pool-border-strong: #b7c0ba;
-  --pool-control-border: #87938c;
-  --pool-border-subtle: rgb(25 32 29 / 12%);
-
-  --pool-action: #1e6654;
-  --pool-action-hover: #185344;
-  --pool-action-active: #123f35;
-  --pool-on-action: #ffffff;
-  --pool-action-soft: #e3f0eb;
-  --pool-accent: #1e6654;
-  --pool-accent-text: #185344;
-  --pool-accent-hover: #185344;
-  --pool-accent-pressed: #123f35;
-  --pool-accent-soft: #e3f0eb;
-  --pool-brand-secondary: #a65a42;
-  --pool-brand-secondary-soft: #f8eae3;
-
-  --pool-success: #256b45;
-  --pool-success-soft: #e6f3eb;
-  --pool-warning: #8a5a00;
-  --pool-warning-soft: #fff2d5;
-  --pool-danger: #b42318;
-  --pool-danger-soft: #fce9e6;
-  --pool-info: #536878;
-  --pool-info-soft: #e9eff1;
-  --pool-purple: #a65a42;
-  --pool-purple-soft: #f8eae3;
-  --pool-gray-soft: rgb(25 32 29 / 8%);
-
-  --pool-focus-color: #1e6654;
-  --pool-focus: 0 0 0 3px rgb(30 102 84 / 32%);
-  --pool-shadow-control: 0 1px 2px rgb(24 32 28 / 8%);
-  --pool-shadow-popover: 0 12px 32px rgb(24 32 28 / 12%);
-  --pool-shadow-dialog: 0 24px 64px rgb(24 32 28 / 18%);
-  --pool-shadow-sm: none;
-  --pool-shadow-md: var(--pool-shadow-popover);
-  --pool-shadow-lg: var(--pool-shadow-dialog);
-  --pool-shadow-panel: none;
-  --pool-shadow-compact: none;
-  --pool-shadow-orbit: none;
-  --pool-shadow-card-lift: 0 8px 24px rgb(24 32 28 / 10%);
-  --pool-shadow-glass: none;
-  --pool-shadow-hero: none;
-  --pool-shadow-hero-lg: none;
-  --pool-shadow-hover: var(--pool-shadow-popover);
-  --pool-shadow: var(--pool-shadow-popover);
-  --pool-material-blur: none;
-
-  --pool-chart-primary: #1e6654;
-  --pool-chart-blue: #007aff;
-  --pool-chart-green: #248a3d;
-  --pool-chart-orange: #c97800;
-  --pool-chart-red: #d70015;
-  --pool-chart-purple: #c31fff;
-  --pool-chart-teal: #0aa0b7;
-  --pool-chart-pink: #ff2d55;
-  --pool-chart-indigo: #4c4dc9;
-  --pool-chart-cyan: #1387b7;
-  --pool-chart-gray: #6f7772;
-  --pool-chart-grid: rgb(25 32 29 / 10%);
-  --pool-chart-tick: #65706b;
-  --pool-chart-tooltip-bg: #ffffff;
-  --pool-chart-tooltip-border: #d9ded9;
-}
-
 html[data-theme='dark'] {
   color-scheme: dark;
-  --pool-bg-page: #101614;
-  --pool-bg-grouped: #141b18;
-  --pool-bg-surface: #171f1c;
-  --pool-bg-surface-2: #202a26;
-  --pool-bg-surface-3: #2a3731;
-  --pool-bg-elevated: #26322d;
-  --pool-bg-material: #171f1c;
-  --pool-bg-material-strong: #26322d;
-  --pool-bg-overlay: rgb(0 0 0 / 58%);
-  --pool-bg-hover: rgb(101 208 165 / 9%);
-  --pool-bg-pressed: rgb(101 208 165 / 15%);
-  --pool-bg-selected: rgb(101 208 165 / 16%);
+  --pool-bg-page: #06080a;
+  --pool-bg-grouped: #0a0d10;
+  --pool-bg-surface: #0e1216;
+  --pool-bg-surface-2: #141920;
+  --pool-bg-surface-3: #1c232b;
+  --pool-bg-elevated: #171d24;
+  --pool-bg-material: rgb(14 18 22 / 62%);
+  --pool-bg-material-strong: rgb(10 13 16 / 78%);
+  --pool-bg-overlay: rgb(2 3 4 / 68%);
+  --pool-bg-hover: rgb(94 233 181 / 9%);
+  --pool-bg-pressed: rgb(94 233 181 / 15%);
+  --pool-bg-selected: rgb(94 233 181 / 16%);
 
-  --pool-text: #f3f5f2;
-  --pool-text-1: #f3f5f2;
-  --pool-text-2: #adb6b0;
-  --pool-text-3: #89948e;
-  --pool-text-disabled: #68736d;
-  --pool-border: #34423b;
-  --pool-border-strong: #526159;
-  --pool-control-border: #66766e;
-  --pool-border-subtle: rgb(243 245 242 / 12%);
+  --pool-text: #edf1f5;
+  --pool-text-1: #edf1f5;
+  --pool-text-2: #a8b4c0;
+  --pool-text-3: #8a97a5;
+  --pool-text-disabled: #626e7a;
+  --pool-border: #222a33;
+  --pool-border-strong: #39434e;
+  --pool-control-border: #5a6672;
+  --pool-border-subtle: rgb(237 241 245 / 10%);
 
-  --pool-action: #65d0a5;
-  --pool-action-hover: #7adab5;
-  --pool-action-active: #4dbd90;
-  --pool-on-action: #09251b;
-  --pool-action-soft: rgb(101 208 165 / 16%);
-  --pool-accent: #65d0a5;
-  --pool-accent-text: #7adab5;
-  --pool-accent-hover: #7adab5;
-  --pool-accent-pressed: #4dbd90;
-  --pool-accent-soft: rgb(101 208 165 / 16%);
+  --pool-action: #5ee9b5;
+  --pool-action-hover: #7ff0c8;
+  --pool-action-active: #43cf9b;
+  --pool-on-action: #04231a;
+  --pool-action-soft: rgb(94 233 181 / 16%);
+  --pool-accent: #5ee9b5;
+  --pool-accent-text: #7ff0c8;
+  --pool-accent-hover: #7ff0c8;
+  --pool-accent-pressed: #43cf9b;
+  --pool-accent-soft: rgb(94 233 181 / 16%);
   --pool-brand-secondary: #e39b7f;
   --pool-brand-secondary-soft: rgb(227 155 127 / 15%);
 
@@ -194,42 +108,175 @@ html[data-theme='dark'] {
   --pool-info-soft: rgb(118 192 208 / 15%);
   --pool-purple: #e39b7f;
   --pool-purple-soft: rgb(227 155 127 / 15%);
-  --pool-gray-soft: rgb(243 245 242 / 9%);
+  --pool-gray-soft: rgb(237 241 245 / 9%);
 
-  --pool-focus-color: #65d0a5;
-  --pool-focus: 0 0 0 3px rgb(101 208 165 / 34%);
-  --pool-shadow-control: 0 1px 2px rgb(0 0 0 / 28%);
-  --pool-shadow-popover: 0 16px 40px rgb(0 0 0 / 38%);
-  --pool-shadow-dialog: 0 28px 72px rgb(0 0 0 / 48%);
+  --pool-focus-color: #5ee9b5;
+  --pool-focus: 0 0 0 3px rgb(94 233 181 / 34%);
+  --pool-shadow-control: 0 1px 2px rgb(0 0 0 / 44%);
+  --pool-shadow-popover: 0 16px 40px rgb(0 0 0 / 56%);
+  --pool-shadow-dialog: 0 28px 72px rgb(0 0 0 / 66%);
   --pool-shadow-sm: none;
   --pool-shadow-md: var(--pool-shadow-popover);
   --pool-shadow-lg: var(--pool-shadow-dialog);
   --pool-shadow-panel: none;
   --pool-shadow-compact: none;
   --pool-shadow-orbit: none;
-  --pool-shadow-card-lift: 0 10px 28px rgb(0 0 0 / 24%);
-  --pool-shadow-glass: none;
+  --pool-shadow-card-lift: 0 10px 28px rgb(0 0 0 / 38%);
+  --pool-shadow-glass: 0 24px 64px rgb(0 0 0 / 46%);
   --pool-shadow-hero: none;
   --pool-shadow-hero-lg: none;
   --pool-shadow-hover: var(--pool-shadow-popover);
   --pool-shadow: var(--pool-shadow-popover);
-  --pool-material-blur: none;
+  --pool-material-blur: saturate(150%) blur(22px);
 
-  --pool-chart-primary: #65d0a5;
-  --pool-chart-blue: #5aa9ff;
-  --pool-chart-green: #5ddf91;
-  --pool-chart-orange: #ffbd5a;
-  --pool-chart-red: #ff7b73;
-  --pool-chart-purple: #f3a8ff;
-  --pool-chart-teal: #40c8e0;
-  --pool-chart-pink: #fb365d;
-  --pool-chart-indigo: #6b66f2;
-  --pool-chart-cyan: #a6e1ff;
-  --pool-chart-gray: #aab3ad;
-  --pool-chart-grid: rgb(243 245 242 / 10%);
-  --pool-chart-tick: #adb6b0;
-  --pool-chart-tooltip-bg: #26322d;
-  --pool-chart-tooltip-border: #526159;
+  /* Atmosphere: mesh-gradient stops the WebGL layer samples, and the CSS fallback
+     that renders when WebGL is unavailable or reduced motion is requested. */
+  --pool-atmo-void: #06080a;
+  --pool-atmo-near: #092520;
+  --pool-atmo-far: #0c1024;
+  --pool-atmo-glow: #5ee9b5;
+  --pool-atmo-alpha: 1;
+  --pool-grain-alpha: 0.022;
+  --pool-glass-bg: rgb(17 22 28 / 84%);
+  --pool-glass-bg-strong: rgb(10 13 16 / 82%);
+  --pool-glass-border: rgb(237 241 245 / 10%);
+  --pool-glass-sheen: rgb(237 241 245 / 14%);
+  --pool-scrim: rgb(6 8 10 / 76%);
+
+  /*
+   * Instrument palette, not poster palette.
+   *
+   * The previous slots were the saturated primaries a chart library ships with --
+   * #5aa9ff, #f3a8ff, #fb365d, #ffbd5a. Eight of those on one dashboard read as a
+   * children's toy rather than as measurement, which is the loudest thing wrong
+   * with a data-dense console. These are the same eight hues at roughly half the
+   * chroma.
+   *
+   * The blue / indigo / purple cluster is separated by LIGHTNESS, not by hue,
+   * because that is the only axis a protanope has for those three -- rotating hue
+   * there buys nothing and the low-chroma versions collapse without it. Solved
+   * against the real floors in tests/chart-color-vision.test.ts, and the result is
+   * better separated than the palette it replaces: worst normal pair 16.8 (was
+   * 12.5), worst deuteranopic 7.8 (was 6.9).
+   */
+  --pool-chart-primary: #5ee9b5;
+  --pool-chart-blue: #5090cc;
+  --pool-chart-green: #6fc48d;
+  --pool-chart-orange: #e0a24f;
+  --pool-chart-red: #e07a72;
+  --pool-chart-purple: #c09ce7;
+  --pool-chart-teal: #4fbcbc;
+  --pool-chart-pink: #e07aa8;
+  --pool-chart-indigo: #6567bd;
+  --pool-chart-cyan: #8fc9dd;
+  --pool-chart-gray: #97a1a8;
+  --pool-chart-grid: rgb(237 241 245 / 10%);
+  --pool-chart-tick: #a8b4c0;
+  --pool-chart-tooltip-bg: #171d24;
+  --pool-chart-tooltip-border: #39434e;
+}
+
+html[data-theme='light'] {
+  color-scheme: light;
+  --pool-bg-page: #f4f2ee;
+  --pool-bg-grouped: #edeae4;
+  --pool-bg-surface: #fdfcfa;
+  --pool-bg-surface-2: #f6f4f0;
+  --pool-bg-surface-3: #e8e5df;
+  --pool-bg-elevated: #ffffff;
+  --pool-bg-material: rgb(253 252 250 / 72%);
+  --pool-bg-material-strong: rgb(255 255 255 / 86%);
+  --pool-bg-overlay: rgb(18 22 26 / 38%);
+  --pool-bg-hover: rgb(15 122 92 / 8%);
+  --pool-bg-pressed: rgb(15 122 92 / 14%);
+  --pool-bg-selected: #dff0e8;
+
+  --pool-text: #14181c;
+  --pool-text-1: #14181c;
+  --pool-text-2: #4e5a64;
+  --pool-text-3: #5d6871;
+  --pool-text-disabled: #8b949b;
+  --pool-border: #dcd8d1;
+  --pool-border-strong: #b8b3aa;
+  --pool-control-border: #7d8890;
+  --pool-border-subtle: rgb(18 22 26 / 12%);
+
+  --pool-action: #0f7a5c;
+  --pool-action-hover: #0c6349;
+  --pool-action-active: #094c38;
+  --pool-on-action: #ffffff;
+  --pool-action-soft: #dff0e8;
+  --pool-accent: #0f7a5c;
+  --pool-accent-text: #0c6349;
+  --pool-accent-hover: #0c6349;
+  --pool-accent-pressed: #094c38;
+  --pool-accent-soft: #dff0e8;
+  --pool-brand-secondary: #a65a42;
+  --pool-brand-secondary-soft: #f8eae3;
+
+  --pool-success: #256b45;
+  --pool-success-soft: #e6f3eb;
+  --pool-warning: #8a5a00;
+  --pool-warning-soft: #fff2d5;
+  --pool-danger: #b42318;
+  --pool-danger-soft: #fce9e6;
+  --pool-info: #536878;
+  --pool-info-soft: #e9eff1;
+  --pool-purple: #a65a42;
+  --pool-purple-soft: #f8eae3;
+  --pool-gray-soft: rgb(18 22 26 / 8%);
+
+  --pool-focus-color: #0f7a5c;
+  --pool-focus: 0 0 0 3px rgb(15 122 92 / 32%);
+  --pool-shadow-control: 0 1px 2px rgb(20 24 28 / 8%);
+  --pool-shadow-popover: 0 12px 32px rgb(20 24 28 / 12%);
+  --pool-shadow-dialog: 0 24px 64px rgb(20 24 28 / 18%);
+  --pool-shadow-sm: none;
+  --pool-shadow-md: var(--pool-shadow-popover);
+  --pool-shadow-lg: var(--pool-shadow-dialog);
+  --pool-shadow-panel: none;
+  --pool-shadow-compact: none;
+  --pool-shadow-orbit: none;
+  --pool-shadow-card-lift: 0 8px 24px rgb(20 24 28 / 10%);
+  --pool-shadow-glass: 0 20px 48px rgb(20 24 28 / 12%);
+  --pool-shadow-hero: none;
+  --pool-shadow-hero-lg: none;
+  --pool-shadow-hover: var(--pool-shadow-popover);
+  --pool-shadow: var(--pool-shadow-popover);
+  --pool-material-blur: saturate(160%) blur(20px);
+
+  /* Atmosphere: mesh-gradient stops the WebGL layer samples, and the CSS fallback
+     that renders when WebGL is unavailable or reduced motion is requested. */
+  --pool-atmo-void: #f4f2ee;
+  --pool-atmo-near: #dff0e8;
+  --pool-atmo-far: #e6e2f2;
+  --pool-atmo-glow: #0f7a5c;
+  --pool-atmo-alpha: 0.5;
+  --pool-grain-alpha: 0.018;
+  --pool-glass-bg: rgb(255 255 255 / 62%);
+  --pool-glass-bg-strong: rgb(255 255 255 / 84%);
+  --pool-glass-border: rgb(18 22 26 / 10%);
+  --pool-glass-sheen: rgb(255 255 255 / 70%);
+  --pool-scrim: rgb(244 242 238 / 82%);
+
+  /* The light counterpart of the dark instrument set: ink-like rather than the iOS
+     system primaries this used to borrow. Same lightness split across blue /
+     indigo / purple, solved against the same floors. */
+  --pool-chart-primary: #0f7a5c;
+  --pool-chart-blue: #2f6dae;
+  --pool-chart-green: #288e44;
+  --pool-chart-orange: #a3661c;
+  --pool-chart-red: #ae342c;
+  --pool-chart-purple: #b57ad0;
+  --pool-chart-teal: #1c7c85;
+  --pool-chart-pink: #a44376;
+  --pool-chart-indigo: #373c7c;
+  --pool-chart-cyan: #2b7f9e;
+  --pool-chart-gray: #6b7378;
+  --pool-chart-grid: rgb(18 22 26 / 10%);
+  --pool-chart-tick: #5d6871;
+  --pool-chart-tooltip-bg: #ffffff;
+  --pool-chart-tooltip-border: #dcd8d1;
 }
 
 .pool-admin-shell {

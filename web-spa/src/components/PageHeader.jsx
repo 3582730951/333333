@@ -1,9 +1,13 @@
 import React from 'react';
 import { Typography } from './pool/index.jsx';
 
+// `data-reveal` opts an element into the shell's scroll narrative; useScrollReveal
+// stamps it and atmosphere.css owns the states. Placed on the shared header rather
+// than on each page because 23 of 29 pages render through here, and a per-page
+// opt-in would drift the moment someone adds the thirtieth.
 export default function PageHeader({ title, subtitle, actions }) {
   return (
-    <header className="pool-pagehead">
+    <header className="pool-pagehead" data-reveal="">
       <div className="pool-pagehead-copy">
         <Typography.Title heading={1} className="pool-page-title" tabIndex={-1}>{title}</Typography.Title>
         {subtitle ? <div className="sub">{subtitle}</div> : null}
@@ -15,7 +19,7 @@ export default function PageHeader({ title, subtitle, actions }) {
 
 export function Panel({ title, extra, children, style }) {
   return (
-    <div className="pool-panel" style={style}>
+    <div className="pool-panel" style={style} data-reveal="">
       {(title || extra) && (
         <div className="pool-panel-head">
           <div className="pool-section-title">{title}</div>

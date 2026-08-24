@@ -6,7 +6,7 @@ function cx(...parts) {
 
 export function Card({ children, className, title, headerExtraContent, bodyStyle, ...props }) {
   return (
-    <section className={cx('pool-card', className)} {...props}>
+    <section className={cx('pool-card', className)} data-reveal="" {...props}>
       {title || headerExtraContent ? (
         <div className="pool-card-head">
           <div className="pool-text-strong">{title}</div>

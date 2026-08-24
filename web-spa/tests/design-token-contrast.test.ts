@@ -9,9 +9,13 @@ const tokenPath = ['.', 'web-spa']
 if (!tokenPath) throw new Error('tokens.css not found');
 const css = readFileSync(tokenPath, 'utf8');
 
+// tokens.css is dark-first: dark is the :root default and light is the explicit
+// opt-out, so the combined `:root,` prefix now sits on the dark block. Both themes
+// stay measured -- the flip changed which selector carries the default, not the
+// contract that neither theme may regress.
 const selectors = {
-  light: /:root,\s*html\[data-theme='light'\]\s*\{([\s\S]*?)\n\}/,
-  dark: /html\[data-theme='dark'\]\s*\{([\s\S]*?)\n\}/,
+  light: /html\[data-theme='light'\]\s*\{([\s\S]*?)\n\}/,
+  dark: /:root,\s*html\[data-theme='dark'\]\s*\{([\s\S]*?)\n\}/,
 } as const;
 
 function tokens(theme: keyof typeof selectors) {

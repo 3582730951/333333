@@ -53,11 +53,11 @@ const tokensCss = readFileSync(TOKENS_PATH, 'utf8');
 
 const SLOTS = ['blue', 'green', 'purple', 'orange', 'teal', 'red', 'indigo', 'pink'] as const;
 
-// tokens.css defaults to light under `:root, html[data-theme='light']` and keeps
-// dark explicit. Both blocks are read so neither theme can regress unmeasured.
+// tokens.css defaults to dark under `:root, html[data-theme='dark']` and keeps
+// light explicit. Both blocks are read so neither theme can regress unmeasured.
 const THEME_SELECTORS = {
-  dark: /html\[data-theme='dark'\]\s*\{([\s\S]*?)\n\}/,
-  light: /:root,\s*html\[data-theme='light'\]\s*\{([\s\S]*?)\n\}/,
+  dark: /:root,\s*html\[data-theme='dark'\]\s*\{([\s\S]*?)\n\}/,
+  light: /html\[data-theme='light'\]\s*\{([\s\S]*?)\n\}/,
 } as const;
 
 function readTheme(theme: keyof typeof THEME_SELECTORS) {
@@ -166,9 +166,17 @@ describe('dichromatic worst case', () => {
   // table read 6.9 off a `.toFixed(1)` and failed against the true 6.8516. Each floor sits a
   // hair under what the palette reaches, so honest float drift does not fail the suite but a
   // real regression does. Binding pairs are all pink-adjacent; purple is no longer among them.
+  //
+  // Raised 2026-08-22 when the palette moved off the saturated library primaries to
+  // a lower-chroma instrument set. Desaturating usually costs dichromatic margin;
+  // it did not here, because the blue/indigo/purple cluster was re-separated by
+  // lightness rather than hue, which is the only axis a protanope has for those
+  // three. Both themes now measure better than the palette these floors were first
+  // recorded from, so the floors move up with them -- a ratchet that only ever
+  // travels down is not a ratchet.
   const FLOORS = {
-    light: { deuteranopia: 6.0, protanopia: 6.5 },   // orange/pink 6.02, green/pink 6.57
-    dark: { deuteranopia: 6.8, protanopia: 7.1 },    // red/pink 6.85, purple/teal 7.13
+    light: { deuteranopia: 6.2, protanopia: 7.9 },   // orange/red 6.27, green/orange 7.94
+    dark: { deuteranopia: 7.7, protanopia: 8.4 },    // green/red 7.77, blue/purple 8.43
   } as const;
 
   it.each(['dark', 'light'] as const)('records the closest %s pair under each dichromacy', (theme) => {

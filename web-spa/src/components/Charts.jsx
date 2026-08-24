@@ -118,13 +118,13 @@ export function UsageAreaChart({ buckets = [], height = 260, ariaLabel = 'Token 
           <defs>
             {['输入', '输出', '缓存'].map((k, i) => (
               <linearGradient key={k} id={`${gradientPrefix}-usage-${i}`} x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor={PALETTE[i]} stopOpacity={0.42} />
-                <stop offset="68%" stopColor={PALETTE[i]} stopOpacity={0.12} />
+                <stop offset="0%" stopColor={PALETTE[i]} stopOpacity={0.16} />
+                <stop offset="68%" stopColor={PALETTE[i]} stopOpacity={0.05} />
                 <stop offset="100%" stopColor={PALETTE[i]} stopOpacity={0.015} />
               </linearGradient>
             ))}
           </defs>
-          <CartesianGrid stroke={c.grid} strokeOpacity={0.58} vertical={false} />
+          <CartesianGrid stroke={c.grid} strokeOpacity={0.34} vertical={false} />
           <XAxis dataKey="t" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={24} padding={{ left: 12, right: 8 }} />
           <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={44} tickFormatter={fmtTokens} />
           <Tooltip content={<PolishedChartTooltip valueFormatter={fmtTokens} />} cursor={{ stroke: c.grid, strokeWidth: 1 }} />
@@ -137,9 +137,9 @@ export function UsageAreaChart({ buckets = [], height = 260, ariaLabel = 'Token 
               stackId="1"
               stroke={PALETTE[i]}
               fill={`url(#${gradientPrefix}-usage-${i})`}
-              strokeWidth={2.25}
+              strokeWidth={1.5}
               dot={false}
-              activeDot={{ r: 4, strokeWidth: 2, fill: 'var(--pool-bg-surface)' }}
+              activeDot={{ r: 3, strokeWidth: 1.5, fill: 'var(--pool-bg-surface)' }}
               isAnimationActive={false}
             />
           ))}
@@ -209,7 +209,7 @@ export function GroupedBar({
     <ChartFrame height={height} ariaLabel={ariaLabel}>
       <ResponsiveContainer width="100%" height="100%">
         <BarChart data={data} margin={{ top: 18, right: 8, left: 0, bottom: 0 }}>
-          <CartesianGrid stroke={c.grid} strokeOpacity={0.58} vertical={false} />
+          <CartesianGrid stroke={c.grid} strokeOpacity={0.34} vertical={false} />
           <XAxis
             dataKey="x"
             tick={{ fontSize: 11, fill: c.tick }}
@@ -336,12 +336,12 @@ export function UsageModelAreaChart({
           <defs>
             {descriptors.map((s) => (
               <linearGradient key={s.series_key} id={`${gradientPrefix}-${s.field}`} x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor={s.color} stopOpacity={0.34} />
+                <stop offset="0%" stopColor={s.color} stopOpacity={0.14} />
                 <stop offset="100%" stopColor={s.color} stopOpacity={0.025} />
               </linearGradient>
             ))}
           </defs>
-          <CartesianGrid stroke={c.grid} strokeOpacity={0.58} vertical={false} />
+          <CartesianGrid stroke={c.grid} strokeOpacity={0.34} vertical={false} />
           <XAxis dataKey="t" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={24} padding={{ left: 12, right: 8 }} />
           <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={44} tickFormatter={fmtTokens} />
           <Tooltip content={<ModelMetricsTooltip />} cursor={{ stroke: c.grid, strokeWidth: 1 }} />
@@ -355,9 +355,9 @@ export function UsageModelAreaChart({
               stackId="model"
               stroke={s.color}
               fill={`url(#${gradientPrefix}-${s.field})`}
-              strokeWidth={2.25}
+              strokeWidth={1.5}
               dot={false}
-              activeDot={{ r: 4, strokeWidth: 2, fill: 'var(--pool-bg-surface)' }}
+              activeDot={{ r: 3, strokeWidth: 1.5, fill: 'var(--pool-bg-surface)' }}
               isAnimationActive={false}
             />
           ))}

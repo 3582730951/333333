@@ -13,9 +13,11 @@ import (
 	"sort"
 	"strings"
 
+	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cloak"
+	"codex-account-pool/internal/cursorproxy"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
@@ -352,6 +354,19 @@ type customCall struct {
 	provider string
 }
 
+type releaseOnCloseBody struct {
+	io.ReadCloser
+	release func()
+}
+
+func (b *releaseOnCloseBody) Close() error {
+	err := b.ReadCloser.Close()
+	if b.release != nil {
+		b.release()
+	}
+	return err
+}
+
 // customProviderAffinityContextKey carries the affinity derived from the original
 // downstream protocol body. Responses -> Chat conversion intentionally omits
 // prompt_cache_key, while Messages -> Chat changes the structural prefix used by
@@ -590,6 +605,40 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 			_ = s.settleBillingHoldIfHeld(r.Context(), holdID, "abandoned")
 		}
 	}()
+	resolvedBaseURL := strings.TrimSpace(provider.BaseURL)
+	wireToken := token
+	wireEgress := lease.Egress
+	cursorRelease := func() {}
+	cursorReleasePending := false
+	defer func() {
+		if cursorReleasePending {
+			cursorRelease()
+		}
+	}()
+	if provider.ID == cursorproxy.ProviderID {
+		credential := cursorproxy.Credential{BridgeKey: strings.TrimSpace(token.AccessToken), ProxyURL: cursorProxyEgressURL(lease.Egress)}
+		if strings.EqualFold(strings.TrimSpace(token.CredentialMode), cursorproxy.CredentialBrowser) {
+			credential.ConfigDir = strings.TrimSpace(token.AgentRuntimeID)
+		} else {
+			credential.APIKey = accountprovider.Credential(provider.ID, token)
+		}
+		resolved, release, resolveErr := s.cursorProxy.Acquire(r.Context(), lease.Account.ID, credential)
+		if resolveErr != nil {
+			lease.Release()
+			_ = s.settleBillingHold(r.Context(), holdID, "failed_cursor_proxy_start")
+			writePoolCodeError(w, http.StatusBadGateway, "cursor_proxy_unavailable", resolveErr.Error())
+			return customCall{}, false
+		}
+		cursorRelease = release
+		cursorReleasePending = true
+		resolvedBaseURL = resolved
+		// The external Cursor key belongs only in the selected child process.
+		// Authenticate this loopback hop with the account's independent bridge
+		// secret so request headers and diagnostics never carry the vendor key.
+		wireToken.AccessToken = credential.BridgeKey
+		wireToken.OpenAIAPIKey = credential.BridgeKey
+		wireEgress = cursorLoopbackEgress()
+	}
 	// One wire attempt always uses the selected account's persisted primary outlet.
 	// Failover may choose another account, but it may not rotate this account onto a
 	// group/provider/standby outlet and thereby change its network identity.
@@ -599,7 +648,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 		return s.upstream.Do(r.Context(), upstream.Request{
 			Method:           http.MethodPost,
 			Provider:         provider.ID,
-			BaseURL:          strings.TrimSpace(provider.BaseURL),
+			BaseURL:          resolvedBaseURL,
 			TransportProfile: provider.TransportProfile,
 			UpstreamProtocol: provider.UpstreamProtocol,
 			DownstreamPath:   upstreamPath,
@@ -607,8 +656,8 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 			Body:             bodysource.Bytes(body),
 			Model:            model,
 			Account:          lease.Account,
-			Token:            token,
-			Egress:           lease.Egress,
+			Token:            wireToken,
+			Egress:           wireEgress,
 			CookieJarKey:     customProviderCookieJarKey(r, lease, provider),
 			OSHint:           s.osHint(body, lease.Egress),
 		})
@@ -617,6 +666,8 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 		diagnosticResponseStatus(resp), diagnosticWireErrorClass(diagnosticResponseStatus(resp), requestErr),
 		attemptBodyHash, diagnosticRetryAfter(resp))
 	if requestErr != nil {
+		cursorRelease()
+		cursorReleasePending = false
 		_ = s.settleBillingHold(r.Context(), holdID, "failed_before_response")
 		if attemptsRemaining > 1 {
 			if exclude != nil {
@@ -628,6 +679,14 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 		lease.Release()
 		writeError(w, http.StatusBadGateway, requestErr)
 		return customCall{}, false
+	}
+	if provider.ID == cursorproxy.ProviderID {
+		if resp.Body == nil {
+			cursorRelease()
+		} else {
+			resp.Body = &releaseOnCloseBody{ReadCloser: resp.Body, release: cursorRelease}
+		}
+		cursorReleasePending = false
 	}
 	if resp.StatusCode >= 400 {
 		errBody := readUpstreamErrorBody(resp.Body)

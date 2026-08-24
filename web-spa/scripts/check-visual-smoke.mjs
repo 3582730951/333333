@@ -190,6 +190,22 @@ async function installMocks(page) {
       req.respond(json({ ok: true }));
       return;
     }
+    // The shell opens an EventSource here. It has to be answered, and answered with a
+    // response that *ends*: this case navigates with `networkidle0`, and a genuinely
+    // open stream is an in-flight request that would keep the page from ever going
+    // idle. Left unmocked it falls through to req.continue() and the dev proxy returns
+    // a 5xx, which `badResponses` counts as a failure. A complete one-shot stream
+    // exercises the real snapshot parse and then closes.
+    if (requestPath === '/admin/stream/ambient') {
+      req.respond({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: 'retry: 60000\n\nevent: snapshot\ndata: '
+      + JSON.stringify({ total: 8, active: 6, cooling: 1, quarantined: 1, recheck: 0, codex: 6, claude: 2, cpu_pct: 18.4, mem_pct: 41.2, energy: 0.29 })
+      + '\n\n',
+      });
+      return;
+    }
     if (requestPath === '/admin/accounts/summary') {
       req.respond(json({ total: accountRows.length, active: accountRows.length, quarantined: 0, cooling: 0, recheck: 0, codex: accountRows.length, claude: 0, other: 0 }));
       return;
@@ -284,6 +300,8 @@ async function runCase(browser, testCase) {
     const sider = rect('.pool-sider');
     const topTitle = rect('.pool-topbar-title');
     const topActions = rect('.pool-topbar-actions');
+    const shellHeader = rect('.pool-shell-header');
+    const mainLayout = rect('.pool-main-layout');
     const mobileLists = [...document.querySelectorAll('.pool-mobile-list[role="list"]')];
     const mobileListItems = [...document.querySelectorAll('.pool-mobile-list[role="list"] > [role="listitem"]')];
     return {
@@ -302,6 +320,19 @@ async function runCase(browser, testCase) {
       hasRequiredText: requiredText.every((item) => text.includes(item)),
       hasRequiredLabels: requiredLabels.every((item) => labels.includes(item)),
       reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+      // The shell's own geometry. Every assertion above this line is horizontal --
+      // overflow width, topbar overlap, sidebar offscreen -- so a change that left
+      // the layout intact sideways and catastrophically wrong vertically passed
+      // clean. That happened: a background layer's `position: relative` tied on
+      // specificity with the sider's `position: fixed`, put the sider back in flow,
+      // and pushed the entire main column one viewport down the page. The
+      // screenshots showed it plainly and no assertion looked.
+      shellStartsAtTop: !!(shellHeader && mainLayout)
+        && shellHeader.top <= 1 && mainLayout.top <= 1,
+      // A short page that renders taller than the viewport is the signature of a
+      // shell element having fallen out of its own positioning.
+      documentHeight: document.documentElement.scrollHeight,
+      viewportHeight: viewport.height,
     };
   }, {
     expectedMobileHeader: testCase.expectedMobileHeader || '',
@@ -320,6 +351,12 @@ function assertCase(result) {
   }
   if (!result.metrics.noPageOverflow) failures.push(`document overflows horizontally (${result.metrics.documentWidth}px)`);
   if (result.metrics.topbarOverlap) failures.push('topbar title overlaps actions');
+  if (!result.metrics.shellStartsAtTop) {
+    failures.push('shell header or main column is displaced from the top of the page');
+  }
+  if (result.metrics.documentHeight > result.metrics.viewportHeight * 1.9) {
+    failures.push(`document is ${result.metrics.documentHeight}px tall for a ${result.metrics.viewportHeight}px viewport`);
+  }
   if (!result.metrics.siderHidden) failures.push('mobile sidebar is visible while closed');
   if (result.name === 'desktop-keys' && !result.metrics.hasDesktopColumns) failures.push('desktop table columns are missing');
   if (result.name.startsWith('mobile-') && !result.metrics.hasExpectedMobileHeader) failures.push('mobile table is not using the expected single-column layout');

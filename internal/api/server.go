@@ -28,6 +28,7 @@ import (
 	"codex-account-pool/internal/compatmanifest"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/console"
+	"codex-account-pool/internal/cursorproxy"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/incident"
 	"codex-account-pool/internal/kiro"
@@ -126,6 +127,7 @@ type Server struct {
 	claudeRefresh      *claudeRefreshGates
 	antigravityRefresh *antigravityRefreshFlights
 	kiro               *kiro.Manager
+	cursorProxy        *cursorproxy.Manager
 	passiveHealth      *passivehealth.Monitor
 	// asyncWrites carries fire-and-forget DB writes (usage rows, virtual-ledger rows)
 	// off the request path so the response is not blocked on a write through the single
@@ -185,6 +187,9 @@ type Server struct {
 	codexCachePolicyCache       map[string]codexCachePolicySnapshot
 	providerAPIKeyImportMu      sync.Mutex
 	providerAPIKeyImportFlights map[string]struct{}
+	quotaRefreshMu              sync.Mutex
+	quotaRefreshFlight          *quotaRefreshFlight
+	quotaRefreshLast            quotaRefreshResult
 
 	codexResetMu          sync.Mutex
 	codexResetLocks       map[string]*sync.Mutex
@@ -267,6 +272,7 @@ func NewServer(dep Dependencies) *Server {
 		claudeRefresh:         newClaudeRefreshGates(),
 		antigravityRefresh:    newAntigravityRefreshFlights(),
 		kiro:                  kiro.NewManager(dep.Store, dep.Upstream, dep.Config),
+		cursorProxy:           cursorproxy.NewManager(),
 		passiveHealth:         passivehealth.New(passivehealth.DefaultMaxSeries, passivehealth.DefaultRetention),
 		usageDashboardCache:   newUsageDashboardResponseCache(),
 		claudeCacheFlights:    map[string]chan struct{}{},
@@ -559,6 +565,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/accounts/import-key", s.adminImportKey)
 	s.mux.HandleFunc("/admin/accounts/import-kiro-json", s.adminImportKiroJSON)
 	s.mux.HandleFunc("/admin/accounts/import-kiro-api-key", s.adminImportKiroAPIKey)
+	s.mux.HandleFunc("/admin/accounts/import-cursor", s.adminImportCursor)
+	s.mux.HandleFunc("/admin/cursor", s.adminCursorModule)
 	// Bulk-reassign accounts to a group (exact path; takes precedence over the
 	// /admin/accounts/ subtree handler). Single reassign is /admin/accounts/<id>/group.
 	s.mux.HandleFunc("/admin/accounts/assign-group", s.adminAccountsAssignGroup)
@@ -594,9 +602,14 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/usage/model-audit", s.adminUsageModelAudit)
 	s.mux.HandleFunc("/admin/compat/skills", s.adminSkillsCompatDoctor)
 	s.mux.HandleFunc("/admin/quota", s.adminQuota)
+	s.mux.HandleFunc("/admin/quota/refresh", s.adminQuotaRefresh)
 	// Host + registration-task resource metrics (CPU/mem/disk + node/Chrome/Xvfb RSS).
 	s.mux.HandleFunc("/admin/system", s.adminSystem)
 	s.mux.HandleFunc("/admin/metrics", s.adminMetrics)
+	// Server-Sent Events pulse for the console shell. One-way server->client, so
+	// SSE rather than a WebSocket: no upgrade handshake, no per-frame masking, and
+	// the browser reconnects on its own. See admin_ambient_stream.go.
+	s.mux.HandleFunc("/admin/stream/ambient", s.adminAmbientStream)
 	s.mux.HandleFunc("/admin/settings", s.adminSettings)
 	// /admin/config is the registry-backed System-config surface (requirement #1):
 	// GET returns every runtime-editable field with its effective value + metadata;

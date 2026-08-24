@@ -1,0 +1,437 @@
+/*
+ * Atmosphere: the console's spatial layer.
+ *
+ * Loaded last, on purpose. Everything before it establishes the component
+ * contract -- sizes, states, table and form behaviour -- and this file changes
+ * only how deep the shell feels: what floats, what recedes, what the light does.
+ * Nothing here may alter layout geometry, because the layout gates measure real
+ * boxes and a background effect that moves one is a bug, not a style.
+ *
+ * Three rules held throughout:
+ *   1. No colour literal. Every value is a token, so the whole layer follows the
+ *      theme and `check:pool-ui-migration` stays satisfied.
+ *   2. Only transform and opacity animate. Anything else is a main-thread relayout
+ *      at 60fps, which is the difference between this reading as craft and reading
+ *      as jank.
+ *   3. Nothing is hidden until JavaScript says it is watching. The reveal states
+ *      below are scoped to `.pool-narrative`, a class the observer adds; if the
+ *      hook never mounts, no content is ever invisible.
+ */
+
+/* ---------------------------------------------------------------- depth field */
+
+.pool-atmosphere {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+  /* The CSS field is not a placeholder for the WebGL one -- it is what ships when
+     WebGL2 is unavailable, refused, or the visitor asked for reduced motion, and
+     it is what paints during the frames before the lazy shader chunk arrives. */
+  background:
+    radial-gradient(46% 42% at 22% 26%, var(--pool-atmo-near) 0%, transparent 58%),
+    radial-gradient(40% 38% at 78% 16%, var(--pool-atmo-far) 0%, transparent 54%),
+    /* The accent well is the one that shouted. It is now a hint at the bottom edge
+       rather than a light source, matching the shader's 0.04 base weight. */
+    radial-gradient(52% 34% at 50% 112%, var(--pool-atmo-glow) 0%, transparent 40%),
+    var(--pool-atmo-void);
+  opacity: var(--pool-atmo-alpha);
+}
+
+.pool-atmosphere__canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* Grain over the gradient. Large gradients on an 8-bit display band visibly; a
+   little noise is the standard fix and doubles as the layer's tactile quality.
+   An inline SVG turbulence keeps it a token-driven CSS asset with no image
+   request and no colour literal. */
+.pool-atmosphere__grain {
+  position: absolute;
+  inset: -50%;
+  opacity: var(--pool-grain-alpha);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
+  will-change: transform;
+  animation: pool-grain-drift 7s steps(6, end) infinite;
+}
+
+@keyframes pool-grain-drift {
+  0%   { transform: translate3d(0, 0, 0); }
+  100% { transform: translate3d(6%, 4%, 0); }
+}
+
+/*
+ * The shader grains its own output, in device pixels, from the same token. When it
+ * is live this overlay is a second, independent grain pass composited on top of the
+ * first -- which is visibly twice the noise, and the reason the field read as harsh
+ * rather than as film. The canvas is opaque, so the gradient underneath costs
+ * nothing to leave in place; only the duplicated grain has to go.
+ */
+.pool-atmosphere[data-webgl='true'] .pool-atmosphere__grain {
+  display: none;
+}
+
+/*
+ * The shell's own surfaces have to stop being opaque or the fixed field behind
+ * them is never seen. These override the flat page fills set in layout.css.
+ */
+.pool-app-layout,
+.pool-main-layout,
+.pool-main-layout.pool-layout,
+.pool-content {
+  background: transparent;
+}
+
+/* One opaque floor beneath everything, so a failed canvas and a slow chunk both
+   still land on the page colour rather than on the browser's default white. */
+.pool-app-layout::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background: var(--pool-bg-page);
+}
+
+/*
+ * Content sits above the field. Only .pool-main-layout is touched, and this is
+ * deliberate: the sider, the header and the portal tab bar are already positioned
+ * by layout.css and pages.css (fixed, sticky, fixed) with z-index 1000, 100 and 25
+ * respectively, so they are above a z-index:0 field already.
+ *
+ * An earlier revision listed all four here with `position: relative`. Because this
+ * file loads last and the selectors tie on specificity, that silently un-fixed the
+ * sider -- which put it back in flow, pushed the whole main column 900px down the
+ * page, and doubled the document height. Every gate still passed: the visual smoke
+ * check asserts horizontal overflow and topbar overlap, and neither notices a
+ * layout that is merely wrong vertically. Take stacking order only, never position,
+ * from an element that already has one.
+ */
+.pool-main-layout {
+  position: relative;
+  z-index: 1;
+}
+
+/* ------------------------------------------------------------------ materials */
+
+/*
+ * Glass. The blur token is now a real value rather than `none`, so the sider and
+ * the header read as panes suspended over the field instead of slabs painted on
+ * top of it. `backdrop-filter` is the expensive part, which is why it is spent on
+ * exactly two persistent surfaces and not on every card.
+ */
+.pool-shell-sider {
+  background: var(--pool-bg-material-strong);
+  backdrop-filter: var(--pool-material-blur);
+  -webkit-backdrop-filter: var(--pool-material-blur);
+  border-right: 1px solid var(--pool-glass-border);
+  box-shadow: var(--pool-shadow-glass);
+}
+
+.pool-shell-header {
+  background: var(--pool-bg-material);
+  backdrop-filter: var(--pool-material-blur);
+  -webkit-backdrop-filter: var(--pool-material-blur);
+  border-bottom: 1px solid var(--pool-glass-border);
+}
+
+/* A single hairline of light along the top edge of each glass pane. This is the
+   one purely decorative flourish in the file and it is what makes a translucent
+   panel read as a physical sheet rather than as reduced opacity. */
+.pool-shell-sider::after,
+.pool-shell-header::after {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--pool-glass-sheen), transparent);
+  pointer-events: none;
+}
+
+/*
+ * Cards lift off the field. Kept to a translucent fill plus a border so that a
+ * page holding forty of them does not stack forty blur passes -- the depth here
+ * comes from the shadow and the light edge, both of which composite free.
+ */
+.pool-panel,
+.pool-card,
+.pool-kpi {
+  background: var(--pool-glass-bg);
+  border: 1px solid var(--pool-glass-border);
+  box-shadow: var(--pool-shadow-card-lift);
+}
+
+.pool-kpi {
+  position: relative;
+  overflow: hidden;
+  transition:
+    transform var(--pool-motion-slow) var(--pool-motion-ease),
+    box-shadow var(--pool-motion-slow) var(--pool-motion-ease);
+}
+
+/* Tactile response. 2px is deliberately small: this is a dense operations
+   console, and a card that leaps at the cursor turns a scan across a grid into a
+   sequence of interruptions. */
+.pool-kpi:hover {
+  transform: translate3d(0, -2px, 0);
+  box-shadow: var(--pool-shadow-glass);
+}
+
+/* The accent hairline reads as the tile's own light source and is the only place
+   the brand colour appears at full strength on a card. */
+.pool-kpi::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--pool-kpi-accent, var(--pool-accent)), transparent);
+  opacity: 0.72;
+}
+
+/* ---------------------------------------------------------------- typography */
+
+/*
+ * Micro-labels.
+ *
+ * The scale contrast is the point. A gallery-grade screen pairs display type with
+ * labels a quarter its size, tracked wide and dropped in weight, so the eye reads
+ * the value first and the label only when it asks for it. A console that sets every
+ * label at body size has no hierarchy for the eye to use, and every tile competes.
+ *
+ * Wide tracking on Chinese is deliberate and idiomatic at this size -- it is what
+ * separates a caption from body copy in a face with no small caps to fall back on.
+ */
+.pool-kpi__label,
+.pool-resource-summary__meta,
+.pool-chart-card > .head .s {
+  font-size: var(--pool-type-caption);
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  color: var(--pool-text-3);
+}
+
+/* Column headers are labels, not content: same register, one step tighter so a wide
+   table does not gain a line from the tracking. */
+.pool-table th {
+  font-size: var(--pool-type-caption);
+  font-weight: 600;
+  letter-spacing: 0.045em;
+  color: var(--pool-text-3);
+}
+
+/* The magnetic pull is written to `transform` by useMagneticPointer, so the button
+   must not also transition transform or the two fight and the control lags the
+   cursor. Everything else still eases. */
+.pool-button--primary {
+  transition:
+    background-color var(--pool-motion-fast) var(--pool-motion-ease),
+    box-shadow var(--pool-motion-fast) var(--pool-motion-ease),
+    color var(--pool-motion-fast) var(--pool-motion-ease);
+}
+
+
+/*
+ * Oversized editorial titles. `clamp` rather than breakpoints so the size tracks
+ * the viewport continuously and never lands between two fixed steps; the lower
+ * bound is the old fixed size, so nothing gets smaller than it was.
+ */
+.pool-page-title {
+  font-size: clamp(var(--pool-type-title-1), 3.4vw, 42px);
+  /* Same constraint as the login headline: tight display leading is a Latin
+     luxury, and every page title here is Chinese by default. 1.06 clipped the
+     ink box; 1.15 is as tight as full-width glyphs allow. */
+  line-height: 1.25;
+  letter-spacing: -0.032em;
+  font-weight: 680;
+}
+
+.pool-pagehead-copy .sub {
+  max-width: 68ch;
+  color: var(--pool-text-2);
+  line-height: var(--pool-leading-body);
+}
+
+/* Numerals in a dense console must align in columns and must not reflow as they
+   tick. Tabular figures are the whole reason the KPI value reads as an instrument
+   rather than as prose. */
+.pool-kpi__value {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.028em;
+}
+
+/* ---------------------------------------------------------- navigation rhythm */
+
+/*
+ * The sidebar held three different item shapes at the same left edge: top-level
+ * entries with an icon, section labels with an icon, and section children with
+ * none. Twenty-five rows of that reads as one undifferentiated list -- the eye has
+ * nothing to group by, so it scans every row every time.
+ *
+ * The fix is hierarchy, not decoration: section labels stop carrying an icon (they
+ * are labels, not destinations), their children indent behind a guide line, and the
+ * space between sections is larger than the space within one. Icons come back on
+ * the labels in the collapsed rail, where the icon IS the only affordance left.
+ */
+.pool-admin-shell:not(.pool-sidebar-is-collapsed) .pool-nav-group-label svg {
+  display: none;
+}
+
+.pool-admin-shell:not(.pool-sidebar-is-collapsed) .pool-nav-section {
+  margin-top: var(--pool-space-6);
+}
+
+.pool-admin-shell:not(.pool-sidebar-is-collapsed) .pool-nav-group-label {
+  padding-left: var(--pool-space-3);
+  color: var(--pool-text-3);
+  opacity: 0.72;
+}
+
+/* A guide line binds a section's children together and gives the indent something
+   to be measured against. One pixel, and it stops short of the last row's baseline
+   so it reads as a bracket rather than a border. */
+.pool-admin-shell:not(.pool-sidebar-is-collapsed) .pool-nav-children {
+  position: relative;
+  margin-left: var(--pool-space-4);
+  padding-left: var(--pool-space-3);
+}
+
+.pool-admin-shell:not(.pool-sidebar-is-collapsed) .pool-nav-children::before {
+  content: '';
+  position: absolute;
+  inset: 6px auto 6px 0;
+  width: 1px;
+  background: var(--pool-border);
+}
+
+/* The active row owns the guide line where it crosses it, which is what makes the
+   selection read as "here, inside this section" rather than as a floating pill. */
+.pool-admin-shell:not(.pool-sidebar-is-collapsed) .pool-nav-item[aria-current='page'] {
+  box-shadow: inset 2px 0 0 var(--pool-accent);
+}
+
+/* -------------------------------------------------------------------- layout */
+
+/*
+ * Bento grid. Dense auto-flow so a short tile backfills the hole a tall one
+ * leaves, which is what gives the arrangement its deliberate, non-uniform rhythm
+ * without any of the tiles being hand-placed.
+ */
+.pool-bento {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+  grid-auto-flow: dense;
+  gap: var(--pool-space-4);
+}
+
+.pool-bento__wide { grid-column: span 2; }
+.pool-bento__tall { grid-row: span 2; }
+
+/* A single-column viewport cannot honour a 2-column span, and letting it try is
+   exactly how a grid child pushes the document wider than the viewport. */
+@media (max-width: 720px) {
+  .pool-bento__wide { grid-column: auto; }
+  .pool-bento__tall { grid-row: auto; }
+}
+
+/* ------------------------------------------------------- narrative and motion */
+
+/*
+ * Scroll-triggered reveal.
+ *
+ * Scoped under `.pool-narrative`, which the observer hook adds to the shell only
+ * after it has successfully started. Content is therefore never hidden by a
+ * stylesheet that arrived without its JavaScript -- the failure mode that turns a
+ * reveal effect into a blank page.
+ */
+.pool-narrative [data-reveal] {
+  opacity: 0;
+  transform: translate3d(0, 16px, 0);
+  transition:
+    opacity 620ms var(--pool-motion-ease),
+    transform 620ms var(--pool-motion-ease);
+  /* Staggered by position within the page, set by the hook. Capped in the hook so
+     a long page cannot push its last section a second and a half behind. */
+  transition-delay: calc(var(--pool-reveal-index, 0) * 60ms);
+}
+
+.pool-narrative [data-reveal][data-revealed='true'] {
+  opacity: 1;
+  transform: none;
+}
+
+/* Route entrance. The whole content region arrives as one gesture before its
+   sections stagger in, which is what makes navigation read as a cut between
+   chapters rather than a repaint. */
+.pool-route-content[data-page-ready='true'] {
+  animation: pool-route-enter 420ms var(--pool-motion-ease) both;
+}
+
+@keyframes pool-route-enter {
+  from { opacity: 0; transform: translate3d(0, 8px, 0); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* Live pulse on the connection indicator. Opacity only, so it composites on its
+   own layer and never touches layout. */
+/*
+ * Transport status. Sized and spaced to read as a deliberate indicator rather than
+ * a stray mark -- as a bare 7px dot wedged between two controls with no margin, it
+ * looked like a rendering artefact. The ring is what makes it legible as an
+ * instrument light at this size.
+ */
+.pool-ambient-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin: 0 var(--pool-space-2);
+  border-radius: var(--pool-radius-pill);
+  /* Hollow when the stream is not carrying anything. Semantically right -- an
+     unlit indicator is not the same as a lit grey one -- and it stops the resting
+     state from reading as a heavy dark dot in the light theme, where --pool-text-3
+     is dark enough to draw the eye before the search field does. */
+  background: transparent;
+  border: 1.5px solid var(--pool-text-3);
+  box-shadow: none;
+  flex: none;
+}
+
+.pool-ambient-dot--live {
+  background: var(--pool-action);
+  border-color: var(--pool-action);
+  box-shadow: 0 0 0 3px var(--pool-action-soft);
+  animation: pool-ambient-pulse 2.4s var(--pool-motion-ease) infinite;
+}
+
+@keyframes pool-ambient-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+
+/* ----------------------------------------------------------- reduced motion */
+
+/*
+ * One block, everything off. Reveal states are reset rather than merely
+ * un-animated: a visitor who asked for reduced motion must still see every
+ * section, and `[data-reveal]` without its transition would otherwise leave the
+ * un-intersected ones at opacity 0 forever.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .pool-atmosphere__grain { animation: none; }
+
+  .pool-narrative [data-reveal],
+  .pool-narrative [data-reveal][data-revealed='true'] {
+    opacity: 1;
+    transform: none;
+    transition: none;
+    transition-delay: 0ms;
+  }
+
+  .pool-route-content[data-page-ready='true'] { animation: none; }
+  .pool-ambient-dot--live { animation: none; }
+  .pool-kpi { transition: none; }
+  .pool-kpi:hover { transform: none; }
+}

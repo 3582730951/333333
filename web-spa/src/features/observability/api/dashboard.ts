@@ -20,8 +20,10 @@ export const accountPoolSummarySchema = z.object({
   recheck: z.coerce.number().int().nonnegative(),
   codex: z.coerce.number().int().nonnegative(),
   claude: z.coerce.number().int().nonnegative(),
+  kiro: z.coerce.number().int().nonnegative().optional(),
+  cursor: z.coerce.number().int().nonnegative().optional(),
   other: z.coerce.number().int().nonnegative().optional(),
-}).passthrough().transform((value) => ({ ...value, other: value.other ?? 0 }));
+}).passthrough().transform((value) => ({ ...value, kiro: value.kiro ?? 0, cursor: value.cursor ?? 0, other: value.other ?? 0 }));
 
 const registrationDaySchema = z.object({
   date: z.string().optional(),

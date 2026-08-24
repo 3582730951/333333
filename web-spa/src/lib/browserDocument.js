@@ -188,3 +188,37 @@ export function observeDocumentBodyAttributes(callback, attributeFilter = []) {
     return noop;
   }
 }
+
+/**
+ * Reads resolved custom properties off the document element.
+ *
+ * The WebGL atmosphere layer paints with the same palette as everything else, and
+ * that palette lives in tokens.css -- `check:pool-ui-migration` rejects a colour
+ * literal in any source file outside it, and rightly so: a shader carrying its own
+ * copy of the brand colours is drift that no theme switch can reach. So the shader
+ * reads its uniforms from here instead, which also makes it follow light/dark and
+ * any future theme for free.
+ *
+ * Returns a plain object keyed by the requested names with trimmed values, and an
+ * empty string for anything the document does not define. Never throws: a computed
+ * style read fails in a detached or SSR-shaped environment, and a background effect
+ * must never be the reason a page does not render.
+ *
+ * @param {string[]} names Custom property names, leading double dash included.
+ * @returns {Record<string, string>}
+ */
+export function readDocumentElementCustomProperties(names) {
+  const out = {};
+  const requested = Array.isArray(names) ? names : [];
+  for (const name of requested) out[name] = '';
+  try {
+    if (typeof document === 'undefined' || typeof getComputedStyle !== 'function') return out;
+    const element = document.documentElement;
+    if (!element) return out;
+    const style = getComputedStyle(element);
+    for (const name of requested) out[name] = String(style.getPropertyValue(name) || '').trim();
+  } catch {
+    // Fall through to the empty defaults seeded above.
+  }
+  return out;
+}

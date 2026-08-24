@@ -10,6 +10,7 @@ import (
 	"codex-account-pool/internal/anthropicwire"
 	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/cloak"
+	"codex-account-pool/internal/cursorproxy"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream"
@@ -556,18 +557,42 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		req.TransportProfile = prov.TransportProfile
 		req.UpstreamProtocol = prov.UpstreamProtocol
 		req.MinimalProbe = true
-		switch prov.UpstreamProtocol {
-		case storage.CustomProviderProtocolResponses:
-			req.DownstreamPath = "/responses"
-			req.SetBodyBytes([]byte(`{"model":"` + model + `","input":[{"role":"user","content":"ping"}],"max_output_tokens":1,"stream":false}`))
-		case storage.CustomProviderProtocolAnthropicMessages:
-			req.DownstreamPath = "/messages"
-			body, osHint := s.claudeCodeMinimalProbeBody(ctx, account, token, egress, model, "ping", 1)
-			req.SetBodyBytes(body)
-			req.OSHint = osHint
-		default:
-			req.DownstreamPath = "/chat/completions"
-			req.SetBodyBytes([]byte(`{"model":"` + model + `","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"stream":false}`))
+		if provider == cursorproxy.ProviderID {
+			credential := cursorproxy.Credential{BridgeKey: strings.TrimSpace(token.AccessToken), ProxyURL: cursorProxyEgressURL(egress)}
+			if strings.EqualFold(strings.TrimSpace(token.CredentialMode), cursorproxy.CredentialBrowser) {
+				credential.ConfigDir = strings.TrimSpace(token.AgentRuntimeID)
+			} else {
+				credential.APIKey = accountprovider.Credential(provider, token)
+			}
+			baseURL, release, resolveErr := s.cursorProxy.Acquire(ctx, account.ID, credential)
+			if resolveErr != nil {
+				res.Err = resolveErr
+				return res
+			}
+			defer release()
+			req.Method = http.MethodGet
+			req.BaseURL = baseURL
+			req.DownstreamPath = "/models"
+			req.SetBodyBytes(nil)
+			res.ProbeScope = "account_auth_models"
+			res.ModelChecked = false
+			req.Token.AccessToken = credential.BridgeKey
+			req.Token.OpenAIAPIKey = credential.BridgeKey
+			req.Egress = cursorLoopbackEgress()
+		} else {
+			switch prov.UpstreamProtocol {
+			case storage.CustomProviderProtocolResponses:
+				req.DownstreamPath = "/responses"
+				req.SetBodyBytes([]byte(`{"model":"` + model + `","input":[{"role":"user","content":"ping"}],"max_output_tokens":1,"stream":false}`))
+			case storage.CustomProviderProtocolAnthropicMessages:
+				req.DownstreamPath = "/messages"
+				body, osHint := s.claudeCodeMinimalProbeBody(ctx, account, token, egress, model, "ping", 1)
+				req.SetBodyBytes(body)
+				req.OSHint = osHint
+			default:
+				req.DownstreamPath = "/chat/completions"
+				req.SetBodyBytes([]byte(`{"model":"` + model + `","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"stream":false}`))
+			}
 		}
 	} else {
 		// The Codex /responses backend (WHAM) is STREAMING-ONLY and hard-validates the

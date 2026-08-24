@@ -8,11 +8,13 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"codex-account-pool/internal/accountprovider"
+	"codex-account-pool/internal/cursorproxy"
 	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
@@ -39,6 +41,7 @@ const (
 	quotaPollIntervalFloor = 120 // seconds — never poll more often than every 2 min
 	quotaPollInterval      = 300 // seconds — default
 	quotaPollMaxConcurrent = 5   // max concurrent fetches per tick
+	quotaRefreshTimeout    = 10 * time.Minute
 )
 
 var whamUsageURL = "https://chatgpt.com/backend-api/wham/usage"
@@ -103,6 +106,21 @@ type quotaPollTarget struct {
 	Egress  storage.EgressProfile
 }
 
+type quotaRefreshResult struct {
+	Updated     int   `json:"updated"`
+	Failed      int   `json:"failed"`
+	Candidates  int   `json:"candidates"`
+	StartedAt   int64 `json:"started_at"`
+	CompletedAt int64 `json:"completed_at"`
+	Coalesced   bool  `json:"coalesced,omitempty"`
+	Reused      bool  `json:"reused,omitempty"`
+}
+
+type quotaRefreshFlight struct {
+	done   chan struct{}
+	result quotaRefreshResult
+}
+
 type quotaPollError struct {
 	reason     string
 	statusCode int
@@ -149,13 +167,13 @@ func (s *Server) StartQuotaPoller(ctx context.Context) {
 		ticker := time.NewTicker(time.Duration(quotaPollInterval) * time.Second)
 		defer ticker.Stop()
 		// First poll immediately after the stagger.
-		s.pollAllCodexQuotas(ctx)
+		s.waitForQuotaRefresh(ctx)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.pollAllCodexQuotas(ctx)
+				s.waitForQuotaRefresh(ctx)
 			}
 		}
 	})
@@ -164,31 +182,38 @@ func (s *Server) StartQuotaPoller(ctx context.Context) {
 // pollAllCodexQuotas fetches usage snapshots for every active Codex/Claude
 // account, concurrency-capped. Best-effort: a single account failure never
 // blocks the rest.
-func (s *Server) pollAllCodexQuotas(ctx context.Context) {
+func (s *Server) pollAllCodexQuotas(ctx context.Context) (result quotaRefreshResult) {
+	result.StartedAt = storage.Now()
+	defer func() { result.CompletedAt = storage.Now() }()
 	accounts, err := s.store.ListAccounts(ctx)
 	if err != nil {
 		log.Printf("[QUOTA-POLL] ListAccounts error: %v", err)
-		return
+		result.Failed = 1
+		return result
 	}
 	now := storage.Now()
 	candidateIDs := quotaPollCandidateAccountIDs(accounts, now)
 	if len(candidateIDs) == 0 {
-		return
+		return result
 	}
+	result.Candidates = len(candidateIDs)
 	tokens, err := s.store.ListTokensByAccountIDs(ctx, candidateIDs)
 	if err != nil {
 		log.Printf("[QUOTA-POLL] ListTokensByAccountIDs error: %v", err)
-		return
+		result.Failed = len(candidateIDs)
+		return result
 	}
 	codex, missingTokens := codexQuotaPollTargets(accounts, tokens, now)
 	claude := claudeQuotaPollTargets(accounts, tokens, now)
 	kiro := kiroQuotaPollTargets(accounts, tokens, now)
-	if len(codex) == 0 && len(claude) == 0 && len(kiro) == 0 && missingTokens == 0 {
-		return
+	cursor := cursorQuotaPollTargets(accounts, tokens, now)
+	if len(codex) == 0 && len(claude) == 0 && len(kiro) == 0 && len(cursor) == 0 && missingTokens == 0 {
+		return result
 	}
 	s.attachQuotaPollEgresses(ctx, codex)
 	s.attachQuotaPollEgresses(ctx, claude)
 	s.attachQuotaPollEgresses(ctx, kiro)
+	s.attachQuotaPollEgresses(ctx, cursor)
 	updated := 0
 	failed := missingTokens
 	// Concurrency-capped worker pool so we never open N connections at once.
@@ -272,7 +297,14 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer supervisor.Recover("quota-poller-kiro-worker")
+			defer func() {
+				if panicValue := recover(); panicValue != nil {
+					mu.Lock()
+					failed++
+					mu.Unlock()
+					supervisor.LogPanic("quota-poller-kiro-worker", panicValue)
+				}
+			}()
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
@@ -294,13 +326,129 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) {
 			}
 		}()
 	}
+	for i := range cursor {
+		target := cursor[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if panicValue := recover(); panicValue != nil {
+					mu.Lock()
+					failed++
+					mu.Unlock()
+					supervisor.LogPanic("quota-poller-cursor-worker", panicValue)
+				}
+			}()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				return
+			}
+			defer func() { <-sem }()
+			if err := s.pollOneCursorQuota(ctx, target.Account, target.Token, target.Egress); err != nil {
+				s.recordQuotaPollError(ctx, target.Account, cursorproxy.ProviderID, err)
+				mu.Lock()
+				failed++
+				mu.Unlock()
+			} else {
+				mu.Lock()
+				updated++
+				mu.Unlock()
+			}
+		}()
+	}
 	wg.Wait()
 	if updated > 0 && s.scheduler != nil {
 		s.scheduler.NotifyStateChanged()
 	}
 	if updated > 0 || failed > 0 {
-		log.Printf("[QUOTA-POLL] tick complete: updated=%d failed=%d total_codex=%d total_claude=%d", updated, failed, len(codex), len(claude))
+		log.Printf("[QUOTA-POLL] tick complete: updated=%d failed=%d total_codex=%d total_claude=%d total_kiro=%d total_cursor=%d", updated, failed, len(codex), len(claude), len(kiro), len(cursor))
 	}
+	result.Updated = updated
+	result.Failed = failed
+	return result
+}
+
+// beginQuotaRefresh coalesces both the background ticker and every manual UI
+// refresh into one global flight. This prevents repeated clicks, multiple admin
+// tabs, and a coincident ticker from multiplying upstream requests.
+func (s *Server) beginQuotaRefresh(base context.Context) (*quotaRefreshFlight, bool) {
+	s.quotaRefreshMu.Lock()
+	if current := s.quotaRefreshFlight; current != nil {
+		s.quotaRefreshMu.Unlock()
+		return current, false
+	}
+	if last := s.quotaRefreshLast; last.CompletedAt > 0 && storage.Now()-last.CompletedAt < quotaPollIntervalFloor {
+		last.Reused = true
+		flight := &quotaRefreshFlight{done: make(chan struct{}), result: last}
+		close(flight.done)
+		s.quotaRefreshMu.Unlock()
+		return flight, false
+	}
+	flight := &quotaRefreshFlight{done: make(chan struct{})}
+	s.quotaRefreshFlight = flight
+	s.quotaRefreshMu.Unlock()
+	if base == nil {
+		base = context.Background()
+	}
+	go func() {
+		defer func() {
+			if panicValue := recover(); panicValue != nil {
+				supervisor.LogPanic("quota-refresh-flight", panicValue)
+				flight.result.Failed++
+			}
+			if flight.result.StartedAt == 0 {
+				flight.result.StartedAt = storage.Now()
+			}
+			flight.result.CompletedAt = storage.Now()
+			s.quotaRefreshMu.Lock()
+			if s.quotaRefreshFlight == flight {
+				s.quotaRefreshFlight = nil
+			}
+			s.quotaRefreshLast = flight.result
+			close(flight.done)
+			s.quotaRefreshMu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(base, quotaRefreshTimeout)
+		defer cancel()
+		flight.result = s.pollAllCodexQuotas(ctx)
+	}()
+	return flight, true
+}
+
+func (s *Server) waitForQuotaRefresh(ctx context.Context) (quotaRefreshResult, error) {
+	base := s.runtimeTaskCtx
+	if base == nil {
+		base = ctx
+	}
+	flight, leader := s.beginQuotaRefresh(base)
+	select {
+	case <-flight.done:
+		result := flight.result
+		result.Coalesced = !leader
+		return result, nil
+	case <-ctx.Done():
+		return quotaRefreshResult{Coalesced: !leader}, ctx.Err()
+	}
+}
+
+func (s *Server) adminQuotaRefresh(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAllowed(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	result, err := s.waitForQuotaRefresh(r.Context())
+	if err != nil {
+		writeError(w, http.StatusRequestTimeout, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func kiroQuotaPollTargets(accounts []storage.Account, tokens map[string]storage.AccountToken, now int64) []quotaPollTarget {
@@ -313,6 +461,115 @@ func kiroQuotaPollTargets(accounts []storage.Account, tokens map[string]storage.
 		}
 	}
 	return out
+}
+
+func cursorQuotaPollTargets(accounts []storage.Account, tokens map[string]storage.AccountToken, now int64) []quotaPollTarget {
+	var out []quotaPollTarget
+	for _, account := range accounts {
+		if !isCursorQuotaPollCandidate(account, now) {
+			continue
+		}
+		token, ok := tokens[account.ID]
+		if !ok || !strings.EqualFold(strings.TrimSpace(token.CredentialMode), cursorproxy.CredentialBrowser) {
+			continue
+		}
+		out = append(out, quotaPollTarget{Account: account, Token: token})
+	}
+	return out
+}
+
+func (s *Server) pollOneCursorQuota(ctx context.Context, account storage.Account, token storage.AccountToken, egress storage.EgressProfile) error {
+	if !strings.EqualFold(strings.TrimSpace(token.CredentialMode), cursorproxy.CredentialBrowser) {
+		return newQuotaPollError("unsupported_api_key_billing", 0, nil, errors.New("Cursor User API keys do not expose individual-plan usage through the official API"))
+	}
+	credential := cursorproxy.Credential{BridgeKey: strings.TrimSpace(token.AccessToken), ConfigDir: strings.TrimSpace(token.AgentRuntimeID)}
+	client, err := s.upstream.EgressHTTPClient(egress)
+	if err != nil {
+		return newQuotaPollError("cursor_egress", 0, nil, err)
+	}
+	usage, err := s.cursorProxy.FetchUsageWithClient(ctx, credential, client)
+	if err != nil {
+		return newQuotaPollError("cursor_usage", 0, nil, err)
+	}
+	if len(usage.Models) == 0 {
+		return newQuotaPollError("partial", 0, nil, errors.New("Cursor usage response contained no model pools"))
+	}
+	for _, snapshot := range cursorUsageSnapshots(account.ID, usage, storage.Now()) {
+		if err := s.store.UpsertAccountRateLimit(ctx, snapshot); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// cursorUsageSnapshots keeps per-model diagnostics while emitting one stable
+// aggregate row for the quota page. The aggregate follows the most-consumed
+// bounded pool; it cannot randomly switch with Go map iteration order.
+func cursorUsageSnapshots(accountID string, usage cursorproxy.Usage, updatedAt int64) []storage.AccountRateLimit {
+	resetAt := int64(0)
+	if start, parseErr := time.Parse(time.RFC3339, usage.StartOfMonth); parseErr == nil {
+		resetAt = start.AddDate(0, 1, 0).Unix()
+	}
+	models := make([]string, 0, len(usage.Models))
+	for model := range usage.Models {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	individual := make([]storage.AccountRateLimit, 0, len(models))
+	aggregate := storage.AccountRateLimit{
+		AccountID: accountID, Provider: cursorproxy.ProviderID,
+		LimiterType: "cursor_monthly", Source: "cursor_usage", UsedPercent: -1,
+		LimitTokens: -1, RemainingTokens: -1, LimitRequests: -1, RemainingRequests: -1,
+		ResetAt: resetAt, Status: "partial", UpdatedAt: updatedAt,
+	}
+	limitingModel := ""
+	bestSet := false
+	for _, model := range models {
+		value := usage.Models[model]
+		usedPercent := float64(-1)
+		limitRequests, remainingRequests := int64(-1), int64(-1)
+		limitTokens, remainingTokens := int64(-1), int64(-1)
+		if value.MaxRequestUsage != nil && *value.MaxRequestUsage > 0 {
+			limitRequests = *value.MaxRequestUsage
+			remainingRequests = max(int64(0), limitRequests-value.NumRequests)
+			usedPercent = float64(value.NumRequests) * 100 / float64(limitRequests)
+		} else if value.MaxTokenUsage != nil && *value.MaxTokenUsage > 0 {
+			limitTokens = *value.MaxTokenUsage
+			remainingTokens = max(int64(0), limitTokens-value.NumTokens)
+			usedPercent = float64(value.NumTokens) * 100 / float64(limitTokens)
+		}
+		if usedPercent > 100 {
+			usedPercent = 100
+		}
+		status := "allowed"
+		if usedPercent < 0 {
+			status = "partial"
+		} else if usedPercent >= 100 {
+			status = "exhausted"
+		}
+		raw, _ := json.Marshal(value)
+		snapshot := storage.AccountRateLimit{
+			AccountID: accountID, Provider: cursorproxy.ProviderID, Model: model,
+			LimiterType: "cursor_model_monthly", Source: "cursor_usage", UsedPercent: usedPercent,
+			LimitTokens: limitTokens, RemainingTokens: remainingTokens,
+			LimitRequests: limitRequests, RemainingRequests: remainingRequests,
+			ResetAt: resetAt, Status: status, Raw: string(raw), UpdatedAt: updatedAt,
+		}
+		individual = append(individual, snapshot)
+		if !bestSet || usedPercent > aggregate.UsedPercent {
+			bestSet = true
+			limitingModel = model
+			aggregate.UsedPercent = usedPercent
+			aggregate.LimitTokens = limitTokens
+			aggregate.RemainingTokens = remainingTokens
+			aggregate.LimitRequests = limitRequests
+			aggregate.RemainingRequests = remainingRequests
+			aggregate.Status = status
+		}
+	}
+	aggregateRaw, _ := json.Marshal(map[string]any{"limiting_model": limitingModel, "usage": usage})
+	aggregate.Raw = string(aggregateRaw)
+	return append([]storage.AccountRateLimit{aggregate}, individual...)
 }
 
 func (s *Server) pollOneKiroQuota(ctx context.Context, acc storage.Account, token storage.AccountToken, egress storage.EgressProfile) error {
@@ -351,7 +608,7 @@ func (s *Server) pollOneKiroQuota(ctx context.Context, acc storage.Account, toke
 func quotaPollCandidateAccountIDs(accounts []storage.Account, now int64) []string {
 	ids := make([]string, 0, len(accounts))
 	for _, account := range accounts {
-		if !isQuotaPollCandidate(account, now) && !isKiroQuotaPollCandidate(account, now) {
+		if !isQuotaPollCandidate(account, now) && !isKiroQuotaPollCandidate(account, now) && !isCursorQuotaPollCandidate(account, now) {
 			continue
 		}
 		ids = append(ids, account.ID)
@@ -489,6 +746,11 @@ func isKiroQuotaPollCandidate(account storage.Account, now int64) bool {
 	return account.Status == "active" &&
 		account.QuarantineUntil <= now &&
 		strings.EqualFold(strings.TrimSpace(account.Provider), "kiro")
+}
+
+func isCursorQuotaPollCandidate(account storage.Account, now int64) bool {
+	return account.Status == "active" && account.QuarantineUntil <= now &&
+		strings.EqualFold(strings.TrimSpace(account.Provider), cursorproxy.ProviderID)
 }
 
 func (s *Server) recordQuotaPollError(ctx context.Context, acc storage.Account, provider string, err error) {

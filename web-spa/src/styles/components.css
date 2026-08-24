@@ -534,6 +534,23 @@
   background: transparent;
   padding: 0;
   min-height: 30px;
+  /* Shrinkable, so the affix buttons below keep their intrinsic width. */
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/*
+ * Affix controls (reveal, clear) hold their own width and never break their label.
+ *
+ * The input is `width: 100%`, so in this inline-flex row it claimed the whole line
+ * and squeezed the buttons to min-content. For a two-character label that is one
+ * character wide: the password field's 显示 rendered as 显 above 示, stacked
+ * vertically in a box barely wider than a glyph, on the login screen -- the first
+ * thing anyone sees.
+ */
+.pool-input-wrap > .pool-button {
+  flex: none;
+  white-space: nowrap;
 }
 
 .pool-textarea {
@@ -4141,7 +4158,27 @@ so the mark owns the size
   grid-template-columns: minmax(0, 7fr) minmax(380px, 5fr);
   align-items: stretch;
   padding: 0;
-  background: var(--pool-bg-grouped);
+  /*
+   * Transparent, with the fallback field on a fixed ::before floor behind it.
+   *
+   * Painting the gradient on this element directly is what the first attempt did,
+   * and it hid the canvas completely: .pool-atmosphere is `position: fixed` at
+   * z-index 0, and an opaque background on the grid that sits above it wins. Same
+   * shape as .pool-app-layout::before in atmosphere.css, and for the same reason.
+   */
+  position: relative;
+  background: transparent;
+}
+
+.pool-login-wrap::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background:
+    radial-gradient(52% 44% at 14% 20%, var(--pool-atmo-near) 0%, transparent 60%),
+    radial-gradient(44% 38% at 86% 76%, var(--pool-atmo-far) 0%, transparent 56%),
+    var(--pool-atmo-void);
 }
 
 .pool-login-story {
@@ -4151,10 +4188,31 @@ so the mark owns the size
   justify-content: center;
   gap: 32px;
   padding: 48px clamp(40px, 7vw, 112px);
-  background:
-    radial-gradient(circle at 12% 18%, var(--pool-brand-secondary-soft) 0 7%, transparent 7.2%),
-    var(--pool-bg-page);
-  border-right: 1px solid var(--pool-border);
+  /*
+   * A soft field, not a sticker.
+   *
+   * This was `radial-gradient(circle at 12% 18%, ... 0 7%, transparent 7.2%)` -- a
+   * 0.2% falloff, which is a hard-edged disc. Against the deeper page colour it
+   * stopped reading as ambient light and started reading as a stray blob parked
+   * behind the wordmark, in a warm hue nothing else on the screen shares. The
+   * atmosphere tokens are the same ones the shell's depth field samples, so the
+   * login screen now shares its language instead of inventing one.
+   */
+  position: relative;
+  z-index: 1;
+  background: transparent;
+  border-right: 0;
+}
+
+/* A hairline that fades out at both ends, rather than a rule that slices the field
+   in half. The column split still reads; the surface stays continuous. */
+.pool-login-story::after {
+  content: '';
+  position: absolute;
+  inset: 12% auto 12% 100%;
+  width: 1px;
+  background: linear-gradient(180deg, transparent, var(--pool-glass-border) 22%, var(--pool-glass-border) 78%, transparent);
+  pointer-events: none;
 }
 
 .pool-login-wordmark {
@@ -4191,7 +4249,16 @@ so the mark owns the size
   color: var(--pool-text);
   font-size: clamp(40px, 4.2vw, 56px);
   font-weight: 680;
-  line-height: 1.14;
+  /*
+   * 1.14 does not contain CJK glyphs. At 1280px the line box computed to 61px
+   * against a 69px ink box, so the headline overflowed its own element by 8px and
+   * crowded the paragraph under it. Latin type tolerates leading that tight; a
+   * face with full-width ideographs does not, and this headline is Chinese in the
+   * default locale. 1.3 is where the line box finally contains the ink box -- 1.2
+   * still left 5px hanging out of the element. At 56px the headline still reads as
+   * tight display type; the size is doing that work, not the leading.
+   */
+  line-height: 1.3;
   letter-spacing: -.045em;
 }
 
@@ -4340,15 +4407,22 @@ so the mark owns the size
   min-width: 0;
   place-items: center;
   padding: 40px clamp(28px, 5vw, 72px);
-  background: var(--pool-bg-surface);
+  /* Transparent, so the field runs unbroken across both columns and the card reads
+     as floating on it rather than as the second of two flat panels. */
+  position: relative;
+  z-index: 1;
+  background: transparent;
 }
 
 .pool-login-card {
   width: min(440px, 100%);
   padding: 32px;
-  background: var(--pool-bg-surface);
-  border: 1px solid var(--pool-border);
+  background: var(--pool-glass-bg-strong);
+  backdrop-filter: var(--pool-material-blur);
+  -webkit-backdrop-filter: var(--pool-material-blur);
+  border: 1px solid var(--pool-glass-border);
   border-radius: var(--pool-radius-portal);
+  box-shadow: var(--pool-shadow-glass);
 }
 
 .pool-login-form-head {

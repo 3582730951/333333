@@ -164,6 +164,8 @@ export async function fetchAccountsBundle(params: AccountsPageParams, signal?: A
 export interface AccountArchiveDownload {
   blob: Blob;
   filename: string;
+  exported?: number;
+  skipped?: number;
 }
 
 export interface AccountArchiveImportResult {
@@ -205,23 +207,27 @@ function archiveBlob(data: unknown, contentType: string): Blob {
   return data instanceof Blob ? data : new Blob([data as BlobPart], { type: contentType });
 }
 
-export async function fetchAccountArchive(ids: string[] = [], signal?: AbortSignal): Promise<AccountArchiveDownload> {
+export type AccountExportFormat = 'backup' | 'cliproxyapi' | 'codex-auth';
+
+export async function fetchAccountArchive(ids: string[] = [], formatOrSignal: AccountExportFormat | AbortSignal = 'backup', signal?: AbortSignal): Promise<AccountArchiveDownload> {
+  const format: AccountExportFormat = typeof formatOrSignal === 'string' ? formatOrSignal : 'backup';
+  const requestSignal = typeof formatOrSignal === 'string' ? signal : formatOrSignal;
   const normalizedIDs = [...new Set(ids.map((id) => String(id || '').trim()).filter(Boolean))];
   const response = await api.get('/admin/accounts/export', {
     params: {
-      format: 'backup',
+      format,
       ...(normalizedIDs.length ? { ids: normalizedIDs.join(',') } : {}),
     },
     responseType: 'blob',
     timeout: accountArchiveTimeoutMs,
-    ...(signal ? { signal } : {}),
+    ...(requestSignal ? { signal: requestSignal } : {}),
   });
   const contentType = responseHeader(response.headers, 'content-type').toLowerCase();
   const isZIP = contentType.includes('application/zip');
   const isJSON = contentType.includes('application/json');
-  if (!isZIP && !isJSON) throw new Error('服务器未返回账号 JSON 或 ZIP 备份。');
+  if (!isZIP && !isJSON) throw new Error('服务器未返回账号 JSON 或 ZIP 导出文件。');
   const blob = archiveBlob(response.data, isZIP ? 'application/zip' : 'application/json');
-  if (blob.size < 2) throw new Error('账号备份文件为空或不完整。');
+  if (blob.size < 2) throw new Error('账号导出文件为空或不完整。');
   const prefix = new Uint8Array(await blob.slice(0, Math.min(32, blob.size)).arrayBuffer());
   if (isZIP && (prefix[0] !== 0x50 || prefix[1] !== 0x4b)) {
     throw new Error('服务器返回的账号 ZIP 备份无效。');
@@ -234,7 +240,14 @@ export async function fetchAccountArchive(ids: string[] = [], signal?: AbortSign
   }
   const fallbackName = isZIP ? 'account-pool.zip' : 'account.json';
   const filename = filenameFromDisposition(responseHeader(response.headers, 'content-disposition')) || fallbackName;
-  return { blob, filename };
+  const exported = Number(responseHeader(response.headers, 'x-accounts-exported'));
+  const skipped = Number(responseHeader(response.headers, 'x-accounts-skipped'));
+  return {
+    blob,
+    filename,
+    ...(Number.isFinite(exported) && exported > 0 ? { exported } : {}),
+    ...(Number.isFinite(skipped) && skipped > 0 ? { skipped } : {}),
+  };
 }
 
 export async function importAccountArchive(file: File, signal?: AbortSignal): Promise<AccountArchiveImportResult> {

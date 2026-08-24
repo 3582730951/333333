@@ -7,9 +7,13 @@ export type ResolvedTheme = 'light' | 'dark';
 
 const THEME_KEY = 'pool_theme';
 
+// Dark is the product's default surface, not a preference the user has to find:
+// the console is a dark-first curatorial shell and every token block is authored
+// against it. `light` stays a first-class explicit choice, `auto` still follows
+// the OS, and an unrecognised stored value falls back to dark rather than light.
 function storedPreference(): ThemePreference {
-  const value = getLocalItem(THEME_KEY, 'light');
-  return value === 'auto' || value === 'dark' ? value : 'light';
+  const value = getLocalItem(THEME_KEY, 'dark');
+  return value === 'auto' || value === 'light' ? value : 'dark';
 }
 
 function systemTheme(): ResolvedTheme {
@@ -37,8 +41,9 @@ export function useTheme() {
   }, [preference, resolved]);
 
   const setPreference = useCallback((next: ThemePreference) => setPreferenceState(next), []);
+  // Cycle order follows the new default: dark -> light -> auto -> dark.
   const cycle = useCallback(() => {
-    setPreferenceState((current) => current === 'auto' ? 'light' : current === 'light' ? 'dark' : 'auto');
+    setPreferenceState((current) => current === 'dark' ? 'light' : current === 'light' ? 'auto' : 'dark');
   }, []);
 
   return useMemo(() => ({ preference, resolved, setPreference, cycle }), [preference, resolved, setPreference, cycle]);

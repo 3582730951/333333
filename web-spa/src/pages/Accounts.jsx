@@ -111,6 +111,7 @@ const QUOTA_REASON_LABELS = {
   token_missing: '缺少可用凭据',
   token_expired: '凭据已过期',
   unsupported_api_key_billing: '按量计费不提供订阅额度',
+  unsupported_cursor_api_key_billing: 'Cursor User API Key 不提供个人额度接口',
   unsupported_claude_non_oauth: '当前认证方式不提供订阅额度',
   unsupported_provider: '当前提供商不提供额度同步',
 };
@@ -233,6 +234,8 @@ export default function Accounts() {
   const [search, setSearch] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [authType, setAuthType] = useState('all');
+  const [groupFilter, setGroupFilter] = useState('all');
+  const [exportFormat, setExportFormat] = useState('backup');
   const [selected, setSelected] = useState([]);
   const [selectedAccountMeta, setSelectedAccountMeta] = useState({});
   const [selectMode, setSelectMode] = useState(false);
@@ -259,7 +262,7 @@ export default function Accounts() {
     error,
     lastRefresh,
     reload: load,
-  } = useAccountsPage({ page, pageSize, search, authType });
+  } = useAccountsPage({ page, pageSize, search, authType, group: groupFilter === 'all' ? '' : groupFilter });
   const rows = data.rows || [];
   const total = data.total || 0;
   const groups = data.groups || [];
@@ -279,21 +282,22 @@ export default function Accounts() {
   const onPageChange = (cur) => { setPage(cur); };
 
   const refreshCurrentAccounts = useCallback(async () => {
-    const params = { page, pageSize, search, authType };
+    const params = { page, pageSize, search, authType, group: groupFilter === 'all' ? '' : groupFilter };
     const next = await fetchAccountsPage(params);
     queryClient.setQueryData(accountQueryKeys.list(params), (current) => ({
       ...(current || { groups: [], error: null }),
       ...next,
     }));
     return next;
-  }, [authType, page, pageSize, queryClient, search]);
+  }, [authType, groupFilter, page, pageSize, queryClient, search]);
 
   const handleAccountImported = useCallback((result) => {
     const candidate = result && typeof result === 'object' && result.id ? result : null;
     if (candidate && page === 1 && !search) {
       const credential = accountCredentialPresentation(candidate);
-      if (authType === 'all' || authType === credential.key) {
-        const params = { page, pageSize, search, authType };
+      const groupMatches = groupFilter === 'all' || String(candidate.group_name || '') === groupFilter;
+      if (groupMatches && (authType === 'all' || authType === credential.key)) {
+        const params = { page, pageSize, search, authType, group: groupFilter === 'all' ? '' : groupFilter };
         queryClient.setQueryData(accountQueryKeys.list(params), (current) => {
           if (!current || !Array.isArray(current.rows)) return current;
           const exists = current.rows.some((row) => row.id === candidate.id);
@@ -318,7 +322,7 @@ export default function Accounts() {
     importRefreshTimersRef.current = [2500, 10_000, 30_000].map((delay) => setBrowserTimeout(() => {
       void refreshCurrentAccounts().catch(() => {});
     }, delay));
-  }, [authType, page, pageSize, queryClient, refreshCurrentAccounts, search]);
+  }, [authType, groupFilter, page, pageSize, queryClient, refreshCurrentAccounts, search]);
 
   const updateCachedAccount = useCallback((id, patch) => {
     queryClient.setQueriesData({ queryKey: accountQueryKeys.all }, (current) => {
@@ -432,7 +436,7 @@ export default function Accounts() {
     try {
       await post('/admin/accounts/assign-group', { ids, group: moveGroup });
       const moved = new Set(ids);
-      queryClient.setQueryData(accountQueryKeys.list({ page, pageSize, search, authType }), (current) => current ? {
+      queryClient.setQueryData(accountQueryKeys.list({ page, pageSize, search, authType, group: groupFilter === 'all' ? '' : groupFilter }), (current) => current ? {
         ...current,
         rows: (current.rows || []).map((account) => moved.has(account.id) ? { ...account, group_name: moveGroup } : account),
       } : current);
@@ -450,13 +454,17 @@ export default function Accounts() {
     const controller = createAbortController();
     accountArchiveAbortRef.current = controller;
     try {
-      const archive = await fetchAccountArchive(ids, abortSignal(controller));
+      const archive = await fetchAccountArchive(ids, exportFormat, abortSignal(controller));
       if (controller?.signal.aborted) return false;
       if (!downloadBlob(archive.filename, archive.blob)) {
         Toast.error('浏览器未能开始下载，请检查下载权限');
         return false;
       }
-      Toast.success(ids.length ? `已导出 ${ids.length} 个账号` : '已导出全部账号');
+      if (archive.skipped) {
+        Toast.warning(`已导出 ${archive.exported || '可兼容'} 个账号，跳过 ${archive.skipped} 个不兼容账号`);
+      } else {
+        Toast.success(ids.length ? `已导出 ${ids.length} 个账号` : '已导出全部账号');
+      }
       return true;
     } catch (e) {
       if (controller?.signal.aborted) return false;
@@ -757,8 +765,27 @@ export default function Accounts() {
               { label: '登录账号', value: 'account' },
             ]}
           />
+          <Select
+            value={groupFilter}
+            onChange={(value) => { setGroupFilter(value); setPage(1); }}
+            style={{ width: 148 }}
+            optionList={[
+              { label: '全部分组', value: 'all' },
+              ...groups.map((group) => ({ label: group.name, value: group.name })),
+            ]}
+          />
           <Button icon={<IconSearch />} onClick={doSearch}>搜索</Button>
           <Button icon={<IconDownload />} onClick={exportCSV}>导出 CSV</Button>
+          <Select
+            value={exportFormat}
+            onChange={setExportFormat}
+            style={{ width: 168 }}
+            optionList={[
+              { label: '完整账号备份', value: 'backup' },
+              { label: 'CLIProxyAPI', value: 'cliproxyapi' },
+              { label: 'Codex auth.json', value: 'codex-auth' },
+            ]}
+          />
           <Button icon={<IconDownload />} loading={accountExportRunning} disabled={accountImportRunning} onClick={() => exportAccountBackup([])}>一键导出全部</Button>
           <Button icon={<IconDownload />} loading={accountExportRunning} disabled={!selected.length || accountImportRunning} onClick={() => exportAccountBackup([...selected])}>一键导出所选{selected.length ? `(${selected.length})` : ''}</Button>
           <Button icon={<IconFile />} disabled={accountExportRunning || accountImportRunning} onClick={() => setArchiveImportOpen(true)}>一键导入账号池</Button>

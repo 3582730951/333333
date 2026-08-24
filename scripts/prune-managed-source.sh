@@ -37,7 +37,7 @@ if [[ -f "${ROOT}/scripts/verify-console-release.sh" ]]; then
 fi
 
 managed_roots=(
-  cmd internal services sidecar scripts deploy web-spa/src web-spa/scripts
+  cmd internal services sidecar modules scripts deploy web-spa/src web-spa/scripts
   workers/node-registrar/src
 )
 candidate_file="$(mktemp)"

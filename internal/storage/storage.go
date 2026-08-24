@@ -644,6 +644,7 @@ type AccountPoolSummary struct {
 	Codex       int `json:"codex"`
 	Claude      int `json:"claude"`
 	Kiro        int `json:"kiro"`
+	Cursor      int `json:"cursor"`
 	Other       int `json:"other"`
 }
 
@@ -5525,6 +5526,8 @@ LEFT JOIN account_auth_tokens t ON t.account_id = a.id
 			summary.Claude++
 		case "kiro":
 			summary.Kiro++
+		case "cursor":
+			summary.Cursor++
 		default:
 			summary.Other++
 		}
@@ -5534,7 +5537,7 @@ LEFT JOIN account_auth_tokens t ON t.account_id = a.id
 
 func accountProviderSummary(provider, accessToken, apiKey string) string {
 	if provider = strings.TrimSpace(provider); provider != "" {
-		return provider
+		return strings.ToLower(provider)
 	}
 	if strings.HasPrefix(accessToken, "sk-ant") || strings.HasPrefix(apiKey, "sk-ant") {
 		return "claude"
@@ -5555,21 +5558,28 @@ func firstNonEmptyString(values ...string) string {
 // When search is empty, no LIKE filter is applied (the fast path for the default
 // "all accounts" view). Status filters are applied when non-empty.
 func (s *Store) ListAccountsPage(ctx context.Context, limit, offset int, search, status string) ([]Account, int, error) {
-	return s.listAccountsPage(ctx, limit, offset, search, status, "", "created_at, id DESC")
+	return s.listAccountsPage(ctx, limit, offset, search, status, "", "", "created_at, id DESC")
 }
 
 func (s *Store) ListAccountsPageDesc(ctx context.Context, limit, offset int, search, status string) ([]Account, int, error) {
-	return s.listAccountsPage(ctx, limit, offset, search, status, "", "created_at DESC, id DESC")
+	return s.listAccountsPage(ctx, limit, offset, search, status, "", "", "created_at DESC, id DESC")
 }
 
 // ListAccountsPageByAuthType keeps pagination totals exact when the admin console
 // separates API-key identities from login/OAuth accounts. authType accepts
 // "api_key", "account", or an empty string for the original unfiltered view.
 func (s *Store) ListAccountsPageByAuthType(ctx context.Context, limit, offset int, search, status, authType string) ([]Account, int, error) {
-	return s.listAccountsPage(ctx, limit, offset, search, status, authType, "created_at, id DESC")
+	return s.ListAccountsPageFiltered(ctx, limit, offset, search, status, authType, "")
 }
 
-func (s *Store) listAccountsPage(ctx context.Context, limit, offset int, search, status, authType, orderBy string) ([]Account, int, error) {
+// ListAccountsPageFiltered applies the account-pool filters in SQL so pagination
+// totals and page boundaries remain exact. group is an exact group name; an empty
+// value keeps the original all-groups view.
+func (s *Store) ListAccountsPageFiltered(ctx context.Context, limit, offset int, search, status, authType, group string) ([]Account, int, error) {
+	return s.listAccountsPage(ctx, limit, offset, search, status, authType, group, "created_at, id DESC")
+}
+
+func (s *Store) listAccountsPage(ctx context.Context, limit, offset int, search, status, authType, group, orderBy string) ([]Account, int, error) {
 	where := ""
 	args := []interface{}{}
 	appendCondition := func(condition string, values ...interface{}) {
@@ -5586,6 +5596,9 @@ func (s *Store) listAccountsPage(ctx context.Context, limit, offset int, search,
 	}
 	if status != "" {
 		appendCondition("status = ?", status)
+	}
+	if group = strings.TrimSpace(group); group != "" {
+		appendCondition("group_name = ?", group)
 	}
 	apiKeyCredential := `(EXISTS (SELECT 1 FROM account_auth_tokens aat WHERE aat.account_id = accounts.id AND LOWER(aat.auth_method) = 'api_key') OR EXISTS (SELECT 1 FROM account_kiro_credentials akc WHERE akc.account_id = accounts.id AND LOWER(akc.auth_method) = 'api_key'))`
 	switch strings.ToLower(strings.TrimSpace(authType)) {

@@ -38,6 +38,7 @@ func (s *Server) adminAccounts(w http.ResponseWriter, r *http.Request) {
 	search := strings.TrimSpace(r.URL.Query().Get("search"))
 	status := strings.TrimSpace(r.URL.Query().Get("status"))
 	authType := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("authType")))
+	group := strings.TrimSpace(r.URL.Query().Get("group"))
 	if authType != "" && authType != "all" && authType != "api_key" && authType != "account" {
 		writeError(w, http.StatusBadRequest, errors.New("authType must be api_key, account, or all"))
 		return
@@ -46,7 +47,7 @@ func (s *Server) adminAccounts(w http.ResponseWriter, r *http.Request) {
 		authType = ""
 	}
 	if page > 0 && pageSize > 0 {
-		accounts, total, err := s.store.ListAccountsPageByAuthType(r.Context(), pageSize, (page-1)*pageSize, search, status, authType)
+		accounts, total, err := s.store.ListAccountsPageFiltered(r.Context(), pageSize, (page-1)*pageSize, search, status, authType, group)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -906,6 +907,9 @@ func (s *Server) adminSetAccountStatus(w http.ResponseWriter, r *http.Request, a
 	if s.scheduler != nil {
 		s.scheduler.InvalidateAccountCache()
 	}
+	if status != "active" && s.cursorProxy != nil {
+		s.cursorProxy.Stop(accountID)
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"account_id": accountID, "status": status})
 }
 
@@ -1071,6 +1075,9 @@ func (s *Server) adminDeleteAccount(w http.ResponseWriter, r *http.Request, acco
 	if err := s.store.DeleteAccount(r.Context(), accountID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if s.cursorProxy != nil {
+		s.cursorProxy.Stop(accountID)
 	}
 	if s.scheduler != nil {
 		s.scheduler.InvalidateAccountCache()

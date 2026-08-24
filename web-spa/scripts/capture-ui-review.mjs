@@ -577,6 +577,17 @@ async function handleAPI(req) {
   const p = url.pathname;
   const role = currentRole(req);
   if (p === '/healthz') return req.respond(json({ ok: true }));
+  // Ambient SSE pulse for the shell's atmosphere layer. Answered with a complete
+  // one-shot stream so the capture stays deterministic and nothing stays in flight.
+  if (p === '/admin/stream/ambient') {
+    return req.respond({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: 'retry: 60000\n\nevent: snapshot\ndata: '
+      + JSON.stringify({ total: 8, active: 6, cooling: 1, quarantined: 1, recheck: 0, codex: 6, claude: 2, cpu_pct: 18.4, mem_pct: 41.2, energy: 0.29 })
+      + '\n\n',
+    });
+  }
   if (p === '/client/errors') return req.respond({ status: 204, body: '' });
   if (p === '/auth/login') {
     const email = JSON.parse(req.postData() || '{}').email || '';
@@ -721,6 +732,44 @@ async function handleAPI(req) {
   if (p === '/admin/system') return req.respond(json({
     supported: true,
     hostname: 'fixture-vps',
+    // Same class of gap as compatibility_manifest below: with no key here the card
+    // rendered its "暂无被动健康样本" empty state in every screenshot ever taken of
+    // /system, so its table, health tags and latency columns had never once been
+    // reviewed. Field names come from passiveHealthSeriesSchema, which mirrors the
+    // Go payload.
+    passive_provider_health: {
+      generated_at: now - 120,
+      retention_seconds: 86400,
+      max_series: 256,
+      series_count: 5,
+      evictions: 2,
+      series: [
+        { provider: 'openai-codex', model: 'gpt-5-codex', egress_id: 'egress_direct', health: 'healthy', observations: 4820, health_samples: 4610, successes: 4590, failures: 20, canceled: 210, rate_limited: 4, success_ewma: 0.996, latency_ewma_ms: 412, last_status_code: 200, first_observed_at: now - 82000, last_observed_at: now - 45 },
+        { provider: 'anthropic', model: 'claude-sonnet-4-5', egress_id: 'egress_warp_2', health: 'healthy', observations: 3140, health_samples: 3080, successes: 3021, failures: 59, canceled: 60, rate_limited: 11, success_ewma: 0.981, latency_ewma_ms: 638, last_status_code: 200, first_observed_at: now - 79000, last_observed_at: now - 90 },
+        { provider: 'deepseek', model: 'deepseek-v4', egress_id: 'egress_socks_1', health: 'degraded', observations: 1268, health_samples: 1204, successes: 1042, failures: 162, canceled: 64, rate_limited: 87, success_ewma: 0.865, latency_ewma_ms: 1483, last_status_code: 429, last_error_class: 'rate_limited', first_observed_at: now - 61000, last_observed_at: now - 210 },
+        { provider: 'kiro', model: 'kiro-pro', egress_id: 'egress_warp_5', health: 'unhealthy', observations: 402, health_samples: 388, successes: 214, failures: 174, canceled: 14, rate_limited: 6, success_ewma: 0.551, latency_ewma_ms: 2870, last_status_code: 503, last_error_class: 'upstream_unavailable', first_observed_at: now - 32000, last_observed_at: now - 620 },
+        { provider: 'cursor', model: 'cursor-fast', egress_id: 'egress_direct', health: 'unknown', observations: 18, health_samples: 6, successes: 6, failures: 0, canceled: 12, rate_limited: 0, success_ewma: 1, latency_ewma_ms: 305, last_status_code: 200, first_observed_at: now - 5400, last_observed_at: now - 1800 },
+      ],
+    },
+    // Field names taken from compatmanifest.Status's `json:` tags, not from the page.
+    // Without this key the card renders its disabled state -- every field a dash --
+    // and every screenshot ever taken of /system photographed an empty card while
+    // the capture reported success. Its own blank-card rule is what surfaced it.
+    compatibility_manifest: {
+      enabled: true,
+      source: 'https://compat.openai.example/manifest',
+      state: 'current',
+      digest: 'sha256:4f1c9ab7e2d80516',
+      generation: 42,
+      fetched_at: now - 900,
+      expires_at: now + 2700,
+      last_attempt_at: now - 900,
+      last_success_at: now - 900,
+      snapshot_slot: 'a',
+      signature_checked: true,
+      canary: 'stable',
+      model_count: 37,
+    },
     uptime_seconds: 456789,
     cpu: { usage_pct: 18, cores: 4, load1: 0.42, load5: 0.55, load15: 0.61 },
     mem: { scope: 'cgroup', total_kb: 8388608, available_kb: 4259840, used_kb: 4128768, used_pct: 49 },
@@ -1276,6 +1325,13 @@ async function pageMetrics(page) {
       if (rect.width <= 0 || rect.height <= 120) return null;
       const text = (card.innerText || '').replace(/\s+/g, ' ').trim();
       const title = card.querySelector('.t')?.textContent?.trim() || text.slice(0, 40);
+      // A card that deliberately renders the shared empty state is not a defect.
+      // This was a regex over two Chinese strings, which covered "暂无数据" and
+      // "加载图表" and nothing else -- so /system's passive-health card, whose empty
+      // state reads "暂无被动健康样本", was reported as a blank chart on every run.
+      // Matching the component instead of its copy is both precise and immune to the
+      // next wording, and to the English locale.
+      if (card.querySelector('.pool-empty')) return null;
       if (/暂无数据|加载图表/.test(text)) return null;
       // Every drawn primitive in MicroCharts, not just the SVG-based ones. Sparkline and
       // RadialGauge draw SVG; RankedBars, StackedMeter and HeatStrip draw filled divs, and
@@ -1295,6 +1351,27 @@ async function pageMetrics(page) {
           return style.display !== 'none' && style.visibility !== 'hidden' && box.width > 1 && box.height > 1;
         });
       if (visibleVisuals.length > 0) return null;
+      // Not every .pool-chart-card draws. Two on /system carry their data as a
+      // definition grid (兼容清单) and as a sortable table (Provider 被动健康), and
+      // both were reported blank while showing a full screen of populated rows --
+      // the same shape of false alarm the comment above describes for filled divs,
+      // one element type further out. A rule that cries wolf on a card that is
+      // plainly rendered is how the real blank ones stop being believed.
+      //
+      // Populated is the test, not merely present: a `dd` holding an em dash is the
+      // empty state this rule exists to catch, and an empty tbody still counts as
+      // blank.
+      const populatedRows = [...card.querySelectorAll('tbody tr')].filter((row) => (
+        (row.innerText || '').replace(/\s+/g, '').replace(/[—-]/g, '').length > 0
+      ));
+      if (populatedRows.length > 0) return null;
+      // A definition grid carries its data in `dd`. Dashes are the empty state this
+      // rule is for, and a lone populated pair is not a card's worth of content, so
+      // require at least two real values.
+      const populatedTerms = [...card.querySelectorAll('dd')].filter((cell) => (
+        (cell.innerText || '').replace(/\s+/g, '').replace(/[—-]/g, '').length > 0
+      ));
+      if (populatedTerms.length >= 2) return null;
       return {
         title,
         height: Math.round(rect.height),
@@ -1829,8 +1906,17 @@ async function captureStates(browser, baseURL) {
   );
   await login.goto(`${baseURL}/?fixture_login_delay=1`, { waitUntil: 'domcontentloaded' });
   await waitForText(login, 'Pool 控制台');
-  await clickButtonByText(login, '登录');
-  await waitForText(login, '请输入 Token');
+  // The screen opens on the email/password form; the admin-token field this block
+  // goes on to type into only exists after switching. Two things were wrong here
+  // and each hid the other: `登录` matched the *tab* of the user form rather than
+  // any submit control, so nothing was ever validated, and the text waited for
+  // afterwards -- `请输入 Token` -- is not a substring of the real message,
+  // `请输入管理员 Token。`. The step could only ever time out, which is why the
+  // login states have not been captured.
+  await clickButtonByText(login, '管理员 Token 登录');
+  await waitForText(login, '管理员登录');
+  await clickButtonByText(login, '进入管理控制台');
+  await waitForText(login, '请输入管理员 Token。');
   await captureState(login, dir, 'login-validation.png', ['validation'], covered);
   await login.type('input[placeholder="admin_token"]', 'wrong-admin-token');
   await clickButtonByText(login, '登录');

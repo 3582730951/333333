@@ -12,6 +12,9 @@ import LoadErrorBanner from './components/LoadErrorBanner.jsx';
 import { useAuth } from './app/AuthProvider';
 import { adminRoutes, legacyRedirects, portalRoutes, settingsSections } from './app/routeDefinitions';
 import { useTheme } from './app/useTheme';
+import { useAmbientSignal } from './app/useAmbientSignal';
+import useScrollReveal from './hooks/useScrollReveal';
+import useMagneticPointer from './hooks/useMagneticPointer';
 import { useAdminDensity } from './app/useAdminDensity';
 import useResponsiveLayout from './hooks/useResponsiveLayout.js';
 import { getLocale, setLocale, t } from './lib/i18n.js';
@@ -28,6 +31,11 @@ const SIDEBAR_COLLAPSED_WIDTH = 68;
 const adminPages = new Map<string, LazyExoticComponent<ComponentType<any>>>(adminRoutes.map((route) => [route.path, lazy(route.lazyLoader)]));
 const portalPages = new Map<string, LazyExoticComponent<ComponentType<any>>>(portalRoutes.map((route) => [route.path, lazy(route.lazyLoader)]));
 const LoginPage = lazy(() => import('./pages/Login.jsx'));
+// Lazy, and it must stay lazy: this pulls in the WebGL program, and
+// `scripts/check-build-budget.mjs` measures the initial static graph against a
+// 256 KiB gzip ceiling. A background effect has no business competing with the
+// first paint for that budget.
+const AtmosphereLayer = lazy(() => import('./components/AtmosphereLayer'));
 
 const ADMIN_GROUPS = [
   { key: 'accounts', labelKey: 'nav.accounts', icon: IconUserGroup },
@@ -250,7 +258,21 @@ export default function App() {
   const accountMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const mobileMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const wasMobileRef = useRef(responsive.isMobile);
+  // State, not a ref: the narrative hook has to re-run when this element actually
+  // mounts, and it mounts a render after auth resolves. A ref would stay null on
+  // the only render the effect ever sees.
+  const [shellContentNode, setShellContentNode] = useState<HTMLDivElement | null>(null);
   const isAdmin = auth.role === 'admin';
+  // One stream for the whole shell. The sample never enters React state -- see
+  // useAmbientSignal -- so a tick costs one canvas frame and no re-render.
+  //
+  // Admins only: the endpoint is /admin/stream/ambient. A portal user cannot ever
+  // connect to it, so opening it for them spends four doomed requests on the way to
+  // the fallback and then shows them a status light that is grey by construction.
+  const ambient = useAmbientSignal(auth.authed && isAdmin);
+  // Magnetic pull on the primary action. One delegated listener; no-op on touch,
+  // coarse pointers and reduced motion.
+  useMagneticPointer(auth.ready);
 
   useEffect(() => {
     if (!auth.authed || !isAdmin) return undefined;
@@ -407,6 +429,9 @@ export default function App() {
     : activeRoute
       ? t(activeRoute.titleKey)
       : t('app.title');
+  // Re-arms on every route change; the hook is a no-op under reduced motion and
+  // when IntersectionObserver is unavailable, in which case nothing is ever hidden.
+  useScrollReveal(shellContentNode, routeIdentity);
   const shellViewIdentity = `shell:${isAdmin ? 'admin' : 'portal'}:${routeIdentity}`;
   const currentViewIdentity = !auth.ready
     ? 'auth:boot'
@@ -528,6 +553,10 @@ export default function App() {
     return (
       <>
         <RouteStatus announcement={routeAnnouncement} />
+        {/* The login screen returns above the shell, so it was the one surface with no
+            depth field -- the first thing anyone sees, and the flattest. It carries no
+            live sample: there is no session yet to have a pulse. */}
+        <Suspense fallback={null}><AtmosphereLayer /></Suspense>
         <Suspense fallback={<BootScreen portal={location.pathname.startsWith('/portal')} />}>
           <CommittedView identity="auth:login" title={t('auth.login_title')} onCommit={handleViewCommit}>
             <LoginPage onSuccess={auth.refresh} />
@@ -578,6 +607,7 @@ export default function App() {
       >
         {t('app.skip_to_content')}
       </a>
+      <Suspense fallback={null}><AtmosphereLayer subscribe={ambient.subscribe} /></Suspense>
       {isAdmin && responsive.isMobile && mobileOpen ? <div className="pool-shell-drawer-overlay" aria-hidden="true" onClick={closeMobileMenu} /> : null}
       {isAdmin ? <Sider
         id={responsive.isMobile ? 'pool-mobile-navigation' : 'pool-desktop-navigation'}
@@ -629,12 +659,20 @@ export default function App() {
           </>}
           <div className="pool-topbar-actions">
             {isAdmin && !responsive.isMobile ? <Button className="pool-command-trigger" onClick={() => setCommandOpen(true)} icon={<IconSearch />} aria-label={t('command.open')}><span>{t('command.search')}</span><kbd>{commandShortcut}</kbd></Button> : null}
+            {isAdmin ? (
+              <span
+                className={`pool-ambient-dot ${ambient.status === 'live' ? 'pool-ambient-dot--live' : ''}`}
+                role="status"
+                aria-label={t(`ambient.${ambient.status}`)}
+                title={t(`ambient.${ambient.status}`)}
+              />
+            ) : null}
             <Button className="pool-topbar-icon-button pool-desktop-only" theme="borderless" icon={<IconLanguage />} onClick={switchLocale} aria-label={t('app.language')} />
             <Button className="pool-topbar-icon-button pool-desktop-only" theme="borderless" icon={theme.resolved === 'dark' ? <IconMoon /> : <IconSun />} onClick={theme.cycle} aria-label={`${t('app.theme')}: ${t(`theme.${theme.preference}`)}`} title={`${t('app.theme')}: ${t(`theme.${theme.preference}`)}`} />
             {accountMenu}
           </div>
         </Header>
-        <Content id="main-content" tabIndex={-1} className="pool-content"><div className="pool-shell"><AppRoutes admin={isAdmin} routeIdentity={routeIdentity} routeTitle={routeTitle} onViewCommit={handleViewCommit} /></div></Content>
+        <Content id="main-content" tabIndex={-1} className="pool-content"><div className="pool-shell" ref={setShellContentNode}><AppRoutes admin={isAdmin} routeIdentity={routeIdentity} routeTitle={routeTitle} onViewCommit={handleViewCommit} /></div></Content>
         {!isAdmin && responsive.isMobile ? <nav className="pool-portal-tabbar" aria-label={t('app.navigation')}>
           {navigation.map((item) => <button type="button" key={item.itemKey} className="pool-portal-tabbar__item" aria-label={item.text} aria-current={currentNavKey === item.itemKey ? 'page' : undefined} onClick={() => navigateFromShell(item.itemKey)}>{item.icon}<span>{item.text}</span></button>)}
         </nav> : null}

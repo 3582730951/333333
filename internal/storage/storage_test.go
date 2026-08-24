@@ -500,6 +500,8 @@ func TestAccountPoolSummaryCountsDashboardFields(t *testing.T) {
 		{Account{ID: "claude-legacy", GroupName: "cyber", Status: "active"}, AccountToken{AccessToken: "sk-ant-oat-test"}},
 		{Account{ID: "custom-disabled", GroupName: "cyber", Provider: "deepseek", Status: "disabled"}, AccountToken{OpenAIAPIKey: "sk-custom"}},
 		{Account{ID: "codex-quarantined", GroupName: "cyber", Provider: "codex", Status: "active"}, AccountToken{AccessToken: "codex-token-2"}},
+		{Account{ID: "kiro-active", GroupName: "kiro", Provider: "KIRO", Status: "active"}, AccountToken{AccessToken: "kiro-token"}},
+		{Account{ID: "cursor-active", GroupName: "cursor", Provider: "Cursor", Status: "active"}, AccountToken{AccessToken: "cursor-token"}},
 	}
 	for _, item := range accounts {
 		if err := store.UpsertAccount(ctx, item.account, item.token); err != nil {
@@ -521,13 +523,15 @@ func TestAccountPoolSummaryCountsDashboardFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := AccountPoolSummary{
-		Total:       4,
-		Active:      2,
+		Total:       6,
+		Active:      4,
 		Quarantined: 1,
 		Cooling:     1,
 		Recheck:     1,
 		Codex:       2,
 		Claude:      1,
+		Kiro:        1,
+		Cursor:      1,
 		Other:       1,
 	}
 	if got != want {
@@ -632,6 +636,10 @@ func TestListAccountsPageByAuthTypeSeparatesAPIKeysAndLoginAccounts(t *testing.T
 	searched, total, err := store.ListAccountsPageByAuthType(ctx, 20, 0, "Kiro", "", "api_key")
 	if err != nil || total != 1 || len(searched) != 1 || searched[0].ID != "kiro-key" {
 		t.Fatalf("searched api-key page total=%d rows=%+v err=%v", total, searched, err)
+	}
+	grouped, total, err := store.ListAccountsPageFiltered(ctx, 20, 0, "", "", "api_key", "kiro")
+	if err != nil || total != 1 || len(grouped) != 1 || grouped[0].ID != "kiro-key" {
+		t.Fatalf("group-filtered api-key page total=%d rows=%+v err=%v", total, grouped, err)
 	}
 }
 

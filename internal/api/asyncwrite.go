@@ -705,6 +705,9 @@ func (s *Server) FlushWritesContext(ctx context.Context) error {
 			close(s.codexStateCommits)
 		}
 		s.asyncMu.Unlock()
+		if s.cursorProxy != nil {
+			s.cursorProxy.Close()
+		}
 		s.stopGoalCompactionWorkers()
 		go func() {
 			defer supervisor.Recover("bounded-async-flush")

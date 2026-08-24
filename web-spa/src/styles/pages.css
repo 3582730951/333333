@@ -143,7 +143,24 @@ body {
   background: var(--pool-bg-surface-2);
 }
 
-.pool-command-trigger > kbd {
+/*
+ * Descendant, not child, and the label has to become a row.
+ *
+ * Button renders `children` inside `<span class="pool-button__label">`, so
+ * `.pool-command-trigger > kbd` matched nothing: the shortcut key rendered as bare
+ * inline text welded to the word before it -- the topbar read "搜索Ctrl K" with no
+ * gap, no key cap, and 90px of dead space to its right where `margin-left: auto`
+ * was supposed to push it.
+ */
+.pool-command-trigger .pool-button__label {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: var(--pool-space-2);
+  width: 100%;
+}
+
+.pool-command-trigger kbd {
   margin-left: auto;
   padding: 2px 6px;
   border: 1px solid var(--pool-border);
@@ -408,7 +425,23 @@ body {
 
 .pool-page-actions {
   display: flex;
-  flex: 0 0 auto;
+  /*
+   * Shrinkable, and capped at the line it sits on.
+   *
+   * This was `flex: 0 0 auto`, which made `flex-wrap: wrap` on the next line dead
+   * code: with basis auto and shrink 0 the box is always its own max-content width,
+   * so its children always fit inside it and never wrap. On /accounts that is
+   * 1540px of buttons inside a 1128px header -- the row simply ran off the right of
+   * the viewport and the last control was unreachable. Letting it shrink is what
+   * gives the wrap something to do.
+   *
+   * The document-level gates did not see this: the overflow is inside .pool-shell,
+   * not on documentElement, so `page horizontal overflow: 0` was accurate and
+   * useless here. capture-ui-review's per-page shell measurement is what caught it.
+   */
+  flex: 0 1 auto;
+  max-width: 100%;
+  min-width: 0;
   flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;

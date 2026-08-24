@@ -128,9 +128,11 @@ test_backup_rotation() {
 
 test_managed_source_pruning() {
   local fixture="${TMP}/source" manifest="${TMP}/manifest.txt"
-  mkdir -p "$fixture/cmd/app" "$fixture/internal/api" "$fixture/web-spa/src" "$fixture/deploy/mailbox" "$fixture/scripts" "$fixture/config" "$fixture/data" "$fixture/plugins"
+  mkdir -p "$fixture/cmd/app" "$fixture/internal/api" "$fixture/modules/cursor-proxy" "$fixture/web-spa/src" "$fixture/deploy/mailbox" "$fixture/scripts" "$fixture/config" "$fixture/data" "$fixture/plugins"
   printf 'package main\n' >"$fixture/cmd/app/main.go"
   printf 'package api\n' >"$fixture/internal/api/removed.go"
+  printf '{}\n' >"$fixture/modules/cursor-proxy/keep.json"
+  printf '{}\n' >"$fixture/modules/cursor-proxy/removed.json"
   printf 'export const keep = true;\n' >"$fixture/web-spa/src/keep.ts"
   printf 'export const stale = true;\n' >"$fixture/web-spa/src/removed.js"
   printf 'stale deploy\n' >"$fixture/deploy/mailbox/removed.js"
@@ -138,11 +140,11 @@ test_managed_source_pruning() {
   printf '{}\n' >"$fixture/config/config.json"
   printf 'runtime\n' >"$fixture/data/pool.sqlite3"
   printf 'plugin\n' >"$fixture/plugins/custom.go"
-  printf '%s\n' 'cmd/app/main.go' 'scripts/keep.sh' 'web-spa/src/keep.ts' >"$manifest"
+  printf '%s\n' 'cmd/app/main.go' 'modules/cursor-proxy/keep.json' 'scripts/keep.sh' 'web-spa/src/keep.ts' >"$manifest"
 
   PROJECT_ROOT="$fixture" MANAGED_SOURCE_MANIFEST="$manifest" "$ROOT/scripts/prune-managed-source.sh" >/dev/null
-  [[ -f "$fixture/cmd/app/main.go" && -f "$fixture/scripts/keep.sh" && -f "$fixture/web-spa/src/keep.ts" ]] || fail "manifest files were removed"
-  [[ ! -e "$fixture/internal/api/removed.go" && ! -e "$fixture/web-spa/src/removed.js" && ! -e "$fixture/deploy/mailbox/removed.js" ]] || fail "stale managed files survived"
+  [[ -f "$fixture/cmd/app/main.go" && -f "$fixture/modules/cursor-proxy/keep.json" && -f "$fixture/scripts/keep.sh" && -f "$fixture/web-spa/src/keep.ts" ]] || fail "manifest files were removed"
+  [[ ! -e "$fixture/internal/api/removed.go" && ! -e "$fixture/modules/cursor-proxy/removed.json" && ! -e "$fixture/web-spa/src/removed.js" && ! -e "$fixture/deploy/mailbox/removed.js" ]] || fail "stale managed files survived"
   [[ -f "$fixture/config/config.json" && -f "$fixture/data/pool.sqlite3" && -f "$fixture/plugins/custom.go" ]] || fail "operator/runtime files were touched"
 
   printf 'package api\n' >"$fixture/internal/api/optout.go"
@@ -222,12 +224,13 @@ test_console_prune_is_atomic() {
 
 test_manifest_generation_without_git() {
 	local fixture="${TMP}/source-archive" generated="${TMP}/source-archive-manifest.txt"
-	mkdir -p "$fixture/scripts" "$fixture/cmd/app" "$fixture/internal/api" "$fixture/internal/console/dist/assets"
+	mkdir -p "$fixture/scripts" "$fixture/cmd/app" "$fixture/internal/api" "$fixture/internal/console/dist/assets" "$fixture/modules/cursor-proxy"
   cp "$ROOT/scripts/generate-managed-source-manifest.sh" "$fixture/scripts/generate-managed-source-manifest.sh"
   printf 'package main\n' >"$fixture/cmd/app/main.go"
   printf '<script src="/console/assets/index.js"></script>\n' >"$fixture/internal/console/dist/index.html"
   printf 'console.log("archive")\n' >"$fixture/internal/console/dist/assets/index.js"
 	printf '<svg/>\n' >"$fixture/internal/console/dist/assets/logo.svg"
+	printf '{"name":"fixture"}\n' >"$fixture/modules/cursor-proxy/package.json"
 	printf 'runtime-auth-material\n' >"$fixture/internal/api/passwd.txt"
 
   bash "$fixture/scripts/generate-managed-source-manifest.sh" "$generated" >/dev/null
@@ -235,7 +238,8 @@ test_manifest_generation_without_git() {
     cmd/app/main.go \
     internal/console/dist/index.html \
     internal/console/dist/assets/index.js \
-    internal/console/dist/assets/logo.svg; do
+    internal/console/dist/assets/logo.svg \
+    modules/cursor-proxy/package.json; do
     grep -Fqx "$expected" "$generated" ||
 		fail "source-archive manifest omitted ${expected}"
 	done

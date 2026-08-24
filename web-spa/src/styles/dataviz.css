@@ -166,18 +166,32 @@
   gap: 7px;
 }
 
+/*
+ * A band, not a row of blocks.
+ *
+ * Eight hourly buckets across a full-width card gave each cell roughly 90x34 -- an
+ * almost-square, rounded, saturated tile. Eight of those read as a child's toy
+ * rather than as an activity trace, which is the single loudest thing on the
+ * dashboard. Halving the height and tightening the gap and the radius turns the
+ * same data into a strip you read along, and the aspect ratio is what does it.
+ */
 .pool-heatstrip__cells {
   display: flex;
   min-width: 0;
   align-items: stretch;
-  gap: 3px;
+  /* Hairline separators rather than gutters. At 3px the buckets read as eight
+     separate objects; at 1px they read as one trace divided into hours, which is
+     what the data actually is. */
+  gap: 1px;
+  border-radius: 3px;
+  overflow: hidden;
 }
 
 .pool-heatstrip__cell {
   min-width: 0;
-  height: 34px;
+  height: 16px;
   flex: 1 1 0;
-  border-radius: 3px;
+  border-radius: 0;
 }
 
 .pool-heatstrip__footer {
