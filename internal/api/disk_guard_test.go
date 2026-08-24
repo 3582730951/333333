@@ -412,3 +412,44 @@ func TestRunSafeDiskCleanupCompletesExpiredGoalReclamationInOnePass(t *testing.T
 		t.Fatalf("expired maintenance snapshot=%+v", snap)
 	}
 }
+
+// A stage that fails for a reason other than the maintenance deadline must not take
+// the rest of the chain with it.
+//
+// This is the defect a v3 diagnostics bundle exposed: codex_session_mappings cleanup
+// timed out at its own 2.5s cap 941 times, and because every stage used to `return`
+// on error, the four stages behind it never ran on any of those cycles --
+// route_bindings_deleted sat at exactly 0 while the tables they drain kept growing.
+// The stages are independent jobs over unrelated tables and each already carries its
+// own deadline, so one failing has no bearing on the next.
+//
+// Driven by closing the store: every stage then fails immediately with a real
+// database error rather than a context error, which leaves the shared maintenance
+// budget intact and is precisely the case the old code collapsed. Contrast with
+// TestDiskCleanupWriterBackpressureReportsOnlyRootOperation, where the budget IS
+// gone and stopping after the first failure is still the right answer.
+func TestRunSafeDiskCleanupContinuesAfterANonDeadlineStageFailure(t *testing.T) {
+	store, err := storage.OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Init(context.Background()); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	store.Close()
+
+	s := &Server{store: store, cfg: config.Default()}
+	snap := DiskGuardSnapshot{}
+	s.runSafeDiskCleanup(context.Background(), &snap)
+
+	if snap.CleanupFailureEvents < 2 {
+		t.Fatalf("only %d stage(s) ran; a failing stage still aborts the chain: %+v",
+			snap.CleanupFailureEvents, snap)
+	}
+	// The reported operation is the last stage attempted, so it must have advanced
+	// past the first one -- that is the observable proof the chain kept going.
+	if snap.CleanupErrorOperation == "context_cleanup" {
+		t.Fatalf("chain stopped at the first stage: %+v", snap)
+	}
+}

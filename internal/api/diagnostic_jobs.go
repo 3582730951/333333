@@ -763,7 +763,12 @@ func validateDiagnosticEntry(entry *zip.File) error {
 				return errDiagnosticDLP
 			}
 			for _, cell := range row {
-				if cell != "" && strings.ContainsRune("=+-@\t\r", rune(cell[0])) {
+				// Same predicate the sanitizer used to write this archive. Spelling
+				// the rule out twice is how a one-sided exemption ships: the writer
+				// would leave a value unguarded, this gate would reject it, and every
+				// export carrying that value would fail as dlp_validation_failed
+				// rather than publish.
+				if diagnosticNeedsFormulaGuard(cell) {
 					return errDiagnosticDLP
 				}
 				if diagnosticDLPMatch(cell) {

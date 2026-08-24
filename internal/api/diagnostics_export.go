@@ -2423,17 +2423,44 @@ func diagnosticContainsUnixPath(text string) bool {
 	return false
 }
 
-func diagnosticSafeCSVCell(value string) string {
-	value = strings.NewReplacer("\r", " ", "\n", " ").Replace(value)
+// diagnosticNumericCellRE matches a cell that is nothing but a numeric literal:
+// optional sign, digits with an optional fraction, optional exponent. Anchored on
+// both ends on purpose -- "-1" matches and "-1+cmd|'/c calc'!A0" does not, which is
+// exactly the line between a number and a formula.
+var diagnosticNumericCellRE = regexp.MustCompile(`^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$`)
+
+// diagnosticNeedsFormulaGuard reports whether a CSV cell must be prefixed with an
+// apostrophe before a spreadsheet would evaluate it.
+//
+// This is the ONE predicate for that question. The sanitizer that writes the archive
+// and the DLP gate that re-reads it must agree exactly, or the export fails
+// validation instead of publishing -- so both call this rather than each spelling
+// out the rule. See diagnosticContainsUnixPath for the same invariant, and the same
+// reason.
+//
+// A bare numeric literal is exempt. Guarding it was a real cost with no benefit: a
+// negative number is not an injection vector in any spreadsheet, and prefixing it
+// turns a numeric column into text. A v3 bundle from the field carried 154
+// route_attempts rows whose tier read `'-1`, so nothing downstream -- the console's
+// own diagnostics views included -- could sort or aggregate that column.
+func diagnosticNeedsFormulaGuard(value string) bool {
 	if value == "" {
-		return value
+		return false
 	}
 	switch value[0] {
 	case '=', '+', '-', '@', '\t', '\r':
-		return "'" + value
+		return !diagnosticNumericCellRE.MatchString(value)
 	default:
-		return value
+		return false
 	}
+}
+
+func diagnosticSafeCSVCell(value string) string {
+	value = strings.NewReplacer("\r", " ", "\n", " ").Replace(value)
+	if diagnosticNeedsFormulaGuard(value) {
+		return "'" + value
+	}
+	return value
 }
 
 func (b diagnosticCodebook) safeCSVRow(row []string) []string {

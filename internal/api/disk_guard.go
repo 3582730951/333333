@@ -252,6 +252,27 @@ func diskGuardCleanupDue(now, lastMaintenance int64, level string, force bool) b
 		now-lastMaintenance >= int64(diskGuardNormalCleanupInterval/time.Second)
 }
 
+// runSafeDiskCleanup advances every retention stage once, in order of cost.
+//
+// A failing stage records the failure and the run CONTINUES to the next one. It used
+// to return, and that turned one slow table into a total retention outage: the stages
+// are independent jobs over unrelated tables, each already holds its own deadline
+// (1.5s/2.5s/1.5s/3s/3s under a 10s cap), so aborting the chain buys nothing and
+// costs everything downstream of the failure.
+//
+// Observed in a v3 diagnostics bundle: codex_session_mappings cleanup timed out at
+// its 2.5s cap 941 times, and because it sits second in the chain, route-binding
+// cleanup, goal reclamation, goal-budget enforcement and diagnostic-job expiry were
+// all skipped on every one of those cycles -- route_bindings_deleted stayed at
+// exactly 0 while the failure counter climbed into the hundreds.
+// The tables those stages drain kept growing, which is visible two steps later as
+// 1918 database backpressure events and a full diagnostics export that could no
+// longer finish inside its deadline and fell back to emergency mode with 23 of 33
+// tables omitted.
+//
+// The shared maintenanceCtx still bounds total work, so continuing cannot run long:
+// once it expires every remaining stage fails immediately, which the deadline check
+// below turns into an early stop rather than a burst of pointless failures.
 func (s *Server) runSafeDiskCleanup(ctx context.Context, snap *DiskGuardSnapshot) {
 	maintenanceCtx, maintenanceCancel := context.WithTimeout(ctx, diskGuardCleanupTimeout)
 	defer maintenanceCancel()
@@ -261,78 +282,84 @@ func (s *Server) runSafeDiskCleanup(ctx context.Context, snap *DiskGuardSnapshot
 	contextCancel()
 	if err != nil {
 		noteDiskCleanupFailure(snap, "context_cleanup", "context_cleanup_failed", err)
-		return
+	} else {
+		snap.ContextsDeleted += deleted
 	}
-	snap.ContextsDeleted += deleted
 
 	// Session/affinity retention used to run after as many as sixteen Goal
 	// reclamation transactions under one shared deadline. A busy continuity store
 	// therefore consumed the entire maintenance budget before mapping cleanup could
 	// start. Run small metadata retention first and give every stage its own cap.
-	mappingCtx, mappingCancel := context.WithTimeout(maintenanceCtx, diskGuardMappingCleanupTimeout)
-	mappings, err := s.store.CleanupCodexSessionMappings(mappingCtx)
-	mappingCancel()
-	if err != nil {
-		noteDiskCleanupFailure(snap, "mapping_cleanup", "mapping_cleanup_failed", err)
-		return
+	if maintenanceCtx.Err() == nil {
+		mappingCtx, mappingCancel := context.WithTimeout(maintenanceCtx, diskGuardMappingCleanupTimeout)
+		mappings, mappingErr := s.store.CleanupCodexSessionMappings(mappingCtx)
+		mappingCancel()
+		if mappingErr != nil {
+			noteDiskCleanupFailure(snap, "mapping_cleanup", "mapping_cleanup_failed", mappingErr)
+		} else {
+			snap.CodexMappingsDeleted += mappings
+		}
 	}
-	snap.CodexMappingsDeleted += mappings
 
-	routeCtx, routeCancel := context.WithTimeout(maintenanceCtx, diskGuardRouteCleanupTimeout)
-	bindings, err := s.store.CleanupInactiveRouteBindings(routeCtx, 256)
-	routeCancel()
-	if err != nil {
-		noteDiskCleanupFailure(snap, "route_binding_cleanup", "route_binding_cleanup_failed", err)
-		return
+	if maintenanceCtx.Err() == nil {
+		routeCtx, routeCancel := context.WithTimeout(maintenanceCtx, diskGuardRouteCleanupTimeout)
+		bindings, routeErr := s.store.CleanupInactiveRouteBindings(routeCtx, 256)
+		routeCancel()
+		if routeErr != nil {
+			noteDiskCleanupFailure(snap, "route_binding_cleanup", "route_binding_cleanup_failed", routeErr)
+		} else {
+			snap.RouteBindingsDeleted += bindings.Total()
+		}
 	}
-	snap.RouteBindingsDeleted += bindings.Total()
 
 	// Advance multiple bounded phases for expired goals. One step removes at most
 	// 64 rows/8 MiB, so a single step every five minutes left large abandoned tool
 	// sessions visible for hours after expiry.
-	goalCtx, goalCancel := context.WithTimeout(maintenanceCtx, diskGuardGoalCleanupTimeout)
-	for step := 0; step < goalStorageMaintenanceStepsPerRun && goalCtx.Err() == nil; step++ {
-		reclaimed, reclaimErr := s.store.CleanupGoalContinuityStep(goalCtx)
-		if reclaimErr != nil {
-			goalCancel()
-			noteDiskCleanupFailure(snap, "goal_cleanup", "goal_cleanup_failed", reclaimErr)
-			return
+	if maintenanceCtx.Err() == nil {
+		goalCtx, goalCancel := context.WithTimeout(maintenanceCtx, diskGuardGoalCleanupTimeout)
+		for step := 0; step < goalStorageMaintenanceStepsPerRun && goalCtx.Err() == nil; step++ {
+			reclaimed, reclaimErr := s.store.CleanupGoalContinuityStep(goalCtx)
+			if reclaimErr != nil {
+				noteDiskCleanupFailure(snap, "goal_cleanup", "goal_cleanup_failed", reclaimErr)
+				break
+			}
+			snap.GoalBytesReclaimed += reclaimed.BytesFreed
+			snap.GoalsDeleted += reclaimed.Goals
+			if !reclaimed.Progressed {
+				break
+			}
 		}
-		snap.GoalBytesReclaimed += reclaimed.BytesFreed
-		snap.GoalsDeleted += reclaimed.Goals
-		if !reclaimed.Progressed {
-			break
-		}
+		goalCancel()
 	}
-	goalCancel()
 
 	// Converge below the target, not to it. See goalStorageMaintenanceFloor: the
 	// target doubles as CommitGoalTurn's admission ceiling for a new goal.
-	maintenanceFloor := goalStorageMaintenanceFloor(s.goalStorageMaxBytes(maintenanceCtx))
-	budgetCtx, budgetCancel := context.WithTimeout(maintenanceCtx, diskGuardGoalBudgetTimeout)
-	for step := 0; step < goalStorageMaintenanceStepsPerRun && budgetCtx.Err() == nil; step++ {
-		used, err := s.store.GoalStorageBytes(budgetCtx)
-		if err != nil {
-			budgetCancel()
-			noteDiskCleanupFailure(snap, "goal_budget_measure", "goal_budget_measure_failed", err)
-			return
+	if maintenanceCtx.Err() == nil {
+		maintenanceFloor := goalStorageMaintenanceFloor(s.goalStorageMaxBytes(maintenanceCtx))
+		budgetCtx, budgetCancel := context.WithTimeout(maintenanceCtx, diskGuardGoalBudgetTimeout)
+		for step := 0; step < goalStorageMaintenanceStepsPerRun && budgetCtx.Err() == nil; step++ {
+			used, usedErr := s.store.GoalStorageBytes(budgetCtx)
+			if usedErr != nil {
+				noteDiskCleanupFailure(snap, "goal_budget_measure", "goal_budget_measure_failed", usedErr)
+				break
+			}
+			if used <= maintenanceFloor {
+				break
+			}
+			reclaimed, reclaimErr := s.store.EnforceGoalStorageBudgetStep(budgetCtx, maintenanceFloor)
+			if reclaimErr != nil {
+				noteDiskCleanupFailure(snap, "goal_budget_cleanup", "goal_budget_cleanup_failed", reclaimErr)
+				break
+			}
+			snap.GoalBytesReclaimed += reclaimed.BytesFreed
+			snap.GoalsDeleted += reclaimed.Goals
+			if !reclaimed.Progressed {
+				break
+			}
 		}
-		if used <= maintenanceFloor {
-			break
-		}
-		reclaimed, err := s.store.EnforceGoalStorageBudgetStep(budgetCtx, maintenanceFloor)
-		if err != nil {
-			budgetCancel()
-			noteDiskCleanupFailure(snap, "goal_budget_cleanup", "goal_budget_cleanup_failed", err)
-			return
-		}
-		snap.GoalBytesReclaimed += reclaimed.BytesFreed
-		snap.GoalsDeleted += reclaimed.Goals
-		if !reclaimed.Progressed {
-			break
-		}
+		budgetCancel()
 	}
-	budgetCancel()
+
 	if maintenanceCtx.Err() == nil {
 		s.cleanupExpiredDiagnosticJobs(maintenanceCtx)
 	}
