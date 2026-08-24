@@ -13,6 +13,7 @@ import (
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/anthropicwire"
 	"codex-account-pool/internal/bodysource"
+	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/routing"
@@ -28,9 +29,18 @@ const (
 	// Lowercase forms used by the wire header-order table (HTTP/2 field names).
 	claudeAgentIDHeaderLower     = "x-claude-code-agent-id"
 	claudeParentAgentHeaderLower = "x-claude-code-parent-agent-id"
-	// OAuth (Claude Pro/Max) carries the oauth beta; API keys must not.
-	claudeOAuthBetas             = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,extended-cache-ttl-2025-04-11"
-	claudeAPIKeyBetas            = "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24"
+	// Beta lists captured from real 2.1.226/2.1.236–2.1.241 linux-x64 binaries
+	// (see /tmp/cc_fp/captured_requests.log): these are the exact set a genuine
+	// Claude Code client sends for a 1M-native model. context-1m is deliberately
+	// NOT listed here — it rides only a model that actually has the 1M window (the
+	// official client gates it on has1mContext(model)), so it is injected
+	// dynamically in claudeBetasForRequest. mid-conversation-system and
+	// fallback-credit were missing here (a stale "time fingerprint" the official
+	// client always sends), and extended-cache-ttl was present but never observed
+	// on the wire.
+	claudeOAuthBetas             = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01"
+	claudeAPIKeyBetas            = "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01"
+	claudeContext1MBeta          = "context-1m-2025-08-07"
 	claudeCacheDiagnosticsBeta   = "cache-diagnosis-2026-04-07"
 	claudeCacheDiagnosticsHeader = "X-Codex-Claude-Cache-Diagnostics"
 )
@@ -559,12 +569,12 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 		// sending the SDK-correct header here is the closest faithful shape and is
 		// what the reference relay does. Prefer OAuth (sk-ant-oat) accounts when full
 		// Claude Code mimicry matters.
-		dst.Set("Anthropic-Beta", mergeBetas(claudeAPIKeyBetas, spec.Headers, true))
+		dst.Set("Anthropic-Beta", claudeBetasForRequest(claudeAPIKeyBetas, spec, true))
 	} else {
 		if token != "" {
 			dst.Set("Authorization", "Bearer "+token)
 		}
-		dst.Set("Anthropic-Beta", mergeBetas(claudeOAuthBetas, spec.Headers, false))
+		dst.Set("Anthropic-Beta", claudeBetasForRequest(claudeOAuthBetas, spec, false))
 	}
 	// Claude Code 2.1.226 sends this in both API-key and third-party Bearer
 	// configurations (verified through ANTHROPIC_BASE_URL captures).
@@ -829,6 +839,67 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+// claudeBetasForRequest computes the Anthropic-Beta header value for a Claude
+// messages turn. mergeBetas forwards a downstream client's own betas verbatim —
+// a genuine Claude Code client already manages context-1m itself, so injecting it
+// here would undo the pool's virtual-1M fallback (messages.go calls
+// withoutAnthropicContext1MBeta to strip it deliberately). The beta is therefore
+// added only when the client sent NO betas (pool probes / minimal callers) AND the
+// request model actually carries the 1M window, mirroring the official client's
+// has1mContext(model) gate.
+func claudeBetasForRequest(canonical string, spec Request, dropOAuth bool) string {
+	betas := mergeBetas(canonical, spec.Headers, dropOAuth)
+	if len(spec.Headers.Values("Anthropic-Beta")) == 0 && claudeRequestModelHas1MContext(spec) {
+		betas = withClaudeContext1MBeta(betas)
+	}
+	return betas
+}
+
+func claudeRequestModel(spec Request) string {
+	body := requestBody(spec)
+	if len(body) == 0 {
+		return ""
+	}
+	var root map[string]interface{}
+	if decodeClaudeJSONObject(body, &root) != nil {
+		return ""
+	}
+	return claudeMessagesModel(root, "")
+}
+
+func claudeRequestModelHas1MContext(spec Request) bool {
+	return capability.ClaudeModelHas1MContext(claudeRequestModel(spec))
+}
+
+// withClaudeContext1MBeta inserts context-1m at its native position (immediately
+// after the claude-code-20250219 beta), matching the order the official client
+// emits for a 1M model. Appending at the tail would produce a wire order real
+// Claude Code never sends.
+func withClaudeContext1MBeta(betas string) string {
+	if strings.TrimSpace(betas) == "" {
+		return claudeContext1MBeta
+	}
+	parts := splitCSV(betas)
+	for _, p := range parts {
+		if strings.EqualFold(strings.TrimSpace(p), claudeContext1MBeta) {
+			return betas
+		}
+	}
+	out := make([]string, 0, len(parts)+1)
+	inserted := false
+	for _, p := range parts {
+		out = append(out, p)
+		if !inserted && strings.EqualFold(strings.TrimSpace(p), "claude-code-20250219") {
+			out = append(out, claudeContext1MBeta)
+			inserted = true
+		}
+	}
+	if !inserted {
+		out = append(out, claudeContext1MBeta)
+	}
+	return strings.Join(out, ",")
 }
 
 func appendClaudeBeta(h http.Header, beta string) {

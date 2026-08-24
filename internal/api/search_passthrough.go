@@ -36,6 +36,7 @@ func (s *Server) handleSearchPassthrough(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	r = s.withIntelligentRoutingFallbacks(r, policy)
 	resolvedRaw := originalRaw
 	if policy.ForceModel != "" {
 		resolvedRaw = setForcedModel(resolvedRaw, policy.ForceModel)

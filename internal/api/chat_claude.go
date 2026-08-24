@@ -176,9 +176,12 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	// Final body step (after cache_control injection): stamp the Claude Code
 	// x-anthropic-billing-header so OAuth traffic relayed from an OpenAI-compatible
 	// client still carries the header every genuine Claude Code request has, with a
-	// cc_version coherent with our User-Agent and the captured fixed .503 build (no cch).
+	// cc_version coherent with our User-Agent and the message-derived attribution
+	// suffix (mirrors the native path; no cch — the NATIVE_CLIENT_ATTESTATION
+	// feature is off).
 	if claudeIsOAuth(token) {
-		result.Body = cloak.EnsureClaudeCodeBillingHeader(result.Body, s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion))
+		result.Body = cloak.EnsureClaudeCodeBillingHeaderWithFingerprint(result.Body,
+			s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion), s.cfg.ClaudeAttributionFingerprintEnabled())
 	}
 	result.Body = s.applyClaudeCacheDiagnostics(r.Context(), r.Header, result.Body, affinity)
 
@@ -312,7 +315,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	}
 chatClaudeSuccess:
 	s.verifyAccountModel(r.Context(), lease.Account, model, requestedModel.ContextMode)
-	s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header)
+	s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header, lease.Trial)
 	s.captureQuota(r.Context(), lease.Account.ID, "claude", model, resp.Header)
 
 	if stream && isEventStream(resp.Header) {

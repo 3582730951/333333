@@ -989,6 +989,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	r = s.withIntelligentRoutingFallbacks(r, pol)
 	// Carry the matched key/user identity in the context so usage is attributed to the
 	// owning portal user (their console reads /user/usage).
 	r = r.WithContext(withDownstreamKey(r.Context(), pol))
@@ -2021,6 +2022,18 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// leave the durable identity describing a different device boundary.
 	mappingTransportStrict := strict || (mapping != nil && mapping.enabled)
 
+	// Safety-rotation detach: the single request immediately after an upstream
+	// session rotation must not carry the retired chain's previous_response_id /
+	// turn-state pointers (they live under the old session id). Strip them from the
+	// upstream request while the downstream session mapping stays intact.
+	if mapping != nil && mapping.rotateUpstreamSessionOnSafety && mapping.bindingHasSafetyRotation() {
+		if stripped, strippedHdr, ok := codexSafetyRotationFreshRequest(body, baseHeader); ok {
+			body = stripped
+			baseHeader = strippedHdr
+			mapping.markSafetyDetached()
+		}
+	}
+
 	// Per-account conversation isolation ("串号隔离", default on, runtime-toggleable):
 	// namespace the forwarded conversation-correlation identifiers so a rate-limited
 	// / risk-flagged session on one account can never contaminate another account
@@ -2669,7 +2682,7 @@ codexSuccess:
 		resetHeaderExhaustion = s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, resp.StatusCode, resp.Header, nil, "success_header_exhaustion")
 	}
 	if !goalQuotaGrace && !resetHeaderExhaustion {
-		s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header)
+		s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header, lease.Trial)
 	}
 	s.captureQuota(r.Context(), lease.Account.ID, "codex", model, resp.Header)
 
@@ -3121,6 +3134,9 @@ codexSuccess:
 			if nativeRecorder.completedSuccessfully() {
 				responseID, responseModel, _ := nativeRecorder.metadata()
 				if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
+					if mapping.rotateUpstreamSessionOnSafety && nativeRecorder.safetyBufferingDetected() {
+						mapping.noteSafetyBuffering()
+					}
 					turnState := nativeRecorder.responseTurnState()
 					var responseJSON []byte
 					if turnState == "" {
@@ -3177,6 +3193,9 @@ codexSuccess:
 			responseID, responseModel, _ := recorder.metadata()
 			var mappingErr error
 			if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
+				if mapping.rotateUpstreamSessionOnSafety && recorder.safetyBufferingDetected() {
+					mapping.noteSafetyBuffering()
+				}
 				turnState := recorder.responseTurnState()
 				if turnState == "" {
 					turnState = responseTurnState(upstreamHeader, recorder.ResponseJSON())
@@ -3670,6 +3689,9 @@ func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request,
 		return
 	}
 	if mapping := codexSessionMappingFromContext(ctx); mapping != nil && mapping.enabled {
+		if mapping.rotateUpstreamSessionOnSafety && codexResponseSafetyBuffered(responseBody) {
+			mapping.noteSafetyBuffering()
+		}
 		if err := s.commitCodexSessionMapping(ctx, mapping, lease, egress, response.ID, responseTurnState(responseHeader, responseBody), compact); err != nil {
 			log.Printf("[CODEX-SESSION-MAPPING] terminal commit request_id=%s: %v", requestIDFromContext(ctx), err)
 			_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{Action: "codex_session_mapping_commit_failed", State: "retryable", Reason: codexMappingErrorCode(err), Detail: "terminal_metadata_only"})

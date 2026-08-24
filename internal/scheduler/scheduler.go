@@ -222,6 +222,7 @@ type candidate struct {
 	resolvedModel string
 	bootstrap     bool    // concrete Kiro model is static-known but not runtime-verified
 	score         float64 // normalized account/token/egress load; lower is better
+	trial         bool    // selected via intelligent-routing cooldown trial (stale cooldown)
 }
 
 type accountSelectionSnapshot struct {
@@ -278,6 +279,7 @@ type SchedulerMetrics struct {
 	CandidateFallbacks    int64 `json:"candidate_fallbacks"`
 	CandidateIndexBuilds  int64 `json:"candidate_index_builds"`
 	CandidateIndexEntries int64 `json:"candidate_index_entries"`
+	TrialSelections       int64 `json:"trial_selections"`
 	EgressEWMAOutlets     int64 `json:"egress_ewma_outlets"`
 	EgressEWMASamples     int64 `json:"egress_ewma_samples"`
 }
@@ -584,7 +586,13 @@ type Lease struct {
 	ResolvedModel string
 	RouteEpoch    int64
 	FencingToken  uint64
-	release       func()
+	// Trial marks an intelligent-routing cooldown trial lease: the account's
+	// cooldown state said "blocked" but no other candidate existed, so the
+	// scheduler tried the soonest-recovering account anyway. A successful
+	// upstream response therefore proves the stale cooldown wrong and the API
+	// layer clears it so the account rejoins the pool immediately.
+	Trial   bool
+	release func()
 }
 
 func New(store *storage.Store, cfg config.Config) *Scheduler {
@@ -704,6 +712,7 @@ func (s *Scheduler) Metrics() SchedulerMetrics {
 		RouteSelects: routeSelects, RouteNanos: routeNanos, RouteAvgNanos: routeAverage, RouteMaxNanos: atomic.LoadInt64(&s.metrics.RouteMaxNanos),
 		CandidateEvaluations: atomic.LoadInt64(&s.metrics.CandidateEvaluations), CandidateFallbacks: atomic.LoadInt64(&s.metrics.CandidateFallbacks), CandidateIndexBuilds: atomic.LoadInt64(&s.metrics.CandidateIndexBuilds),
 		CandidateIndexEntries: s.candidateIndexCount.Load(),
+		TrialSelections:       atomic.LoadInt64(&s.metrics.TrialSelections),
 		EgressEWMAOutlets:     ewmaOutlets, EgressEWMASamples: ewmaSamples,
 	}
 }
@@ -909,17 +918,14 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 
 	var lease Lease
 	var err error
-	// Once a route has queued work, new requests join behind it instead of racing
-	// the head waiter for a newly released lease. Affinity selections above retain
-	// priority because they preserve an existing conversation's account binding.
-	if !route.SkipWait && ctx.Done() != nil && s.routeHasWaiters(route) {
-		lease, err = s.waitForFreshLease(ctx, route, &NoAccountError{
-			Group: route.Group, Provider: route.Provider, AllowedProviders: append([]string(nil), route.AllowedProviders...), Model: route.Model,
-			Counters: NoAccountCounters{Concurrency: 1},
-		})
-	} else {
-		lease, err = s.selectFreshIndexed(ctx, route)
-	}
+	// Intelligent routing: every request attempts a fresh selection first so a
+	// free account is picked instantly ("秒选择") instead of joining a wait queue
+	// that may not need it. Only a request that actually finds the route
+	// transiently saturated (concurrency/token/cooldown) joins the FIFO queue
+	// below; queue discipline therefore applies exactly where waiting can help,
+	// and a recovered pool is served immediately. Affinity selections above
+	// retain priority because they preserve an existing conversation's binding.
+	lease, err = s.selectFreshIndexed(ctx, route)
 	if err != nil {
 		var stale *NoAccountError
 		if (errors.As(err, &stale) && (stale.Counters.RecheckPending > 0 || stale.Counters.RateLimitCooldown > 0 || stale.Counters.EgressCooldown > 0)) || (errors.Is(err, ErrNoAccount) && len(route.Exclude) > 0) {
@@ -2885,5 +2891,5 @@ func (s *Scheduler) activateCoordinatedCandidate(c candidate, route Route, coord
 	// candidate, so the lease is built without a second DB read while holding s.mu —
 	// keeping the hot critical section to map ops only (the previous GetEgressBinding
 	// here serialized every lease grant and release behind a SQLite round-trip).
-	return Lease{Account: account, Binding: c.binding, Egress: egress, ResolvedModel: c.resolvedModel, FencingToken: coordinated.FencingToken(), release: release}
+	return Lease{Account: account, Binding: c.binding, Egress: egress, ResolvedModel: c.resolvedModel, FencingToken: coordinated.FencingToken(), Trial: c.trial, release: release}
 }

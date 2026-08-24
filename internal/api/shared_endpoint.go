@@ -35,6 +35,7 @@ func (s *Server) handleSharedEndpoint(w http.ResponseWriter, r *http.Request) {
 			[]string{"kiro_unsupported_endpoint:" + r.URL.Path},
 			"official_claude_passthrough", "kiro", "Route Files, Skills, Agents and related endpoints to provider_hint=\"claude\".")
 	case strings.HasPrefix(target, "custom:"):
+		r = s.withIntelligentRoutingFallbacks(r, policy)
 		s.handleCustomProviderPassthrough(w, r, strings.TrimPrefix(target, "custom:"), policy)
 	default:
 		s.writeCapabilityUnavailable(w, http.StatusBadRequest,

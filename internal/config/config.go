@@ -22,10 +22,10 @@ const (
 	// discovery and on version-gated live Codex requests. ChatGPT gates the returned
 	// model catalog and some live models by this value, so old preserved config
 	// values are floored to this default during normalization.
-	// Refreshed 2026-08-20 from the official Codex CLI 0.148.0 release published
-	// 2026-08-18. The application-level protocol traits for every accepted
+	// Refreshed 2026-08-24 from the official Codex CLI 0.149.1 release published
+	// 2026-08-24. The application-level protocol traits for every accepted
 	// downstream version live in codexCLIFingerprints below.
-	DefaultClientVersion                  = "0.148.0"
+	DefaultClientVersion                  = "0.149.1"
 	DefaultStickyWaitMillis               = 100
 	DefaultStrictStickyMaxCooldownSeconds = 60
 	DefaultCooldownWaitMaxSeconds         = 30
@@ -98,8 +98,13 @@ const (
 	// DefaultClaudeNodeVersion is the Node runtime version reported in
 	// X-Stainless-Runtime-Version. Kept here (not in the identity package) so the
 	// upstream Node fingerprint can be bumped from one place / overridden by config.
-	// Reconfirmed 2026-08-09 from the Claude Code 2.1.226 shipping binary.
+	// Reconfirmed 2026-08-24 from the Claude Code 2.1.236–2.1.241 shipping binaries.
 	DefaultClaudeNodeVersion = "v26.3.0"
+	// DefaultClaudeCLIVersion is the newest verified Claude Code release in the
+	// fingerprint library (claudeCLIFingerprints). The pool stamps this claude-cli
+	// version on requests unless the operator pins claude_cli_version or the
+	// account identity selects a lag release.
+	DefaultClaudeCLIVersion = "2.1.241"
 	// DefaultModelProbeIntervalHours refreshes each account's last-good model
 	// catalog every six hours. The worker adds per-account jitter.
 	DefaultModelProbeIntervalHours           = 6
@@ -135,11 +140,14 @@ type CodexCLIFingerprint struct {
 	PromptCacheKeyBySession bool
 }
 
-// codexCLIFingerprints is the five-release fingerprint library verified against
-// the corresponding official Codex releases. Keep newest first. Codex 0.148.0
-// retains the 0.147.0 Responses metadata contract while adding client-side CLI
-// features that do not alter these upstream fields.
+// codexCLIFingerprints is the seven-release fingerprint library verified against
+// the corresponding official Codex releases. Keep newest first. Codex 0.149.1
+// and 0.149.0 retain the 0.147.0/0.148.0 Responses metadata contract while adding
+// client-side CLI features (TUI, app-server, Guardian V2) that do not alter these
+// upstream fields.
 var codexCLIFingerprints = [...]CodexCLIFingerprint{
+	{Version: "0.149.1", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
+	{Version: "0.149.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
 	{Version: "0.148.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
 	{Version: "0.147.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
 	{Version: "0.146.1", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, PromptCacheKeyBySession: true},
@@ -157,7 +165,7 @@ func SupportedCodexCLIVersions() []string {
 	return versions
 }
 
-// IsSupportedCodexCLIVersion reports whether value is one of the five official
+// IsSupportedCodexCLIVersion reports whether value is one of the seven official
 // stable versions covered by this build.
 func IsSupportedCodexCLIVersion(value string) bool {
 	_, ok := CodexCLIFingerprintForVersion(value)
@@ -176,6 +184,94 @@ func CodexCLIFingerprintForVersion(value string) (CodexCLIFingerprint, bool) {
 		}
 	}
 	return CodexCLIFingerprint{}, false
+}
+
+// ClaudeCLIFingerprint is the coherent upstream wire tuple of one verified Claude
+// Code release. The claude-cli version, the @anthropic-ai/sdk "Stainless" package
+// version, and the Node runtime ship as ONE combination in the official binary;
+// rotating one axis alone produces a client-version combination no real release
+// ever emitted — itself a relay-detection signal upstream can flag.
+type ClaudeCLIFingerprint struct {
+	// Version is the claude-cli version used in the User-Agent and as the plain
+	// cc_version value in the x-anthropic-billing-header block (no build suffix).
+	Version string
+	// StainlessPackageVersion is the X-Stainless-Package-Version header value.
+	StainlessPackageVersion string
+	// NodeVersion is the X-Stainless-Runtime-Version header value.
+	NodeVersion string
+}
+
+// claudeCLIFingerprints is the verified Claude Code fingerprint library, newest
+// first. Verified on 2026-08-24 by running the official linux-x64 binaries for
+// 2.1.226 and 2.1.236–2.1.241 against a local capture server:
+//   - 2.1.236–2.1.241 all ship @anthropic-ai/sdk 0.112.1 on Node v26.3.0;
+//   - 2.1.226 shipped @anthropic-ai/sdk 0.94.0 on Node v26.3.0;
+//   - every release emits a billing block of the form
+//     `cc_version=<v>.<3-hex>; cc_entrypoint=<cli|sdk-cli>;` — the message-derived
+//     attribution suffix is LIVE (see below), and no cch field rides along
+//     (NATIVE_CLIENT_ATTESTATION is off).
+//
+// Watch item: the real client appends a message-derived `.xxx` attribution
+// suffix to cc_version (SHA256(salt+firstMsg[4,7,20]+version)[:3]). It is
+// UNCONDITIONAL inside the attribution header, which is enabled by default
+// (GrowthBook tengu_attribution_header) and was verified LIVE on official
+// 2.1.236–2.1.241 binaries on 2026-08-24 (every captured cc_version carried the
+// suffix; the hash matched the algorithm exactly). The pool mirrors the
+// algorithm in cloak.computeClaudeAttributionFingerprint behind
+// ClaudeAttributionFingerprint (env CODEX_POOL_CLAUDE_ATTRIBUTION_FINGERPRINT),
+// which DEFAULTS ON to match the genuine wire. A signed_custom manifest
+// assertion (attribution_suffix: "plain") flips it OFF if a future capture shows
+// the server turned the feature down; a "live" assertion forces it back ON. The
+// task#12 auto-fetch binary records cc_version VERBATIM and diffs for `.<3-hex>`.
+//
+// The anthropic-beta header is intentionally NOT stored here: captured 2.1.241
+// wire proves it is model-dependent (fallback-credit rides opus-5 but not sonnet;
+// haiku emits a shorter, differently-ordered list) and entitlement-gated
+// (context-1m appears for native-1M models only on an entitled account, not a
+// fake token). That variability is handled dynamically in claudeBetasForRequest,
+// not as a static row in this library.
+var claudeCLIFingerprints = [...]ClaudeCLIFingerprint{
+	{Version: "2.1.241", StainlessPackageVersion: "0.112.1", NodeVersion: "v26.3.0"},
+	{Version: "2.1.240", StainlessPackageVersion: "0.112.1", NodeVersion: "v26.3.0"},
+	{Version: "2.1.239", StainlessPackageVersion: "0.112.1", NodeVersion: "v26.3.0"},
+	{Version: "2.1.238", StainlessPackageVersion: "0.112.1", NodeVersion: "v26.3.0"},
+	{Version: "2.1.237", StainlessPackageVersion: "0.112.1", NodeVersion: "v26.3.0"},
+	{Version: "2.1.236", StainlessPackageVersion: "0.112.1", NodeVersion: "v26.3.0"},
+	{Version: "2.1.226", StainlessPackageVersion: "0.94.0", NodeVersion: "v26.3.0"},
+}
+
+// SupportedClaudeCLIVersions returns a copy of the verified Claude Code version
+// window so callers cannot mutate the process-wide compatibility contract.
+func SupportedClaudeCLIVersions() []string {
+	versions := make([]string, len(claudeCLIFingerprints))
+	for i, fingerprint := range claudeCLIFingerprints {
+		versions[i] = fingerprint.Version
+	}
+	return versions
+}
+
+// ClaudeCLIFingerprintForVersion returns an immutable copy of the exact Claude
+// Code profile carried by this build. Like the Codex library it deliberately
+// offers no nearest/future match: a version outside the verified window is
+// treated as unsupported rather than approximated.
+func ClaudeCLIFingerprintForVersion(value string) (ClaudeCLIFingerprint, bool) {
+	value = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "v"))
+	for _, fingerprint := range claudeCLIFingerprints {
+		if value == fingerprint.Version {
+			return fingerprint, true
+		}
+	}
+	return ClaudeCLIFingerprint{}, false
+}
+
+// ClaudeStainlessVersionForCLI returns the coherent @anthropic-ai/sdk package
+// version that shipped with claudeVer, or fallback when claudeVer is outside the
+// verified window. It never invents a cli↔SDK combination.
+func ClaudeStainlessVersionForCLI(claudeVer, fallback string) string {
+	if fingerprint, ok := ClaudeCLIFingerprintForVersion(claudeVer); ok {
+		return fingerprint.StainlessPackageVersion
+	}
+	return fallback
 }
 
 var (
@@ -284,6 +380,28 @@ type Config struct {
 	// Disabling it retains the full-scan compatibility path for one release.
 	SchedulerIndexEnabled    bool `json:"scheduler_index_enabled"`
 	ResourceHeadroomPercent  int  `json:"resource_headroom_percent"`
+	// IntelligentRoutingEnabled is the master switch for the intelligent routing
+	// mechanism: per-group fallback chains (GroupFallbacks) evaluated through
+	// SelectAcross so an empty group is skipped instantly, instant selection when
+	// the pool has a free account (no queue pre-gate), and cooldown trial
+	// selection so accounts whose quota recovered but whose cooldown state is
+	// stale still receive traffic.
+	IntelligentRoutingEnabled bool `json:"intelligent_routing_enabled"`
+	// GroupFallbacks maps an account-pool group to the ordered list of groups a
+	// request should fail over to when the primary group cannot serve it (empty
+	// pool, or every matching account blocked). The chain is evaluated atomically
+	// with the primary via SelectAcross; groups without any compatible account
+	// contribute zero candidates and are skipped instantly.
+	GroupFallbacks map[string][]string `json:"group_fallbacks"`
+	// SafetySessionRotationGroups opts specific user groups into upstream session
+	// rotation. When a user group is present with value true, a Codex Responses
+	// terminal that carries the safety_buffering control field ("security-not-
+	// displayed" — the codex protocol's withheld-content signal) makes the gateway
+	// rotate that binding's upstream RootSessionID to a fresh generated id. The
+	// downstream session mapping is unchanged; only the upstream sees a new
+	// session, and the single following turn detaches from the old response chain.
+	// Keyed by user-group id; a group is opted in only when its value is true.
+	SafetySessionRotationGroups map[string]bool `json:"safety_session_rotation_groups"`
 	ContextJournalTTLSeconds int  `json:"context_journal_ttl_seconds"`
 	// ContextJournalMaxRows / ContextJournalMaxMB bound the encrypted replay journal on
 	// low-config VPS hosts. When either is exceeded the disk guard evicts the rows with
@@ -414,6 +532,14 @@ type Config struct {
 	// package constants), which should track the current shipping client.
 	CodexCLIVersionOverride  string `json:"codex_cli_version"`
 	ClaudeCLIVersionOverride string `json:"claude_cli_version"`
+	// ClaudeAttributionFingerprint, when true, makes the pool append the real Claude
+	// Code attribution fingerprint to the billing block's cc_version (the client's
+	// message-derived 3-hex SHA256 suffix). Defaults ON: official 2.1.236–2.1.241
+	// binaries verified LIVE on 2026-08-24 (every cc_version carries the suffix;
+	// hash matches the algorithm). The env flag CODEX_POOL_CLAUDE_ATTRIBUTION_FINGERPRINT
+	// and a signed_custom manifest attribution_suffix assertion ("live"/"plain")
+	// override it, so the pool follows the server's remote-config state.
+	ClaudeAttributionFingerprint bool `json:"claude_attribution_fingerprint"`
 	// CodexJA3 selects the TLS ClientHello fingerprint the curl_cffi sidecar replays
 	// for OAuth Codex traffic. Empty (DEFAULT) = the sidecar's native Chrome
 	// impersonation — see upstream.resolveCodexJA3. The "real Codex" aliases
@@ -939,6 +1065,7 @@ func Default() Config {
 		UpstreamBaseURL:                   DefaultUpstreamBaseURL,
 		OpenAIAPIUpstreamBaseURL:          DefaultOpenAIAPIUpstreamBaseURL,
 		ClientVersion:                     DefaultClientVersion,
+		ClaudeAttributionFingerprint:      true, // verified live on official 2.1.236–2.1.241 (2026-08-24)
 		CompatibilityManifestEnabled:      true,
 		CompatibilityManifestSource:       "official",
 		CompatibilityManifestRefreshHours: DefaultCompatibilityManifestRefreshHours,
@@ -977,6 +1104,7 @@ func Default() Config {
 		UsageJournalSegmentBytes:          DefaultUsageJournalSegmentBytes,
 		AccountTokenBudget:                DefaultAccountTokenBudget,
 		SchedulerIndexEnabled:             true,
+		IntelligentRoutingEnabled:         true,
 		ResourceHeadroomPercent:           10,
 		ContextJournalTTLSeconds:          3600,
 		ContextJournalMaxRows:             50000,
@@ -1283,6 +1411,14 @@ func (c *Config) ClaudeCLIVersionOrDefault(def string) string {
 	return def
 }
 
+// ClaudeAttributionFingerprintEnabled reports whether the billing block should carry
+// the real Claude Code message-derived attribution suffix (see cloak's
+// computeClaudeAttributionFingerprint). Defaults on (the verified live client
+// state); the operator env flag and a signed_custom manifest assertion override it.
+func (c *Config) ClaudeAttributionFingerprintEnabled() bool {
+	return c.ClaudeAttributionFingerprint
+}
+
 func (c *Config) ClaudeNodeVersionOrDefault(def string) string {
 	if v := strings.TrimSpace(c.ClaudeNodeVersion); v != "" {
 		return v
@@ -1487,6 +1623,11 @@ func (c *Config) applyEnv() error {
 	}
 	if v := os.Getenv("CODEX_POOL_CODEX_CLI_VERSION"); v != "" {
 		c.CodexCLIVersionOverride = v
+	}
+	if v := os.Getenv("CODEX_POOL_CLAUDE_ATTRIBUTION_FINGERPRINT"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			c.ClaudeAttributionFingerprint = parsed
+		}
 	}
 	if v := os.Getenv("CODEX_POOL_ADMIN_TOKEN"); v != "" {
 		c.AdminToken = v
@@ -2025,6 +2166,46 @@ func (c *Config) normalize() {
 		c.GatewayReliabilityGuardMode = strings.ToLower(strings.TrimSpace(c.GatewayReliabilityGuardMode))
 	default:
 		c.GatewayReliabilityGuardMode = "lenient"
+	}
+	// Intelligent routing fallback chains: trim every entry, drop blanks and
+	// self-references, and deduplicate while preserving the configured order.
+	if len(c.GroupFallbacks) > 0 {
+		normalized := make(map[string][]string, len(c.GroupFallbacks))
+		for group, chain := range c.GroupFallbacks {
+			group = strings.TrimSpace(group)
+			if group == "" {
+				continue
+			}
+			out := make([]string, 0, len(chain))
+			seen := make(map[string]struct{}, len(chain))
+			for _, fallback := range chain {
+				fallback = strings.TrimSpace(fallback)
+				if fallback == "" || strings.EqualFold(fallback, group) {
+					continue
+				}
+				if _, duplicate := seen[strings.ToLower(fallback)]; duplicate {
+					continue
+				}
+				seen[strings.ToLower(fallback)] = struct{}{}
+				out = append(out, fallback)
+			}
+			if len(out) > 0 {
+				normalized[group] = out
+			}
+		}
+		c.GroupFallbacks = normalized
+	}
+	// Safety-session-rotation opt-ins: trim keys; a blank key or a false value is
+	// dropped (only an explicit true opt-in matters).
+	if len(c.SafetySessionRotationGroups) > 0 {
+		normalized := make(map[string]bool, len(c.SafetySessionRotationGroups))
+		for group, on := range c.SafetySessionRotationGroups {
+			group = strings.TrimSpace(group)
+			if group != "" && on {
+				normalized[group] = true
+			}
+		}
+		c.SafetySessionRotationGroups = normalized
 	}
 }
 

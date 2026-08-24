@@ -9,7 +9,7 @@
   "upstream_base_url": "https://chatgpt.com/backend-api/codex",
   "openai_api_upstream_base_url": "https://api.openai.com/v1",
   "oauth_token_url": "",
-  "client_version": "0.148.0",
+  "client_version": "0.149.1",
   "default_group": "cyber",
   "sticky_wait_millis": 100,
   "strict_sticky_max_cooldown_seconds": 60,

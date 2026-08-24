@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"codex-account-pool/internal/config"
@@ -33,6 +34,17 @@ type acrossEvaluatedCandidate struct {
 	route     Route
 	candidate candidate
 	pending   int
+}
+
+// acrossTrialCandidate is an intelligent-routing cooldown trial candidate found
+// while evaluating one across-choice. When every choice came up empty because
+// its accounts were cooldown-stuck, SelectAcross probes the soonest-recovering
+// few instead of failing the whole request (see tryAcrossCooldownTrials).
+type acrossTrialCandidate struct {
+	choiceKey     string
+	route         Route
+	candidate     candidate
+	cooldownUntil int64
 }
 
 // SelectAcross evaluates every exact-capability account in the supplied tier,
@@ -98,12 +110,18 @@ func (s *Scheduler) SelectAcross(ctx context.Context, choices []RouteChoice) (Ro
 		}
 	}
 
-	evaluated, counters, err := s.evaluateAcrossCandidates(ctx, normalized)
+	evaluated, trials, counters, poolSize, err := s.evaluateAcrossCandidates(ctx, normalized)
 	if err != nil {
 		return RoutedLease{}, err
 	}
 	if len(evaluated) == 0 {
-		return RoutedLease{}, &NoAccountError{Group: acrossGroups(normalized), Model: normalized[0].Route.Model, Counters: counters}
+		// A cooldown-only empty result is a stale-quota probe opportunity, not a
+		// hard miss: probe the soonest-recovering accounts before concluding the
+		// tier is unavailable.
+		if lease, ok := s.tryAcrossCooldownTrials(ctx, trials, counters); ok {
+			return lease, nil
+		}
+		return RoutedLease{}, &NoAccountError{Group: acrossGroups(normalized), Model: normalized[0].Route.Model, Counters: counters, EmptyPool: poolSize == 0}
 	}
 
 	requests := make([]LeaseCandidateRequest, 0, len(evaluated))
@@ -121,7 +139,7 @@ func (s *Scheduler) SelectAcross(ctx context.Context, choices []RouteChoice) (Ro
 		})
 	}
 	if len(requests) == 0 {
-		return RoutedLease{}, &NoAccountError{Group: acrossGroups(normalized), Model: normalized[0].Route.Model, Counters: counters}
+		return RoutedLease{}, &NoAccountError{Group: acrossGroups(normalized), Model: normalized[0].Route.Model, Counters: counters, EmptyPool: poolSize == 0}
 	}
 
 	selection, reason, acquireErr := s.acquireAcross(ctx, requests)
@@ -169,21 +187,28 @@ func (s *Scheduler) normalizeAcrossRoute(ctx context.Context, route *Route) erro
 	return nil
 }
 
-func (s *Scheduler) evaluateAcrossCandidates(ctx context.Context, choices []RouteChoice) ([]acrossEvaluatedCandidate, NoAccountCounters, error) {
+func (s *Scheduler) evaluateAcrossCandidates(ctx context.Context, choices []RouteChoice) ([]acrossEvaluatedCandidate, []acrossTrialCandidate, NoAccountCounters, int, error) {
 	all := make([]acrossEvaluatedCandidate, 0)
+	trials := make([]acrossTrialCandidate, 0)
 	counters := NoAccountCounters{}
+	// poolSize is the aggregate raw account count across every choice. All-zero
+	// means every target group is itself empty — a configuration error no skip
+	// counter can express — and SelectAcross reports that as EmptyPool so the
+	// audit reason reads group_has_no_accounts rather than looking like load.
+	poolSize := 0
 	// Stable ordering keeps coordinator inputs reproducible; fairness comes from
 	// the coordinator's single global round-robin, not map iteration.
 	sort.SliceStable(choices, func(i, j int) bool { return choices[i].ChoiceKey < choices[j].ChoiceKey })
 	for _, choice := range choices {
 		selection, err := s.accountsSnapshot(ctx, choice.Route.Group)
 		if err != nil {
-			return nil, counters, err
+			return nil, nil, counters, 0, err
 		}
 		index, err := s.candidateIndexSnapshot(ctx, selection, choice.Route)
 		if err != nil {
-			return nil, counters, err
+			return nil, nil, counters, 0, err
 		}
+		poolSize += index.poolSize
 		addNoAccountCounters(&counters, index.staticCounters)
 		evaluation := s.newCandidateEvaluationContext(ctx, choice.Route, selection)
 		pending := s.queuedForRoute(choice.Route)
@@ -192,12 +217,47 @@ func (s *Scheduler) evaluateAcrossCandidates(ctx context.Context, choices []Rout
 			item, ok := s.evaluateIndexedCandidate(indexed, &evaluation, &candidateCounters)
 			addNoAccountCounters(&counters, candidateCounters)
 			if !ok {
+				// Only a cooldown-stuck candidate is trial-eligible; everything else
+				// (quarantine, recheck, egress down, capacity, token) must not probe.
+				if trial, until, trialOK := s.evaluateIndexedTrialCandidate(indexed, &evaluation); trialOK {
+					trials = append(trials, acrossTrialCandidate{choiceKey: choice.ChoiceKey, route: choice.Route, candidate: trial, cooldownUntil: until})
+				}
 				continue
 			}
 			all = append(all, acrossEvaluatedCandidate{choiceKey: choice.ChoiceKey, route: choice.Route, candidate: item, pending: pending})
 		}
 	}
-	return all, counters, nil
+	return all, trials, counters, poolSize, nil
+}
+
+// tryAcrossCooldownTrials probes intelligent-routing cooldown trials across every
+// empty across-choice. It engages only when cooldown-class counters fired and each
+// probe is still gated by the coordinator, exactly like the single-route trial in
+// tryCooldownTrial. A successful probe returns a RoutedLease carrying the probed
+// candidate's choice key.
+func (s *Scheduler) tryAcrossCooldownTrials(ctx context.Context, trials []acrossTrialCandidate, counters NoAccountCounters) (RoutedLease, bool) {
+	if !s.Config().IntelligentRoutingEnabled {
+		return RoutedLease{}, false
+	}
+	if counters.RateLimitCooldown == 0 && counters.EgressCooldown == 0 {
+		return RoutedLease{}, false
+	}
+	if len(trials) == 0 {
+		return RoutedLease{}, false
+	}
+	sort.SliceStable(trials, func(i, j int) bool { return trials[i].cooldownUntil < trials[j].cooldownUntil })
+	if len(trials) > maxCooldownTrialAttempts {
+		trials = trials[:maxCooldownTrialAttempts]
+	}
+	for _, trial := range trials {
+		lease, _, ok := s.tryLeaseAccountFromCandidate(ctx, trial.candidate, trial.route)
+		if !ok {
+			continue
+		}
+		atomic.AddInt64(&s.metrics.TrialSelections, 1)
+		return RoutedLease{Lease: lease, ChoiceKey: trial.choiceKey}, true
+	}
+	return RoutedLease{}, false
 }
 
 func addNoAccountCounters(dst *NoAccountCounters, src NoAccountCounters) {

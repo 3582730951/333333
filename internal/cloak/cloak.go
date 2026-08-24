@@ -51,9 +51,14 @@ const (
 
 // claudeBillingHeaderPrefix marks the x-anthropic-billing-header system block that
 // real Claude Code prepends to every request (carrying cc_version + the native
-// build component). Captured 2026-08-09 ground truth for 2.1.226: it is the FIRST
-// system block, type text, has NO cache_control and NO cch member, and uses the
-// fixed .503 build component on every request.
+// build component). Captured 2026-08-24 ground truth for 2.1.226/2.1.236–2.1.241:
+// it is the FIRST system block, type text, has NO cache_control and NO cch member,
+// and cc_version carries the message-derived 3-hex attribution suffix
+// (cc_version=<v>.<3-hex>; the earlier plain `.NNN`-less ground truth was a
+// truncated/relay-capture artifact). The suffix is the real client's attribution
+// fingerprint (see computeClaudeAttributionFingerprint), which the pool mirrors by
+// default via ClaudeCodeCacheOptions.AttributionFingerprint so the emitted wire can
+// track the real client without a recompile.
 const claudeBillingHeaderPrefix = "x-anthropic-billing-header:"
 
 // claudeCodeToolNames maps OpenCode/lowercase tool names to Claude Code's
@@ -77,6 +82,17 @@ type ClaudeCodeCacheOptions struct {
 	NativeBreakpoints bool
 	BreakpointPolicy  string
 	TTL               string
+
+	// AttributionFingerprint, when true, appends the real Claude Code attribution
+	// fingerprint to the billing block's cc_version (cc_version=<v>.<3-hex>).
+	// The algorithm is the client's obfuscated attribution hash
+	// SHA256(salt + firstUserMsg[4] + firstUserMsg[7] + firstUserMsg[20] + version)[:3]
+	// — see computeClaudeAttributionFingerprint. Defaults ON: official 2.1.236–2.1.241
+	// binaries verified LIVE on 2026-08-24 (every cc_version carries the suffix; the
+	// hash matched the algorithm exactly). The capability is server-side remote-
+	// configured, so messages.go derives this from the operator env flag / a signed
+	// manifest attribution_suffix assertion to follow any rollback to plain.
+	AttributionFingerprint bool
 }
 
 // VirtualizeClaudeCode is Virtualize with the Claude Code x-anthropic-billing-header
@@ -87,7 +103,8 @@ type ClaudeCodeCacheOptions struct {
 // body. The billing block carries no cache_control and is placed at system[0] (ahead
 // of any identity block), matching the captured real client shape, and is added AFTER
 // capCacheControlBreakpoints so it neither consumes a breakpoint nor is affected by
-// the cap. Its build component is the one captured from the shipping binary.
+// the cap. When ClaudeCodeCacheOptions.AttributionFingerprint is set, cc_version
+// additionally carries the real client's message-derived attribution suffix.
 func VirtualizeClaudeCode(body []byte, id identity.Identity, sensitiveWords []string, oauth bool, billingVersion string) Result {
 	return VirtualizeClaudeCodeWithCache(body, id, sensitiveWords, oauth, billingVersion, ClaudeCodeCacheOptions{})
 }
@@ -95,10 +112,11 @@ func VirtualizeClaudeCode(body []byte, id identity.Identity, sensitiveWords []st
 func VirtualizeClaudeCodeWithCache(body []byte, id identity.Identity, sensitiveWords []string, oauth bool, billingVersion string, cache ClaudeCodeCacheOptions) Result {
 	rules := make([]streamrewrite.Rule, 0, len(sensitiveWords)+1)
 	out := body
+	nativeClaudeCode := false
 
 	var root map[string]interface{}
 	if decodeClaudeJSONObject(body, &root) == nil {
-		nativeClaudeCode := firstSystemIsClaudeCode(root)
+		nativeClaudeCode = firstSystemIsClaudeCode(root)
 		if md, ok := root["metadata"].(map[string]interface{}); ok {
 			vid := claudeVirtualUserID(id, oauth || nativeClaudeCode)
 			if orig, _ := md["user_id"].(string); orig != "" && orig != vid {
@@ -134,12 +152,6 @@ func VirtualizeClaudeCodeWithCache(body []byte, id identity.Identity, sensitiveW
 		}
 		anthropicwire.CapCacheControlBreakpoints(root, 4)
 		anthropicwire.NormalizeCacheControlTTLForPolicy(root, cache.TTL)
-		if (oauth || nativeClaudeCode) && strings.TrimSpace(billingVersion) != "" {
-			setClaudeBillingBlock(root, billingVersion)
-		}
-		if b, err := anthropicwire.MarshalPreservingOrder(body, root); err == nil {
-			out = b
-		}
 	}
 
 	for _, w := range sensitiveWords {
@@ -149,6 +161,20 @@ func VirtualizeClaudeCodeWithCache(body []byte, id identity.Identity, sensitiveW
 	}
 
 	m := streamrewrite.New(rules)
+	if root != nil && (oauth || nativeClaudeCode) && strings.TrimSpace(billingVersion) != "" {
+		// The attribution fingerprint must be derived from the text the server will
+		// actually receive. The real client computes it from the first user message
+		// before sending; we compute it AFTER sensitive-word scrubbing so a server
+		// re-deriving the fingerprint from the wire sees the same chars. Scrubbing an
+		// unescaped text block is byte-identical for typical (plain-ASCII) patterns.
+		setClaudeBillingBlock(root, billingVersion, claudeAttributionFingerprint(root, billingVersion, cache.AttributionFingerprint, m))
+	}
+	if root != nil {
+		if b, err := anthropicwire.MarshalPreservingOrder(body, root); err == nil {
+			out = b
+		}
+	}
+
 	out = m.ReplaceAll(out)
 	return Result{Body: out, Scrubber: m}
 }
@@ -598,13 +624,17 @@ func capCacheControlBreakpoints(root map[string]interface{}, max int) {
 }
 
 // EnsureClaudeCodeBillingHeader makes the request carry a well-formed Claude Code
-// x-anthropic-billing-header system block as system[0], matching captured ground truth
-// (capture/out_v2): a text block, NO cache_control, of the form
+// x-anthropic-billing-header system block as system[0], matching the shipping
+//	2.1.236–2.1.241 wire shape (captured from the official binaries): a text block,
+//	NO cache_control, of the form
 //
-//	x-anthropic-billing-header: cc_version=<version>.503; cc_entrypoint=cli;
+//		x-anthropic-billing-header: cc_version=<version>.<3-hex>; cc_entrypoint=cli;
 //
 // It runs after other virtualization/cache-control injection so the attribution
-// attribution block is the final request shape.
+// block is the final request shape. This standalone form emits the plain prefix and
+// takes the caller-provided fingerprint (the optional message-derived 3-hex suffix,
+// or "" for the standalone entrypoint used by non-virtualized callers); the folded-in
+// VirtualizeClaudeCodeWithCache path computes the suffix itself.
 // Behavior:
 //   - real Claude Code (block already present): the block is REPLACED so cc_version is
 //     realigned to our account-bound claude-cli version (the downstream's real version
@@ -615,11 +645,25 @@ func capCacheControlBreakpoints(root map[string]interface{}, max int) {
 // version is the SAME claude-cli version emitted in the User-Agent, so cc_version and the
 // UA agree. Apply only to OAuth/Claude-Code traffic.
 func EnsureClaudeCodeBillingHeader(body []byte, version string) []byte {
+	return EnsureClaudeCodeBillingHeaderWithFingerprint(body, version, false)
+}
+
+// EnsureClaudeCodeBillingHeaderWithFingerprint is EnsureClaudeCodeBillingHeader
+// with the real client's message-derived attribution suffix. The body at this point
+// is the FINAL request shape (already virtualized and scrubbed), so the first user
+// message text is read straight from it — the same text the server re-derives from
+// the wire. enabled=false keeps the plain cc_version (matching a server-side
+// turn-down of the attribution feature).
+func EnsureClaudeCodeBillingHeaderWithFingerprint(body []byte, version string, enabled bool) []byte {
 	var root map[string]interface{}
 	if decodeClaudeJSONObject(body, &root) != nil {
 		return body
 	}
-	if !setClaudeBillingBlock(root, version) {
+	fingerprint := ""
+	if enabled {
+		fingerprint = computeClaudeAttributionFingerprint(firstClaudeUserMessageText(root), version)
+	}
+	if !setClaudeBillingBlock(root, version, fingerprint) {
 		return body
 	}
 	if out, err := anthropicwire.MarshalPreservingOrder(body, root); err == nil {
@@ -649,11 +693,12 @@ func decodeClaudeJSONObject(body []byte, root *map[string]interface{}) error {
 // setClaudeBillingBlock injects/replaces the Claude Code x-anthropic-billing-header
 // system block on an already-parsed request root, returning whether root["system"] is
 // now a usable shape (false only for an unexpected non-string/array/nil system type, so
-// the byte-level caller can leave the body untouched). Factored out of
+// the byte-level caller can leave the body untouched). fingerprint, when non-empty, is
+// appended to cc_version as the real client's attribution suffix. Factored out of
 // EnsureClaudeCodeBillingHeader so VirtualizeClaudeCode can fold the stamp into its
 // single parse/marshal pass without a second JSON round-trip. See
 // EnsureClaudeCodeBillingHeader for the fingerprint rationale.
-func setClaudeBillingBlock(root map[string]interface{}, version string) bool {
+func setClaudeBillingBlock(root map[string]interface{}, version, fingerprint string) bool {
 	attrs := claudeBillingAttrs{entrypoint: "cli"}
 	switch sys := root["system"].(type) {
 	case []interface{}:
@@ -667,7 +712,7 @@ func setClaudeBillingBlock(root map[string]interface{}, version string) bool {
 				}
 			}
 		}
-		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForAttrs(version, attrs)}
+		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForAttrs(version, attrs, fingerprint)}
 		if idx >= 0 {
 			sys[idx] = billing
 			root["system"] = sys
@@ -675,10 +720,10 @@ func setClaudeBillingBlock(root map[string]interface{}, version string) bool {
 			root["system"] = append([]interface{}{billing}, sys...)
 		}
 	case string:
-		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForAttrs(version, attrs)}
+		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForAttrs(version, attrs, fingerprint)}
 		root["system"] = []interface{}{billing, map[string]interface{}{"type": "text", "text": sys}}
 	case nil:
-		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForAttrs(version, attrs)}
+		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForAttrs(version, attrs, fingerprint)}
 		root["system"] = []interface{}{billing}
 	default:
 		return false
@@ -703,7 +748,7 @@ type claudeBillingAttrs struct {
 // subagent (a Task-tool invocation) rather than the main conversation; an observed real
 // block reads:
 //
-//	x-anthropic-billing-header: cc_version=2.1.226.503; cc_entrypoint=cli; cc_is_subagent=true;
+//	x-anthropic-billing-header: cc_version=2.1.241; cc_entrypoint=cli; cc_is_subagent=true;
 //
 // Dropping it was a coherence leak in the same class the cc_entrypoint projection already
 // guards against. A subagent request is independently recognizable from its body (subagent
@@ -740,9 +785,10 @@ func parseClaudeBillingAttrs(text string) claudeBillingAttrs {
 }
 
 // claudeBillingHeaderTextForAttrs renders the block, keeping the real client's field order
-// (cc_version, cc_entrypoint, then cc_is_subagent when present).
-func claudeBillingHeaderTextForAttrs(version string, attrs claudeBillingAttrs) string {
-	out := claudeBillingHeaderTextForEntrypoint(version, attrs.entrypoint)
+// (cc_version, cc_entrypoint, then cc_is_subagent when present). A non-empty
+// fingerprint appends the client's message-derived attribution suffix to cc_version.
+func claudeBillingHeaderTextForAttrs(version string, attrs claudeBillingAttrs, fingerprint string) string {
+	out := claudeBillingHeaderTextForEntrypoint(version, attrs.entrypoint, fingerprint)
 	if attrs.subagent != "" {
 		out += fmt.Sprintf(" cc_is_subagent=%s;", attrs.subagent)
 	}
@@ -750,21 +796,116 @@ func claudeBillingHeaderTextForAttrs(version string, attrs claudeBillingAttrs) s
 }
 
 // claudeBillingHeaderText builds the billing-header block for a claude-cli version.
-// Shipping 2.1.226 emits the fixed .503 build component and no cch field.
-// The launch entrypoint is projected from an existing native billing block.
+// The shipping 2.1.236–2.1.241 binaries emit cc_version=<v>.<3-hex> with the
+// message-derived attribution suffix and no cch field (verified by running the
+// official linux-x64 binaries against a capture server on 2026-08-24; the earlier
+// plain `.NNN`-less ground truth was a truncated/relay-capture artifact). The launch
+// entrypoint is projected from an existing native billing block.
 func claudeBillingHeaderText(version string) string {
-	return claudeBillingHeaderTextForEntrypoint(version, "cli")
+	return claudeBillingHeaderTextForEntrypoint(version, "cli", "")
 }
 
-func claudeBillingHeaderTextForEntrypoint(version, entrypoint string) string {
+func claudeBillingHeaderTextForEntrypoint(version, entrypoint, fingerprint string) string {
 	if version == "" {
 		version = identity.ClaudeCLIVersion
 	}
 	if entrypoint != "sdk-cli" {
 		entrypoint = "cli"
 	}
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s;",
-		version, identity.ClaudeCodeBuild, entrypoint)
+	if fingerprint != "" {
+		version = version + "." + fingerprint
+	}
+	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s; cc_entrypoint=%s;",
+		version, entrypoint)
+}
+
+// claudeAttributionFingerprint returns the client's 3-hex attribution suffix to
+// append to cc_version, or "" when the capability is disabled or the request has no
+// user-authored first message. The fingerprint is computed from the request's FIRST
+// USER message text — the same text a real Claude Code client fingerprints before
+// sending — so the value on the outbound wire matches what the real client would
+// have computed for the same body. When scrub is non-nil the extracted text is first
+// run through the same sensitive-word scrubber applied to the outbound body, so a
+// server re-deriving the fingerprint from the received wire sees the same chars.
+func claudeAttributionFingerprint(root map[string]interface{}, version string, enabled bool, scrub *streamrewrite.Matcher) string {
+	if !enabled {
+		return ""
+	}
+	text := firstClaudeUserMessageText(root)
+	if text == "" {
+		return ""
+	}
+	if scrub != nil {
+		text = string(scrub.ReplaceAll([]byte(text)))
+	}
+	return computeClaudeAttributionFingerprint(text, version)
+}
+
+// firstClaudeUserMessageText extracts the text of the first role=="user" message in
+// the Anthropic Messages request, mirroring the client's extractFirstMessageText
+// (a string content, or the first text block of an array content). Returns "" when
+// there is no user message with text.
+func firstClaudeUserMessageText(root map[string]interface{}) string {
+	msgs, ok := root["messages"].([]interface{})
+	if !ok {
+		return ""
+	}
+	for _, m := range msgs {
+		msg, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role != "user" {
+			continue
+		}
+		switch content := msg["content"].(type) {
+		case string:
+			return content
+		case []interface{}:
+			for _, blk := range content {
+				if bm, ok := blk.(map[string]interface{}); ok {
+					if t, _ := bm["type"].(string); t == "text" {
+						if text, _ := bm["text"].(string); text != "" {
+							return text
+						}
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// attributionFingerprintSalt is the hardcoded salt from Claude Code's backend
+// validation (src/utils/fingerprint.ts): "Must match exactly for fingerprint
+// validation to pass."
+const attributionFingerprintSalt = "59cf53e54c78"
+
+// computeClaudeAttributionFingerprint reproduces the official client's obfuscated
+// attribution hash (src/utils/fingerprint.ts, v2.1.76 deobfuscated source):
+//
+//	chars = msg[4] + msg[7] + msg[20]   // each missing → "0"
+//	fingerprint = hex(SHA256("59cf53e54c78" + chars + version))[:3]
+//
+// The 3-hex value rides the billing block as cc_version=<version>.<fingerprint> and
+// attributes the request to a genuine Claude Code client; it is message-dependent
+// (NOT a fixed build literal — the earlier hardcoded `.503` was a relay artifact and
+// is gone). Indexing is by rune, which equals JS string indexing for BMP text and
+// differs only for surrogate-pair characters in the first 21 code units — an edge
+// the real client and its validation side share identically for ASCII traffic.
+func computeClaudeAttributionFingerprint(messageText, version string) string {
+	runes := []rune(messageText)
+	chars := make([]rune, 0, 3)
+	for _, i := range []int{4, 7, 20} {
+		if i < len(runes) {
+			chars = append(chars, runes[i])
+		} else {
+			chars = append(chars, '0')
+		}
+	}
+	input := attributionFingerprintSalt + string(chars) + version
+	sum := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(sum[:])[:3]
 }
 
 // nodePlatform maps a virtual OS name to the Node.js process.platform value

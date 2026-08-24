@@ -95,6 +95,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	r = s.withIntelligentRoutingFallbacks(r, pol)
 	r = r.WithContext(withDownstreamKey(r.Context(), pol))
 	r = r.WithContext(withDownstreamClientScope(r.Context(), pol.KeyHash, r))
 	r = r.WithContext(withGoalIdentityAliases(r.Context(), goalAliases(r, raw, "claude")))
@@ -513,8 +514,12 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	id := s.virtualIdentity(r.Context(), lease.Account.ID, osHint)
 	// Virtualize the request to a consistent first-party Claude Code client and, in the
 	// SAME single JSON parse/marshal pass, stamp the x-anthropic-billing-header for
-	// native Claude Code/OAuth traffic (cc_version coherent with our UA and the
-	// captured fixed .503 build component; current 2.1.226 emits no cch field).
+	// native Claude Code/OAuth traffic (cc_version coherent with our UA). The captured
+	// 2.1.226–2.1.241 wire carries the real client's message-derived attribution suffix
+	// (cc_version=<v>.<3-hex>; no cch — NATIVE_CLIENT_ATTESTATION is off), and the pool
+	// mirrors it by DEFAULT (ClaudeAttributionFingerprint). A signed_custom manifest
+	// attribution_suffix assertion ("live"/"plain") or the env flag flips it, so the
+	// pool tracks a server-side attribution rollout without a recompile.
 	// Folding the billing stamp in here avoids a second full unmarshal+marshal over what
 	// is often a very large Claude Code request body.
 	oauth := claudeIsOAuth(token)
@@ -532,9 +537,10 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	claudeTTL := s.claudeCacheTTLForRoute(r.Context(), affinity)
 	breakpointPolicy := s.claudeCacheBreakpointPolicy(r.Context(), affinity, lease.Account.ID, group, apiKeyHash)
 	result := cloak.VirtualizeClaudeCodeWithCache(raw, id, wordsForClaude, oauth, billingVer, cloak.ClaudeCodeCacheOptions{
-		NativeBreakpoints: nativeCacheInject,
-		BreakpointPolicy:  breakpointPolicy,
-		TTL:               claudeTTL,
+		NativeBreakpoints:    nativeCacheInject,
+		BreakpointPolicy:     breakpointPolicy,
+		TTL:                  claudeTTL,
+		AttributionFingerprint: s.cfg.ClaudeAttributionFingerprintEnabled(),
 	})
 	body := result.Body
 	if nativeCacheInject {
@@ -625,7 +631,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			writeError(w, http.StatusBadGateway, readErr)
 			return outcomeDone
 		}
-		s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header)
+		s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header, lease.Trial)
 		s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(result.Scrubber.ReplaceAll(responseBody))
@@ -756,7 +762,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	}
 claudeSuccess:
 	s.verifyAccountModel(r.Context(), lease.Account, model, requestedClaudeModelFromContext(r.Context()).ContextMode)
-	s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header)
+	s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header, lease.Trial)
 	s.captureQuota(r.Context(), lease.Account.ID, "claude", model, resp.Header)
 
 	if isEventStream(resp.Header) {

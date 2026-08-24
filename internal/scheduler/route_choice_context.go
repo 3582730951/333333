@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -23,6 +24,11 @@ type RouteChoiceState struct {
 	mu        sync.Mutex
 	templates []RouteChoice
 	claim     RouteChoiceClaim
+	// primary is the choice key of a strict first tier. When set, a schedulable
+	// account in that group is selected directly without fallback competition, and
+	// the remaining choices engage only when it has none. Group fallbacks use this
+	// so a healthy primary group keeps serving instantly.
+	primary   string
 	selected  string
 	claimed   string
 	claimDone bool
@@ -35,6 +41,16 @@ type RouteChoiceState struct {
 // each template contributes only its target group and optional explicit fields.
 func WithRouteChoices(ctx context.Context, choices []RouteChoice, claim RouteChoiceClaim) (context.Context, *RouteChoiceState) {
 	state := &RouteChoiceState{templates: append([]RouteChoice(nil), choices...), claim: claim}
+	return context.WithValue(ctx, routeChoiceContextKey{}, state), state
+}
+
+// WithPrimaryRouteChoices behaves like WithRouteChoices but treats the named
+// choice as a strict first tier (see RouteChoiceState.primary): a schedulable
+// account there is selected via the ordinary single-group path so a healthy
+// primary group keeps serving instantly, and the fallback choices only engage
+// when the primary group has no schedulable account.
+func WithPrimaryRouteChoices(ctx context.Context, primary string, choices []RouteChoice, claim RouteChoiceClaim) (context.Context, *RouteChoiceState) {
+	state := &RouteChoiceState{templates: append([]RouteChoice(nil), choices...), claim: claim, primary: primary}
 	return context.WithValue(ctx, routeChoiceContextKey{}, state), state
 }
 
@@ -99,6 +115,33 @@ func (s *Scheduler) selectFromRouteChoiceContext(ctx context.Context, route Rout
 			merged.AllowedProviders = append([]string(nil), template.Route.AllowedProviders...)
 		}
 		choices = append(choices, RouteChoice{ChoiceKey: template.ChoiceKey, Route: merged})
+	}
+	if state.primary != "" {
+		// Primary-first: a schedulable account in the primary group is selected via
+		// the ordinary single-group path so it serves instantly without competing
+		// against fallback targets in the across coordinator's round-robin. Only a
+		// NoAccountError (empty, quarantined, or cooldown-stuck past its trial)
+		// falls through to the across evaluation where fallback groups step in.
+		var primaryRoute *Route
+		for i := range choices {
+			if choices[i].ChoiceKey == state.primary {
+				primaryRoute = &choices[i].Route
+				break
+			}
+		}
+		if primaryRoute != nil {
+			lease, selectErr := s.Select(bypassCtx, *primaryRoute)
+			if selectErr == nil {
+				state.claimDone = true
+				state.claimed = state.primary
+				state.selected = state.primary
+				return lease, true, nil
+			}
+			var nae *NoAccountError
+			if !errors.As(selectErr, &nae) {
+				return Lease{}, true, selectErr
+			}
+		}
 	}
 	routed, err := s.SelectAcross(bypassCtx, choices)
 	if err != nil {

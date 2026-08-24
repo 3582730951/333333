@@ -159,7 +159,7 @@ func (s *Server) handleCustomProviderPassthroughWithModel(
 		return
 	}
 
-	s.guardRateLimitForAccount(r.Context(), lease.Account, response.Header)
+	s.guardRateLimitForAccount(r.Context(), lease.Account, response.Header, lease.Trial)
 	s.captureQuota(r.Context(), lease.Account.ID, provider.ID, routeModel, response.Header)
 	if resourceAffinity.Hash != "" {
 		s.persistCustomProviderResourceBinding(r.Context(), provider.ID, resourceAffinity, resourceKind, lease)

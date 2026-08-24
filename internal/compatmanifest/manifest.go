@@ -63,6 +63,14 @@ type ClientProfile struct {
 	CLIVersion       string `json:"cli_version,omitempty"`
 	NodeVersion      string `json:"node_version,omitempty"`
 	StainlessVersion string `json:"stainless_version,omitempty"`
+	// AttributionSuffix is an empirical assertion ONLY a signed_custom manifest can
+	// make — verified by running the official client binary against a capture server
+	// — of whether the billing block's cc_version currently carries the
+	// message-derived `.xxx` attribution suffix ("live") or not ("plain"). The
+	// gateway mirrors it by enabling (or disabling) ClaudeAttributionFingerprint. The
+	// "official" npm-derived payload can never assert it, because npm does not run
+	// the client.
+	AttributionSuffix string `json:"attribution_suffix,omitempty"`
 }
 
 // Model describes only conservative, client-visible fallback metadata. A live
@@ -668,6 +676,16 @@ func Validate(payload Payload, now time.Time, allowExpired bool) error {
 	if node := strings.TrimSpace(payload.Claude.NodeVersion); node != "" {
 		if extractDottedVersion(node) != strings.TrimPrefix(node, "v") {
 			return errors.New("claude.node_version is not a dotted version")
+		}
+	}
+	// AttributionSuffix is an empirical assertion only a signed capture pipeline can
+	// make; the official npm-derived payload never runs the client and must not
+	// claim it. "live" forces the pool's attribution suffix on (the verified current
+	// state); "plain" forces it off (a future server-side turn-down). Restrict the
+	// value so a bad manifest cannot inject arbitrary text.
+	if suffix := strings.TrimSpace(payload.Claude.AttributionSuffix); suffix != "" {
+		if payload.Source != "signed_custom" || (suffix != "live" && suffix != "plain") {
+			return errors.New("claude.attribution_suffix may only be \"live\" or \"plain\" from a signed_custom manifest")
 		}
 	}
 	if payload.Source == "official" && payload.Codex.Version == "" && payload.Claude.CLIVersion == "" {

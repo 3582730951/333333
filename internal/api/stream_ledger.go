@@ -392,6 +392,19 @@ func (r *codexStreamLedgerRecorder) responseTurnState() string {
 	return r.turnState
 }
 
+// safetyBufferingDetected reports whether the terminal response object carried the
+// Responses safety_buffering control field — the codex protocol's
+// "security-not-displayed" signal that withheld content from the response.
+func (r *codexStreamLedgerRecorder) safetyBufferingDetected() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.completed == nil {
+		return false
+	}
+	_, ok := r.completed["safety_buffering"]
+	return ok
+}
+
 // partialText returns the assistant output text accumulated so far.
 func (r *codexStreamLedgerRecorder) partialText() string {
 	r.mu.Lock()

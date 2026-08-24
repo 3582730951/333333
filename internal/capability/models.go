@@ -478,10 +478,35 @@ func claudeWindow(slug string) int64 {
 
 // Claude Fable 5, Opus 5, and Sonnet 5 ship with a one-million-token context as
 // the standard and maximum window. Unlike older extended-context models, they
-// have no 200K variant and do not require a context-1m beta entitlement.
+// have no 200K variant, so every paid subscription gets the 1M window without
+// proving a context-1m beta entitlement. The official client still emits the
+// context-1m beta on these models for entitled accounts (captured 2.1.241 wire),
+// which the pool mirrors via ClaudeModelHas1MContext.
 func claudeDefault1M(slug string) bool {
 	slug = strings.ReplaceAll(strings.ToLower(strings.TrimSpace(slug)), ".", "-")
 	return slug == "claude-fable-5" || slug == "claude-opus-5" || slug == "claude-sonnet-5"
+}
+
+// ClaudeModelHas1MContext reports whether Claude Code's context-1m beta rides a
+// model string: it is emitted for the explicit [1m] opt-in alias on any model,
+// and unconditionally for the generation-5 native-one-million models
+// (Fable/Opus/Sonnet 5), whose 1M window is the model default on every paid
+// subscription. The extended-context Opus 4.6–4.8 line carries the beta ONLY
+// via the [1m] alias — a plain claude-opus-4-8 request is a 200K turn and must
+// never synthesize it (a non-entitled account would reject the 1M beta).
+//
+// Captured 2.1.241 wire: an entitled account sends context-1m for
+// claude-opus-5 (plain and [1m]); a non-entitled (fake) token omits it. The
+// account's entitlement is enforced by the pool at route time (Context1MState,
+// plus the virtual-1M fallback strips the beta for accounts that cannot prove
+// it); this gate is only the model-string half of the policy.
+func ClaudeModelHas1MContext(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	m = strings.ReplaceAll(m, ".", "-")
+	if strings.Contains(m, "[1m]") {
+		return true
+	}
+	return claudeDefault1M(m)
 }
 
 // NormalizeClaudeModelAlias maps a Claude model alias that Anthropic's API would reject

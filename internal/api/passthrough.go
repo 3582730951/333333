@@ -68,6 +68,7 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
+	r = s.withIntelligentRoutingFallbacks(r, pol)
 	hint := normalizeProviderHintLoose(r.Header.Get("X-Pool-Provider"))
 	if strings.TrimSpace(r.Header.Get("X-Pool-Provider")) == "" {
 		hint = normalizeProviderHintLoose(pol.ProviderHint)
@@ -207,7 +208,7 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 	}
 passthroughSuccess:
 
-	s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header)
+	s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header, lease.Trial)
 	s.captureQuota(r.Context(), lease.Account.ID, "claude", "", resp.Header)
 	if resourceAffinity.Hash != "" {
 		s.persistClaudeResourceBinding(r.Context(), resourceAffinity, resourceKind, lease)

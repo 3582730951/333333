@@ -91,6 +91,23 @@ func applyCompatibilityManifestConfig(cfg config.Config, payload compatmanifest.
 		cfg.ClaudeCLIVersionOverride = strings.TrimSpace(payload.Claude.CLIVersion)
 		cfg.ClaudeNodeVersion = strings.TrimSpace(payload.Claude.NodeVersion)
 		cfg.ClaudeStainlessVersion = strings.TrimSpace(payload.Claude.StainlessVersion)
+		// Attribution suffix: a signed_custom manifest may assert (from a real client
+		// capture) whether cc_version currently carries the message-derived `.xxx`
+		// suffix ("live") or not ("plain"), and the pool must mirror it or it diverges
+		// from every genuine client. Only the signed source can assert this
+		// (validateSignature restricts it), and it is honored only while the operator
+		// is fully manifest-driven (no Claude pin) — an operator who pins the
+		// fingerprint surface keeps manual control. The pool DEFAULTS to live (the
+		// verified 2026-08-24 state), so a signed "plain" assertion is what flips it
+		// back off when the server turns the feature down.
+		if payload.Source == "signed_custom" {
+			switch strings.TrimSpace(payload.Claude.AttributionSuffix) {
+			case "live":
+				cfg.ClaudeAttributionFingerprint = true
+			case "plain":
+				cfg.ClaudeAttributionFingerprint = false
+			}
+		}
 	}
 	return cfg
 }

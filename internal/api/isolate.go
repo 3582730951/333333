@@ -500,8 +500,22 @@ func (s *Server) guardRateLimit(ctx context.Context, accountID string, header ht
 // also the point where an account's consecutive-failure streak is cleared: one good
 // response means the upstream is serving traffic, and the breaker must not carry a
 // stale count toward a later bench.
-func (s *Server) guardRateLimitForAccount(ctx context.Context, account storage.Account, header http.Header) {
+//
+// trial marks an intelligent-routing cooldown trial lease: the scheduler probed the
+// account because its cooldown looked stale and no other candidate existed. A
+// successful upstream response here proves the quota signal wrong, so the binding
+// cooldown is lifted immediately instead of leaving the account outside the pool
+// until the old cooldown expiry. guardRateLimit below may still impose a fresh
+// cooldown if the response itself signals one.
+func (s *Server) guardRateLimitForAccount(ctx context.Context, account storage.Account, header http.Header, trial bool) {
 	s.noteUpstreamSuccess(account.ID)
+	if trial {
+		if err := s.store.SetBindingCooldown(ctx, account.ID, 0); err != nil {
+			log.Printf("[INTELLIGENT-ROUTING] trial cooldown clear failed account=%s err=%v", account.ID, err)
+		} else if s.scheduler != nil {
+			s.scheduler.NotifyStateChanged()
+		}
+	}
 	if account.IgnoreRateLimitControls {
 		return
 	}

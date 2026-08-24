@@ -104,9 +104,9 @@ func (c *Client) applyClaudeCodeCustomHeaders(dst http.Header, spec Request, id 
 	// shape for the same reason applyClaudeHeaders does it: an API key cannot present the
 	// OAuth client's permission marker, and pairing them is itself a rejectable mismatch.
 	if oauthCredential {
-		dst.Set("Anthropic-Beta", mergeBetas(claudeOAuthBetas, spec.Headers, false))
+		dst.Set("Anthropic-Beta", claudeBetasForRequest(claudeOAuthBetas, spec, false))
 	} else {
-		dst.Set("Anthropic-Beta", mergeBetas(claudeAPIKeyBetas, spec.Headers, true))
+		dst.Set("Anthropic-Beta", claudeBetasForRequest(claudeAPIKeyBetas, spec, true))
 	}
 
 	if strings.TrimSpace(spec.Headers.Get(claudeCacheDiagnosticsHeader)) != "" {

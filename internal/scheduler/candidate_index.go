@@ -22,7 +22,21 @@ const (
 	candidateIndexTTL       = 5 * time.Second
 	candidateIndexRetention = 2 * time.Minute
 	candidateIndexMaxKeys   = 4096
+
+	// maxCooldownTrialAttempts bounds how many cooldown-stuck accounts a single
+	// intelligent-routing trial probes. Trials run only after a normal selection
+	// found nothing, and each attempt is still gated by the coordinator's atomic
+	// concurrency/token enforcement, so a genuinely exhausted account cannot be
+	// over-ridden by a trial.
+	maxCooldownTrialAttempts = 3
 )
+
+// trialCandidate pairs a cooldown-trial choice with the wall-clock instant its
+// blocker clears, so trials probe the soonest-recovering accounts first.
+type trialCandidate struct {
+	choice        candidate
+	cooldownUntil int64
+}
 
 type indexedCandidate struct {
 	snapshot      storage.AccountWithEgress
@@ -307,6 +321,158 @@ func (s *Scheduler) evaluateIndexedCandidate(indexed indexedCandidate, evaluatio
 	return candidate{account: account, egress: egress, binding: binding, resolvedModel: indexed.resolvedModel, bootstrap: bootstrap, score: score}, true
 }
 
+// trialRateLimitExhausted mirrors storage's exhausted test without the rejected
+// status: a rejected row is the quota poller's hard verdict and is never
+// trial-worthy; a zero-remaining row may be a stale snapshot and is worth one
+// probe (see evaluateIndexedTrialCandidate).
+func trialRateLimitExhausted(r storage.AccountRateLimit) bool {
+	switch strings.TrimSpace(r.LimiterType) {
+	case "requests":
+		return r.RemainingRequests == 0
+	case "tokens", "input_tokens", "output_tokens", "unified", "5h_polled":
+		return r.RemainingTokens == 0
+	}
+	return r.RemainingTokens == 0 || r.RemainingRequests == 0
+}
+
+// evaluateIndexedTrialCandidate classifies an indexed candidate that the normal
+// evaluation rejected. It returns the candidate only when the sole blocker is an
+// account-level cooldown (rate-limit reset or binding cooldown) that may be stale:
+// a probe here proves the quota signal wrong and, on upstream success, the API
+// layer clears the binding cooldown so the account rejoins the pool immediately.
+// Accounts in quarantine, under recheck, egress-unhealthy, at capacity, or
+// token-exhausted are never trial-eligible — those rejections mean "wait or
+// isolate", not "probe".
+func (s *Scheduler) evaluateIndexedTrialCandidate(indexed indexedCandidate, evaluation *candidateEvaluationContext) (candidate, int64, bool) {
+	account := indexed.snapshot.Account
+	if account.Status != "active" {
+		return candidate{}, 0, false
+	}
+	if account.QuarantineUntil > evaluation.now && !account.IgnoreRateLimitControls {
+		return candidate{}, 0, false
+	}
+	if evaluation.route.Exclude[account.ID] {
+		return candidate{}, 0, false
+	}
+	candidateRoute := routeForProviderModel(evaluation.route, indexed.provider)
+	var cooldownUntil int64
+	// Rate-limit cooldown only makes an account trial-eligible when the limiter
+	// snapshot is NOT hard-rejected. A rejected row is the quota poller's explicit
+	// "no quota" verdict and must be respected (the account would just 429 again);
+	// a zero-remaining row from an older poll may simply be stale and is worth
+	// exactly one probe, which the API layer converts into a cooldown clear.
+	if !account.IgnoreRateLimitControls {
+		for _, r := range evaluation.rateLimits[account.ID] {
+			if r.ResetAt <= evaluation.now || strings.EqualFold(strings.TrimSpace(r.Status), "rejected") {
+				continue
+			}
+			if p := strings.TrimSpace(r.Provider); p != "" && p != indexed.provider {
+				continue
+			}
+			if m := strings.TrimSpace(r.Model); m != "" && m != candidateRoute.Model {
+				continue
+			}
+			if !trialRateLimitExhausted(r) {
+				continue
+			}
+			if cooldownUntil == 0 || r.ResetAt < cooldownUntil {
+				cooldownUntil = r.ResetAt
+			}
+		}
+	}
+	binding := effectiveAccountEgressBinding(indexed.snapshot.Binding, account.ID, firstRouteValue(evaluation.route.PreferredEgressIDs...))
+	if binding.CooldownUntil > evaluation.now && !account.IgnoreRateLimitControls && binding.CooldownUntil > cooldownUntil {
+		cooldownUntil = binding.CooldownUntil
+	}
+	// Recheck-pending accounts are deliberately trial-ineligible: the recheck loop
+	// probes them explicitly, and bypassing it would weaken the isolation it gives.
+	if binding.RecheckPending && !account.IgnoreRateLimitControls {
+		return candidate{}, 0, false
+	}
+	if cooldownUntil == 0 {
+		// No cooldown blocks this account; the normal evaluation must have rejected
+		// it for a non-cooldown reason, so it is not a trial candidate.
+		return candidate{}, 0, false
+	}
+	// The account must otherwise be schedulable: egress healthy, sidecar bound, not
+	// at capacity, token budget available. Only the cooldown gate is lifted;
+	// selectEgressWithCache still rejects an egress profile that is itself in
+	// cooldown, and the coordinator still enforces per-account concurrency/token.
+	egress, ok := s.selectEgressWithCache(evaluation.ctx, binding, evaluation.now, true, &evaluation.requestEgress, evaluation.egressCacheMutex, &evaluation.egressCacheTime)
+	if !ok {
+		return candidate{}, 0, false
+	}
+	egress, ok = s.applyBoundSidecarWithCache(evaluation.ctx, binding, egress, evaluation.now, &evaluation.requestEgress, evaluation.egressCacheMutex)
+	if !ok {
+		return candidate{}, 0, false
+	}
+	egressLoad, sidecarLoad := s.currentEgressLoads(egress)
+	if concurrencyLimited(egress.MaxConcurrency, egressLoad) ||
+		(strings.TrimSpace(egress.TransportSidecarID) != "" && concurrencyLimited(egress.TransportSidecarMaxConcurrency, sidecarLoad)) {
+		return candidate{}, 0, false
+	}
+	inflight, tokens := s.currentLoad(account.ID)
+	if tokenBudgetLimited(evaluation.cfg.AccountTokenBudget, evaluation.route.Compaction, inflight, tokens, evaluation.route.EstimatedTokens) {
+		return candidate{}, 0, false
+	}
+	bootstrap := indexed.bootstrap
+	if evaluation.route.FairScheduling && indexed.provider == "kiro" && capability.KiroSupportsGPTModel(candidateRoute.Model) {
+		bootstrap = false
+	}
+	// Trial ordering is by cooldownUntil, so score only breaks ties when two
+	// accounts recover at the same instant; reuse the normal load formula.
+	concurrencyLoad := float64(inflight) + normalizedLoad(egressLoad, egress.MaxConcurrency) + normalizedLoad(sidecarLoad, egress.TransportSidecarMaxConcurrency)
+	tokenLoad := normalizedTokenLoad(tokens, evaluation.cfg.AccountTokenBudget)
+	latencyPenalty := float64(maxInt64(0, egress.LatencyMillis)) / 100000.0
+	weight := account.RoutingWeight
+	if weight <= 0 {
+		weight = 100
+	}
+	if weight > 1000 {
+		weight = 1000
+	}
+	score := (concurrencyLoad + tokenLoad + latencyPenalty + 1) / (float64(weight) / 100)
+	return candidate{account: account, egress: egress, binding: binding, resolvedModel: indexed.resolvedModel, bootstrap: bootstrap, score: score, trial: true}, cooldownUntil, true
+}
+
+// tryCooldownTrial runs the intelligent-routing last-resort probe after a normal
+// selection found nothing. It engages only when cooldown-class counters fired — a
+// concurrency/token-only failure means the pool is legitimately busy and must
+// wait — and probes the soonest-recovering few accounts. A successful probe is
+// observable through SchedulerMetrics.TrialSelections.
+func (s *Scheduler) tryCooldownTrial(ctx context.Context, route Route, index *routeCandidateIndex, evaluation *candidateEvaluationContext, counters *NoAccountCounters) (Lease, bool) {
+	if !s.Config().IntelligentRoutingEnabled {
+		return Lease{}, false
+	}
+	if counters.RateLimitCooldown == 0 && counters.EgressCooldown == 0 {
+		return Lease{}, false
+	}
+	trials := make([]trialCandidate, 0, maxCooldownTrialAttempts)
+	for _, indexed := range index.candidates {
+		if choice, until, ok := s.evaluateIndexedTrialCandidate(indexed, evaluation); ok {
+			trials = append(trials, trialCandidate{choice: choice, cooldownUntil: until})
+		}
+	}
+	if len(trials) == 0 {
+		return Lease{}, false
+	}
+	sort.SliceStable(trials, func(i, j int) bool { return trials[i].cooldownUntil < trials[j].cooldownUntil })
+	if len(trials) > maxCooldownTrialAttempts {
+		trials = trials[:maxCooldownTrialAttempts]
+	}
+	choices := make([]candidate, 0, len(trials))
+	for _, trial := range trials {
+		choices = append(choices, trial.choice)
+	}
+	// Trials count into an isolated counter set so a failed probe does not double
+	// the cooldown counts already recorded by the normal evaluation.
+	if lease, ok := s.tryCandidateChoices(ctx, route, choices, &NoAccountCounters{}); ok {
+		atomic.AddInt64(&s.metrics.TrialSelections, 1)
+		return lease, true
+	}
+	return Lease{}, false
+}
+
 func (s *Scheduler) candidateSampleIndexes(route Route, size int) ([3]int, int) {
 	var indexes [3]int
 	if size <= 3 {
@@ -431,6 +597,9 @@ func (s *Scheduler) selectFreshIndexed(ctx context.Context, route Route) (Lease,
 		return lease, nil
 	}
 	if len(index.candidates) <= 3 {
+		if lease, ok := s.tryCooldownTrial(ctx, route, index, &evaluation, &counters); ok {
+			return lease, nil
+		}
 		return Lease{}, s.noAccountErrorForPool(route, counters, index.poolSize)
 	}
 	atomic.AddInt64(&s.metrics.CandidateFallbacks, 1)
@@ -445,6 +614,9 @@ func (s *Scheduler) selectFreshIndexed(ctx context.Context, route Route) (Lease,
 	if lease, ok := s.tryCandidateChoices(ctx, route, best, &counters); ok {
 		return lease, nil
 	}
+	if lease, ok := s.tryCooldownTrial(ctx, route, index, &evaluation, &counters); ok {
+		return lease, nil
+	}
 	return Lease{}, s.noAccountErrorForPool(route, counters, index.poolSize)
 }
 
@@ -457,6 +629,9 @@ func (s *Scheduler) selectFreshFullScan(ctx context.Context, route Route, index 
 	}
 	s.sortCandidateChoices(best, true)
 	if lease, ok := s.tryCandidateChoices(ctx, route, best, &counters); ok {
+		return lease, nil
+	}
+	if lease, ok := s.tryCooldownTrial(ctx, route, index, evaluation, &counters); ok {
 		return lease, nil
 	}
 	return Lease{}, s.noAccountErrorForPool(route, counters, index.poolSize)

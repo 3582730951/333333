@@ -33,16 +33,13 @@ import (
 
 // Current official client versions. Kept here so a single edit updates the
 // fingerprint everywhere. These should track the real shipping clients.
-// Refreshed 2026-08-09 from the shipping Claude Code 2.1.226 binary and the
-// official Codex CLI 0.148.0 source/release. Claude's shipping tuple remains
-// Node v26.3.0 with Stainless package 0.94.0.
+// Refreshed 2026-08-24 from the shipping Claude Code 2.1.236–2.1.241 binaries
+// and the official Codex CLI 0.149.1 source/release. Claude's shipping tuple
+// remains Node v26.3.0 with Stainless package 0.112.1 (2.1.226 shipped 0.94.0);
+// the per-version cli↔SDK pairing lives in config.claudeCLIFingerprints.
 const (
 	CodexCLIVersion  = config.DefaultClientVersion
-	ClaudeCLIVersion = "2.1.226"
-	// ClaudeCodeBuild is the fourth cc_version component embedded in the
-	// shipping 2.1.226 native binary. The current Bun build emits the fixed
-	// decimal value .503 on every captured request.
-	ClaudeCodeBuild = "503"
+	ClaudeCLIVersion = "2.1.241"
 	// CodexOriginator is the interactive Codex CLI entrypoint id; CodexOriginatorExec
 	// is the `codex exec` (non-interactive) entrypoint. The official client sends one
 	// or the other depending on how it was launched, so the relay mirrors whichever
@@ -304,18 +301,16 @@ var allProfiles = func() []profile {
 // tail = plausible lag where the upstream allows lag. A config override, when set,
 // supersedes these.
 var (
-	// Keep the three coupled Claude version axes on the one combination captured
-	// from the shipping 2.1.226 binary. Independently rotating stale values can
-	// create a cli/runtime/SDK tuple that no real Claude Code release ever shipped.
-	claudeCLIVersionPool = []string{ClaudeCLIVersion}
+	// Claude pool: the verified shipping window (config.claudeCLIFingerprints).
+	// Per-account diversity across releases is safe because the Stainless/SDK and
+	// Node axes are DERIVED from the chosen claude-cli version, never picked
+	// independently — independently rotating stale values creates a cli/runtime/SDK
+	// tuple no real Claude Code release ever shipped.
+	claudeCLIVersionPool = []string{config.DefaultClaudeCLIVersion, "2.1.240", "2.1.239", "2.1.238", "2.1.237", "2.1.236", "2.1.226"}
 	// Newer Codex models are actively client-version gated, so the Codex UA/version
 	// axis must not lag behind the current client by default.
 	codexCLIVersionPool = []string{CodexCLIVersion}
-	nodeVersionPool     = []string{"v26.3.0"}
-	// stainlessVersionPool is the @anthropic-ai/sdk (Stainless) version axis,
-	// reported in X-Stainless-Package-Version. It is captured ground truth from
-	// the real Claude Code client and is independent of the claude-cli version.
-	stainlessVersionPool = []string{"0.94.0"}
+	nodeVersionPool     = []string{config.DefaultClaudeNodeVersion}
 )
 
 func poolForFamily(osName string) []profile {
@@ -469,6 +464,7 @@ func forProfile(secret []byte, accountID string, p profile) Identity {
 		secret = DefaultSecret
 	}
 	d := deriver{secret: secret, account: accountID}
+	claudeVer := pickStr(d, "claude-cli-version", claudeCLIVersionPool, ClaudeCLIVersion)
 
 	id := Identity{
 		AccountID:               accountID,
@@ -480,8 +476,8 @@ func forProfile(secret []byte, accountID string, p profile) Identity {
 		StainlessOS:             p.stainlessOS,
 		StainlessArch:           p.stainlessArch,
 		NodeVersion:             pickStr(d, "node-version", nodeVersionPool, nodeVersionPool[0]),
-		ClaudeCLIVersion:        pickStr(d, "claude-cli-version", claudeCLIVersionPool, ClaudeCLIVersion),
-		StainlessPackageVersion: pickStr(d, "stainless-version", stainlessVersionPool, stainlessVersionPool[0]),
+		ClaudeCLIVersion:        claudeVer,
+		StainlessPackageVersion: config.ClaudeStainlessVersionForCLI(claudeVer, "0.112.1"),
 		CodexCLIVersion:         pickStr(d, "codex-cli-version", codexCLIVersionPool, CodexCLIVersion),
 		SessionID:               d.uuid("session"),
 		ClaudeSessionID:         d.uuid("claude-session"),

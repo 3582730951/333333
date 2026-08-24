@@ -756,7 +756,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 		lease.Release()
 		return customCall{}, false
 	}
-	s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header)
+	s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header, lease.Trial)
 	s.captureQuota(r.Context(), lease.Account.ID, provider.ID, model, resp.Header)
 	handedOff = true
 	return customCall{resp: resp, lease: lease, holdID: holdID, scrubber: scrubber, affinity: affinity, provider: provider.ID}, true

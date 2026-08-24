@@ -12,6 +12,7 @@ import (
 	"github.com/tidwall/sjson"
 
 	"codex-account-pool/internal/anthropicwire"
+	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 )
 
@@ -289,6 +290,34 @@ func normalizeProviderHintLoose(v string) string {
 		return "auto"
 	}
 	return v
+}
+
+// withIntelligentRoutingFallbacks decorates a request's context with same-group
+// fallback route choices when intelligent routing is enabled and the resolved
+// group declares a fallback chain. The scheduler's primary-first selection then
+// serves the primary group instantly whenever it holds a schedulable account and
+// steps to the next fallback group the moment the primary has none — the
+// "没有账号就立刻切换" behavior. User-group routing is excluded: it already runs its
+// own cross-group dispatch with persistent bindings.
+func (s *Server) withIntelligentRoutingFallbacks(r *http.Request, pol downstreamPolicy) *http.Request {
+	if !s.cfg.IntelligentRoutingEnabled {
+		return r
+	}
+	if strings.TrimSpace(pol.UserGroupID) != "" {
+		return r
+	}
+	primary := strings.TrimSpace(pol.Group)
+	fallbacks := s.cfg.GroupFallbacks[primary]
+	if len(fallbacks) == 0 {
+		return r
+	}
+	choices := make([]scheduler.RouteChoice, 0, 1+len(fallbacks))
+	choices = append(choices, scheduler.RouteChoice{ChoiceKey: primary, Route: scheduler.Route{Group: primary}})
+	for _, group := range fallbacks {
+		choices = append(choices, scheduler.RouteChoice{ChoiceKey: group, Route: scheduler.Route{Group: group}})
+	}
+	ctx, _ := scheduler.WithPrimaryRouteChoices(r.Context(), primary, choices, nil)
+	return r.WithContext(ctx)
 }
 
 func (s *Server) attachUserGroupPolicy(w http.ResponseWriter, r *http.Request, pol downstreamPolicy) (*http.Request, bool) {

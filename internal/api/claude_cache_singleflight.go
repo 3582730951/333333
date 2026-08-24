@@ -70,8 +70,9 @@ func claudeCacheSingleflightKey(accountID, model string, body []byte, affinity r
 // that are below the reusable-prefix threshold. Billing attribution is transport
 // identity rather than prompt content, so remove only those blocks before hashing;
 // all actual system/messages/tools/metadata content remains part of the key. This
-// remains correct for the fixed .503 component emitted by Claude Code 2.1.226 and
-// also keeps the cache key stable across a future client build bump.
+// stays correct for the message-derived attribution suffix (cc_version=<v>.<3-hex>)
+// emitted by the shipping client, which changes with the first user message, so the
+// cache key never depends on it; it also stays stable across a future client bump.
 func claudeCacheSingleflightBodyHash(body []byte) string {
 	canonical := body
 	var root map[string]json.RawMessage

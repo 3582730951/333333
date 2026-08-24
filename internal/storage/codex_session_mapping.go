@@ -137,9 +137,16 @@ type CodexSessionBinding struct {
 	// old Goal marker in full history to affect a later ordinary user turn.
 	GoalModeActive bool
 	GoalTurnID     string
-	CreatedAt      int64
-	UpdatedAt      int64
-	ExpiresAt      int64
+	// SafetyRotatedAt records when this binding's upstream RootSessionID was
+	// rotated because the previous response carried the Responses safety_buffering
+	// control field ("security-not-displayed") under the per-user-group rotation
+	// toggle. The very next request for this binding detaches from the old chain
+	// (previous_response_id/turn-state stripped) and then clears the marker, so
+	// exactly one fresh turn starts under the new session id.
+	SafetyRotatedAt int64
+	CreatedAt       int64
+	UpdatedAt       int64
+	ExpiresAt       int64
 }
 
 // CodexSessionCommit atomically creates/refreshes a mapping and attaches aliases
@@ -215,6 +222,7 @@ type codexSessionIdentityPayload struct {
 	WindowGeneration   int64  `json:"window_generation"`
 	GoalModeActive     bool   `json:"goal_mode_active,omitempty"`
 	GoalTurnID         string `json:"goal_turn_id,omitempty"`
+	SafetyRotatedAt    int64  `json:"safety_rotated_at,omitempty"`
 }
 
 func normalizedCodexSessionAliases(in []CodexSessionAlias) []CodexSessionAlias {
@@ -331,6 +339,7 @@ func (s *Store) sealCodexSessionIdentity(binding CodexSessionBinding) (string, e
 		WindowGeneration:   binding.WindowGeneration,
 		GoalModeActive:     binding.GoalModeActive,
 		GoalTurnID:         binding.GoalTurnID,
+		SafetyRotatedAt:    binding.SafetyRotatedAt,
 	})
 	if err != nil {
 		return "", err
@@ -357,6 +366,7 @@ func (s *Store) openCodexSessionIdentity(value string, binding *CodexSessionBind
 	binding.WindowGeneration = payload.WindowGeneration
 	binding.GoalModeActive = payload.GoalModeActive
 	binding.GoalTurnID = strings.TrimSpace(payload.GoalTurnID)
+	binding.SafetyRotatedAt = payload.SafetyRotatedAt
 	if binding.RootSessionID == "" || binding.ThreadID == "" {
 		return errors.New("codex session mapping identity incomplete")
 	}

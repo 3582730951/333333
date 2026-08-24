@@ -35,6 +35,7 @@ func (s *Server) handleCodexPassthrough(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	r = s.withIntelligentRoutingFallbacks(r, policy)
 	s.handleCodexPassthroughWithPolicy(w, r, policy, "", nil)
 }
 
@@ -172,7 +173,7 @@ func (s *Server) handleCodexPassthroughWithPolicy(
 	}
 
 passthroughSuccess:
-	s.guardRateLimitForAccount(r.Context(), lease.Account, response.Header)
+	s.guardRateLimitForAccount(r.Context(), lease.Account, response.Header, lease.Trial)
 	s.captureQuota(r.Context(), lease.Account.ID, "codex", routeModel, response.Header)
 	if resourceAffinity.Hash != "" {
 		s.persistCodexResourceBinding(r.Context(), resourceAffinity, resourceKind, lease)

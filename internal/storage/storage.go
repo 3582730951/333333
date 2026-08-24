@@ -7594,7 +7594,12 @@ func (s *Store) UpsertEgressProfile(ctx context.Context, p EgressProfile) error 
 	if p.Health == "" {
 		p.Health = "healthy"
 	}
-	if p.MaxConcurrency <= 0 {
+	if p.MaxConcurrency <= 0 && p.ID != DefaultDirectEgressID {
+		// A non-positive concurrency means "unlimited" in concurrencyLimited, and the
+		// migration seeds the default direct outlet with 0 for exactly that reason.
+		// Coercing 0 to 16 here would silently turn the shared default outlet into a
+		// hard cap on the first admin save / import that touches it, so the default
+		// outlet keeps 0 while fresh proxy egresses still get a sane 16.
 		p.MaxConcurrency = 16
 	}
 	if strings.TrimSpace(p.DynamicConfigJSON) == "" {

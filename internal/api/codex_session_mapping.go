@@ -159,6 +159,16 @@ type codexSessionMapping struct {
 	// process restart cannot lose the decision mid-turn.
 	goalModeActive bool
 	goalTurnID     string
+	// rotateUpstreamSessionOnSafety is the per-user-group safety-rotation toggle
+	// latched at resolve. When the terminal carries the Responses safety_buffering
+	// control field, safetyRotationPending marks the commit to rotate the binding's
+	// upstream RootSessionID to a fresh generated id (downstream mapping unchanged).
+	// safetyDetachRequest marks the single request immediately after a rotation,
+	// which detaches from the retired response chain by stripping CPA state pointers
+	// before the upstream request is built.
+	rotateUpstreamSessionOnSafety bool
+	safetyRotationPending         bool
+	safetyDetachRequest           bool
 }
 
 // codexContextMigration is a fresh, self-contained replay of a native Codex
@@ -781,6 +791,89 @@ func stripCodexStateForRecoveredRoot(body []byte, header http.Header) ([]byte, h
 	return out, nextHeader, true
 }
 
+// safetySessionRotationEnabledFor reports whether the user-group safety-rotation
+// toggle is on for a request. Opt-in is per user group via
+// config.SafetySessionRotationGroups; legacy keys without a user group are off.
+func (s *Server) safetySessionRotationEnabledFor(userGroupID string) bool {
+	if s == nil {
+		return false
+	}
+	return s.cfg.SafetySessionRotationGroups[strings.TrimSpace(userGroupID)]
+}
+
+// codexSafetyRotationFreshRequest detaches the single post-rotation turn from the
+// retired safety-buffered chain. Unlike codexRetiredEpochFreshRootRequest it is
+// allowed to operate on a stateful downstream request — the whole point is to keep
+// the downstream session mapping intact while presenting a clean new upstream turn.
+func codexSafetyRotationFreshRequest(body []byte, header http.Header) ([]byte, http.Header, bool) {
+	out := append([]byte(nil), body...)
+	for _, path := range codexFreshRootStatePaths {
+		var err error
+		out, err = sjson.DeleteBytes(out, path)
+		if err != nil {
+			return body, header, false
+		}
+	}
+	if updated, metadataChanged := stripCodexRetiredEpochEmbeddedTurnMetadata(out, "client_metadata.x-codex-turn-metadata"); metadataChanged {
+		out = updated
+	}
+	nextHeader := header.Clone()
+	for _, name := range codexFreshRootStateHeaders {
+		nextHeader.Del(name)
+	}
+	if value := codexHeaderValue(nextHeader, "X-Codex-Turn-Metadata"); value != "" {
+		if cleaned, metadataChanged := stripCodexRetiredEpochTurnMetadata(value); metadataChanged {
+			nextHeader.Set("X-Codex-Turn-Metadata", cleaned)
+		}
+	}
+	return out, nextHeader, true
+}
+
+// codexResponseSafetyBuffered reports whether a completed non-streaming upstream
+// Responses body carries the safety_buffering control field — the codex protocol's
+// "security-not-displayed" signal that withheld content from the response.
+func codexResponseSafetyBuffered(body []byte) bool {
+	return gjson.ParseBytes(body).Get("safety_buffering").Exists()
+}
+
+// bindingHasSafetyRotation reports whether the resolved binding still carries a
+// pending safety-rotation marker, i.e. this request is the one immediately after a
+// rotation and must detach from the retired chain.
+func (m *codexSessionMapping) bindingHasSafetyRotation() bool {
+	if m == nil || !m.enabled {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	binding := m.binding
+	if binding == nil {
+		binding = m.prospective
+	}
+	return binding != nil && binding.SafetyRotatedAt != 0
+}
+
+// noteSafetyBuffering latches that the current terminal carried the upstream
+// safety_buffering field so the commit rotates the binding to a fresh session id.
+func (m *codexSessionMapping) noteSafetyBuffering() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.safetyRotationPending = true
+	m.mu.Unlock()
+}
+
+// markSafetyDetached records that this request was the post-rotation detach turn,
+// so the commit clears the binding's pending rotation marker after persisting.
+func (m *codexSessionMapping) markSafetyDetached() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.safetyDetachRequest = true
+	m.mu.Unlock()
+}
+
 // recoverCodexSessionMapping transitions a strict, account-bound CPA tree into a
 // fresh epoch after the bound account disappeared or the upstream rejected its
 // previous_response_id.  A goal checkpoint is lossless and preferred; the legacy
@@ -1104,6 +1197,7 @@ func (s *Server) resolveCodexSessionMappingInNamespace(ctx context.Context, r *h
 	if !mapping.enabled {
 		return mapping, nil
 	}
+	mapping.rotateUpstreamSessionOnSafety = s.safetySessionRotationEnabledFor(pol.UserGroupID)
 	keyPart := strings.TrimSpace(pol.KeyHash)
 	if keyPart == "" && r != nil {
 		if token := strings.TrimSpace(downstreamBearer(r)); token != "" {
@@ -1862,6 +1956,44 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 	binding.ParentThreadID = mapping.snapshot.ParentThreadID
 	binding.ForkedFromThreadID = mapping.snapshot.ForkedFromThreadID
 	binding.WindowGeneration = mapping.snapshot.WindowGeneration
+	// Safety-buffering rotation: when the terminal carried the Responses
+	// safety_buffering field under the user-group toggle, present a fresh upstream
+	// session id on the binding while the downstream aliases (which resolve this
+	// same binding) stay untouched. The single following turn detaches from the
+	// retired response chain and then clears the marker. The in-flight snapshot is
+	// deliberately left alone: a separately issued native continue within this
+	// request still owns the old session chain.
+	if mapping.rotateUpstreamSessionOnSafety {
+		if mapping.safetyRotationPending {
+			if binding.ThreadID != "" && binding.ThreadID != binding.RootSessionID {
+				// Child branch: the safety-buffered turn lived in a child thread
+				// under a still-valid root session. Rotating the root here would
+				// leave ThreadID/ParentThreadID pointing into the old (retired)
+				// tree while the root names a new session — an upstream thread can
+				// never sit under a different session id, so the next continuation
+				// surfaces as a corrupt session. Instead open a fresh child thread
+				// under the same parent: session-id and x-codex-parent-thread-id
+				// stay valid, the child thread id is new, and the stripped
+				// previous_response_id cannot resolve into the retired child chain.
+				binding.ThreadID = identity.NewUUIDv7()
+			} else {
+				previousSession := binding.RootSessionID
+				binding.RootSessionID = identity.NewUUIDv7()
+				if binding.ThreadID != "" && binding.ThreadID == previousSession {
+					binding.ThreadID = binding.RootSessionID
+				}
+			}
+			binding.SafetyRotatedAt = storage.Now()
+			s.enqueueAudit(storage.AuditLogRow{
+				Action: "codex_upstream_session_safety_rotated",
+				State:  "active",
+				Reason: "safety_buffering",
+				Detail: "downstream_mapping_preserved_upstream_session_rotated",
+			})
+		} else if mapping.safetyDetachRequest {
+			binding.SafetyRotatedAt = 0
+		}
+	}
 	created := binding.ID == ""
 	expiresAt := time.Now().Add(s.codexSessionMappingRetention(persistCtx)).Unix()
 	instructionSnapshot := mapping.instructions.snapshotCommit(binding.TreeID, expiresAt)
