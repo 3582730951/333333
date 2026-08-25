@@ -201,6 +201,16 @@ func customProviderClaudeModelAliasesEquivalent(left, right string) bool {
 
 func applyCustomProviderModelMapping(provider storage.CustomProvider, raw []byte, requested string) ([]byte, string, bool) {
 	target, mapped := customProviderMappedModel(provider, requested)
+	if !mapped && providerIsDeepSeek(provider) {
+		// Built-in DeepSeek rewrite: routing resolved to a DeepSeek provider and the
+		// codex/claude-code client requested a stock model with no operator mapping.
+		// Rewrite it to the provider's native deepseek-chat/deepseek-reasoner so the
+		// client keeps its default model. Operator mappings above always win, and
+		// already-DeepSeek models pass through.
+		if t, ok := deepseekCodexClaudeRewrite(requested); ok {
+			target, mapped = t, true
+		}
+	}
 	if !mapped || strings.EqualFold(strings.TrimSpace(target), strings.TrimSpace(requested)) {
 		return raw, requested, mapped
 	}

@@ -576,9 +576,25 @@ func codexGPT56Model(model string, raw []byte) bool {
 	return model == "gpt-5.6" || strings.HasPrefix(model, "gpt-5.6-")
 }
 
-// applyCodexGPT56AutomaticCacheBreakpoint marks an already-existing stable
-// developer/system input_text block before the first user item. It never creates,
-// moves, or converts messages, instructions, tools, history, or reasoning fields.
+// applyCodexGPT56AutomaticCacheBreakpoint marks the end of the reusable prefix at
+// the last stable content block before the current turn's user message, following
+// OpenAI's documented multi-turn pattern (top-level implicit mode + explicit
+// breakpoint after the last stable item). It never creates, moves, or converts
+// messages, instructions, tools, history, or reasoning fields — only cache metadata.
+//
+// Placement rationale:
+//   - Fresh turn (preamble + one user): the breakpoint lands on the last
+//     developer/system input_text block, so a retry that edits the first user
+//     message still reuses the preamble ("shared prefix != cached prefix" gotcha).
+//   - Continuation turn: the breakpoint lands on the last block-bearing item before
+//     the current user message (an assistant output_text block or a
+//     function_call_output output block), so conversation history — not just the
+//     preamble — stays cacheable. The trailing per-turn reliability envelope
+//     (bare-string content) and the current user message are dynamic and excluded.
+//
+// mode is always "explicit": the OpenAI spec enum for PromptCacheBreakpointParam is
+// ["explicit"] only, so the historical "implicit" value was schema-invalid and
+// ignored by upstream.
 func applyCodexGPT56AutomaticCacheBreakpoint(raw []byte) []byte {
 	var root map[string]json.RawMessage
 	if json.Unmarshal(raw, &root) != nil {
@@ -595,37 +611,11 @@ func applyCodexGPT56AutomaticCacheBreakpoint(raw []byte) []byte {
 	if json.Unmarshal(root["input"], &input) != nil {
 		return raw
 	}
-	itemIndex, blockIndex := -1, -1
-	for i, itemRaw := range input {
-		var item map[string]json.RawMessage
-		if json.Unmarshal(itemRaw, &item) != nil {
-			continue
-		}
-		var role string
-		_ = json.Unmarshal(item["role"], &role)
-		role = strings.ToLower(strings.TrimSpace(role))
-		if role == "user" {
-			break
-		}
-		if role != "developer" && role != "system" {
-			continue
-		}
-		var blocks []json.RawMessage
-		if json.Unmarshal(item["content"], &blocks) != nil {
-			continue
-		}
-		for j, blockRaw := range blocks {
-			var block map[string]json.RawMessage
-			var blockType string
-			if json.Unmarshal(blockRaw, &block) == nil && json.Unmarshal(block["type"], &blockType) == nil && blockType == "input_text" {
-				itemIndex, blockIndex = i, j
-			}
-		}
-	}
+	itemIndex, kind, blockIndex := stableCodexPrefixBreakpoint(input)
 	if itemIndex < 0 {
 		return raw
 	}
-	out, err := sjson.SetBytes(raw, fmt.Sprintf("input.%d.content.%d.prompt_cache_breakpoint.mode", itemIndex, blockIndex), "implicit")
+	out, err := sjson.SetBytes(raw, fmt.Sprintf("input.%d.%s.%d.prompt_cache_breakpoint.mode", itemIndex, kind, blockIndex), "explicit")
 	if err != nil {
 		return raw
 	}
@@ -634,6 +624,98 @@ func applyCodexGPT56AutomaticCacheBreakpoint(raw []byte) []byte {
 		return raw
 	}
 	return out
+}
+
+// stableCodexPrefixBreakpoint locates the last content block that can host a cache
+// breakpoint inside the STABLE prefix: the last block-bearing item before the
+// current turn's user message, ignoring any trailing bare-string reliability
+// envelope. kind is "content" (message input_text/output_text block) or "output"
+// (function_call_output output block); returns (-1, "", -1) when no stable block
+// exists.
+func stableCodexPrefixBreakpoint(input []json.RawMessage) (itemIndex int, kind string, blockIndex int) {
+	n := len(input)
+	if n == 0 {
+		return -1, "", -1
+	}
+	// The reliability layer appends a per-turn envelope as a trailing bare-string
+	// item; it changes every turn and is not part of the reusable prefix.
+	tail := n
+	for tail > 0 && codexItemBareStringContent(input[tail-1]) {
+		tail--
+	}
+	lastUser := -1
+	for i := tail - 1; i >= 0; i-- {
+		if codexItemRole(input[i]) == "user" {
+			lastUser = i
+			break
+		}
+	}
+	if lastUser <= 0 {
+		return -1, "", -1
+	}
+	for i := lastUser - 1; i >= 0; i-- {
+		if k, idx, ok := codexItemLastCacheableBlock(input[i]); ok {
+			return i, k, idx
+		}
+	}
+	return -1, "", -1
+}
+
+// codexItemRole returns the item's lowercased role, or "" for non-message items
+// (function_call, function_call_output, reasoning).
+func codexItemRole(item json.RawMessage) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(item, &m) != nil {
+		return ""
+	}
+	var role string
+	_ = json.Unmarshal(m["role"], &role)
+	return strings.ToLower(strings.TrimSpace(role))
+}
+
+// codexItemBareStringContent reports whether the item's content is a plain string
+// (the reliability envelope shape) rather than an array of blocks.
+func codexItemBareStringContent(item json.RawMessage) bool {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(item, &m) != nil {
+		return false
+	}
+	raw, ok := m["content"]
+	if !ok {
+		return false
+	}
+	b := bytes.TrimSpace(raw)
+	return len(b) > 0 && b[0] == '"'
+}
+
+// codexItemLastCacheableBlock returns the array kind ("content"|"output") and index
+// of the last input_text/output_text block on the item that can host a breakpoint.
+func codexItemLastCacheableBlock(item json.RawMessage) (kind string, blockIndex int, ok bool) {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(item, &m) != nil {
+		return "", 0, false
+	}
+	for _, arrayKey := range []string{"content", "output"} {
+		raw, exists := m[arrayKey]
+		if !exists {
+			continue
+		}
+		var blocks []json.RawMessage
+		if json.Unmarshal(raw, &blocks) != nil {
+			continue
+		}
+		for i := len(blocks) - 1; i >= 0; i-- {
+			var block map[string]json.RawMessage
+			var blockType string
+			if json.Unmarshal(blocks[i], &block) == nil && json.Unmarshal(block["type"], &blockType) == nil {
+				switch strings.ToLower(strings.TrimSpace(blockType)) {
+				case "input_text", "output_text":
+					return arrayKey, i, true
+				}
+			}
+		}
+	}
+	return "", 0, false
 }
 
 func jsonRawContainsKey(raw json.RawMessage, want string) bool {

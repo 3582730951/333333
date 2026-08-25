@@ -1197,6 +1197,13 @@ func optimalStableModelsTemplateValues() map[string]interface{} {
 		"codex_session_mapping_retention_days": float64(7),
 		"codex_cpa_strict":                     true,
 		"codex_stateless_passthrough":          false,
+		// GPT-5.6 explicit prompt-cache breakpoint. "auto" adds a valid explicit
+		// breakpoint on the last cacheable block before the current turn and marks the
+		// top-level prompt_cache_options mode implicit. It only fires for API-key codex
+		// accounts that passed the upstream explicit-breakpoint capability probe AND
+		// the profitability ratio, so unprobed or unprofitable traffic is untouched
+		// and the mutation is metadata-only (verified by codexCacheOnlyMutation).
+		"codex_gpt56_explicit_cache_mode": "auto",
 		"goal_continuity_enabled":              true,
 		"goal_retention_days":                  float64(7),
 		"context_journal_ttl_seconds":          float64(7 * 24 * 60 * 60),
@@ -1223,7 +1230,7 @@ func systemConfigTemplates() []map[string]interface{} {
 		{
 			"id":          "optimal-stable-models-v1",
 			"name":        "全模型稳定推荐配置",
-			"description": "启用会话隔离、流式保活、故障转移和 Kiro 原生高质量缓存，并锁定 Claude 进程内 Bun 指纹（关闭强制直连与 Chrome 指纹逃生阀）。",
+			"description": "启用会话隔离、流式保活、故障转移、Kiro 原生高质量缓存与 GPT-5.6 显式缓存断点（auto，能力探测+盈利门控，仅改缓存元数据），并锁定 Claude 进程内 Bun 指纹（关闭强制直连与 Chrome 指纹逃生阀）。",
 			"section":     "config",
 			"values":      optimalStableModelsTemplateValues(),
 		},

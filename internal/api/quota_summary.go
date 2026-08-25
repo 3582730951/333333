@@ -34,6 +34,7 @@ type QuotaSummary struct {
 	Secondary    *QuotaWindow       `json:"secondary,omitempty"`
 	Credits      *QuotaCredits      `json:"credits,omitempty"`
 	ResetCredits *QuotaResetCredits `json:"reset_credits,omitempty"`
+	Estimate     *QuotaEstimate     `json:"estimate,omitempty"`
 
 	SyncReason string `json:"sync_reason"`
 	SyncedAt   int64  `json:"synced_at,omitempty"`
@@ -136,6 +137,7 @@ func BuildQuotaSummary(account storage.Account, token *storage.AccountToken, sna
 		out.Supported = false
 		return out
 	}
+	out.Estimate = estimateQuota(account, primary, out.Credits, now)
 	if primary == nil {
 		out.SyncReason = "never_polled"
 		return out

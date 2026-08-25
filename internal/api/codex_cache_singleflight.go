@@ -165,19 +165,22 @@ func codexInputPrefixAtBreakpoint(raw json.RawMessage) ([]byte, bool) {
 			markerEnd = item.Index + len(item.Raw)
 			closeSuffix = "]"
 		}
-		content := item.Get("content")
-		if content.Type != gjson.JSON || len(content.Raw) == 0 || content.Raw[0] != '[' {
-			return true
-		}
-		content.ForEach(func(_, block gjson.Result) bool {
-			if block.Index > 0 && block.Get("prompt_cache_breakpoint").Exists() {
-				markerEnd = block.Index + len(block.Raw)
-				// The marker is inside content, so close content, the item, and
-				// the enclosing input array after the exact raw block bytes.
-				closeSuffix = "]}}]"
+		for _, arrayKey := range []string{"content", "output"} {
+			blocks := item.Get(arrayKey)
+			if blocks.Type != gjson.JSON || len(blocks.Raw) == 0 || blocks.Raw[0] != '[' {
+				continue
 			}
-			return true
-		})
+			blocks.ForEach(func(_, block gjson.Result) bool {
+				if block.Index > 0 && block.Get("prompt_cache_breakpoint").Exists() {
+					markerEnd = block.Index + len(block.Raw)
+					// The marker is inside a block array (content or output), so
+					// close the block array, the item, and the enclosing input
+					// array after the exact raw block bytes.
+					closeSuffix = "]}}]"
+				}
+				return true
+			})
+		}
 		return true
 	})
 	if markerEnd < 0 || markerEnd > len(input) {
