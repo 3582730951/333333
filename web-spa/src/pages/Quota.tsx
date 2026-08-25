@@ -39,6 +39,7 @@ function syncReason(row: QuotaRow): string {
 type ExtraCredits = {
   hasCredits: boolean;
   unlimited: boolean;
+  spendControl: boolean;
   balance: string;
   limit: string;
   used: string;
@@ -55,6 +56,7 @@ function extraCredits(row: QuotaRow): ExtraCredits | null {
   return {
     hasCredits: Boolean(credits.has_credits),
     unlimited: Boolean(credits.unlimited),
+    spendControl: Boolean(credits.spend_control),
     balance: String(credits.balance || '').trim(),
     limit: String(credits.limit || '').trim(),
     used: String(credits.used || '').trim(),
@@ -124,10 +126,28 @@ export default function Quota() {
     const average = withUsage.length
       ? withUsage.reduce((sum, item) => sum + item.used, 0) / withUsage.length
       : null;
+    // Only token-metered windows can be summed: Claude unified / token windows are
+    // input-token budgets, while Kiro's kiro_usage is a credit count and Cursor's
+    // cursor_monthly is a request count. Summing across those units produced a
+    // meaningless headline total, so non-token limiters are excluded and the
+    // per-provider breakdown is shown in the panel note instead.
+    const tokenLimiters = new Set(['unified', 'tokens', 'input_tokens', 'output_tokens', '5h_oauth_usage']);
     const remaining = rows.reduce((sum, row) => {
+      const limiter = row.quota_summary?.primary?.limiter_type || row.limiter_type || '';
+      if (!tokenLimiters.has(limiter)) return sum;
       const value = row.quota_summary?.primary?.remaining_tokens ?? row.remaining_tokens;
       return value == null || Number(value) < 0 ? sum : sum + Number(value);
     }, 0);
+    // Per-provider token remainders, so the caption can say what it is summing.
+    const remainingByProvider = rows.reduce((acc, row) => {
+      const limiter = row.quota_summary?.primary?.limiter_type || row.limiter_type || '';
+      if (!tokenLimiters.has(limiter)) return acc;
+      const value = row.quota_summary?.primary?.remaining_tokens ?? row.remaining_tokens;
+      if (value == null || Number(value) < 0) return acc;
+      const provider = row.provider || 'unknown';
+      acc[provider] = (acc[provider] || 0) + Number(value);
+      return acc;
+    }, {} as Record<string, number>);
     const stale = rows.filter((row) => {
       const reason = syncReason(row);
       return reason !== 'ok';
@@ -143,7 +163,7 @@ export default function Quota() {
         color: pctColor(item.used),
         meta: item.row.provider ? `${item.row.provider}${item.row.plan_type ? ` · ${item.row.plan_type}` : ''}` : undefined,
       }));
-    return { critical, warning, healthy, average, remaining, stale, pressure, measured: withUsage.length };
+    return { critical, warning, healthy, average, remaining, remainingByProvider, stale, pressure, measured: withUsage.length };
   }, [rows]);
 
   // Credit-metered accounts form their own population; the panel only exists when the
@@ -155,7 +175,11 @@ export default function Quota() {
     if (!entries.length) return null;
 
     const unlimited = entries.filter((item) => item.credit.unlimited).length;
-    const depleted = entries.filter((item) => !item.credit.unlimited && !item.credit.hasCredits).length;
+    // "Depleted" means the extra balance is genuinely gone. A spend-control-only
+    // row (no credits block upstream) has has_credits=false but nothing was used
+    // up — counting it here read like every Free/Plus account had run dry.
+    const depleted = entries.filter((item) => !item.credit.unlimited && !item.credit.hasCredits && !item.credit.spendControl).length;
+    const spendOnly = entries.filter((item) => !item.credit.unlimited && !item.credit.hasCredits && item.credit.spendControl).length;
     const spendReached = entries.filter((item) => item.credit.spendReached).length;
     // Only accounts with a real spend-control percentage can be ranked; an account
     // with credits but no workspace limit has nothing to plot.
@@ -182,7 +206,7 @@ export default function Quota() {
         name: item.row.label || item.row.account_id || t('common.unnamed_account'),
         balance: item.credit.balance,
       }));
-    return { accounts: entries.length, unlimited, depleted, spendReached, ranked, balances };
+    return { accounts: entries.length, unlimited, depleted, spendOnly, spendReached, ranked, balances };
   }, [rows]);
 
   const cols: any[] = [
@@ -215,7 +239,9 @@ export default function Quota() {
       if (!credit) return <span className="pool-muted">—</span>;
       if (credit.unlimited) return <Tag color="green">{t('quota.credits_unlimited_tag')}</Tag>;
       if (credit.spendReached) return <Tag color="red">{t('quota.credits_spend_reached_tag')}</Tag>;
-      if (!credit.hasCredits) return <Tag color="red">{t('quota.credits_depleted_tag')}</Tag>;
+      // A spend-control-only row means "no extra balance", not "balance used up".
+      if (!credit.hasCredits && !credit.spendControl) return <Tag color="red">{t('quota.credits_depleted_tag')}</Tag>;
+      if (!credit.hasCredits) return <Tag color="amber">{t('quota.credits_spend_only_tag')}</Tag>;
       if (credit.balance) return <span className="pool-nowrap">{credit.balance}</span>;
       // Upstream can confirm credits exist while hiding the amount.
       return <Tag color="green">{t('quota.credits_available_tag')}</Tag>;
@@ -248,6 +274,12 @@ export default function Quota() {
                 caption={t('quota.average_caption')}
                 label={t('quota.remaining_total').replace('{value}', fmtTokens(overview.remaining))}
               />
+              {Object.keys(overview.remainingByProvider).length > 1 ? (
+                <p className="pool-quota-overview__note">
+                  {t('quota.remaining_breakdown').replace('{list}', Object.entries(overview.remainingByProvider)
+                    .map(([provider, value]) => `${provider} ${fmtTokens(value)}`).join(' · '))}
+                </p>
+              ) : null}
               <StackedMeter
                 segments={[
                   { key: 'healthy', name: t('quota.band_healthy'), value: overview.healthy, color: C.green },
@@ -298,6 +330,12 @@ export default function Quota() {
                 <dt>{t('quota.credits_depleted')}</dt>
                 <dd className={credits.depleted ? 'pool-danger-text' : ''}>{fmtInt(credits.depleted)}</dd>
               </div>
+              {credits.spendOnly ? (
+                <div>
+                  <dt>{t('quota.credits_spend_only')}</dt>
+                  <dd>{fmtInt(credits.spendOnly)}</dd>
+                </div>
+              ) : null}
               {credits.spendReached ? (
                 <div>
                   <dt>{t('quota.credits_spend_reached')}</dt>

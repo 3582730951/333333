@@ -38,8 +38,10 @@ func headerInt(h http.Header, name string) (int64, bool) {
 	if v == "" {
 		return 0, false
 	}
-	// Some limits arrive with thousands separators or trailing units; keep the
-	// leading integer run.
+	// Some limits arrive with thousands separators or trailing units. Strip
+	// separators first so "1,234,567" parses as 1234567 (the old leading-run
+	// logic would have read it as 1), then keep the leading integer run.
+	v = strings.ReplaceAll(v, ",", "")
 	end := 0
 	for end < len(v) && (v[end] >= '0' && v[end] <= '9') {
 		end++

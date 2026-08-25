@@ -94,6 +94,19 @@ func estimateQuota(account storage.Account, primary *storage.AccountRateLimit, c
 	}
 	switch strings.ToLower(planType) {
 	case "api", "payg", "pay_as_you_go", "pay-as-you-go":
+		// Pay-as-you-go has no plan window, but when the upstream reports a
+		// spendable credit balance it is the only real dollar figure available —
+		// surface it as the remaining allowance instead of refusing to estimate.
+		if credits != nil && credits.HasCredits {
+			if extra := parseUSDString(credits.Balance); extra > 0 {
+				est.Estimated = true
+				est.Method = "payg_credits_balance"
+				est.ExtraUSD = extra
+				est.RemainingUSD = extra
+				est.Note = "pay-as-you-go balance from upstream credits"
+				return est
+			}
+		}
 		est.Method = "pay_as_you_go"
 		est.Note = "pay-as-you-go billing has no plan window; use upstream balance"
 		return est
@@ -111,8 +124,16 @@ func estimateQuota(account storage.Account, primary *storage.AccountRateLimit, c
 		return est
 	}
 	usedPct := est.UsedPercent
-	if usedPct < 0 || usedPct > 100 {
-		usedPct = 0
+	if usedPct < 0 {
+		// A window row exists but carries no percentage (e.g. only a reset time was
+		// signalled). Estimating would fabricate a full-price balance; report the
+		// basis instead.
+		est.Method = "no_window_data"
+		est.Note = "no usage window data for USD estimate"
+		return est
+	}
+	if usedPct > 100 {
+		usedPct = 100
 	}
 	used := plan.usd * usedPct / 100
 	est.LimitUSD = round2(plan.usd)

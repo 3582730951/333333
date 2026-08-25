@@ -16,7 +16,7 @@ import useAsyncAction from '../hooks/useAsyncAction.js';
 import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
 import useResponsiveLayout from '../hooks/useResponsiveLayout.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
-import { fmtInt, fmtRelative, fmtTokens, middleEllipsis } from '../lib/format.js';
+import { fmtInt, fmtRelative, fmtTokens, fmtUSD, middleEllipsis } from '../lib/format.js';
 import { accountQueryKeys, useAccountsPage } from '../features/accounts/queries/accounts.ts';
 import { fetchAccountArchive, fetchAccountsPage, importAccountArchive } from '../features/accounts/api/accounts.ts';
 import { abortController, abortSignal, createAbortController } from '../lib/browserAbort.js';
@@ -152,6 +152,18 @@ export function quotaPresentation(account) {
   }
   const resetAt = Number(primary.reset_at);
   if (Number.isFinite(resetAt) && resetAt > 0) details.push(`${fmtRelative(resetAt)}重置`);
+  // The USD estimate is a plan-price approximation from the server; surface it
+  // only when it is actually an estimate (never_polled / unknown plan / payg
+  // without a balance all come through as method without numbers).
+  const estimate = account?.quota_summary?.estimate;
+  const estUSD = estimate && estimate.estimated && Number.isFinite(Number(estimate.remaining_usd)) && Number(estimate.remaining_usd) >= 0
+    ? {
+        remaining: Number(estimate.remaining_usd),
+        extra: Number(estimate.extra_usd) || 0,
+        plan: String(estimate.plan || '').trim(),
+        method: String(estimate.method || ''),
+      }
+    : null;
   return {
     percent: usedPercent,
     remainingPercent,
@@ -160,11 +172,21 @@ export function quotaPresentation(account) {
     reasonLabel: quotaReasonLabel(reason),
     windowLabel: quotaWindowLabel(primary),
     detail: details.join(' · '),
+    estUSD,
   };
+}
+
+function quotaEstLabel(est) {
+  if (!est) return null;
+  const parts = [`≈ ${fmtUSD(est.remaining)} 剩余`];
+  if (est.extra > 0) parts.push(`+${fmtUSD(est.extra)} 额外`);
+  if (est.plan) parts.push(est.plan);
+  return parts.join(' · ');
 }
 
 function AccountQuota({ account, compact = false }) {
   const quota = quotaPresentation(account);
+  const estLabel = quotaEstLabel(quota.estUSD);
   if (quota.percent == null) {
     return (
       <div className={`pool-account-quota pool-account-quota--unknown${compact ? ' pool-account-quota--compact' : ''}`}>
@@ -172,10 +194,11 @@ function AccountQuota({ account, compact = false }) {
           <strong>额度待同步</strong>
         </div>
         <span className="pool-account-quota__meta">{quota.reasonLabel}</span>
+        {estLabel ? <span className="pool-account-quota__usd">{estLabel}</span> : null}
       </div>
     );
   }
-  const ariaLabel = `${quota.windowLabel}，已用 ${quota.percent}%，剩余 ${quota.remainingPercent}%${quota.detail ? `，${quota.detail}` : ''}`;
+  const ariaLabel = `${quota.windowLabel}，已用 ${quota.percent}%，剩余 ${quota.remainingPercent}%${quota.detail ? `，${quota.detail}` : ''}${estLabel ? `，${estLabel}` : ''}`;
   return (
     <div className={`pool-account-quota pool-account-quota--${quota.tone}${compact ? ' pool-account-quota--compact' : ''}`} aria-label={ariaLabel}>
       <div className="pool-account-quota__head">
@@ -186,6 +209,7 @@ function AccountQuota({ account, compact = false }) {
       <span className="pool-account-quota__meta">
         {quota.windowLabel}{quota.detail ? ` · ${quota.detail}` : ''}
       </span>
+      {estLabel ? <span className="pool-account-quota__usd">{estLabel}</span> : null}
     </div>
   );
 }

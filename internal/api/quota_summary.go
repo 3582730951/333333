@@ -51,6 +51,7 @@ type QuotaSummary struct {
 type QuotaCredits struct {
 	HasCredits          bool    `json:"has_credits"`
 	Unlimited           bool    `json:"unlimited"`
+	SpendControl        bool    `json:"spend_control,omitempty"`
 	Balance             string  `json:"balance,omitempty"`
 	SpendControlReached bool    `json:"spend_control_reached,omitempty"`
 	Source              string  `json:"source,omitempty"`
@@ -137,11 +138,14 @@ func BuildQuotaSummary(account storage.Account, token *storage.AccountToken, sna
 		out.Supported = false
 		return out
 	}
-	out.Estimate = estimateQuota(account, primary, out.Credits, now)
+	// A never-polled account has no window data at all; estimating from nothing
+	// would read as a full-price balance, so skip the estimate until the first
+	// successful poll lands.
 	if primary == nil {
 		out.SyncReason = "never_polled"
 		return out
 	}
+	out.Estimate = estimateQuota(account, primary, out.Credits, now)
 	if primary.UpdatedAt > 0 && now-primary.UpdatedAt > quotaFreshSeconds {
 		out.SyncReason = "stale"
 		out.Stale = true
@@ -276,6 +280,7 @@ func selectQuotaCredits(snapshots []storage.AccountRateLimit) *QuotaCredits {
 	return &QuotaCredits{
 		HasCredits:          boolean("has_credits"),
 		Unlimited:           boolean("unlimited"),
+		SpendControl:        boolean("spend_control"),
 		Balance:             text("balance"),
 		SpendControlReached: boolean("spend_control_reached"),
 		Source:              text("source"),

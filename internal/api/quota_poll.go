@@ -878,6 +878,12 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 
 	now := storage.Now()
 
+	// The wham response is the authoritative current plan (registration-time
+	// detection drifts); persist it so the USD estimate keys off the live plan.
+	if plan := strings.TrimSpace(wham.PlanType); plan != "" {
+		_ = s.store.SetAccountPlanType(ctx, acc.ID, plan)
+	}
+
 	var rawDetail []byte
 	if wham.RateLimit.SecondaryWindow.LimitWindowSeconds > 0 {
 		raw, _ := json.Marshal(map[string]interface{}{
@@ -889,25 +895,11 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 	}
 
 	pw := wham.RateLimit.PrimaryWindow
-	if pw.LimitWindowSeconds <= 0 {
-		return newQuotaPollError("partial", 0, rawDetail, fmt.Errorf("no primary window in wham response"))
-	}
-
-	snap := storage.AccountRateLimit{
-		AccountID:       acc.ID,
-		Provider:        "codex",
-		LimiterType:     "5h_polled",
-		Source:          "5h_polled",
-		UsedPercent:     pw.UsedPercent,
-		RemainingTokens: -1,
-		LimitTokens:     -1,
-		ResetAt:         now + pw.ResetAfterSeconds,
-		Status:          statusFromReached(wham.RateLimit.LimitReached),
-		Raw:             string(rawDetail),
-		UpdatedAt:       now,
-	}
-	_ = s.store.UpsertAccountRateLimit(ctx, snap)
 	sw := wham.RateLimit.SecondaryWindow
+	// The 7d window and the credits/spend-control blocks are siblings of the
+	// primary window in the same response; persist whatever is present even when
+	// the primary window is missing, so a malformed primary never discards the
+	// rest of the payload. The partial error marker still flags the hole.
 	if sw.LimitWindowSeconds > 0 {
 		_ = s.store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
 			AccountID:         acc.ID,
@@ -930,6 +922,24 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 		s.upsertCodexResetCreditsSnapshot(ctx, acc.ID, credits)
 	}
 	s.upsertCodexCreditsSnapshot(ctx, acc.ID, wham, now)
+	if pw.LimitWindowSeconds <= 0 {
+		return newQuotaPollError("partial", 0, rawDetail, fmt.Errorf("no primary window in wham response"))
+	}
+
+	snap := storage.AccountRateLimit{
+		AccountID:       acc.ID,
+		Provider:        "codex",
+		LimiterType:     "5h_polled",
+		Source:          "5h_polled",
+		UsedPercent:     pw.UsedPercent,
+		RemainingTokens: -1,
+		LimitTokens:     -1,
+		ResetAt:         now + pw.ResetAfterSeconds,
+		Status:          statusFromReached(wham.RateLimit.LimitReached),
+		Raw:             string(rawDetail),
+		UpdatedAt:       now,
+	}
+	_ = s.store.UpsertAccountRateLimit(ctx, snap)
 	return nil
 }
 
@@ -960,6 +970,10 @@ func (s *Server) upsertCodexCreditsSnapshot(ctx context.Context, accountID strin
 		}
 	}
 	if wham.SpendControl != nil {
+		// Distinguish a spend-control-only row (no extra credits block) from a
+		// genuinely depleted balance: the console must not render the former as
+		// "已耗尽".
+		detail["spend_control"] = true
 		detail["spend_control_reached"] = wham.SpendControl.Reached
 		if wham.SpendControl.Reached {
 			status = "spend_limit_reached"

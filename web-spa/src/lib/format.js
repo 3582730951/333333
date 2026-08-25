@@ -5,6 +5,19 @@ const numberFormatter = () => new Intl.NumberFormat(intlLocale(), { maximumFract
 
 export const fmtInt = (value) => (value == null ? '—' : numberFormatter().format(Number(value) || 0));
 
+// Dollar figure for quota estimates. Whole dollars stay clean ("$15"), fractional
+// amounts keep two decimals ("$15.5" → "$15.50").
+export function fmtUSD(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  return new Intl.NumberFormat(intlLocale(), {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  }).format(n);
+}
+
 export function fmtTokens(value) {
   const n = Number(value) || 0;
   return new Intl.NumberFormat(intlLocale(), {

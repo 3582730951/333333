@@ -7109,6 +7109,17 @@ overlong presentation. */
   white-space: nowrap;
 }
 
+.pool-account-quota__usd {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--pool-accent);
+  font-size: 11px;
+  font-weight: 640;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .pool-account-quota--unknown {
   padding: 7px 9px;
   border-radius: var(--pool-radius-sm);

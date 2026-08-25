@@ -6,7 +6,7 @@ import { Panel } from './PageHeader.jsx';
 import { showErrorToast } from './ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
-import { fmtTokens, fmtInt, fmtDateTime, fmtRelative } from '../lib/format.js';
+import { fmtTokens, fmtInt, fmtDateTime, fmtRelative, fmtUSD } from '../lib/format.js';
 import {
   healthTestRequestBody, isKiroAccount, isKiroSuspended, isProtectedProbeQuarantine,
   isProviderAPIKeyAccount, requiresPaidHealthTest,
@@ -332,12 +332,45 @@ export default function AccountDrawer({
         </Panel>
       ) : null}
 
-      {!providerAPIKey ? (
-        <Panel title="账号额度" style={{ marginBottom: 14 }}>
-          <Row k="主动重置次数" v={formatResetCredits(resetCredits)} />
-          <Row k="更新时间" v={resetCredits?.updated_at ? fmtRelative(resetCredits.updated_at) : '—'} />
-        </Panel>
-      ) : null}
+      {!providerAPIKey ? (() => {
+        const summary = account.quota_summary || {};
+        const primary = summary.primary || null;
+        const secondary = summary.secondary || null;
+        const credits = summary.credits || null;
+        const estimate = summary.estimate || null;
+        const estUSD = estimate && estimate.estimated
+          && Number.isFinite(Number(estimate.remaining_usd)) && Number(estimate.remaining_usd) >= 0;
+        const windowLabel = (w, fallback) => {
+          const limiter = String(w?.limiter_type || '');
+          if (limiter.includes('5h')) return '5 小时窗口';
+          if (limiter.includes('7d')) return '7 天窗口';
+          return fallback;
+        };
+        const windowRow = (w, label) => {
+          if (!w) return <Row k={label} v="—" />;
+          const parts = [];
+          const pct = Number(w.used_percent);
+          if (Number.isFinite(pct) && pct >= 0) parts.push(`${Math.round(pct)}% 已用`);
+          const remaining = Number(w.remaining_tokens);
+          if (Number.isFinite(remaining) && remaining >= 0) parts.push(`${fmtTokens(remaining)} Token 剩余`);
+          const reset = Number(w.reset_at);
+          if (reset > 0) parts.push(`${fmtRelative(reset)}重置`);
+          return <Row k={label} v={parts.join(' · ') || '—'} />;
+        };
+        return (
+          <Panel title="账号额度" style={{ marginBottom: 14 }}>
+            {windowRow(primary, windowLabel(primary, '主窗口'))}
+            {windowRow(secondary, windowLabel(secondary, '7 天窗口'))}
+            <Row k="美元估算" v={estUSD
+              ? `≈ ${fmtUSD(estimate.remaining_usd)} 剩余${Number(estimate.extra_usd) > 0 ? ` · +${fmtUSD(estimate.extra_usd)} 额外` : ''}${estimate.plan ? ` · ${estimate.plan}` : ''}`
+              : '—'} />
+            {credits ? <Row k="额外余额" v={credits.balance || credits.remaining || (credits.unlimited ? '不限' : '—')} /> : null}
+            {credits && (credits.limit || credits.used) ? <Row k="支出上限" v={`${credits.used || '—'} / ${credits.limit || '—'}`} /> : null}
+            <Row k="主动重置次数" v={formatResetCredits(resetCredits)} />
+            <Row k="更新时间" v={resetCredits?.updated_at ? fmtRelative(resetCredits.updated_at) : '—'} />
+          </Panel>
+        );
+      })() : null}
 
       <Panel title="调度例外" style={{ marginBottom: 14 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
