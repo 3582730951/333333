@@ -185,12 +185,15 @@ internal/api/custom_reasoning_compat_test.go
 internal/api/custom_stream.go
 internal/api/custom_stream_test.go
 internal/api/custom_usage_attribution_test.go
+internal/api/deepseek_codex_claude.go
+internal/api/deepseek_codex_claude_test.go
 internal/api/degraded_replay_test.go
 internal/api/diagnose.go
 internal/api/diagnostic_incident_test.go
 internal/api/diagnostic_jobs.go
 internal/api/diagnostic_jobs_test.go
 internal/api/diagnostic_runtime.go
+internal/api/diagnostics_csv_formula_guard_test.go
 internal/api/diagnostics_emergency.go
 internal/api/diagnostics_export.go
 internal/api/diagnostics_export_schema_test.go
@@ -229,6 +232,7 @@ internal/api/httputil_stream_copy_test.go
 internal/api/identity_convergence.go
 internal/api/import_egress.go
 internal/api/import_egress_test.go
+internal/api/intelligent_routing_test.go
 internal/api/isolate.go
 internal/api/isolate_test.go
 internal/api/keys.go
@@ -297,6 +301,7 @@ internal/api/quota_claude_usage_test.go
 internal/api/quota_codex_stream.go
 internal/api/quota_codex_stream_test.go
 internal/api/quota_e2e_test.go
+internal/api/quota_estimate.go
 internal/api/quota_poll.go
 internal/api/quota_poll_test.go
 internal/api/quota_resource_test.go
@@ -756,7 +761,9 @@ internal/scheduler/affinity_cache_test.go
 internal/scheduler/candidate_index.go
 internal/scheduler/candidate_index_test.go
 internal/scheduler/capability_health_test.go
+internal/scheduler/egress_repro_test.go
 internal/scheduler/empty_pool_test.go
+internal/scheduler/intelligent_routing_test.go
 internal/scheduler/kiro_block_reason_test.go
 internal/scheduler/kiro_bootstrap_test.go
 internal/scheduler/lease_coordinator.go
@@ -973,6 +980,7 @@ scripts/analyze_goal_context_diagnostics.py
 scripts/build-gateway.sh
 scripts/check-repository-hygiene.sh
 scripts/ci.sh
+scripts/claude_fetch_fingerprint.sh
 scripts/clear-context-journal.sh
 scripts/collect-vps-diagnostics.sh
 scripts/diagnose-all.sh
