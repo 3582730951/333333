@@ -9,49 +9,15 @@ import (
 	"codex-account-pool/internal/storage"
 )
 
-// quotaPlanPriceInfo maps a plan label to the plan's list monthly USD value so the
-// pool can express an account's remaining subscription quota in dollars.
-//
-// Prices are approximate OpenAI/Anthropic/Cursor list prices and can drift; they are
-// a baseline for estimation, not a billing source of truth. Neither sub2api nor
-// cliproxyapi computes this for subscription accounts (sub2api reports utilization
-// windows, cliproxyapi is purely reactive failover), so this is a gateway capability
-// built on the existing AccountRateLimit windows.
-type quotaPlanPriceInfo struct {
-	matches []string // lowercased plan substrings, most-specific first
-	usd     float64
-	label   string
-}
-
-var quotaPlanPriceByFamily = map[string][]quotaPlanPriceInfo{
-	"openai": {
-		{matches: []string{"free"}, usd: 0, label: "Free"},
-		{matches: []string{"plus"}, usd: 20, label: "ChatGPT Plus"},
-		{matches: []string{"max", "ultra"}, usd: 200, label: "ChatGPT Max"},
-		{matches: []string{"pro"}, usd: 200, label: "ChatGPT Pro"},
-		{matches: []string{"team"}, usd: 30, label: "ChatGPT Team"},
-		{matches: []string{"enterprise"}, usd: 0, label: "ChatGPT Enterprise"},
-	},
-	"claude": {
-		{matches: []string{"free"}, usd: 0, label: "Claude Free"},
-		{matches: []string{"max_5x", "max5x"}, usd: 100, label: "Claude Max 5x"},
-		{matches: []string{"max_20x", "max20x"}, usd: 200, label: "Claude Max 20x"},
-		{matches: []string{"max"}, usd: 100, label: "Claude Max"},
-		{matches: []string{"pro"}, usd: 20, label: "Claude Pro"},
-		{matches: []string{"team"}, usd: 25, label: "Claude Team"},
-	},
-	"cursor": {
-		{matches: []string{"free", "hobby"}, usd: 0, label: "Cursor Free"},
-		{matches: []string{"pro"}, usd: 20, label: "Cursor Pro"},
-		{matches: []string{"business"}, usd: 40, label: "Cursor Business"},
-	},
-}
-
-// QuotaEstimate expresses the account's remaining subscription quota in USD. It is an
-// ESTIMATE: the plan's list price scaled by the current usage window (same window the
-// quota summary surfaces), plus any reported pay-as-you-go credit balance. The
-// Method field records the basis so callers can distinguish a plan-derived number
-// from an unavailable one.
+// QuotaEstimate expresses the account's remaining subscription quota in USD. It
+// follows the sub2api billing model: usage windows (5h/7d) are RATE LIMITS
+// measured in requests/tokens, not dollar spend, so the estimate never converts a
+// plan's list price into dollars. The only USD figures emitted are real dollar
+// amounts the upstream itself reports — the pay-as-you-go credit balance. An
+// account whose plan carries no reported balance gets Method "window_based" with
+// no fabricated numbers; its truthful utilization lives in
+// QuotaSummary.Primary/Secondary.UsedPercent (the console renders those as
+// percentage windows, matching sub2api's UsageProgressBar).
 type QuotaEstimate struct {
 	Estimated    bool    `json:"estimated"`
 	Plan         string  `json:"plan,omitempty"`
@@ -67,10 +33,12 @@ type QuotaEstimate struct {
 	UpdatedAt    int64   `json:"updated_at,omitempty"`
 }
 
-// estimateQuota derives a USD estimate from the account's plan and the primary usage
-// window. It returns a non-nil estimate for any account that reaches supported
-// billing, using Method to describe the basis; callers that gate earlier (inactive,
-// unsupported provider, API-key billing, token missing) never see one.
+// estimateQuota derives a USD figure from the account's plan and the primary
+// usage window. Only a real upstream-reported balance can produce dollars
+// (Method "payg_credits_balance"); subscription windows are rate limits and are
+// surfaced as percentages, never converted to a dollar figure. Callers that gate
+// earlier (inactive, unsupported provider, API-key billing, token missing) never
+// see one.
 func estimateQuota(account storage.Account, primary *storage.AccountRateLimit, credits *QuotaCredits, now int64) *QuotaEstimate {
 	planType := strings.TrimSpace(account.PlanType)
 	est := &QuotaEstimate{
@@ -88,8 +56,7 @@ func estimateQuota(account storage.Account, primary *storage.AccountRateLimit, c
 		}
 		est.UpdatedAt = primary.UpdatedAt
 	}
-	family := quotaPlanFamily(account.Provider)
-	if family == "" {
+	if quotaPlanFamily(account.Provider) == "" {
 		return est
 	}
 	switch strings.ToLower(planType) {
@@ -111,48 +78,33 @@ func estimateQuota(account storage.Account, primary *storage.AccountRateLimit, c
 		est.Note = "pay-as-you-go billing has no plan window; use upstream balance"
 		return est
 	}
-	plan, ok := quotaPlanForFamily(family, planType)
-	if !ok {
-		est.Method = "unknown_plan"
-		est.Note = fmt.Sprintf("plan %q not recognized for USD estimation", planType)
-		return est
-	}
-	est.Plan = plan.label
-	if plan.usd <= 0 {
-		est.Estimated = true
-		est.Method = "free_plan"
-		return est
-	}
-	usedPct := est.UsedPercent
-	if usedPct < 0 {
-		// A window row exists but carries no percentage (e.g. only a reset time was
-		// signalled). Estimating would fabricate a full-price balance; report the
-		// basis instead.
-		est.Method = "no_window_data"
-		est.Note = "no usage window data for USD estimate"
-		return est
-	}
-	if usedPct > 100 {
-		usedPct = 100
-	}
-	used := plan.usd * usedPct / 100
-	est.LimitUSD = round2(plan.usd)
-	est.UsedUSD = round2(used)
-	est.RemainingUSD = round2(plan.usd - used)
-	est.Method = "plan_price_window"
+	// Subscription plan. The 5h/7d windows constrain requests/tokens, not dollar
+	// spend — multiplying a list price by a window's used_percent would fabricate
+	// a figure upstream never reported (the sub2api model renders the windows
+	// verbatim). The only legitimate dollar is a reported credit balance.
 	if credits != nil && credits.HasCredits {
 		if extra := parseUSDString(credits.Balance); extra > 0 {
+			est.Estimated = true
+			est.Method = "payg_credits_balance"
+			est.Plan = planType
 			est.ExtraUSD = extra
-			est.RemainingUSD = round2(est.RemainingUSD + extra)
-			est.Method = "plan_price_window_plus_credits"
+			est.RemainingUSD = extra
+			est.Note = "upstream credit balance"
+			return est
 		}
 	}
-	est.Estimated = true
+	est.Plan = planType
+	est.Method = "window_based"
+	est.Note = "plan usage is a rate-limit window (requests/tokens), not a USD balance; see primary.used_percent"
+	if planType != "" {
+		est.Note = fmt.Sprintf("%s usage is a rate-limit window (requests/tokens), not a USD balance; see primary.used_percent", planType)
+	}
 	return est
 }
 
-// quotaPlanFamily maps the account's provider to the plan-price family used for USD
-// estimation. Providers without a subscription price baseline return "".
+// quotaPlanFamily maps the account's provider to the subscription family used to
+// decide whether the estimate can speak for it at all. Providers without a
+// subscription model (or with no USD baseline) return "".
 func quotaPlanFamily(provider string) string {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "codex", "chatgpt", "openai":
@@ -164,21 +116,6 @@ func quotaPlanFamily(provider string) string {
 	default:
 		return ""
 	}
-}
-
-func quotaPlanForFamily(family, planType string) (quotaPlanPriceInfo, bool) {
-	plan := strings.ToLower(strings.TrimSpace(planType))
-	if plan == "" {
-		return quotaPlanPriceInfo{}, false
-	}
-	for _, p := range quotaPlanPriceByFamily[family] {
-		for _, m := range p.matches {
-			if strings.Contains(plan, m) {
-				return p, true
-			}
-		}
-	}
-	return quotaPlanPriceInfo{}, false
 }
 
 func round2(v float64) float64 {

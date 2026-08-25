@@ -816,6 +816,7 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 		}
 		return Lease{}, fmt.Errorf("%w: account=%s egress=%s reason=%s", ErrBoundAccountUnavailable, route.RequiredAccountID, route.RequiredEgressID, reason.humanString())
 	}
+	reboundFrom := ""
 	if route.Affinity.Hash != "" && !route.FairScheduling {
 		if bound, err := s.affinitySnapshot(ctx, route.Affinity.Hash); err == nil {
 			hadBinding = true
@@ -906,11 +907,55 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 				}
 				if route.Strict {
 					if !s.strictStickyCanFailover(ctx, bound.AccountID, route) {
+						// Within-threshold cooldown (or threshold=0, never rebind for a
+						// long cooldown): wait the pinned account out instead of
+						// rebinding. A rebind moves the conversation to a fresh account
+						// with an empty upstream prompt-cache prefix — the next turn
+						// pays the full cold-cache price. waitForStatefulStickyLease
+						// re-diagnoses if the block turns non-waitable mid-wait.
+						if reason, ok := s.strictStickyCooldownWait(ctx, bound.AccountID, route); ok {
+							// waitForStatefulStickyLease already returns a terminal
+							// diagnosis (wait timeout with the last reason, or the
+							// bound account turning non-waitable mid-wait). Return it
+							// as-is: re-running the diagnosis here sees a cancelled
+							// ctx and reports "account not found", masking the
+							// cooldown that actually pinned us.
+							lease, waitErr := s.waitForStatefulStickyLease(ctx, bound.AccountID, route, reason)
+							if waitErr == nil {
+								lease.RouteEpoch = bound.Epoch
+								return lease, nil
+							}
+							return Lease{}, waitErr
+						}
 						return Lease{}, s.diagnoseStickyUnavailability(ctx, bound.AccountID, route)
 					}
 					log.Printf("[SCHEDULER] strict-sticky falling through to selectFresh for route affinity=%s", route.Affinity.Hash)
+				} else if cfg.StrictStickyMaxCooldownSeconds > 0 {
+					// Non-strict movable request: a short cooldown on the bound
+					// account is still worth riding out — the upstream session and
+					// its prompt-cache prefix live on that account, and the request
+					// carries its full input, so waiting is lossless. The wait is
+					// bounded by the cooldown threshold; beyond it we fall through to
+					// selectFresh exactly as before (movable failover semantics).
+					if reason, ok := s.strictStickyCooldownWait(ctx, bound.AccountID, route); ok {
+						waitCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.StrictStickyMaxCooldownSeconds)*time.Second)
+						lease, waitErr := s.waitForStatefulStickyLease(waitCtx, bound.AccountID, route, reason)
+						cancel()
+						if waitErr == nil {
+							lease.RouteEpoch = bound.Epoch
+							return lease, nil
+						}
+						log.Printf("[SCHEDULER] affinity cooldown wait expired, rebinding affinity=%s account=%s", route.Affinity.Hash, bound.AccountID)
+					}
 				}
 			}
+			// Any fall-through from this affinity branch rebinds the conversation
+			// away from its bound account (or drops the binding when the bound
+			// account is excluded). Remember the old owner so a successful fresh
+			// selection below can audit the switch — cross-account conversation
+			// moves are the #1 prompt-cache killer, so they must be visible, not
+			// silent.
+			reboundFrom = bound.AccountID
 		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return Lease{}, err
 		}
@@ -961,7 +1006,33 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 			}
 		}
 	}
+	if reboundFrom != "" && lease.Account.ID != reboundFrom {
+		s.auditAffinityRebind(ctx, reboundFrom, lease.Account.ID, route)
+	}
 	return lease, nil
+}
+
+// auditAffinityRebind records a conversation whose affinity binding moved from one
+// account to another, with the route identity that caused the rebind. Cross-account
+// moves reset the upstream prompt-cache prefix, so every one should be explainable
+// (cooldown past threshold, egress health, exclusion, fair-scheduling weight) rather
+// than invisible. Written with a detached context so a cancelled request still leaves
+// the trail; failures only log, the rebind itself is already committed.
+func (s *Scheduler) auditAffinityRebind(ctx context.Context, from, to string, route Route) {
+	detail := fmt.Sprintf("from=%s to=%s affinity=%s route_key=%s group=%s model=%s",
+		from, to, route.Affinity.Hash, route.Affinity.Key, route.Group, route.Model)
+	if len(detail) > 4000 {
+		detail = detail[:4000]
+	}
+	if err := s.store.InsertAuditLog(context.WithoutCancel(ctx), storage.AuditLogRow{
+		AccountID: to,
+		Action:    "affinity_rebind",
+		State:     "recovered",
+		Reason:    "sticky_unavailable",
+		Detail:    detail,
+	}); err != nil {
+		log.Printf("[SCHEDULER] affinity rebind audit failed from=%s to=%s: %v", from, to, err)
+	}
 }
 
 func (s *Scheduler) observeRouteSelection(started time.Time) {
@@ -2382,14 +2453,29 @@ func (s *Scheduler) strictStickyCanFailover(ctx context.Context, accountID strin
 	if account.Status != "active" || (account.QuarantineUntil > now && !account.IgnoreRateLimitControls) {
 		return false
 	}
+	cooldownThreshold := time.Duration(s.Config().StrictStickyMaxCooldownSeconds) * time.Second
 	if until, ok := s.accountRateLimitCooldownUntil(ctx, account, route, now); !account.IgnoreRateLimitControls && ok && until > now {
+		// A short cooldown is worth riding out: rebinding moves the conversation to
+		// a fresh account whose upstream prompt-cache prefix is empty, so the very
+		// next turn pays the full cold-cache price. Only a cooldown beyond the
+		// configured threshold (or threshold=0, "never rebind for a long cooldown")
+		// is allowed to fail over.
+		if cooldownThreshold == 0 || time.Duration(until-now)*time.Second <= cooldownThreshold {
+			return false
+		}
 		return true
 	}
 	binding, err := s.store.GetEgressBinding(ctx, accountID)
 	if err != nil {
 		return true
 	}
-	if !account.IgnoreRateLimitControls && (binding.RecheckPending || binding.CooldownUntil > now) {
+	if !account.IgnoreRateLimitControls && binding.CooldownUntil > now {
+		if cooldownThreshold == 0 || time.Duration(binding.CooldownUntil-now)*time.Second <= cooldownThreshold {
+			return false
+		}
+		return true
+	}
+	if !account.IgnoreRateLimitControls && binding.RecheckPending {
 		return true
 	}
 	egress, err := s.store.GetEgressProfile(ctx, binding.PrimaryEgressID)
@@ -2409,6 +2495,43 @@ func (s *Scheduler) strictStickyCanFailover(ctx context.Context, accountID strin
 		return true
 	}
 	return route.Movable
+}
+
+// strictStickyCooldownWait reports a waitable transient cooldown on the bound
+// account whose remaining duration sits within the strict-sticky cooldown
+// threshold. A caller that gets false from strictStickyCanFailover uses this to
+// distinguish "cooldown short enough to ride out — wait for the pinned account"
+// from "account is genuinely gone — fail/diagnose instead of waiting pointlessly".
+// threshold=0 keeps the "never rebind for a long cooldown" meaning: any cooldown
+// is reported as waitable. Non-cooldown blocks (inactive, quarantined, egress
+// health) never report waitable.
+func (s *Scheduler) strictStickyCooldownWait(ctx context.Context, accountID string, route Route) (leaseBlockReason, bool) {
+	threshold := time.Duration(s.Config().StrictStickyMaxCooldownSeconds) * time.Second
+	now := storage.Now()
+	account, err := s.store.GetAccount(ctx, accountID)
+	if err != nil || account.Status != "active" || (account.QuarantineUntil > now && !account.IgnoreRateLimitControls) {
+		return leaseBlockNone, false
+	}
+	withinThreshold := func(remaining int64) bool {
+		if threshold == 0 {
+			return true
+		}
+		return time.Duration(remaining)*time.Second <= threshold
+	}
+	if until, ok := s.accountRateLimitCooldownUntil(ctx, account, route, now); !account.IgnoreRateLimitControls && ok && until > now {
+		if withinThreshold(until - now) {
+			return leaseBlockRateLimitCooldown, true
+		}
+		return leaseBlockNone, false
+	}
+	binding, err := s.store.GetEgressBinding(ctx, accountID)
+	if err != nil {
+		return leaseBlockNone, false
+	}
+	if !account.IgnoreRateLimitControls && binding.CooldownUntil > now && withinThreshold(binding.CooldownUntil-now) {
+		return leaseBlockEgressCooldown, true
+	}
+	return leaseBlockNone, false
 }
 
 // diagnoseStickyUnavailability returns an ErrStrictUnavailable error annotated with the
@@ -2431,7 +2554,12 @@ func (s *Scheduler) diagnoseStickyUnavailability(ctx context.Context, accountID 
 		return fmt.Errorf("%w: account %s quarantined for %ds (reason: %s)", ErrStrictUnavailable, accountID, remaining, account.QuarantineReason)
 	}
 	if until, ok := s.accountRateLimitCooldownUntil(ctx, account, route, now); !account.IgnoreRateLimitControls && ok {
-		return fmt.Errorf("%w: account %s provider=%q model=%q rate-limit cooldown for %ds", ErrStrictUnavailable, accountID, providerForRoute(s, ctx, account, route), route.Model, until-now)
+		remaining := until - now
+		hint := ""
+		if cfg.StrictStickyMaxCooldownSeconds > 0 && remaining <= int64(cfg.StrictStickyMaxCooldownSeconds) {
+			hint = " (pinned: within strict-sticky cooldown threshold)"
+		}
+		return fmt.Errorf("%w: account %s provider=%q model=%q rate-limit cooldown for %ds%s", ErrStrictUnavailable, accountID, providerForRoute(s, ctx, account, route), route.Model, remaining, hint)
 	}
 
 	// 2. Egress binding / cooldown

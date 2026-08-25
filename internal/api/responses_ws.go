@@ -25,6 +25,41 @@ import (
 
 type forceCodexResponsesWebSocketKey struct{}
 type codexResponsesWebSocketSessionKey struct{}
+
+// codexResponsesWebSocketPrewarmKey marks a downstream response.create/append
+// frame that carries generate:false — OpenAI's prewarm signal ("write the
+// prefix cache, do not generate"). Such a frame must stay on the upstream
+// WebSocket (the HTTP/SSE path strips `generate` at the choke point and would
+// silently turn the prewarm into a full, billable inference) and must not
+// persist any turn/session state (no binding commit, no goal checkpoint).
+type codexResponsesWebSocketPrewarmKey struct{}
+
+func codexPrewarmFrameFromContext(ctx context.Context) bool {
+	prewarm, _ := ctx.Value(codexResponsesWebSocketPrewarmKey{}).(bool)
+	return prewarm
+}
+
+// codexResponsesGenerateFalse reports whether a scanned response.create/append
+// frame is a prewarm signal (generate == false). The scanner keeps `generate`
+// in BodyMeta.Scalars because the field is tracked for Responses WebSocket
+// frames; the HTTP Responses schema does not define it, so an HTTP request can
+// never set this bit.
+func codexResponsesGenerateFalse(meta bodysource.BodyMeta) bool {
+	raw, ok := meta.Scalars["generate"]
+	if !ok {
+		return false
+	}
+	// json.Unmarshal treats null as a no-op (zero value), so it must be rejected
+	// explicitly: only a literal false is a prewarm signal.
+	if strings.EqualFold(strings.TrimSpace(string(raw)), "null") {
+		return false
+	}
+	var value bool
+	if json.Unmarshal(raw, &value) != nil {
+		return false
+	}
+	return !value
+}
 type codexResponsesWebSocketHTTPSRecoveryTurnKey struct{}
 
 const (
@@ -433,6 +468,7 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 				_ = writeWebSocketError(downstream, http.StatusInternalServerError, openErr.Error())
 				return
 			}
+			prewarm := codexResponsesGenerateFalse(meta)
 			turnBaseCtx, cancelTurn := context.WithCancel(baseCtx)
 			// One downstream WebSocket can carry many inference turns. Give each
 			// turn its own request and usage events while every retry/bridge inside
@@ -441,6 +477,9 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 			turnBaseCtx = contextWithUsageEventID(turnBaseCtx, newRequestID())
 			turnBaseCtx = contextWithBodySource(turnBaseCtx, source)
 			turnBaseCtx = contextWithBodyMeta(turnBaseCtx, meta)
+			if prewarm {
+				turnBaseCtx = context.WithValue(turnBaseCtx, codexResponsesWebSocketPrewarmKey{}, true)
+			}
 			// Snapshot only unresolved cross-transport context at turn admission.
 			// Merely choosing HTTPS from the first turn is not a recovery and must keep
 			// native HTTP previous_response_id continuation enabled.

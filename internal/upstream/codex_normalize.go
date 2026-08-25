@@ -620,6 +620,16 @@ func applyCodexGPT56AutomaticCacheBreakpoint(raw []byte) []byte {
 		return raw
 	}
 	out, err = sjson.SetBytes(out, "prompt_cache_options.mode", "implicit")
+	if err != nil {
+		return raw
+	}
+	// GPT-5.6's prompt_cache_options.ttl accepts exactly "30m" (cache read 0.1x,
+	// write 1.25x). Without it the upstream default TTL is the old-model window
+	// (5-10 minutes), which an agentic conversation's inter-turn gap easily
+	// crosses — every resumed turn then pays a cold cache. Pinning 30m stretches
+	// the hit window to the model maximum at zero context cost: ttl is pure cache
+	// metadata, covered by the codexCacheOnlyMutation guard below.
+	out, err = sjson.SetBytes(out, "prompt_cache_options.ttl", "30m")
 	if err != nil || !codexCacheOnlyMutation(raw, out) {
 		return raw
 	}

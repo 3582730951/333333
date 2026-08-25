@@ -152,9 +152,10 @@ export function quotaPresentation(account) {
   }
   const resetAt = Number(primary.reset_at);
   if (Number.isFinite(resetAt) && resetAt > 0) details.push(`${fmtRelative(resetAt)}重置`);
-  // The USD estimate is a plan-price approximation from the server; surface it
-  // only when it is actually an estimate (never_polled / unknown plan / payg
-  // without a balance all come through as method without numbers).
+  // The USD estimate only ever carries a real upstream-reported balance
+  // (payg_credits_balance); subscription windows (window_based) never produce
+  // dollars and surface no numbers here — the truthful utilization is the
+  // primary/secondary window percentages above, per the sub2api model.
   const estimate = account?.quota_summary?.estimate;
   const estUSD = estimate && estimate.estimated && Number.isFinite(Number(estimate.remaining_usd)) && Number(estimate.remaining_usd) >= 0
     ? {

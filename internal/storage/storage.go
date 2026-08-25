@@ -9287,6 +9287,26 @@ func (s *Store) ListAuditLog(ctx context.Context, limit int) ([]AuditLogRow, err
 	return scanAuditLogRows(rows)
 }
 
+// ListAuditLogByActionSince returns audit records for one action created at or
+// after `since` (ascending, oldest first), bounded by `limit`. Used by the
+// cache-export diagnostics that correlate lifecycle events (affinity rebinds)
+// with the usage rows that followed them.
+func (s *Store) ListAuditLogByActionSince(ctx context.Context, action string, since int64, limit int) ([]AuditLogRow, error) {
+	action = strings.TrimSpace(action)
+	if action == "" {
+		return nil, errors.New("audit action filter is empty")
+	}
+	if limit <= 0 || limit > 5000 {
+		limit = 1000
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, account_id, account_label, action, state, reason, detail, created_at FROM audit_log WHERE action = ? AND created_at >= ? ORDER BY id ASC LIMIT ?`, action, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAuditLogRows(rows)
+}
+
 // ListAuditLogForAccount returns recent audit records for one account without
 // forcing callers to load and filter the global audit stream.
 func (s *Store) ListAuditLogForAccount(ctx context.Context, accountID string, limit int) ([]AuditLogRow, error) {

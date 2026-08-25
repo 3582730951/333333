@@ -121,6 +121,11 @@ type Server struct {
 	// (in-memory + TTL'd + size-bounded; same pattern as oauth/login). Only written
 	// when the gateway_reliability flag is on. See reliability.go.
 	relState *reliability.Store
+	// promptCacheDrift tracks per-conversation prompt_cache_key / system-prompt
+	// stability across turns and audits the first drift after a quiet window, so a
+	// conversation silently leaving its cache shard is explainable. See
+	// prompt_drift.go.
+	promptCacheDrift *promptCacheDriftGuard
 	// regHandler handles registration API requests
 	regHandler         *Handler
 	teamLifecycle      *teamflow.Coordinator
@@ -268,6 +273,7 @@ func NewServer(dep Dependencies) *Server {
 			routingAuditLogMaxKeys,
 		),
 		relState:              reliability.NewStore(relStateTTL, relStateMax),
+		promptCacheDrift:      newPromptCacheDriftGuard(),
 		regHandler:            NewHandler(dep.Store, dep.Upstream, dep.Config.DefaultRegisterMethod, dep.Config.RegistrationConcurrency, &dep.Config), // builds live provider Manager from provider_settings
 		claudeRefresh:         newClaudeRefreshGates(),
 		antigravityRefresh:    newAntigravityRefreshFlights(),
@@ -1889,8 +1895,14 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		retentionSource = "downstream_unsupported"
 	}
 	group := requestUserGroupPolicy(r.Context())
+	// injectedSystemPrompt feeds the prompt-cache drift guard: a hot-reloaded
+	// system prompt changes the upstream prefix every turn and silently kills
+	// cache hits, so the guard needs to know what was actually injected (and
+	// when nothing was, so prepared retries don't false-positive).
+	injectedSystemPrompt := ""
 	if !prepared {
 		if !strictNativeCPA && !instructionPlan.applies() && prompt.ShouldRewrite(group.SystemPrompt, isCompact, group.SystemPromptApplyToCompaction) {
+			injectedSystemPrompt = group.SystemPrompt
 			if isChat {
 				body, _, err = prompt.InjectChatSystemPrompt(body, group.SystemPrompt)
 			} else {
@@ -2006,6 +2018,14 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	if promptCacheKeySource == "official_codex_stable_prefix" {
 		codexCacheShardHint = codexPromptCacheKeyShardFromKey(promptCacheKeyWithMeta(body, usageMeta), codexCacheShardCount)
 	}
+	// C-前缀稳定性守卫: 同一会话相邻轮 key/source/系统提示漂移 → audit。
+	// key 为 "" 的请求(无 key 且死区无锚点)不参与; 系统提示只在真正注入的
+	// 轮次计入, prepared 重试轮不会误报。
+	if affinity.Hash != "" && promptCacheKeySource != "" {
+		if s.promptCacheDrift.note(r.Context(), s.store, affinity.Hash, promptCacheKeySource, promptCacheKeyWithMeta(body, usageMeta), injectedSystemPrompt) {
+			// 已在 audit_log 留痕; 请求级不再重复。
+		}
+	}
 
 	// Resolve the persistent identity only after the exact account and egress are
 	// selected. A transport/auth retry below reuses this snapshot and therefore the
@@ -2070,6 +2090,18 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 
 	codexClientVersion := s.codexClientVersionForModel(model)
 	webSocketSession := codexResponsesWebSocketSession(r.Context())
+	// A generate:false frame is a prewarm signal: it must be forwarded on the
+	// upstream WebSocket (where `generate` is a legal frame control) and must
+	// never be downgraded to HTTP/SSE (the HTTP choke point strips the field and
+	// the upstream would run a full billable inference instead of a cache write).
+	codexPrewarm := codexPrewarmFrameFromContext(r.Context())
+	if codexPrewarm {
+		_ = s.store.InsertAuditLog(context.WithoutCancel(r.Context()), storage.AuditLogRow{
+			AccountID: lease.Account.ID, AccountLabel: lease.Account.Label,
+			Action: "codex_prewarm_frame", State: "forwarded", Reason: "generate_false",
+			Detail: fmt.Sprintf("model=%s affinity=%s key_source=%s", resolvedModel, affinity.Hash, promptCacheKeySource),
+		})
+	}
 	codexUseWebSocket := forceCodexResponsesWebSocket(r.Context()) || !isChat && !isCompact && streamReq && capability.CodexPrefersWebSocket(model)
 	if webSocketSession != nil && webSocketSession.UseHTTPSFallback() {
 		codexUseWebSocket = false
@@ -2090,7 +2122,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// before every WebSocket mode-specific return so a forced downstream WS cannot
 	// accidentally bypass it. Stateful continuations are deliberately excluded;
 	// their connection-local pointer is handled by the established recovery path.
-	if codexUseWebSocket && forceCodexResponsesWebSocket(r.Context()) && webSocketSession != nil && !isCompact &&
+	if codexUseWebSocket && forceCodexResponsesWebSocket(r.Context()) && webSocketSession != nil && !isCompact && !codexPrewarm &&
 		len(body) > codexResponsesWebSocketHTTPBridgeThreshold &&
 		strings.TrimSpace(topLevelStringWithMeta(body, usageMeta, "previous_response_id")) == "" {
 		codexUseWebSocket = false
@@ -2107,7 +2139,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// downstream Responses WebSocket can bridge this SSE stream without coupling
 	// the two transport legs.
 	if codexUseWebSocket && s.flagEnabled(r.Context(), "codex_prefer_sidecar_ja3_over_ws", s.cfg.CodexPreferSidecarJA3OverWS) &&
-		strings.EqualFold(strings.TrimSpace(lease.Egress.Type), "curl_cffi_sidecar") {
+		strings.EqualFold(strings.TrimSpace(lease.Egress.Type), "curl_cffi_sidecar") && !codexPrewarm {
 		codexUseWebSocket = false
 	}
 	if forceCodexResponsesWebSocket(r.Context()) && webSocketSession != nil && !codexUseWebSocket {
@@ -3131,7 +3163,7 @@ codexSuccess:
 				}
 				s.recordCodexUpstreamAttempt(r.Context(), codexSessionMappingFromContext(r.Context()), lease, finalEgress, terminalState, terminalFailure.StatusCode)
 			}
-			if nativeRecorder.completedSuccessfully() {
+			if nativeRecorder.completedSuccessfully() && !codexPrewarm {
 				responseID, responseModel, _ := nativeRecorder.metadata()
 				if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
 					if mapping.rotateUpstreamSessionOnSafety && nativeRecorder.safetyBufferingDetected() {
@@ -3187,7 +3219,7 @@ codexSuccess:
 			streamCtx = withResponseRuleFilter(streamCtx, rf)
 		}
 		commitStreamMapping := func(recorder *codexStreamLedgerRecorder, upstreamHeader http.Header, committedEgress storage.EgressProfile) error {
-			if recorder == nil || !recorder.completedSuccessfully() {
+			if recorder == nil || !recorder.completedSuccessfully() || codexPrewarm {
 				return nil
 			}
 			responseID, responseModel, _ := recorder.metadata()
@@ -3672,6 +3704,11 @@ codexSuccess:
 }
 
 func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request, requestBody []byte, affinity routing.AffinityKey, responseBody []byte, responseHeader http.Header, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string, compact bool) {
+	// A prewarm frame never commits turn state: it only writes the upstream
+	// prefix cache and its response id must not become the conversation anchor.
+	if codexPrewarmFrameFromContext(ctx) {
+		return
+	}
 	var response struct {
 		ID     string `json:"id"`
 		Model  string `json:"model"`

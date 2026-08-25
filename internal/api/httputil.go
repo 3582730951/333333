@@ -797,7 +797,21 @@ func automaticPromptCacheKey(model, prefixHash string) string {
 
 func automaticPromptCachePrefixHash(raw []byte) string {
 	prefixHash := routing.StablePromptPrefixHash(raw)
-	if prefixHash == "" || !automaticPromptCacheKeySafe(raw) {
+	if prefixHash == "" {
+		// Dead zone: the final input item is an assistant/tool turn (agentic
+		// Codex), so StablePromptPrefixFingerprint refuses to synthesize a key.
+		// The conversation anchor (first user turn) is still derivable and stable
+		// across turns, and it is exactly the key the user-ended turns already
+		// use — without this, every agentic turn silently changes shard and the
+		// upstream prefix cache built by the user turns goes cold.
+		if automaticPromptCacheKeySafe(raw) && hasHistoricalUserTurn(raw) {
+			if anchor := routing.ConversationAnchor(raw); anchor != "" {
+				return "conversation:" + anchor
+			}
+		}
+		return ""
+	}
+	if !automaticPromptCacheKeySafe(raw) {
 		return ""
 	}
 	// The official Codex client keeps one prompt_cache_key for the lifetime of a

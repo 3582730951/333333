@@ -93,6 +93,8 @@ internal/api/ban_delete_test.go
 internal/api/billing_holds.go
 internal/api/body_meta.go
 internal/api/body_source_test.go
+internal/api/cache_health_export.go
+internal/api/cache_health_export_test.go
 internal/api/cache_hits_export.go
 internal/api/cf_solver_recovery_test.go
 internal/api/chat_claude.go
@@ -139,6 +141,7 @@ internal/api/codex_goal_quota.go
 internal/api/codex_goal_quota_test.go
 internal/api/codex_passthrough.go
 internal/api/codex_passthrough_test.go
+internal/api/codex_prewarm_test.go
 internal/api/codex_reauth.go
 internal/api/codex_reauth_test.go
 internal/api/codex_reset_credits.go
@@ -285,6 +288,8 @@ internal/api/password.go
 internal/api/password_test.go
 internal/api/phone_countries.json
 internal/api/pool_import_key_test.go
+internal/api/prompt_drift.go
+internal/api/prompt_drift_test.go
 internal/api/protocol_stream_terminal_test.go
 internal/api/provider_api_key.go
 internal/api/provider_api_key_test.go

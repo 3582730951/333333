@@ -71,6 +71,26 @@ func (s *Server) adminCacheHitsExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if !legacyV1 {
+		// Recommendation F: cache observability. account_health.csv carries the
+		// sub2api-style cacheRateBand health score; interval_distribution.csv
+		// splits miss causes into drift (short interval) vs cooldown (long
+		// interval); affinity_rebind_events.csv shows the rebuild cost of each
+		// cross-account move. Thresholds default to 0.7/0.4 and can be disabled
+		// with 0/0.
+		cacheWarning := defaultCacheHealthWarning
+		cacheCritical := defaultCacheHealthCritical
+		if v, err := strconv.ParseFloat(strings.TrimSpace(r.URL.Query().Get("cache_warning")), 64); err == nil {
+			cacheWarning = v
+		}
+		if v, err := strconv.ParseFloat(strings.TrimSpace(r.URL.Query().Get("cache_critical")), 64); err == nil {
+			cacheCritical = v
+		}
+		files["account_health.csv"] = csvString(cacheAccountHealthHeader(), cacheAccountHealthRows(report.ByAccountModel, codebook, cacheWarning, cacheCritical))
+		files["interval_distribution.csv"] = csvString(cacheIntervalHeader(), cacheIntervalRows(usageRows))
+		files["affinity_rebind_events.csv"] = csvString(cacheRebindHeader(), cacheRebindRows(r.Context(), s.store, codebook, usageRows, win.EffectiveStartAt))
+		order = append(order, "account_health.csv", "interval_distribution.csv", "affinity_rebind_events.csv")
+	}
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	for _, name := range order {
