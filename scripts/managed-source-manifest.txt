@@ -146,6 +146,7 @@ internal/api/codex_reauth.go
 internal/api/codex_reauth_test.go
 internal/api/codex_reset_credits.go
 internal/api/codex_reset_credits_test.go
+internal/api/codex_session_across_repro_test.go
 internal/api/codex_session_mapping.go
 internal/api/codex_session_mapping_test.go
 internal/api/codex_session_recovery_test.go
@@ -313,6 +314,11 @@ internal/api/quota_resource_test.go
 internal/api/quota_summary.go
 internal/api/quota_summary_test.go
 internal/api/quota_test.go
+internal/api/quota_window_cost.go
+internal/api/quota_window_estimate.go
+internal/api/quota_window_estimate_test.go
+internal/api/quota_window_poll.go
+internal/api/quota_window_poll_test.go
 internal/api/ratelimit.go
 internal/api/ratelimit_test.go
 internal/api/reasoning_effort_test.go
@@ -846,6 +852,7 @@ internal/storage/provider_secrets_test.go
 internal/storage/public_chat.go
 internal/storage/public_chat_test.go
 internal/storage/quota_test.go
+internal/storage/quota_window.go
 internal/storage/read_pool_test.go
 internal/storage/registration_canary.go
 internal/storage/registration_workflow.go
