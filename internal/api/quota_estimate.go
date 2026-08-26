@@ -22,6 +22,8 @@ type QuotaEstimate struct {
 	Estimated    bool    `json:"estimated"`
 	Plan         string  `json:"plan,omitempty"`
 	LimitUSD     float64 `json:"limit_usd,omitempty"`
+	LimitUSDMin  float64 `json:"limit_usd_min,omitempty"`
+	LimitUSDMax  float64 `json:"limit_usd_max,omitempty"`
 	UsedUSD      float64 `json:"used_usd,omitempty"`
 	RemainingUSD float64 `json:"remaining_usd,omitempty"`
 	ExtraUSD     float64 `json:"extra_usd,omitempty"`
@@ -29,6 +31,7 @@ type QuotaEstimate struct {
 	Window       string  `json:"window,omitempty"`
 	Currency     string  `json:"currency"`
 	Method       string  `json:"method"`
+	Confidence   string  `json:"confidence,omitempty"`
 	Note         string  `json:"note,omitempty"`
 	UpdatedAt    int64   `json:"updated_at,omitempty"`
 }

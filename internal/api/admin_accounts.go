@@ -210,11 +210,13 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 		if t, ok := tokens[account.ID]; ok {
 			token = &t
 		}
+		summary := BuildQuotaSummary(account, token, quotaSnapshots[account.ID], now)
+		s.attachQuotaWindowEstimate(ctx, account, &summary, now)
 		view := accountView{
 			Account:      account,
 			Provider:     providers[account.ID],
 			Capabilities: capabilities[account.ID],
-			QuotaSummary: BuildQuotaSummary(account, token, quotaSnapshots[account.ID], now),
+			QuotaSummary: summary,
 		}
 		if token != nil {
 			view.AuthMethod = accountprovider.EffectiveAuthMethod(view.Provider, *token)

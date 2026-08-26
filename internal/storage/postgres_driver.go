@@ -427,8 +427,8 @@ func (s *Store) initPostgres(ctx context.Context) error {
 driver TEXT NOT NULL, version TEXT NOT NULL, checksum TEXT NOT NULL, applied_at BIGINT NOT NULL, PRIMARY KEY(driver,version))`); err != nil {
 		return err
 	}
-	const version = "20260727_base_v1"
-	combined := postgresSchema(schemaSQL + goalContinuitySchemaSQL + codexSessionMappingSchemaSQL + lifecycleSchemaSQL)
+	const version = "20260826_quota_window_v1"
+	combined := postgresSchema(schemaSQL + goalContinuitySchemaSQL + codexSessionMappingSchemaSQL + quotaWindowSchemaSQL + lifecycleSchemaSQL)
 	checksumRaw := sha256.Sum256([]byte(combined))
 	checksum := hex.EncodeToString(checksumRaw[:])
 	var existing string

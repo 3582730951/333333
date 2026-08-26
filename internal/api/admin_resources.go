@@ -1404,6 +1404,7 @@ func (s *Server) quotaViewsForAccounts(ctx context.Context, accounts []storage.A
 		}
 		snaps := snapsByID[account.ID]
 		summary := BuildQuotaSummary(account, token, snaps, now)
+		s.attachQuotaWindowEstimate(ctx, account, &summary, now)
 		base := quotaBaseSnapshot(account, summary, snaps)
 		qv := quotaView{
 			AccountRateLimit: base,

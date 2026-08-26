@@ -1460,6 +1460,12 @@ func (s *Store) init(ctx context.Context, progress func(string)) error {
 	if _, err := s.db.ExecContext(ctx, codexSessionMappingSchemaSQL); err != nil {
 		return err
 	}
+	// Quota window estimation samples (used_percent + recorded cost per cycle) are
+	// additive; raw samples are pruned after cycle finalization.
+	report("quota_window_schema")
+	if _, err := s.db.ExecContext(ctx, quotaWindowSchemaSQL); err != nil {
+		return err
+	}
 	// Create lifecycle management tables
 	report("runtime_schemas")
 	if _, err := s.db.ExecContext(ctx, lifecycleSchemaSQL); err != nil {

@@ -916,6 +916,10 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 			Raw:               string(rawDetail),
 			UpdatedAt:         now,
 		})
+		// Empirical window estimation: snapshot used_percent together with the
+		// recorded cost of the current 7d cycle.
+		s.recordQuotaWindowSample(ctx, acc.ID, quotaWindowKind7d,
+			quotaWindowMinutesForCodex(sw.LimitWindowSeconds), now+sw.ResetAfterSeconds, now, sw.UsedPercent)
 	}
 	if credits := parseCodexResetCredits(body, "usage_fallback"); credits.Known {
 		credits.UpdatedAt = now
@@ -940,6 +944,10 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 		UpdatedAt:       now,
 	}
 	_ = s.store.UpsertAccountRateLimit(ctx, snap)
+	// Empirical window estimation: snapshot used_percent together with the
+	// recorded cost of the current 5h cycle.
+	s.recordQuotaWindowSample(ctx, acc.ID, quotaWindowKind5h,
+		quotaWindowMinutesForCodex(pw.LimitWindowSeconds), now+pw.ResetAfterSeconds, now, pw.UsedPercent)
 	return nil
 }
 
@@ -1130,8 +1138,24 @@ func (s *Server) pollOneClaudeQuota(ctx context.Context, acc storage.Account, to
 		if err := s.store.UpsertAccountRateLimit(ctx, snap); err != nil {
 			return err
 		}
+		// Empirical window estimation: snapshot used_percent together with the
+		// recorded cost of the current oauth usage cycle.
+		if kind := quotaWindowKindForClaudeLimiter(win.LimiterType); kind != "" {
+			s.recordQuotaWindowSample(ctx, acc.ID, kind,
+				quotaWindowMinutesForClaude(win.LimiterType), win.ResetAt, storage.Now(), win.UsedPercent)
+		}
 	}
 	return nil
+}
+
+func quotaWindowKindForClaudeLimiter(limiterType string) string {
+	switch {
+	case strings.HasPrefix(limiterType, "7d"):
+		return quotaWindowKind7d
+	case strings.HasPrefix(limiterType, "5h"):
+		return quotaWindowKind5h
+	}
+	return ""
 }
 
 func parseClaudeOAuthUsage(body []byte, now int64) (claudeOAuthUsageParsed, error) {
