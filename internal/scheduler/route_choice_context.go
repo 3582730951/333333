@@ -96,6 +96,21 @@ func (s *Scheduler) selectFromRouteChoiceContext(ctx context.Context, route Rout
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.used = true
+	if strings.TrimSpace(route.RequiredAccountID) != "" || strings.TrimSpace(route.RequiredEgressID) != "" {
+		// Durable server-side session identity pins account+egress exactly.
+		// The choice machinery (SelectAcross) evaluates whole account pools and
+		// returns an arbitrary account with the group-selected egress, which the
+		// session identity check rejects as an epoch conflict (409 "Codex session
+		// identity is no longer available"). Delegate to the strict path that
+		// honors the pins; the remaining choices engage only when it has no
+		// schedulable account on the pinned outlet.
+		bypassCtx := context.WithValue(ctx, routeChoiceBypassKey{}, true)
+		lease, selectErr := s.Select(bypassCtx, route)
+		if selectErr != nil {
+			return Lease{}, true, selectErr
+		}
+		return lease, true, nil
+	}
 	bypassCtx := context.WithValue(ctx, routeChoiceBypassKey{}, true)
 	choices := make([]RouteChoice, 0, len(state.templates))
 	for _, template := range state.templates {
