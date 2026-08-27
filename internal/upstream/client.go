@@ -2001,6 +2001,19 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) error {
 	if spec.Account.IsFedramp {
 		setIfEmptyPreserveCase(dst, "X-OpenAI-Fedramp", "true")
 	}
+	// The official Codex CLI stamps x-codex-routing-hint on every codex-backend
+	// request: the /responses and compact transports (client.rs build_api_transport
+	// / compact_input) and the WebSocket handshake (client.rs build_websocket_headers),
+	// each only when the account authenticates to the codex backend. This block runs
+	// only for OAuth accounts (API-key returns above), matching that gate. The hint is
+	// gateway-owned: any downstream-supplied value is stripped and the header is
+	// synthesized from the FINAL upstream body model.
+	deleteHeaderFold(dst, "x-codex-routing-hint")
+	if spec.DownstreamPath == "" || strings.Contains(spec.DownstreamPath, "/responses") || strings.Contains(strings.ToLower(spec.DownstreamPath), "compact") {
+		if hint := codexRoutingHintHeaderValue(spec); hint != "" {
+			setHeaderPreserveCase(dst, "x-codex-routing-hint", hint)
+		}
+	}
 	return nil
 }
 

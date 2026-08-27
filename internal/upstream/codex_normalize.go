@@ -38,6 +38,36 @@ func codexStoreValue(upstreamBaseURL string) bool {
 	return false
 }
 
+// codexIncludeWireValue is the include array the official Codex CLI always
+// serializes (codex-rs client.rs:959 — ResponsesApiRequest.include has no
+// skip_serializing_if): it requests server-side encrypted reasoning delivery.
+var codexIncludeWireValue = []byte(`["reasoning.encrypted_content"]`)
+
+// codexIncludeNeedsDefault reports whether a Responses include member is a wire
+// deviation from that always-serialized canonical value: absent or an empty
+// array. A non-empty include is a downstream parse contract and is preserved
+// verbatim — forcing a different value would hand the client a stream it did
+// not ask for. A non-array include is left for the upstream to validate.
+func codexIncludeNeedsDefault(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return true
+	}
+	var items []string
+	if err := json.Unmarshal(trimmed, &items); err != nil {
+		return false
+	}
+	if len(items) == 0 {
+		return true
+	}
+	for _, item := range items {
+		if item == "reasoning.encrypted_content" {
+			return false
+		}
+	}
+	return false
+}
+
 // normalizeCodexResponsesBody ensures a Codex /responses request body matches the shape
 // the real Codex client always sends, on the fields the WHAM backend hard-validates:
 //
@@ -73,6 +103,14 @@ func codexStoreValue(upstreamBaseURL string) bool {
 //     present. codex-rs sets this in build_reasoning; omitting it makes the live
 //     backend reject an otherwise valid request with HTTP 400. The gateway keeps
 //     effort/summary intact and only adds or corrects the context member.
+//
+//   - "include": the official client ALWAYS serializes include:["reasoning.
+//     encrypted_content"] (codex-rs client.rs:959, no skip_serializing_if). An
+//     absent or empty include is a wire deviation the relay corrects to that
+//     canonical value. A non-empty include is a downstream parse contract and is
+//     preserved verbatim — a different value would change the event stream the
+//     client asked for. This is the backfill for native pass-through; the
+//     Messages->Chat->Responses bridge already emits the canonical include.
 //
 // DELIBERATELY NOT NORMALIZED HERE: "stream". The WHAM backend is streaming-only and a
 // non-streaming (stream:false) request is rejected with the SAME 400 {"detail":"Store must
@@ -116,6 +154,7 @@ func normalizeCodexResponsesBody(raw []byte, upstreamBaseURL string, responsesLi
 		Store             *bool           `json:"store"`
 		ParallelToolCalls json.RawMessage `json:"parallel_tool_calls"`
 		Tools             json.RawMessage `json:"tools"`
+		Include           json.RawMessage `json:"include"`
 		Reasoning         *struct {
 			Context string `json:"context"`
 		} `json:"reasoning"`
@@ -136,7 +175,8 @@ func normalizeCodexResponsesBody(raw []byte, upstreamBaseURL string, responsesLi
 		parallelOK = len(probe.ParallelToolCalls) == 0 || !toolsKnown || !toolsEmpty
 	}
 	reasoningContextOK := !responsesLite || (probe.Reasoning != nil && probe.Reasoning.Context == "all_turns")
-	if instructionsOK && storeOK && parallelOK && reasoningContextOK {
+	includeOK := !codexIncludeNeedsDefault(probe.Include)
+	if instructionsOK && storeOK && parallelOK && reasoningContextOK && includeOK {
 		// Already matches the real-client shape: forward byte-identical.
 		return raw
 	}
@@ -180,6 +220,13 @@ func normalizeCodexResponsesBody(raw []byte, upstreamBaseURL string, responsesLi
 	}
 	if !reasoningContextOK {
 		if !set("reasoning.context", "all_turns") {
+			return raw
+		}
+	}
+	if !includeOK {
+		var err error
+		out, err = sjson.SetRawBytes(out, "include", codexIncludeWireValue)
+		if err != nil {
 			return raw
 		}
 	}

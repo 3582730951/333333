@@ -169,21 +169,21 @@ func TestNormalizeCodexClassicParallelToolCallsRequireTools(t *testing.T) {
 		},
 		{
 			name:         "function tool preserves parallel true",
-			body:         `{"model":"gpt-5.5","instructions":"keep","store":false,"tools":[{"type":"function","name":"Read","parameters":{"type":"object"}}],"parallel_tool_calls":true,"input":"hi"}`,
+			body:         `{"model":"gpt-5.5","instructions":"keep","store":false,"tools":[{"type":"function","name":"Read","parameters":{"type":"object"}}],"parallel_tool_calls":true,"include":["reasoning.encrypted_content"],"input":"hi"}`,
 			wantPresent:  true,
 			wantParallel: true,
 			byteExact:    true,
 		},
 		{
 			name:         "official tool preserves explicit false",
-			body:         `{"model":"gpt-5.5","instructions":"keep","store":false,"tools":[{"type":"web_search"}],"parallel_tool_calls":false,"input":"hi"}`,
+			body:         `{"model":"gpt-5.5","instructions":"keep","store":false,"tools":[{"type":"web_search"}],"parallel_tool_calls":false,"include":["reasoning.encrypted_content"],"input":"hi"}`,
 			wantPresent:  true,
 			wantParallel: false,
 			byteExact:    true,
 		},
 		{
 			name:         "unknown future tools shape passes through",
-			body:         `{"model":"gpt-5.5","instructions":"keep","store":false,"tools":{"future":true},"parallel_tool_calls":true,"input":"hi"}`,
+			body:         `{"model":"gpt-5.5","instructions":"keep","store":false,"tools":{"future":true},"parallel_tool_calls":true,"include":["reasoning.encrypted_content"],"input":"hi"}`,
 			wantPresent:  true,
 			wantParallel: true,
 			byteExact:    true,
@@ -409,7 +409,7 @@ func TestNormalizeCodexResponsesLiteMergesGatewayToolsAndInstructions(t *testing
 }
 
 func TestNormalizeCodexResponsesLiteAlreadyNormalizedIsByteIdentical(t *testing.T) {
-	raw := []byte(`{ "model":"gpt-5.6-sol", "store":false, "parallel_tool_calls":false, "reasoning":{"context":"all_turns"}, "input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"keep","parameters":{"const":900719925474099312345}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"keep"}]},{"role":"user","content":"hi"}] }`)
+	raw := []byte(`{ "model":"gpt-5.6-sol", "store":false, "parallel_tool_calls":false, "reasoning":{"context":"all_turns"}, "include":["reasoning.encrypted_content"], "input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"keep","parameters":{"const":900719925474099312345}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"keep"}]},{"role":"user","content":"hi"}] }`)
 	got := normalizeCodexResponsesBody(raw, whamBaseURL, true)
 	if !bytes.Equal(got, raw) {
 		t.Fatalf("already-normalized Lite body changed:\nwant %s\n got %s", raw, got)
@@ -468,8 +468,61 @@ func TestNormalizeCodexResponsesLiteCompactAddsOnlyLiteFields(t *testing.T) {
 	}
 }
 
+func TestNormalizeCodexResponsesBodyDefaultsCanonicalInclude(t *testing.T) {
+	// codex-rs (client.rs:959) always serializes include=["reasoning.encrypted_content"]
+	// on every Responses request. Absent/empty include is a wire deviation that the
+	// normalizer backfills; a non-empty include is a downstream parse contract and is
+	// preserved verbatim (e.g. custom_stream_test's ["web_search_call.results"]).
+	tests := []struct {
+		name string
+		body string
+		want string // substring expected after normalization; "" = byte-identical
+	}{
+		{
+			name: "absent include gets canonical value",
+			body: `{"model":"gpt-5.6-sol","instructions":"x","store":false,"input":[{"role":"user","content":"hi"}]}`,
+			want: `"include":["reasoning.encrypted_content"]`,
+		},
+		{
+			name: "empty include gets canonical value",
+			body: `{"model":"gpt-5.6-sol","instructions":"x","store":false,"include":[],"input":[{"role":"user","content":"hi"}]}`,
+			want: `"include":["reasoning.encrypted_content"]`,
+		},
+		{
+			name: "non-array include left for upstream validation",
+			body: `{"model":"gpt-5.6-sol","instructions":"x","store":false,"include":"bad","input":[{"role":"user","content":"hi"}]}`,
+			want: `"include":"bad"`,
+		},
+		{
+			name: "non-empty custom include preserved verbatim",
+			body: `{"model":"gpt-5.6-sol","instructions":"x","store":false,"include":["web_search_call.results"],"input":[{"role":"user","content":"hi"}]}`,
+			want: "",
+		},
+		{
+			name: "canonical include leaves body byte-identical",
+			body: `{"model":"gpt-5.6-sol","instructions":"x","store":false,"include":["reasoning.encrypted_content"],"input":[{"role":"user","content":"hi"}]}`,
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := []byte(tt.body)
+			got := normalizeCodexResponsesBody(raw, whamBaseURL, false)
+			if tt.want == "" {
+				if !bytes.Equal(got, raw) {
+					t.Fatalf("canonical body changed:\nwant %s\n got %s", raw, got)
+				}
+				return
+			}
+			if !bytes.Contains(got, []byte(tt.want)) {
+				t.Fatalf("include not as expected:\nwant substring %s\n got %s", tt.want, got)
+			}
+		})
+	}
+}
+
 func TestNormalizeCodexResponsesBodyDoesNotApplyLiteEnvelopeWithoutLiteTransport(t *testing.T) {
-	raw := []byte(`{"model":"gpt-5.6-sol","instructions":"classic","store":false,"tools":[{"type":"web_search"}],"input":"hi"}`)
+	raw := []byte(`{"model":"gpt-5.6-sol","instructions":"classic","store":false,"tools":[{"type":"web_search"}],"include":["reasoning.encrypted_content"],"input":"hi"}`)
 	got := normalizeCodexResponsesBody(raw, whamBaseURL, false)
 	if !bytes.Equal(got, raw) {
 		t.Fatalf("API-key/classic request was rewritten as Lite:\nwant %s\n got %s", raw, got)
@@ -477,7 +530,7 @@ func TestNormalizeCodexResponsesBodyDoesNotApplyLiteEnvelopeWithoutLiteTransport
 }
 
 func TestNormalizeCodexClassicOfficialFieldsRemainByteIdentical(t *testing.T) {
-	raw := []byte(`{"model":"gpt-5.6-sol","instructions":"classic developer","store":false,"stream":true,"tools":[{"type":"function","name":"request_user_input","parameters":{"type":"object"}}],"parallel_tool_calls":true,"tool_choice":"auto","reasoning":{"effort":"xhigh","summary":"auto"},"service_tier":"priority","prompt_cache_key":"thread-cache","text":{"verbosity":"low"},"previous_response_id":"resp_previous","input":[{"role":"user","content":"continue"}],"client_metadata":{"custom":"keep"}}`)
+	raw := []byte(`{"model":"gpt-5.6-sol","instructions":"classic developer","store":false,"stream":true,"tools":[{"type":"function","name":"request_user_input","parameters":{"type":"object"}}],"parallel_tool_calls":true,"tool_choice":"auto","reasoning":{"effort":"xhigh","summary":"auto"},"include":["reasoning.encrypted_content"],"service_tier":"priority","prompt_cache_key":"thread-cache","text":{"verbosity":"low"},"previous_response_id":"resp_previous","input":[{"role":"user","content":"continue"}],"client_metadata":{"custom":"keep"}}`)
 	got := normalizeCodexResponsesBody(raw, whamBaseURL, false)
 	if !bytes.Equal(got, raw) {
 		t.Fatalf("classic/API-key request fields changed:\nwant %s\n got %s", raw, got)

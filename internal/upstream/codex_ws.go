@@ -533,7 +533,10 @@ func buildCodexWebSocketCreatePayload(body []byte, ids codexWebSocketIDs) ([]byt
 	}{
 		{"tool_choice", "auto"},
 		{"store", false},
-		{"include", []interface{}{}},
+		// The official client always serializes include:["reasoning.encrypted_content"]
+		// on the WS create frame too (codex-rs build_responses_request serves both
+		// transports). The default is only installed when the frame omitted it.
+		{"include", []interface{}{"reasoning.encrypted_content"}},
 	} {
 		if err := setDefault(field.path, field.value); err != nil {
 			return nil, err

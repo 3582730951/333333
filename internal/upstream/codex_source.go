@@ -157,8 +157,19 @@ func normalizeCodexSource(client *Client, spec *Request, upstreamBaseURL string,
 				patches = append(patches, bodysource.JSONFieldPatch{Name: "parallel_tool_calls", Value: []byte("false")})
 			}
 		}
-		if _, present := meta.Fields["include"]; !present {
-			patches = append(patches, bodysource.JSONFieldPatch{Name: "include", Value: []byte("[]")})
+	}
+	// The official client always serializes include:["reasoning.encrypted_content"]
+	// (codex-rs client.rs:959). A request missing it or carrying an empty array is a
+	// wire deviation the relay corrects; a non-empty include is a downstream parse
+	// contract and is preserved byte-for-byte. Compact has its own schema and never
+	// carries include.
+	if !compact {
+		includeRaw, ok, err := requestSpan(spec.Body, meta.Fields["include"], maxCodexPatchFieldBytes)
+		if err != nil || !ok {
+			includeRaw = nil
+		}
+		if codexIncludeNeedsDefault(includeRaw) {
+			patches = append(patches, bodysource.JSONFieldPatch{Name: "include", Value: codexIncludeWireValue})
 		}
 	}
 	if reasoning, ok, err := requestSpan(spec.Body, meta.Fields["reasoning"], maxCodexPatchFieldBytes); err != nil {

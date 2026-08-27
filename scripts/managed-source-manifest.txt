@@ -937,6 +937,8 @@ internal/upstream/codex_metadata.go
 internal/upstream/codex_metadata_test.go
 internal/upstream/codex_normalize.go
 internal/upstream/codex_normalize_test.go
+internal/upstream/codex_routing_hint.go
+internal/upstream/codex_routing_hint_test.go
 internal/upstream/codex_source.go
 internal/upstream/codex_source_test.go
 internal/upstream/codex_version.go

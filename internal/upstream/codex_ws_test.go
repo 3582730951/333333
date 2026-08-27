@@ -331,7 +331,7 @@ func TestCodexResponsesWebSocketStreamsBodySourceWithoutMaterializing(t *testing
 	if err = json.Unmarshal(payload["input"], &input); err != nil || input != largeInput {
 		t.Fatalf("large input changed: len=%d err=%v", len(input), err)
 	}
-	if string(payload["type"]) != `"response.create"` || string(payload["stream"]) != "true" || string(payload["tools"]) != "[]" || string(payload["tool_choice"]) != `"auto"` || string(payload["include"]) != "[]" {
+	if string(payload["type"]) != `"response.create"` || string(payload["stream"]) != "true" || string(payload["tools"]) != "[]" || string(payload["tool_choice"]) != `"auto"` || string(payload["include"]) != `["reasoning.encrypted_content"]` {
 		t.Fatalf("source websocket defaults missing: %s", payload)
 	}
 	if _, present := payload["parallel_tool_calls"]; present {

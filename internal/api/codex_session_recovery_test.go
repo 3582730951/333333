@@ -362,7 +362,11 @@ func TestCodexSessionMappingRepairsEncryptedFunctionOutputBeforeCommit(t *testin
 						r.Header.Get("X-Codex-Turn-State") != "" ||
 						strings.Contains(payload, `"type":"function_call"`) ||
 						strings.Contains(payload, "function_call_output") ||
-						strings.Contains(payload, "encrypted_content") ||
+						// The dangerous residual is an encrypted_content OBJECT FIELD on an
+						// input item. The top-level include array member
+						// "reasoning.encrypted_content" (which codex-rs always serializes and
+						// the real upstream accepts) must not be mistaken for it.
+						strings.Contains(payload, `"encrypted_content":`) ||
 						strings.Contains(payload, "opaque-invalid") ||
 						!strings.Contains(payload, "start durable encrypted task") ||
 						!strings.Contains(payload, "preserve recovered result")
@@ -462,7 +466,9 @@ func TestCodexSessionMappingRetiresLateEncryptedFunctionOutputAndRepairsNextTurn
 			payload := string(raw)
 			if strings.Contains(payload, "previous_response_id") || strings.Contains(payload, "function_call_output") ||
 				strings.Contains(payload, `"type":"function_call"`) ||
-				strings.Contains(payload, "encrypted_content") || strings.Contains(payload, "opaque-late-invalid") ||
+				// encrypted_content object field only; the include array member
+				// "reasoning.encrypted_content" is a legitimate codex-rs wire field.
+				strings.Contains(payload, `"encrypted_content":`) || strings.Contains(payload, "opaque-late-invalid") ||
 				!strings.Contains(payload, "late recovered result") {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadRequest)
