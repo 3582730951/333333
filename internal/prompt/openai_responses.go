@@ -229,6 +229,13 @@ func ResponsesRequestToChatCompletionBridge(raw []byte) (ResponsesChatBridgeResu
 	if v, ok := root["parallel_tool_calls"]; ok {
 		out["parallel_tool_calls"] = v
 	}
+	// prompt_cache_key is a routing hint, not context: Chat Completions honors it with
+	// the same semantics as Responses. Rebuilding the body without it sent every bridged
+	// turn of an append-only conversation to an unkeyed cache, so the prefix the previous
+	// turn had just written was never looked up again.
+	if v, ok := root["prompt_cache_key"].(string); ok && strings.TrimSpace(v) != "" {
+		out["prompt_cache_key"] = v
+	}
 	if len(chatTools) > 0 {
 		out["tools"] = chatTools
 	}

@@ -52,6 +52,12 @@ func TestLoadMigratesPre21226ClaudeOAuthFingerprint(t *testing.T) {
 
 func TestOAuthDefaultsAvailableWithoutLoad(t *testing.T) {
 	cfg := Default()
+	// The attribution fingerprint defaults ON: official 2.1.236–2.1.241 binaries
+	// emit cc_version=<v>.<3hex> (verified 2026-08-24), and the pool must mirror
+	// the genuine wire unless an env/manifest assertion flips it.
+	if !cfg.ClaudeAttributionFingerprintEnabled() {
+		t.Fatal("Default() must enable the Claude attribution fingerprint (genuine client state is live)")
+	}
 	for name, value := range map[string]string{
 		"codex auth URL":           cfg.CodexOAuthAuthURL,
 		"codex token URL":          cfg.CodexOAuthTokenURL,
@@ -212,8 +218,8 @@ func TestLoadKeepsNewerCodexClientVersions(t *testing.T) {
 	}
 }
 
-func TestLoadKeepsFiveSupportedCodexCLIVersions(t *testing.T) {
-	wantVersions := []string{"0.148.0", "0.147.0", "0.146.1", "0.146.0", "0.145.0"}
+func TestLoadKeepsSevenSupportedCodexCLIVersions(t *testing.T) {
+	wantVersions := []string{"0.149.1", "0.149.0", "0.148.0", "0.147.0", "0.146.1", "0.146.0", "0.145.0"}
 	if got := SupportedCodexCLIVersions(); !reflect.DeepEqual(got, wantVersions) {
 		t.Fatalf("SupportedCodexCLIVersions() = %v, want %v", got, wantVersions)
 	}
@@ -237,7 +243,7 @@ func TestLoadKeepsFiveSupportedCodexCLIVersions(t *testing.T) {
 
 func TestCodexCLIFingerprintLibraryMatchesDefaultAndReturnsCopies(t *testing.T) {
 	versions := SupportedCodexCLIVersions()
-	if len(versions) != 5 || versions[0] != DefaultClientVersion {
+	if len(versions) != 7 || versions[0] != DefaultClientVersion {
 		t.Fatalf("fingerprint versions=%v default=%q", versions, DefaultClientVersion)
 	}
 	versions[0] = "mutated"
@@ -249,8 +255,49 @@ func TestCodexCLIFingerprintLibraryMatchesDefaultAndReturnsCopies(t *testing.T) 
 		!latest.CodeModeToolNames || !latest.ParentTurnID || !latest.PromptCacheKeyBySession {
 		t.Fatalf("latest fingerprint=%+v ok=%v", latest, ok)
 	}
-	if _, ok := CodexCLIFingerprintForVersion("0.149.0"); ok {
+	if _, ok := CodexCLIFingerprintForVersion("0.150.0"); ok {
 		t.Fatal("unknown future version matched the verified fingerprint library")
+	}
+	if _, ok := CodexCLIFingerprintForVersion("0.149.0"); !ok {
+		t.Fatal("0.149.0 release was not added to the verified fingerprint library")
+	}
+}
+
+func TestClaudeCLIFingerprintLibraryMatchesDefaultAndReturnsCopies(t *testing.T) {
+	want := []string{"2.1.241", "2.1.240", "2.1.239", "2.1.238", "2.1.237", "2.1.236", "2.1.226"}
+	if got := SupportedClaudeCLIVersions(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("SupportedClaudeCLIVersions() = %v, want %v", got, want)
+	}
+	if got := SupportedClaudeCLIVersions()[0]; got != DefaultClaudeCLIVersion {
+		t.Fatalf("fingerprint head=%q default=%q", got, DefaultClaudeCLIVersion)
+	}
+	// The library returns a copy; mutating it must not corrupt the contract.
+	versions := SupportedClaudeCLIVersions()
+	versions[0] = "mutated"
+	if got := SupportedClaudeCLIVersions()[0]; got != DefaultClaudeCLIVersion {
+		t.Fatalf("caller mutated fingerprint library head: %q", got)
+	}
+	// v-prefixed lookup normalizes exactly like the Codex library.
+	latest, ok := ClaudeCLIFingerprintForVersion("v" + DefaultClaudeCLIVersion)
+	if !ok || latest.Version != DefaultClaudeCLIVersion || latest.StainlessPackageVersion != "0.112.1" ||
+		latest.NodeVersion != DefaultClaudeNodeVersion {
+		t.Fatalf("latest fingerprint=%+v ok=%v", latest, ok)
+	}
+	if _, ok := ClaudeCLIFingerprintForVersion("2.1.242"); ok {
+		t.Fatal("unknown future version matched the verified fingerprint library")
+	}
+	if _, ok := ClaudeCLIFingerprintForVersion("2.1.226"); !ok {
+		t.Fatal("2.1.226 release was not added to the verified fingerprint library")
+	}
+	// cli→stainless is a single coherent axis, never two independently-rotated ones.
+	if got := ClaudeStainlessVersionForCLI("2.1.226", "0.112.1"); got != "0.94.0" {
+		t.Fatalf("ClaudeStainlessVersionForCLI(2.1.226) = %q, want 0.94.0", got)
+	}
+	if got := ClaudeStainlessVersionForCLI(DefaultClaudeCLIVersion, "fallback"); got != "0.112.1" {
+		t.Fatalf("ClaudeStainlessVersionForCLI(%s) = %q, want 0.112.1", DefaultClaudeCLIVersion, got)
+	}
+	if got := ClaudeStainlessVersionForCLI("2.1.999", "fallback"); got != "fallback" {
+		t.Fatalf("unknown version should return fallback, got %q", got)
 	}
 }
 

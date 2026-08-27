@@ -599,9 +599,35 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 		osHint := s.osHint(body, lease.Egress)
 		id := s.virtualIdentity(r.Context(), lease.Account.ID, osHint)
 		billingVersion := s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
-		scrub = cloak.VirtualizeClaudeCode(body, id, s.cfg.SensitiveWordsFor(provider.ID), claudeIsOAuth(token), billingVersion)
+		// A relayed Anthropic endpoint caches exactly like the first-party one, so it gets
+		// the same breakpoint and TTL treatment. Passing a zero ClaudeCodeCacheOptions here
+		// silently disabled BOTH the native auto-context breakpoint and every cache_control
+		// TTL normalization for custom providers — the operator's claude_cache_* settings
+		// applied to first-party accounts only, which is why relayed traffic sat near cold
+		// on every model.
+		apiKeyHash, _ := downstreamFromCtx(r.Context())
+		nativeCacheInject := s.nativeCacheBreakpointInjectEnabled(r.Context())
+		claudeTTL := s.claudeCacheTTLForRoute(r.Context(), affinity)
+		breakpointPolicy := s.claudeCacheBreakpointPolicy(r.Context(), affinity, lease.Account.ID, routeGroup, apiKeyHash)
+		scrub = cloak.VirtualizeClaudeCodeWithCache(body, id, s.cfg.SensitiveWordsFor(provider.ID), claudeIsOAuth(token), billingVersion, cloak.ClaudeCodeCacheOptions{
+			NativeBreakpoints: nativeCacheInject,
+			BreakpointPolicy:  breakpointPolicy,
+			TTL:               claudeTTL,
+			// AttributionFingerprint is deliberately left off. It is a wire-realism knob,
+			// not a cache control, and enabling it here would change the cc_version a relay
+			// sees without improving hit rate.
+		})
+		if nativeCacheInject {
+			scrub.Body = prompt.EnsureAnthropicCacheControlWithOptions(scrub.Body, prompt.AnthropicCacheControlOptions{
+				TTL:                claudeTTL,
+				Policy:             breakpointPolicy,
+				LatestTailWrite:    s.claudeCacheLatestTailWriteEnabled(r.Context()),
+				LosslessBlockSplit: s.claudeCacheLosslessBlockSplitEnabled(r.Context()),
+			})
+		}
 	} else {
 		scrub = cloak.ScrubSensitive(body, s.cfg.SensitiveWordsFor(provider.ID))
+		scrub.Body = ensureCustomProviderPromptCacheKey(scrub.Body, provider, model)
 	}
 	body = scrub.Body
 	scrubber := scrub.Scrubber
@@ -775,6 +801,31 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 // handleChatViaCustom relays a /v1/chat/completions request to a custom provider. Both
 // sides speak Chat Completions, so the body and response pass through unchanged (only
 // sensitive-word scrubbing + usage capture are applied).
+// ensureCustomProviderPromptCacheKey gives an OpenAI-compatible relay the same stable
+// prompt_cache_key the first-party Codex handler synthesizes. That synthesis lived only
+// on the Codex path, so a relayed request arrived with no key at all and the upstream
+// fell back to implicit prefix matching — which a multi-key relay pool scatters across
+// backends, producing the "low hit rate on every model" symptom.
+//
+// A key the client chose is never overwritten, and a body with no reusable prefix to key
+// is left alone. Anthropic-protocol providers are excluded: they cache via cache_control
+// breakpoints, and an unknown top-level field risks a strict relay rejecting the request.
+func ensureCustomProviderPromptCacheKey(body []byte, provider storage.CustomProvider, model string) []byte {
+	switch provider.UpstreamProtocol {
+	case storage.CustomProviderProtocolChatCompletions, storage.CustomProviderProtocolResponses:
+	default:
+		return body
+	}
+	if routing.PromptCacheKey(body) != "" {
+		return body
+	}
+	prefixHash := automaticPromptCachePrefixHash(body)
+	if prefixHash == "" {
+		return body
+	}
+	return ensureResponsesPromptCacheKey(body, automaticPromptCacheKey(model, prefixHash))
+}
+
 func (s *Server) handleChatViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
 	r = withCustomProviderDownstreamAffinity(r, raw, "codex")
 	provider, _ = storage.ResolveCustomProviderRoute(provider, storage.CustomProviderDownstreamChat)

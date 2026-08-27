@@ -90,6 +90,131 @@ func TestBuildQuotaSummarySelectsProviderPrimarySecondaryAndReasons(t *testing.T
 	}
 }
 
+func TestEstimateQuota(t *testing.T) {
+	now := int64(1_700_000_000)
+	cases := []struct {
+		name           string
+		account        storage.Account
+		primary        *storage.AccountRateLimit
+		credits        *QuotaCredits
+		wantEstimated  bool
+		wantMethod     string
+		wantLimit      float64
+		wantUsed       float64
+		wantRemaining  float64
+		wantExtra      float64
+		wantPlan       string
+	}{
+		{
+			// sub2api model: a subscription window is a rate limit, not dollars —
+			// no plan price is ever converted, no matter how full the window is.
+			name: "codex plus 55% used", account: storage.Account{Provider: "codex", PlanType: "plus"},
+			primary: &storage.AccountRateLimit{LimiterType: "5h_polled", UsedPercent: 55, UpdatedAt: now},
+			wantEstimated: false, wantMethod: "window_based", wantPlan: "plus",
+		},
+		{
+			name: "claude pro 42% used", account: storage.Account{Provider: "claude", PlanType: "pro"},
+			primary: &storage.AccountRateLimit{LimiterType: "5h_oauth_usage", UsedPercent: 42, UpdatedAt: now},
+			wantEstimated: false, wantMethod: "window_based", wantPlan: "pro",
+		},
+		{
+			name: "claude max 20x", account: storage.Account{Provider: "claude", PlanType: "max_20x"},
+			primary: &storage.AccountRateLimit{LimiterType: "5h_oauth_usage", UsedPercent: 0, UpdatedAt: now},
+			wantEstimated: false, wantMethod: "window_based", wantPlan: "max_20x",
+		},
+		{
+			// Without a price table every plan on a subscription provider is
+			// window_based; the plan name no longer selects a dollar baseline.
+			name: "unlisted plan", account: storage.Account{Provider: "codex", PlanType: "cosmic"},
+			primary: &storage.AccountRateLimit{LimiterType: "5h_polled", UsedPercent: 10, UpdatedAt: now},
+			wantEstimated: false, wantMethod: "window_based", wantPlan: "cosmic",
+		},
+		{
+			name: "api key payg", account: storage.Account{Provider: "codex", PlanType: "api"},
+			primary: &storage.AccountRateLimit{LimiterType: "5h_polled", UsedPercent: 10, UpdatedAt: now},
+			wantEstimated: false, wantMethod: "pay_as_you_go",
+		},
+		{
+			name: "deepseek not supported", account: storage.Account{Provider: "deepseek", PlanType: "payg"},
+			primary: &storage.AccountRateLimit{LimiterType: "deepseek_balance", UsedPercent: -1, UpdatedAt: now},
+			wantEstimated: false, wantMethod: "not_supported",
+		},
+		{
+			// A subscription plan plus a real upstream balance: the balance is the
+			// only dollar figure and is surfaced verbatim (no plan price added).
+			name: "plus credits added", account: storage.Account{Provider: "codex", PlanType: "plus"},
+			primary: &storage.AccountRateLimit{LimiterType: "5h_polled", UsedPercent: 50, UpdatedAt: now},
+			credits: &QuotaCredits{HasCredits: true, Balance: "$5.00"},
+			wantEstimated: true, wantMethod: "payg_credits_balance", wantRemaining: 5, wantExtra: 5, wantPlan: "plus",
+		},
+		{
+			// A window row without a percentage changes nothing: windows never
+			// produce dollars, so the basis is window_based with no numbers.
+			name: "no window data", account: storage.Account{Provider: "claude", PlanType: "pro"},
+			primary: &storage.AccountRateLimit{LimiterType: "5h_oauth_usage", UsedPercent: -1, UpdatedAt: now},
+			wantEstimated: false, wantMethod: "window_based", wantPlan: "pro",
+		},
+		{
+			// Pay-as-you-go has no plan window, but an upstream credit balance is
+			// the one real dollar figure available and should surface as remaining.
+			name: "payg credits balance", account: storage.Account{Provider: "codex", PlanType: "payg"},
+			primary: &storage.AccountRateLimit{LimiterType: "5h_polled", UsedPercent: 10, UpdatedAt: now},
+			credits: &QuotaCredits{HasCredits: true, Balance: "$25.00"},
+			wantEstimated: true, wantMethod: "payg_credits_balance", wantRemaining: 25, wantExtra: 25,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			est := estimateQuota(tc.account, tc.primary, tc.credits, now)
+			if est == nil {
+				t.Fatal("estimate nil")
+			}
+			if est.Estimated != tc.wantEstimated || est.Method != tc.wantMethod {
+				t.Fatalf("estimated=%v method=%q, want estimated=%v method=%q", est.Estimated, est.Method, tc.wantEstimated, tc.wantMethod)
+			}
+			if est.Plan != tc.wantPlan {
+				t.Fatalf("plan=%q, want %q", est.Plan, tc.wantPlan)
+			}
+			if tc.wantEstimated {
+				if est.LimitUSD != tc.wantLimit || est.UsedUSD != tc.wantUsed || est.RemainingUSD != tc.wantRemaining || est.ExtraUSD != tc.wantExtra {
+					t.Fatalf("limit=%v used=%v remaining=%v extra=%v, want limit=%v used=%v remaining=%v extra=%v", est.LimitUSD, est.UsedUSD, est.RemainingUSD, est.ExtraUSD, tc.wantLimit, tc.wantUsed, tc.wantRemaining, tc.wantExtra)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildQuotaSummaryIncludesEstimate(t *testing.T) {
+	now := int64(1_700_000_000)
+	token := storage.AccountToken{AccountID: "acc", AccessToken: "access", RefreshToken: "refresh", ExpiresAt: now + 3600}
+	account := storage.Account{ID: "acc", Provider: "codex", PlanType: "plus", Status: "active"}
+	summary := BuildQuotaSummary(account, &token, []storage.AccountRateLimit{
+		{AccountID: "acc", Provider: "codex", LimiterType: "5h_polled", Source: "5h_polled", UsedPercent: 25, UpdatedAt: now - 10},
+	}, now)
+	if summary.SyncReason != "ok" {
+		t.Fatalf("sync_reason=%q, want ok: %#v", summary.SyncReason, summary)
+	}
+	if summary.Estimate == nil || summary.Estimate.Method != "window_based" {
+		t.Fatalf("estimate missing window_based basis: %#v", summary)
+	}
+	// A subscription window must never fabricate dollars (sub2api model).
+	if summary.Estimate.Estimated || summary.Estimate.RemainingUSD != 0 || summary.Estimate.LimitUSD != 0 {
+		t.Fatalf("window_based estimate must carry no fabricated USD: %#v", summary.Estimate)
+	}
+	if summary.Estimate.UsedPercent != 25 {
+		t.Fatalf("used_percent=%v, want 25", summary.Estimate.UsedPercent)
+	}
+	// unsupported-billing gates must not produce an estimate
+	apiKey := storage.Account{ID: "acc", Provider: "codex", PlanType: "plus", Status: "active"}
+	apiToken := storage.AccountToken{AccountID: "acc", OpenAIAPIKey: "sk-test"}
+	apiSummary := BuildQuotaSummary(apiKey, &apiToken, []storage.AccountRateLimit{
+		{AccountID: "acc", Provider: "codex", LimiterType: "5h_polled", UsedPercent: 25, UpdatedAt: now - 10},
+	}, now)
+	if apiSummary.Supported || apiSummary.Estimate != nil {
+		t.Fatalf("api-key billing should not produce an estimate: %#v", apiSummary)
+	}
+}
+
 func TestAdminQuotaIncludeMissingAndAccountsUseQuotaSummary(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	ctx := context.Background()

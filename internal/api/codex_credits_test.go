@@ -75,9 +75,18 @@ func TestPollOneCodexQuotaPersistsExtraCredits(t *testing.T) {
 	if summary.Credits.UsedPercent != 37 || summary.Credits.RemainingPercent != 63 {
 		t.Fatalf("credits percentages = %+v", summary.Credits)
 	}
+	if !summary.Credits.SpendControl {
+		t.Fatalf("spend_control flag not set: %+v", summary.Credits)
+	}
 	// The balance row must never be promoted into the 5h/7d window slots.
 	if summary.Primary != nil && summary.Primary.LimiterType == codexCreditsLimiterType {
 		t.Fatalf("credits row leaked into primary window: %+v", summary.Primary)
+	}
+	// The live wham plan_type must be persisted so the USD estimate keys off the
+	// current plan, not the plan detected at registration/import time.
+	got, err := h.store.GetAccount(ctx, acc.ID)
+	if err != nil || got.PlanType != "pro" {
+		t.Fatalf("account plan_type = %q (err=%v), want %q", got.PlanType, err, "pro")
 	}
 }
 
@@ -116,10 +125,11 @@ func TestPollOneCodexQuotaOmitsCreditsWhenUpstreamSilent(t *testing.T) {
 // and an unlimited balance has no percentage to report.
 func TestCodexCreditsStatusReflectsUpstreamState(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		body       string
-		wantStatus string
-		wantPct    float64
+		name             string
+		body             string
+		wantStatus       string
+		wantPct          float64
+		wantSpendControl bool
 	}{
 		{
 			name:       "depleted",
@@ -138,6 +148,16 @@ func TestCodexCreditsStatusReflectsUpstreamState(t *testing.T) {
 			body:       `{"rate_limit":{"primary_window":{"used_percent":5,"limit_window_seconds":18000,"reset_after_seconds":60}},"credits":{"has_credits":true,"unlimited":false},"spend_control":{"reached":true}}`,
 			wantStatus: "spend_limit_reached",
 			wantPct:    -1,
+		},
+		{
+			// Spend-control-only rows (no credits block at all) must be
+			// distinguishable from a genuinely depleted balance: has_credits=false
+			// here means "no extra balance", not "balance used up".
+			name:             "spend control only",
+			body:             `{"rate_limit":{"primary_window":{"used_percent":5,"limit_window_seconds":18000,"reset_after_seconds":60}},"spend_control":{"reached":false,"individual_limit":{"source":"workspace","limit":"$50.00","used":"$10.00","remaining":"$40.00","used_percent":20}}}`,
+			wantStatus:       "ok",
+			wantPct:          20,
+			wantSpendControl: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -168,6 +188,10 @@ func TestCodexCreditsStatusReflectsUpstreamState(t *testing.T) {
 			}
 			if snap.UsedPercent != tc.wantPct {
 				t.Fatalf("used percent = %v, want %v", snap.UsedPercent, tc.wantPct)
+			}
+			summary := BuildQuotaSummary(acc, &token, []storage.AccountRateLimit{snap}, storage.Now())
+			if tc.wantSpendControl && (summary.Credits == nil || !summary.Credits.SpendControl) {
+				t.Fatalf("spend_control flag missing in summary: %+v", summary.Credits)
 			}
 		})
 	}

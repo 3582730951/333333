@@ -77,7 +77,7 @@ func TestUpstreamSuccessResetsFailureStreak(t *testing.T) {
 				t.Fatalf("round %d: benched at %d/%d failures", round, i, threshold)
 			}
 		}
-		s.guardRateLimitForAccount(ctx, account, http.Header{})
+		s.guardRateLimitForAccount(ctx, account, http.Header{}, false)
 	}
 	binding, err := s.store.GetEgressBinding(ctx, account.ID)
 	if err != nil {

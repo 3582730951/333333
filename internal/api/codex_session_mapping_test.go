@@ -20,6 +20,7 @@ import (
 	"codex-account-pool/internal/storage"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/tidwall/gjson"
 )
 
 type codexNativeIdentityCapture struct {
@@ -1669,3 +1670,351 @@ func turnIDFromHeader(raw string) string {
 	value, _ := metadata["turn_id"].(string)
 	return value
 }
+
+// TestCodexSafetyRotationFreshRequestDetachesRetiredChain verifies the single
+// post-rotation turn strips every root-state pointer (previous_response_id,
+// session_id, thread/fork headers, embedded turn metadata) so upstream sees a
+// brand-new session even though the downstream mapping is preserved.
+func TestCodexSafetyRotationFreshRequestDetachesRetiredChain(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt",
+		"previous_response_id":"resp-safety-1",
+		"session_id":"retired-session",
+		"turn_state":{"turn_id":"t1"},
+		"client_metadata":{"x-codex-turn-state":"opaque"},
+		"input":"resume"
+	}`)
+	header := http.Header{}
+	header.Set("Session-Id", "retired-session")
+	header.Set("X-Codex-Parent-Thread-Id", "retired-thread")
+	header.Set("X-Codex-Turn-State", "opaque-header")
+	header.Set("X-Codex-Turn-Metadata", `{"turn_id":"t1","session_id":"retired-session","x-codex-turn-state":"opaque"}`)
+
+	out, outHeader, ok := codexSafetyRotationFreshRequest(body, header)
+	if !ok {
+		t.Fatal("detach strip declined a stateful request")
+	}
+	if gjson.GetBytes(out, "previous_response_id").Exists() {
+		t.Fatalf("previous_response_id survived detach: %s", out)
+	}
+	if gjson.GetBytes(out, "session_id").Exists() || gjson.GetBytes(out, "turn_state").Exists() {
+		t.Fatalf("retired session/turn state survived detach: %s", out)
+	}
+	if gjson.GetBytes(out, "client_metadata.x-codex-turn-state").Exists() {
+		t.Fatalf("embedded turn metadata survived detach: %s", out)
+	}
+	if outHeader.Get("Session-Id") != "" || outHeader.Get("X-Codex-Parent-Thread-Id") != "" || outHeader.Get("X-Codex-Turn-State") != "" {
+		t.Fatalf("retired identity headers survived detach: %v", outHeader)
+	}
+	if strings.Contains(outHeader.Get("X-Codex-Turn-Metadata"), "retired-session") || strings.Contains(outHeader.Get("X-Codex-Turn-Metadata"), "opaque") {
+		t.Fatalf("chain-pointer keys survived header turn metadata: %v", outHeader.Get("X-Codex-Turn-Metadata"))
+	}
+	if !strings.Contains(string(out), `"input":"resume"`) {
+		t.Fatalf("payload input was lost during detach: %s", out)
+	}
+}
+
+func TestCodexResponseSafetyBufferedDetectsControlField(t *testing.T) {
+	if !codexResponseSafetyBuffered([]byte(`{"id":"r","status":"completed","safety_buffering":{"detail":"mod"}}`)) {
+		t.Fatal("safety_buffering control field not detected")
+	}
+	if codexResponseSafetyBuffered([]byte(`{"id":"r","status":"completed","output":[]}`)) {
+		t.Fatal("plain completed response misdetected as safety-buffered")
+	}
+}
+
+// TestCodexSessionMappingRotatesUpstreamSessionOnSafetyBuffering is the end-to-end
+// contract behind the user-group toggle: when upstream withholds content via the
+// Responses safety_buffering field, the committed binding rotates to a fresh
+// upstream session id while the downstream Thread-Id aliases keep resolving to the
+// same binding; the immediately following turn detaches from the retired chain and
+// then clears the marker.
+func TestCodexSessionMappingRotatesUpstreamSessionOnSafetyBuffering(t *testing.T) {
+	runSafetyRotationFlow(t, true)
+}
+
+// TestCodexSessionMappingKeepsUpstreamSessionWithoutSafetyToggle is the negative
+// control: with the user-group toggle off, a safety_buffering terminal commits the
+// binding normally and the upstream session id is never rotated.
+func TestCodexSessionMappingKeepsUpstreamSessionWithoutSafetyToggle(t *testing.T) {
+	runSafetyRotationFlow(t, false)
+}
+
+func runSafetyRotationFlow(t *testing.T, toggleOn bool) {
+	t.Helper()
+	var mu sync.Mutex
+	var upstreamSessions []string
+	var previousResponseID string
+	var calls atomic.Int32
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		call := calls.Add(1)
+		mu.Lock()
+		upstreamSessions = append(upstreamSessions, r.Header.Get("Session-Id"))
+		if call == 2 {
+			previousResponseID = string(gjson.ParseBytes(raw).Get("previous_response_id").String())
+		}
+		mu.Unlock()
+		if call == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-safety-1\",\"object\":\"response\",\"model\":\"gpt\",\"status\":\"in_progress\"}}\n\n")
+			_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-safety-1\",\"object\":\"response\",\"model\":\"gpt\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1},\"safety_buffering\":{\"detail\":\"mod\"}}}\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-safety-2","object":"response","model":"gpt","status":"completed","output":[]}`))
+	})
+
+	enableCodexSessionMappingForTest(h)
+	if toggleOn {
+		h.app.cfg.SafetySessionRotationGroups = map[string]bool{"ug_safety_rotation": true}
+	}
+
+	const plain = "cap_safety_rotation"
+	const userGroupID = "ug_safety_rotation"
+	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
+		ID: userGroupID, Name: "Safety Rotation",
+		Targets: []storage.TargetRef{{Kind: storage.TargetKindAccountPoolGroup, ID: "cyber"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertAPIKey(t.Context(), storage.APIKey{
+		KeyHash: hashAPIKey(plain), Label: "safety-rotation", UserGroupID: userGroupID, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.importAccount(t, "safety", "upstream-safety", "access-safety")
+
+	post := func(t *testing.T, body string) (int, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+plain)
+		req.Header.Set("Thread-Id", "safety-thread-1")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(raw)
+	}
+
+	namespace := "key:" + hashAPIKey(plain)
+
+	// First turn: upstream withholds content via safety_buffering. With the toggle
+	// on, the binding must rotate to a fresh upstream session id while downstream
+	// aliases stay intact. Without it, the binding keeps the original session id.
+	firstStatus, firstBody := post(t, `{"model":"gpt","stream":true,"input":"start"}`)
+	if firstStatus != http.StatusOK || !strings.Contains(firstBody, "resp-safety-1") {
+		t.Fatalf("first turn status=%d body=%s", firstStatus, firstBody)
+	}
+
+	rows, err := h.store.FindCodexSessionAlias(t.Context(), namespace, storage.CodexSessionAlias{Type: "response", Value: "resp-safety-1"})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("binding after safety terminal rows=%d err=%v", len(rows), err)
+	}
+	afterTerminal := rows[0]
+	mu.Lock()
+	firstUpstreamSession := ""
+	if len(upstreamSessions) > 0 {
+		firstUpstreamSession = upstreamSessions[0]
+	}
+	mu.Unlock()
+	if firstUpstreamSession == "" {
+		t.Fatal("first upstream request carried no session id")
+	}
+	if toggleOn {
+		if afterTerminal.SafetyRotatedAt == 0 {
+			t.Fatalf("rotation marker was not set: %+v", afterTerminal)
+		}
+		if afterTerminal.RootSessionID == firstUpstreamSession {
+			t.Fatalf("binding did not rotate: session=%s", afterTerminal.RootSessionID)
+		}
+	} else {
+		if afterTerminal.SafetyRotatedAt != 0 {
+			t.Fatalf("rotation marker set without the toggle: %+v", afterTerminal)
+		}
+		if afterTerminal.RootSessionID != firstUpstreamSession {
+			t.Fatalf("binding rotated without the toggle: %s != %s", afterTerminal.RootSessionID, firstUpstreamSession)
+		}
+	}
+
+	// Second turn: resolves the same binding (downstream aliases unchanged). With the
+	// toggle on it detaches from the retired chain — no previous_response_id — and
+	// clears the rotation marker. Without it the resume passes previous_response_id
+	// through untouched.
+	secondStatus, secondBody := post(t, `{"model":"gpt","previous_response_id":"resp-safety-1","input":"resume"}`)
+	if secondStatus != http.StatusOK || !strings.Contains(secondBody, "resp-safety-2") {
+		t.Fatalf("second turn status=%d body=%s", secondStatus, secondBody)
+	}
+	mu.Lock()
+	secondUpstreamSession := ""
+	if len(upstreamSessions) > 1 {
+		secondUpstreamSession = upstreamSessions[1]
+	}
+	mu.Unlock()
+	if secondUpstreamSession == "" {
+		t.Fatal("second upstream request carried no session id")
+	}
+	if toggleOn {
+		if secondUpstreamSession != afterTerminal.RootSessionID {
+			t.Fatalf("second upstream session=%s != rotated binding session=%s", secondUpstreamSession, afterTerminal.RootSessionID)
+		}
+		if secondUpstreamSession == firstUpstreamSession {
+			t.Fatalf("upstream session did not change across the rotation: %s", secondUpstreamSession)
+		}
+		if previousResponseID != "" {
+			t.Fatalf("post-rotation turn leaked previous_response_id upstream: %q", previousResponseID)
+		}
+	} else {
+		if secondUpstreamSession != firstUpstreamSession {
+			t.Fatalf("upstream session changed without the toggle: %s != %s", secondUpstreamSession, firstUpstreamSession)
+		}
+		if previousResponseID != "resp-safety-1" {
+			t.Fatalf("resume turn lost previous_response_id without the toggle: %q", previousResponseID)
+		}
+	}
+
+	afterSecond, err := h.store.ResolveCodexSessionAliases(t.Context(), namespace, []storage.CodexSessionAlias{{Type: "root", Value: "safety-thread-1"}})
+	if err != nil {
+		t.Fatalf("downstream alias lost after the flow: %v", err)
+	}
+	if afterSecond.ID != afterTerminal.ID || afterSecond.RootSessionID != afterTerminal.RootSessionID {
+		t.Fatalf("downstream mapping moved: binding=%+v original=%+v", afterSecond, afterTerminal)
+	}
+	if toggleOn && afterSecond.SafetyRotatedAt != 0 {
+		t.Fatalf("rotation marker not cleared after the detach turn: %+v", afterSecond)
+	}
+}
+
+// TestCodexSessionMappingSafetyRotationPreservesChildBranch pins the fix for
+// "session corrupt" continuations after a safety-buffered child-branch turn. A
+// child branch (ThreadID != RootSessionID, ParentThreadID set) cannot rotate its
+// RootSessionID: the upstream thread tree would then name a thread id that belongs
+// to a retired session, and the next continuation surfaces as a corrupt session.
+// The rotation must instead open a fresh child thread under the same parent while
+// the root session id stays untouched. A fork root (ThreadID == RootSessionID)
+// still rotates root and thread together and keeps its ancestry marker.
+func TestCodexSessionMappingSafetyRotationPreservesChildBranch(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	enableCodexSessionMappingForTest(h)
+	ctx := context.Background()
+
+	root, err := h.store.CommitCodexSessionBinding(ctx, storage.CodexSessionCommit{
+		Namespace: "unauthenticated",
+		Binding: storage.CodexSessionBinding{
+			ID: "root-binding", TreeID: "root-tree", AccountID: "account-root", EgressID: storage.DefaultDirectEgressID, State: "active",
+			InstallationID:  "install-root-device",
+			DeviceOSHint:    "Mac OS",
+			DeviceOSHintSet: true,
+			RootSessionID:   "019f0000-0000-7000-8000-000000000101",
+			ThreadID:        "019f0000-0000-7000-8000-000000000101",
+		},
+		Aliases: []storage.CodexSessionAlias{{Type: "root", Value: "client-root"}, {Type: "session", Value: "client-root"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := scheduler.Lease{Account: storage.Account{ID: "account-root"}, Egress: storage.EgressProfile{ID: storage.DefaultDirectEgressID, Type: "direct"}}
+
+	childBody := []byte(`{"model":"gpt","thread_id":"client-child","session_id":"client-root","parent_thread_id":"client-root","input":"child"}`)
+	childRequest, _ := http.NewRequest(http.MethodPost, "http://example.invalid/v1/responses", bytes.NewReader(childBody))
+
+	childMapping, err := h.app.resolveCodexSessionMapping(ctx, childRequest, childBody, downstreamPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childSnapshot, err := childMapping.identitySnapshot(h.app.identitySecret(), lease, "Linux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preThreadID := childSnapshot.ThreadID
+	if childSnapshot.SessionID != root.RootSessionID || preThreadID == childSnapshot.SessionID || childSnapshot.ParentThreadID != root.ThreadID {
+		t.Fatalf("child snapshot=%+v root=%+v", childSnapshot, root)
+	}
+
+	// First child turn carries safety_buffering under the user-group toggle.
+	childMapping.rotateUpstreamSessionOnSafety = true
+	childMapping.noteSafetyBuffering()
+	if err := h.app.commitCodexSessionMapping(ctx, childMapping, lease, lease.Egress, "resp-child-safety", "", false); err != nil {
+		t.Fatal(err)
+	}
+	committed := childMapping.binding
+	if committed == nil {
+		t.Fatal("child safety turn did not commit a binding")
+	}
+	if committed.RootSessionID != root.RootSessionID {
+		t.Fatalf("child rotation changed the root session id: %s != %s", committed.RootSessionID, root.RootSessionID)
+	}
+	if committed.ParentThreadID != root.ThreadID {
+		t.Fatalf("child rotation changed the parent thread id: %s != %s", committed.ParentThreadID, root.ThreadID)
+	}
+	if committed.ThreadID == preThreadID || committed.ThreadID == committed.RootSessionID {
+		t.Fatalf("child rotation must open a fresh child thread: pre=%s committed=%+v", preThreadID, committed)
+	}
+	if committed.SafetyRotatedAt == 0 {
+		t.Fatalf("child rotation marker not set: %+v", committed)
+	}
+
+	// The following turn detaches (marker cleared) and must reuse the rotated branch.
+	resumeMapping, err := h.app.resolveCodexSessionMapping(ctx, childRequest, childBody, downstreamPolicy{})
+	if err != nil || resumeMapping.binding == nil || resumeMapping.binding.ThreadID != committed.ThreadID {
+		t.Fatalf("post-rotation child resume binding=%+v err=%v", resumeMapping.binding, err)
+	}
+	resumeSnapshot, err := resumeMapping.identitySnapshot(h.app.identitySecret(), lease, "Linux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumeSnapshot.SessionID != root.RootSessionID || resumeSnapshot.ThreadID != committed.ThreadID {
+		t.Fatalf("post-rotation upstream identity does not follow the rotated branch: %+v", resumeSnapshot)
+	}
+	resumeMapping.rotateUpstreamSessionOnSafety = true
+	resumeMapping.markSafetyDetached()
+	if err := h.app.commitCodexSessionMapping(ctx, resumeMapping, lease, lease.Egress, "resp-child-safety-2", "", false); err != nil {
+		t.Fatal(err)
+	}
+	afterDetach := resumeMapping.binding
+	if afterDetach == nil || afterDetach.SafetyRotatedAt != 0 {
+		t.Fatalf("detach turn did not clear the rotation marker: %+v", afterDetach)
+	}
+	if afterDetach.ThreadID != committed.ThreadID || afterDetach.RootSessionID != root.RootSessionID {
+		t.Fatalf("detach turn re-rotated the branch: %+v", afterDetach)
+	}
+
+	// Control: a fork root (ThreadID == RootSessionID) still rotates root+thread
+	// together and keeps its ancestry marker.
+	forkBody := []byte(`{"model":"gpt","thread_id":"fork-client-root","forked_from_thread_id":"client-child","input":"fork"}`)
+	forkRequest, _ := http.NewRequest(http.MethodPost, "http://example.invalid/v1/responses", bytes.NewReader(forkBody))
+	forkMapping, err := h.app.resolveCodexSessionMapping(ctx, forkRequest, forkBody, downstreamPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forkSnapshot, err := forkMapping.identitySnapshot(h.app.identitySecret(), lease, "Linux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forkSnapshot.SessionID != forkSnapshot.ThreadID {
+		t.Fatalf("fork root precondition violated: %+v", forkSnapshot)
+	}
+	forkMapping.rotateUpstreamSessionOnSafety = true
+	forkMapping.noteSafetyBuffering()
+	if err := h.app.commitCodexSessionMapping(ctx, forkMapping, lease, lease.Egress, "resp-fork-safety", "", false); err != nil {
+		t.Fatal(err)
+	}
+	forkCommitted := forkMapping.binding
+	if forkCommitted == nil || forkCommitted.SafetyRotatedAt == 0 {
+		t.Fatalf("fork safety turn did not rotate: %+v", forkCommitted)
+	}
+	if forkCommitted.RootSessionID == forkSnapshot.SessionID || forkCommitted.ThreadID != forkCommitted.RootSessionID {
+		t.Fatalf("fork root rotation inconsistent: pre=%+v committed=%+v", forkSnapshot, forkCommitted)
+	}
+	if forkCommitted.ForkedFromThreadID != forkSnapshot.ForkedFromThreadID {
+		t.Fatalf("fork rotation dropped the ancestry marker: pre=%+v committed=%+v", forkSnapshot, forkCommitted)
+	}
+}
+

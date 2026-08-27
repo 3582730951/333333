@@ -137,7 +137,15 @@ func TestClaudeProOpus48UsesVirtualOneMillionAndCompactsBeforeNativeWindow(t *te
 	}
 }
 
-func TestClaudeOpus5UsesOneMillionByDefaultWithoutLegacyBeta(t *testing.T) {
+// TestClaudeOpus5NativeOneMillionWireCarriesContextBeta verifies that native-1M
+// gen-5 requests (plain claude-opus-5 and the [1m] alias) reach a 1M-capable
+// account carrying the context-1m beta, matching the captured real 2.1.241 wire
+// for an entitled subscription (context-1m present for both spellings). The
+// earlier "WithoutLegacyBeta" behavior was based on v2.1.76 source where
+// has1mContext matched only the [1m] alias; 2.1.241 empirically sends the beta
+// for native-1M models on any entitled account, so omitting it would fingerprint
+// the relay as different from a normal user.
+func TestClaudeOpus5NativeOneMillionWireCarriesContextBeta(t *testing.T) {
 	var calls atomic.Int64
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/messages" {
@@ -148,8 +156,8 @@ func TestClaudeOpus5UsesOneMillionByDefaultWithoutLegacyBeta(t *testing.T) {
 		if !bytes.Contains(raw, []byte(`"model":"claude-opus-5"`)) {
 			t.Errorf("Opus 5 request model changed: %s", raw)
 		}
-		if strings.Contains(strings.ToLower(r.Header.Get("Anthropic-Beta")), anthropicContext1MBeta) {
-			t.Errorf("Opus 5 request synthesized obsolete context beta: %q", r.Header.Get("Anthropic-Beta"))
+		if !strings.Contains(strings.ToLower(r.Header.Get("Anthropic-Beta")), anthropicContext1MBeta) {
+			t.Errorf("Opus 5 request missing native context-1m beta (2.1.241 entitled wire): %q", r.Header.Get("Anthropic-Beta"))
 		}
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")

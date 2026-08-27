@@ -255,8 +255,8 @@ func TestCodexExplicitCacheControlsRequireAPIKeyProbeAndMode(t *testing.T) {
 func TestApplyCodexGPT56AutomaticCacheBreakpointIsLosslessMetadataOnly(t *testing.T) {
 	raw := []byte(`{"model":"gpt-5.6-sol","instructions":"keep top-level","previous_response_id":"resp_keep","reasoning":{"effort":"xhigh","context":"all_turns"},"tools":[{"name":"first","schema":{"const":900719925474099312345}},{"name":"second"}],"max_output_tokens":4096,"verbosity":"high","temperature":0.2,"input":[{"role":"developer","content":[{"type":"input_text","text":"stable developer prefix","future":true}]},{"role":"user","content":[{"type":"input_text","text":"keep user"}]},{"role":"assistant","content":[{"type":"output_text","text":"assistant output item"}]},{"type":"function_call","call_id":"call_keep","name":"tool","arguments":"{}"},{"type":"function_call_output","call_id":"call_keep","output":"tool result"},{"type":"reasoning","encrypted_content":"ciphertext"}]}`)
 	got := applyCodexGPT56AutomaticCacheBreakpoint(raw)
-	if bytes.Equal(got, raw) || !bytes.Contains(got, []byte(`"prompt_cache_options":{"mode":"implicit"}`)) || !bytes.Contains(got, []byte(`"prompt_cache_breakpoint":{"mode":"implicit"}`)) {
-		t.Fatalf("automatic breakpoint missing: %s", got)
+	if bytes.Equal(got, raw) || !bytes.Contains(got, []byte(`"mode":"implicit"`)) || !bytes.Contains(got, []byte(`"ttl":"30m"`)) || !bytes.Contains(got, []byte(`"prompt_cache_breakpoint":{"mode":"explicit"}`)) {
+		t.Fatalf("automatic breakpoint missing (mode implicit + ttl 30m + explicit breakpoint): %s", got)
 	}
 	if !codexCacheOnlyMutation(raw, got) {
 		t.Fatalf("automatic breakpoint changed non-cache fields: %s", got)
@@ -282,8 +282,74 @@ func TestApplyCodexGPT56AutomaticCacheBreakpointRequiresExistingStableBlock(t *t
 func TestApplyCodexGPT56AutomaticCacheBreakpointIgnoresMentionInText(t *testing.T) {
 	raw := []byte(`{"model":"gpt-5.6-sol","input":[{"role":"developer","content":[{"type":"input_text","text":"do not literally mention prompt_cache_breakpoint in metadata"}]},{"role":"user","content":[{"type":"input_text","text":"question"}]}]}`)
 	got := applyCodexGPT56AutomaticCacheBreakpoint(raw)
-	if bytes.Equal(got, raw) || !bytes.Contains(got, []byte(`"prompt_cache_options":{"mode":"implicit"}`)) {
+	if bytes.Equal(got, raw) || !bytes.Contains(got, []byte(`"mode":"implicit"`)) || !bytes.Contains(got, []byte(`"ttl":"30m"`)) {
 		t.Fatalf("text mention suppressed automatic marker: %s", got)
+	}
+}
+
+// codexBreakpointLocation extracts the (item, array kind, block) where the automatic
+// breakpoint was placed, so placement tests assert the reusable prefix extends to
+// conversation history rather than stopping at the developer preamble.
+func codexBreakpointLocation(t *testing.T, got []byte) (itemIdx int, kind string, blockIdx int) {
+	t.Helper()
+	var payload map[string]interface{}
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatal(err)
+	}
+	items, _ := payload["input"].([]interface{})
+	for i, item := range items {
+		m, _ := item.(map[string]interface{})
+		for _, k := range []string{"content", "output"} {
+			blocks, _ := m[k].([]interface{})
+			for j, block := range blocks {
+				bm, _ := block.(map[string]interface{})
+				if bm["prompt_cache_breakpoint"] != nil {
+					return i, k, j
+				}
+			}
+		}
+	}
+	t.Fatalf("no breakpoint found in: %s", got)
+	return 0, "", 0
+}
+
+func TestApplyCodexGPT56AutomaticCacheBreakpointContinuationReusesHistory(t *testing.T) {
+	// Realistic codex CLI continuation: string-form tool output is not block-bearing,
+	// so the breakpoint must land on the assistant output block right before the
+	// current user message — not on the developer preamble.
+	raw := []byte(`{"model":"gpt-5.6-sol","input":[{"role":"developer","content":[{"type":"input_text","text":"preamble"}]},{"role":"user","content":[{"type":"input_text","text":"first turn"}]},{"role":"assistant","content":[{"type":"output_text","text":"tool call response"}]},{"type":"function_call","call_id":"call_1","name":"tool","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"tool result"},{"role":"user","content":[{"type":"input_text","text":"follow up"}]}]}`)
+	got := applyCodexGPT56AutomaticCacheBreakpoint(raw)
+	if item, kind, block := codexBreakpointLocation(t, got); item != 2 || kind != "content" || block != 0 {
+		t.Fatalf("breakpoint at input.%d.%s.%d, want input.2.content.0 (assistant before current user): %s", item, kind, block, got)
+	}
+	if !codexCacheOnlyMutation(raw, got) {
+		t.Fatalf("automatic breakpoint changed non-cache fields: %s", got)
+	}
+}
+
+func TestApplyCodexGPT56AutomaticCacheBreakpointDocumentedOutputArrayPattern(t *testing.T) {
+	// OpenAI's >90% multi-turn pattern: explicit breakpoint inside the
+	// function_call_output output[] input_text block after the last tool result.
+	raw := []byte(`{"model":"gpt-5.6-sol","input":[{"role":"developer","content":[{"type":"input_text","text":"preamble"}]},{"role":"user","content":[{"type":"input_text","text":"first turn"}]},{"role":"assistant","content":[{"type":"output_text","text":"tool call response"}]},{"type":"function_call","call_id":"call_1","name":"tool","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_text","text":"tool result"}]},{"role":"user","content":[{"type":"input_text","text":"follow up"}]}]}`)
+	got := applyCodexGPT56AutomaticCacheBreakpoint(raw)
+	if item, kind, block := codexBreakpointLocation(t, got); item != 4 || kind != "output" || block != 0 {
+		t.Fatalf("breakpoint at input.%d.%s.%d, want input.4.output.0 (last tool result): %s", item, kind, block, got)
+	}
+	if !codexCacheOnlyMutation(raw, got) {
+		t.Fatalf("automatic breakpoint changed non-cache fields: %s", got)
+	}
+}
+
+func TestApplyCodexGPT56AutomaticCacheBreakpointExcludesReliabilityEnvelope(t *testing.T) {
+	// The per-turn reliability envelope is a trailing bare-string item; the breakpoint
+	// must ignore it and land on the last stable block before the current user.
+	raw := []byte(`{"model":"gpt-5.6-sol","input":[{"role":"developer","content":[{"type":"input_text","text":"preamble"}]},{"role":"user","content":[{"type":"input_text","text":"first turn"}]},{"role":"assistant","content":[{"type":"output_text","text":"tool call response"}]},{"type":"function_call","call_id":"call_1","name":"tool","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"tool result"},{"role":"user","content":[{"type":"input_text","text":"follow up"}]},{"role":"developer","content":"per-turn working state"}]}`)
+	got := applyCodexGPT56AutomaticCacheBreakpoint(raw)
+	if item, kind, block := codexBreakpointLocation(t, got); item != 2 || kind != "content" || block != 0 {
+		t.Fatalf("breakpoint at input.%d.%s.%d, want input.2.content.0 (envelope excluded): %s", item, kind, block, got)
+	}
+	if !codexCacheOnlyMutation(raw, got) {
+		t.Fatalf("automatic breakpoint changed non-cache fields: %s", got)
 	}
 }
 

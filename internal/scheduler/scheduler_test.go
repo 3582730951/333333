@@ -2222,3 +2222,179 @@ func TestConcurrentStructuralInvalidationClearsProviderCacheSafely(t *testing.T)
 		t.Fatalf("provider cache retained %d entries after final structural invalidation", remaining)
 	}
 }
+
+// A-会话钉扎: 短冷却(剩余 <= strict_sticky_max_cooldown_seconds)时 movable strict
+// 请求必须钉住原账号等待, 而不是换号 —— 换号会清空上游 prompt 缓存前缀。
+func TestMovableStrictStickyShortCooldownStaysPinned(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-1", "acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := routing.AffinityKey{Hash: "h-rl-short", Key: "k", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+		AccountID: "acc-1", Provider: "codex", Model: "gpt-5", LimiterType: "tokens", Source: "tokens",
+		RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1,
+		ResetAt: storage.Now() + 30, Status: "rejected", // 30s 冷却 <= 默认 60s 阈值
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.StrictStickyMaxCooldownSeconds = 60
+	cfg.StickyWaitMillis = 1
+	s := New(store, cfg)
+	defer s.Close()
+
+	selectCtx, cancel := context.WithTimeout(ctx, 80*time.Millisecond)
+	defer cancel()
+	_, err := s.Select(selectCtx, Route{Group: "cyber", Provider: "codex", Model: "gpt-5", Affinity: key, Strict: true, Movable: true})
+	if !errors.Is(err, ErrStrictUnavailable) {
+		t.Fatalf("movable strict request with 30s cooldown should stay pinned and fail, err = %v", err)
+	}
+	if !strings.Contains(err.Error(), "stateful sticky wait timeout") || !strings.Contains(err.Error(), "rate limit cooldown") {
+		t.Fatalf("pinned wait error should name the cooldown that pinned the account: %v", err)
+	}
+}
+
+// A-会话钉扎: strict_sticky_max_cooldown_seconds=0 时, 任意时长冷却都不换号。
+func TestMovableStrictStickyZeroThresholdNeverRebindsForCooldown(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-1", "acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := routing.AffinityKey{Hash: "h-rl-zero-sticky", Key: "k", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+		AccountID: "acc-1", Provider: "codex", Model: "gpt-5", LimiterType: "tokens", Source: "tokens",
+		RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1,
+		ResetAt: storage.Now() + 120, Status: "rejected",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.StrictStickyMaxCooldownSeconds = 0
+	cfg.StickyWaitMillis = 1
+	s := New(store, cfg)
+	defer s.Close()
+
+	selectCtx, cancel := context.WithTimeout(ctx, 80*time.Millisecond)
+	defer cancel()
+	_, err := s.Select(selectCtx, Route{Group: "cyber", Provider: "codex", Model: "gpt-5", Affinity: key, Strict: true, Movable: true})
+	if !errors.Is(err, ErrStrictUnavailable) {
+		t.Fatalf("threshold=0 means never rebind for a cooldown, err = %v", err)
+	}
+}
+
+// A-会话钉扎: 非 strict movable 请求遇阈值内短冷却先等待; 冷却恢复后仍钉在原
+// 账号, 而不是立即 failover 换号。
+func TestNonStrictMovableShortCooldownRecoversAndStaysPinned(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-1", "acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := routing.AffinityKey{Hash: "h-rl-nonstrict", Key: "k", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+		AccountID: "acc-1", Provider: "codex", Model: "gpt-5", LimiterType: "tokens", Source: "tokens",
+		RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1,
+		ResetAt: storage.Now() + 30, Status: "rejected", // 30s 冷却 <= 60s 阈值
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.StrictStickyMaxCooldownSeconds = 60
+	cfg.StickyWaitMillis = 1
+	s := New(store, cfg)
+	defer s.Close()
+
+	// 冷却在等待期间恢复: 调度器轮询 (~250ms) 发现账号可租后应返回原账号。
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		_ = store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+			AccountID: "acc-1", Provider: "codex", Model: "gpt-5", LimiterType: "tokens", Source: "tokens",
+			RemainingTokens: 100, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1,
+			ResetAt: storage.Now() - 10, Status: "ok",
+		})
+	}()
+	selectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	lease, err := s.Select(selectCtx, Route{Group: "cyber", Provider: "codex", Model: "gpt-5", Affinity: key, Movable: true})
+	if err != nil {
+		t.Fatalf("non-strict movable should ride out a short cooldown on the bound account: %v", err)
+	}
+	defer lease.Release()
+	if lease.Account.ID != "acc-1" {
+		t.Fatalf("selected %q, want acc-1 (pinned through the cooldown)", lease.Account.ID)
+	}
+	if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
+		t.Fatalf("should have waited for the cooldown before leasing, only %v", elapsed)
+	}
+}
+
+// A-会话钉扎: affinity 换号必须留下 audit 轨迹 (from/to/route), 跨账号迁移是
+// 缓存命中率的头号杀手, 不能静默发生。
+func TestAffinityRebindAuditLogged(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-1", "acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := routing.AffinityKey{Hash: "h-rebind-audit", Key: "k", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	// 120s 冷却 > 60s 阈值: 允许 failover, 应产生 audit。
+	if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+		AccountID: "acc-1", Provider: "codex", Model: "gpt-5", LimiterType: "tokens", Source: "tokens",
+		RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1,
+		ResetAt: storage.Now() + 120, Status: "rejected",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.StrictStickyMaxCooldownSeconds = 60
+	cfg.StickyWaitMillis = 1
+	s := New(store, cfg)
+	defer s.Close()
+
+	lease, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Model: "gpt-5", Affinity: key, Movable: true})
+	if err != nil {
+		t.Fatalf("movable request should fail over on long cooldown: %v", err)
+	}
+	defer lease.Release()
+	if lease.Account.ID != "acc-2" {
+		t.Fatalf("selected %q, want acc-2", lease.Account.ID)
+	}
+	rows, err := store.ListAuditLogForAccount(ctx, "acc-2", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, row := range rows {
+		if row.Action == "affinity_rebind" && strings.Contains(row.Detail, "from=acc-1 to=acc-2") && strings.Contains(row.Detail, "affinity=h-rebind-audit") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected affinity_rebind audit from acc-1 to acc-2, got %+v", rows)
+	}
+}

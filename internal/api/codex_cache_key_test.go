@@ -261,3 +261,54 @@ func jsonString(value string) string {
 	raw, _ := json.Marshal(value)
 	return string(raw)
 }
+
+// B-缓存键延续: agentic 死区轮 (assistant/tool 结尾, final_turn_not_user) 必须
+// 得到与同会话 user 轮相同的 conversation-anchor key。若死区轮落到空 key,
+// 上游缓存分片切换, 该轮以及其后的每一轮都从冷缓存开始。
+func TestAgenticDeadZoneTurnKeepsConversationAnchorKey(t *testing.T) {
+	prefix := `{"model":"gpt-5.6","input":[` +
+		`{"role":"developer","content":[{"type":"input_text","text":"keep all context"}]},` +
+		`{"role":"user","content":[{"type":"input_text","text":"question A"}]},` +
+		`{"role":"assistant","content":[{"type":"output_text","text":"REFERENCE_ACCEPTED"}]},` +
+		`{"role":"user","content":[{"type":"input_text","text":"question B"}]}`
+	userEnded := []byte(prefix + `]}`)
+	deadZone := []byte(prefix + `,` +
+		`{"role":"assistant","content":[{"type":"output_text","text":"final answer, no user turn follows"}]}]}`)
+
+	if !hasHistoricalUserTurn(userEnded) {
+		t.Fatal("fixture: user-ended turn must have historical user turns")
+	}
+	userHash := automaticPromptCachePrefixHash(userEnded)
+	deadHash := automaticPromptCachePrefixHash(deadZone)
+	if userHash == "" {
+		t.Fatalf("user-ended turn produced no prefix hash")
+	}
+	if deadHash == "" {
+		t.Fatalf("dead-zone turn (final_turn_not_user) produced no prefix hash: %s", deadZone)
+	}
+	if deadHash != userHash {
+		t.Fatalf("dead-zone turn changed the conversation key: user %q vs dead-zone %q", userHash, deadHash)
+	}
+	if !strings.HasPrefix(deadHash, "conversation:") {
+		t.Fatalf("dead-zone hash should be the conversation anchor, got %q", deadHash)
+	}
+
+	key := automaticPromptCacheKey("gpt-5.6", deadHash)
+	withKey := ensureResponsesPromptCacheKey(deadZone, key)
+	if routing.PromptCacheKey(withKey) != key {
+		t.Fatalf("dead-zone prompt_cache_key was not injected: %s", withKey)
+	}
+}
+
+// B-缓存键延续: 死区轮不能因为历史里缺 user turn 就误注入 —— 单条长 assistant
+// 文本 (无 user 历史) 仍应保持不可推导, 避免把孤立的非会话请求分到会话 shard。
+func TestDeadZoneWithoutUserHistoryStaysUnkeyed(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6","input":[` +
+		`{"role":"assistant","content":[{"type":"output_text","text":"standalone note"}]}]}`)
+	if hasHistoricalUserTurn(body) {
+		t.Fatal("fixture: single assistant turn must have no historical user turn")
+	}
+	if hash := automaticPromptCachePrefixHash(body); hash != "" {
+		t.Fatalf("dead-zone turn without user history must stay unkeyed, got %q", hash)
+	}
+}

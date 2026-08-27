@@ -274,18 +274,19 @@ func TestCodexHTTPAPIKeyPreservesMaxOutputTokens(t *testing.T) {
 func TestCodexHTTPPromptCacheControlsFollowTransportCapability(t *testing.T) {
 	baseBody := `{"model":"gpt-5.6-sol","instructions":"API request","store":false,"stream":false,"prompt_cache_key":"stable","prompt_cache_options":{"mode":"explicit"},"input":[{"role":"developer","content":[{"type":"input_text","text":"stable","prompt_cache_breakpoint":{"mode":"explicit"}}]},{"role":"user","content":[{"type":"input_text","text":"question"}]}]}`
 	tests := []struct {
-		name       string
-		token      storage.AccountToken
-		mode       string
-		capable    bool
-		profitable bool
-		wantMode   string
-		autoBody   bool
+		name                string
+		token               storage.AccountToken
+		mode                string
+		capable             bool
+		profitable          bool
+		wantMode            string
+		wantBreakpointMode  string
+		autoBody            bool
 	}{
 		{name: "chatgpt strips", token: storage.AccountToken{AccessToken: "oauth"}, mode: "auto", capable: true, profitable: true},
 		{name: "unprobed api key strips", token: storage.AccountToken{AccessToken: "sk-test", OpenAIAPIKey: "sk-test"}, mode: "observe"},
-		{name: "probed api key preserves client explicit", token: storage.AccountToken{AccessToken: "sk-test", OpenAIAPIKey: "sk-test"}, mode: "observe", capable: true, wantMode: "explicit"},
-		{name: "profitable auto marks implicit", token: storage.AccountToken{AccessToken: "sk-test", OpenAIAPIKey: "sk-test"}, mode: "auto", capable: true, profitable: true, wantMode: "implicit", autoBody: true},
+		{name: "probed api key preserves client explicit", token: storage.AccountToken{AccessToken: "sk-test", OpenAIAPIKey: "sk-test"}, mode: "observe", capable: true, wantMode: "explicit", wantBreakpointMode: "explicit"},
+		{name: "profitable auto marks implicit top-level explicit breakpoint", token: storage.AccountToken{AccessToken: "sk-test", OpenAIAPIKey: "sk-test"}, mode: "auto", capable: true, profitable: true, wantMode: "implicit", wantBreakpointMode: "explicit", autoBody: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -321,8 +322,8 @@ func TestCodexHTTPPromptCacheControlsFollowTransportCapability(t *testing.T) {
 				if options != nil || bytes.Contains(gotBody, []byte(`"prompt_cache_breakpoint"`)) {
 					t.Fatalf("unsupported controls survived: %s", gotBody)
 				}
-			} else if options["mode"] != tt.wantMode || !bytes.Contains(gotBody, []byte(`"prompt_cache_breakpoint":{"mode":"`+tt.wantMode+`"}`)) {
-				t.Fatalf("cache mode %q not forwarded: %s", tt.wantMode, gotBody)
+			} else if options["mode"] != tt.wantMode || !bytes.Contains(gotBody, []byte(`"prompt_cache_breakpoint":{"mode":"`+tt.wantBreakpointMode+`"}`)) {
+				t.Fatalf("cache mode %q (breakpoint %q) not forwarded: %s", tt.wantMode, tt.wantBreakpointMode, gotBody)
 			}
 		})
 	}

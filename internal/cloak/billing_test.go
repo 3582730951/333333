@@ -24,8 +24,10 @@ func TestClaudeVirtualUserIDMatchesRealShape(t *testing.T) {
 	}
 }
 
-// billingRe extracts the current version, native build component, and entrypoint.
-var billingRe = regexp.MustCompile(`^x-anthropic-billing-header: cc_version=([0-9.]+)\.([0-9a-f]{3}); cc_entrypoint=(cli|sdk-cli);$`)
+// billingRe extracts the current version and entrypoint. The shipping
+// 2.1.236–2.1.241 binaries emit a PLAIN cc_version (no `.NNN` build suffix); the
+// earlier `.503` build-component ground truth was a relay-capture artifact.
+var billingRe = regexp.MustCompile(`^x-anthropic-billing-header: cc_version=([0-9.]+); cc_entrypoint=(cli|sdk-cli);$`)
 
 func firstSystemText(t *testing.T, body []byte) string {
 	t.Helper()
@@ -67,7 +69,7 @@ func TestBillingHeaderInjectedForNonClaudeCodeClient(t *testing.T) {
 // the attribution block when the request comes from a subagent (a Task-tool invocation), as
 // in the observed real block
 //
-//	x-anthropic-billing-header: cc_version=2.1.226.be8; cc_entrypoint=cli; cc_is_subagent=true;
+//	x-anthropic-billing-header: cc_version=2.1.241; cc_entrypoint=cli; cc_is_subagent=true;
 //
 // We rewrite that block to realign cc_version with our User-Agent, and used to drop the
 // marker in the process. A subagent request is independently recognizable from its body, so
@@ -76,13 +78,13 @@ func TestBillingHeaderInjectedForNonClaudeCodeClient(t *testing.T) {
 func TestBillingHeaderPreservesSubagentMarker(t *testing.T) {
 	for _, value := range []string{"true", "false"} {
 		t.Run("preserves "+value, func(t *testing.T) {
-			body := []byte(`{"model":"claude","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.226.be8; cc_entrypoint=cli; cc_is_subagent=` + value + `;"}],"messages":[]}`)
+			body := []byte(`{"model":"claude","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.241; cc_entrypoint=cli; cc_is_subagent=` + value + `;"}],"messages":[]}`)
 			got := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, "2.1.159"))
 			if !strings.Contains(got, "cc_is_subagent="+value+";") {
 				t.Fatalf("cc_is_subagent=%s was dropped from the rewritten block: %q", value, got)
 			}
 			// cc_version is still realigned to ours, and field order is preserved.
-			if !strings.Contains(got, "cc_version=2.1.159.") {
+			if !strings.Contains(got, "cc_version=2.1.159;") {
 				t.Fatalf("cc_version was not realigned to our version: %q", got)
 			}
 			if got := strings.Index(got, "cc_entrypoint="); got < 0 {
@@ -111,11 +113,11 @@ func TestBillingHeaderPreservesSubagentMarker(t *testing.T) {
 	})
 }
 
-func TestCurrentBillingHeaderMatchesCapturedBuildAndSDKEntrypoint(t *testing.T) {
+func TestCurrentBillingHeaderMatchesCapturedSDKEntrypoint(t *testing.T) {
 	body := []byte(`{"model":"claude","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.100.123; cc_entrypoint=sdk-cli;"}],"messages":[]}`)
 	got := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, identity.ClaudeCLIVersion))
 	m := billingRe.FindStringSubmatch(got)
-	if m == nil || m[1] != identity.ClaudeCLIVersion || m[2] != identity.ClaudeCodeBuild || m[3] != "sdk-cli" {
+	if m == nil || m[1] != identity.ClaudeCLIVersion || m[2] != "sdk-cli" {
 		t.Fatalf("shipping billing fingerprint changed: %q", got)
 	}
 }
@@ -125,7 +127,7 @@ func TestBillingHeaderUsesCapturedShippingBuild(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		got := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, identity.ClaudeCLIVersion))
 		m := billingRe.FindStringSubmatch(got)
-		if m == nil || m[1] != identity.ClaudeCLIVersion || m[2] != identity.ClaudeCodeBuild {
+		if m == nil || m[1] != identity.ClaudeCLIVersion {
 			t.Fatalf("billing header diverged from shipping build: %q", got)
 		}
 	}
@@ -198,7 +200,7 @@ func canonicalizeForCompare(t *testing.T, body []byte) string {
 				continue
 			}
 			if txt, _ := bm["text"].(string); strings.HasPrefix(strings.TrimSpace(txt), claudeBillingHeaderPrefix) {
-				bm["text"] = billingRe.ReplaceAllString(txt, "x-anthropic-billing-header: cc_version=$1.NNN; cc_entrypoint=$3;")
+				bm["text"] = billingRe.ReplaceAllString(txt, "x-anthropic-billing-header: cc_version=$1; cc_entrypoint=$2;")
 			}
 		}
 	}
@@ -252,6 +254,104 @@ func TestVirtualizeClaudeCodeNoBillingMatchesVirtualize(t *testing.T) {
 	folded := VirtualizeClaudeCode(body, id, nil, true, "").Body
 	if string(plain) != string(folded) {
 		t.Fatalf("empty billingVersion must equal Virtualize\n plain =%s\n folded=%s", plain, folded)
+	}
+}
+
+func TestComputeClaudeAttributionFingerprintMatchesClient(t *testing.T) {
+	// Reference values computed independently with the documented client algorithm
+	// (src/utils/fingerprint.ts): hex(SHA256("59cf53e54c78" + msg[4] + msg[7] + msg[20]
+	// + version))[:3], missing indices → '0'.
+	tests := []struct {
+		text    string
+		version string
+		want    string
+	}{
+		{"hello world, this is a test message", "2.1.241", "7ae"},
+		{"hello world, this is a test message", "2.1.236", "46f"}, // version-dependent
+		{"the quick brown fox jumps over the lazy dog", "2.1.241", "21b"},
+		{"hi", "2.1.241", "c95"}, // indices 4/7/20 all missing → "0"
+		{"", "2.1.241", "c95"},   // same fallback as the short message
+	}
+	for _, tt := range tests {
+		if got := computeClaudeAttributionFingerprint(tt.text, tt.version); got != tt.want {
+			t.Errorf("computeClaudeAttributionFingerprint(%q, %q) = %q, want %q", tt.text, tt.version, got, tt.want)
+		}
+	}
+}
+
+func TestBillingHeaderAttributionFingerprintGated(t *testing.T) {
+	const version = "2.1.241"
+	base := `{"model":"claude","metadata":{"user_id":"real-user"},"system":[` +
+		`{"type":"text","text":"x-anthropic-billing-header: cc_version=` + version + `; cc_entrypoint=cli;"},` +
+		`{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}` +
+		`],"messages":[{"role":"user","content":[{"type":"text","text":"hello world, this is a test message"}]}]}`
+	id := identity.For(nil, "acc-fp")
+
+	// Off (explicit override — env/manifest turn-down, or the cache-option zero
+	// value): plain cc_version, no `.xxx` suffix.
+	off := VirtualizeClaudeCodeWithCache([]byte(base), id, nil, true, version, ClaudeCodeCacheOptions{})
+	if m := billingRe.FindStringSubmatch(firstSystemText(t, off.Body)); m == nil || m[1] != version {
+		t.Fatalf("attribution off must emit a plain cc_version, got %q", firstSystemText(t, off.Body))
+	}
+
+	// Enabled: the real client's message-derived suffix is appended.
+	on := VirtualizeClaudeCodeWithCache([]byte(base), id, nil, true, version, ClaudeCodeCacheOptions{AttributionFingerprint: true})
+	got := firstSystemText(t, on.Body)
+	if !strings.Contains(got, "cc_version="+version+".7ae;") {
+		t.Fatalf("attribution on must append the message fingerprint, got %q", got)
+	}
+
+	// The fingerprint is message-dependent: a different first user message changes it.
+	other := VirtualizeClaudeCodeWithCache([]byte(`{"model":"claude","system":[`+
+		`{"type":"text","text":"x-anthropic-billing-header: cc_version=`+version+`; cc_entrypoint=cli;"}`+
+		`],"messages":[{"role":"user","content":"the quick brown fox jumps over the lazy dog"}]}`),
+		id, nil, true, version, ClaudeCodeCacheOptions{AttributionFingerprint: true})
+	if !strings.Contains(firstSystemText(t, other.Body), "cc_version="+version+".21b;") {
+		t.Fatalf("fingerprint must follow the first user message, got %q", firstSystemText(t, other.Body))
+	}
+
+	// A string-content user message works the same as a text-block array.
+	strContent := VirtualizeClaudeCodeWithCache([]byte(`{"model":"claude","system":[`+
+		`{"type":"text","text":"x-anthropic-billing-header: cc_version=`+version+`; cc_entrypoint=cli;"}`+
+		`],"messages":[{"role":"user","content":"hello world, this is a test message"}]}`),
+		id, nil, true, version, ClaudeCodeCacheOptions{AttributionFingerprint: true})
+	if !strings.Contains(firstSystemText(t, strContent.Body), "cc_version="+version+".7ae;") {
+		t.Fatalf("string content must fingerprint identically, got %q", firstSystemText(t, strContent.Body))
+	}
+}
+
+// TestBillingHeaderAttributionFingerprintNoUserMessage is the no-op guard: when the
+// body has no user-authored first message (e.g. a pure subagent/system-only request),
+// enabled attribution must leave a plain cc_version rather than emitting a synthetic
+// fingerprint a real client would not have computed.
+func TestBillingHeaderAttributionFingerprintNoUserMessage(t *testing.T) {
+	const version = "2.1.241"
+	body := []byte(`{"model":"claude","system":[` +
+		`{"type":"text","text":"x-anthropic-billing-header: cc_version=` + version + `; cc_entrypoint=cli;"}` +
+		`],"messages":[{"role":"assistant","content":[{"type":"text","text":"assistant-only"}]}]}`)
+	id := identity.For(nil, "acc-fp2")
+	out := VirtualizeClaudeCodeWithCache(body, id, nil, true, version, ClaudeCodeCacheOptions{AttributionFingerprint: true})
+	got := firstSystemText(t, out.Body)
+	if m := billingRe.FindStringSubmatch(got); m == nil || m[1] != version {
+		t.Fatalf("no user message must emit a plain cc_version, got %q", got)
+	}
+}
+
+// TestEnsureClaudeCodeBillingHeaderWithFingerprint covers the standalone OpenAI→Claude
+// relay path (chat_claude.go), which defers the billing stamp until after cache-control
+// injection. It must emit the same message-derived suffix as the folded-in path.
+func TestEnsureClaudeCodeBillingHeaderWithFingerprint(t *testing.T) {
+	const version = "2.1.241"
+	body := []byte(`{"model":"claude","system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],` +
+		`"messages":[{"role":"user","content":"hello world, this is a test message"}]}`)
+
+	plain := EnsureClaudeCodeBillingHeader(body, version)
+	if got := firstSystemText(t, plain); !strings.Contains(got, "cc_version="+version+";") {
+		t.Fatalf("disabled must emit a plain cc_version, got %q", got)
+	}
+	live := EnsureClaudeCodeBillingHeaderWithFingerprint(body, version, true)
+	if got := firstSystemText(t, live); !strings.Contains(got, "cc_version="+version+".7ae;") {
+		t.Fatalf("enabled must append the message fingerprint, got %q", got)
 	}
 }
 

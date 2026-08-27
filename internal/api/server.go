@@ -1966,7 +1966,11 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// do not inject one here or report an unsupported 24h policy as effective. Cache
 	// reuse is driven by the supported prompt_cache_key + stable account affinity.
 	if !prepared && !strictNativeCPA {
-		if updated, normalized := normalizeOfficialCodexPromptCacheKey(r, body, model, s.codexPromptCacheKeyShards(r.Context())); normalized {
+		codexShards := s.codexPromptCacheKeyShards(r.Context())
+		if base := officialCodexStablePromptCacheBase(r, body, model); base != "" {
+			codexShards = s.codexPromptCachePrefixShards(lease.Account.ID, model, base, codexShards, time.Now())
+		}
+		if updated, normalized := normalizeOfficialCodexPromptCacheKey(r, body, model, codexShards); normalized {
 			body = updated
 			promptCacheKeySource = "official_codex_stable_prefix"
 		}

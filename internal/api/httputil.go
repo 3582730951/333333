@@ -577,7 +577,8 @@ func ensureResponsesPromptCacheKey(raw []byte, key string) []byte {
 // keys from other clients are preserved verbatim.
 func normalizeOfficialCodexPromptCacheKey(r *http.Request, raw []byte, model string, shardCounts ...int) ([]byte, bool) {
 	existing := routing.PromptCacheKey(raw)
-	if !looksLikeUUID(existing) || !isOfficialCodexCLIRequest(r) {
+	stable := officialCodexStablePromptCacheBase(r, raw, model)
+	if stable == "" {
 		return raw, false
 	}
 	shards := 4
@@ -587,16 +588,11 @@ func normalizeOfficialCodexPromptCacheKey(r *http.Request, raw []byte, model str
 	if shards < 1 || shards > 16 {
 		shards = 4
 	}
-	prefixHash := officialCodexBasePromptCacheHash(raw)
-	if prefixHash == "" {
-		prefixHash = automaticPromptCachePrefixHash(raw)
-	}
-	stable := automaticPromptCacheKey(model, prefixHash)
-	if stable != "" && shards > 1 {
+	if shards > 1 {
 		seed := officialCodexPromptCacheShardSeedWithRequest(r, raw, existing)
 		stable = fmt.Sprintf("%s_s%02d", stable, codexPromptCacheShard(seed, shards))
 	}
-	if stable == "" || stable == existing {
+	if stable == existing {
 		return raw, false
 	}
 	out, err := sjson.SetBytes(raw, "prompt_cache_key", stable)
@@ -604,6 +600,24 @@ func normalizeOfficialCodexPromptCacheKey(r *http.Request, raw []byte, model str
 		return raw, false
 	}
 	return out, true
+}
+
+// officialCodexStablePromptCacheBase returns the UNSHARDED stable key that
+// normalizeOfficialCodexPromptCacheKey derives for this request, or "" when the request
+// is not an official Codex CLI call carrying a generated per-thread UUID.
+//
+// Shard sizing reads this value rather than the emitted key: it is the identity of the
+// shared upstream prefix, so its aggregate request rate — not any one shard's fraction
+// of it — is what decides how many shards that prefix actually needs.
+func officialCodexStablePromptCacheBase(r *http.Request, raw []byte, model string) string {
+	if !looksLikeUUID(routing.PromptCacheKey(raw)) || !isOfficialCodexCLIRequest(r) {
+		return ""
+	}
+	prefixHash := officialCodexBasePromptCacheHash(raw)
+	if prefixHash == "" {
+		prefixHash = automaticPromptCachePrefixHash(raw)
+	}
+	return automaticPromptCacheKey(model, prefixHash)
 }
 
 // officialCodexPromptCacheShardSeed keeps one conversation on one shard while

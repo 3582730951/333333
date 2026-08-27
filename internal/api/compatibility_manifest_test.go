@@ -36,7 +36,7 @@ func TestCompatibilityManifestCannotDowngradeBundledOrPinnedClient(t *testing.T)
 	// this build. Discovery may report it, but automatic request shaping must stay
 	// on an exact verified profile until that version joins the fingerprint library.
 	cfg = config.Default()
-	got = applyCompatibilityManifestConfig(cfg, compatmanifest.Payload{Codex: compatmanifest.ClientProfile{Version: "0.149.0"}})
+	got = applyCompatibilityManifestConfig(cfg, compatmanifest.Payload{Codex: compatmanifest.ClientProfile{Version: "0.150.0"}})
 	if got.ClientVersion != config.DefaultClientVersion || got.CodexCLIVersionOverride != "" {
 		t.Fatalf("unknown future release bypassed the verified fingerprint library: %+v", got)
 	}
@@ -48,6 +48,34 @@ func TestCompatibilityManifestCannotDowngradeBundledOrPinnedClient(t *testing.T)
 	status, ok := server.compatibilityManifestStatus().(compatmanifest.Status)
 	if !ok || status.Canary != "rejected_version_downgrade" {
 		t.Fatalf("downgrade status=%+v", server.compatibilityManifestStatus())
+	}
+}
+
+func TestCompatibilityManifestAttributionSuffixAssertion(t *testing.T) {
+	claude := compatmanifest.ClientProfile{CLIVersion: "2.1.241", NodeVersion: "v26.3.0", StainlessVersion: "0.112.1"}
+	// Default() has the fingerprint ON (verified live client state).
+	cfg := config.Default()
+	if !cfg.ClaudeAttributionFingerprintEnabled() {
+		t.Fatal("config.Default() must enable the attribution fingerprint")
+	}
+	// Full signed tuple with no assertion keeps the default (live) state.
+	got := applyCompatibilityManifestConfig(cfg, compatmanifest.Payload{Source: "signed_custom", Claude: claude})
+	if !got.ClaudeAttributionFingerprintEnabled() {
+		t.Fatalf("full signed tuple dropped the fingerprint: %+v", got)
+	}
+	// plain from signed_custom: operator is fully manifest-driven → flips OFF.
+	plain := compatmanifest.Payload{Source: "signed_custom", Claude: claude}
+	plain.Claude.AttributionSuffix = "plain"
+	got = applyCompatibilityManifestConfig(config.Default(), plain)
+	if got.ClaudeAttributionFingerprintEnabled() {
+		t.Fatalf("signed plain assertion did not flip the fingerprint off: %+v", got)
+	}
+	// An operator pin on any Claude axis keeps manual control (no flip).
+	cfg = config.Default()
+	cfg.ClaudeCLIVersionOverride = "2.1.241"
+	got = applyCompatibilityManifestConfig(cfg, plain)
+	if !got.ClaudeAttributionFingerprintEnabled() {
+		t.Fatalf("pinned operator lost manual control of the fingerprint (stayed on): %+v", got)
 	}
 }
 

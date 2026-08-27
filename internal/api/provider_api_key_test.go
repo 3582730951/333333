@@ -260,7 +260,10 @@ func TestGPT56APIKeyImportRunsTwoRequestCacheCapabilityProbe(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
 			raw, _ := io.ReadAll(r.Body)
 			if bytes.Contains(raw, []byte("application turn")) {
-				if !bytes.Contains(raw, []byte(`"prompt_cache_options":{"mode":"implicit"}`)) || !bytes.Contains(raw, []byte(`"prompt_cache_breakpoint":{"mode":"implicit"}`)) {
+				// auto 模式 = 顶层 implicit options + 稳定前缀末尾 explicit breakpoint。
+				// (OpenAI PromptCacheBreakpointParam enum 只有 ["explicit"],
+				// 历史 "implicit" breakpoint 值 schema-invalid, 上游直接忽略。)
+				if !bytes.Contains(raw, []byte(`"mode":"implicit"`)) || !bytes.Contains(raw, []byte(`"ttl":"30m"`)) || !bytes.Contains(raw, []byte(`"prompt_cache_breakpoint":{"mode":"explicit"}`)) {
 					t.Errorf("application request missing automatic implicit breakpoint: %s", raw)
 				}
 				_, _ = io.WriteString(w, `{"id":"app","model":"gpt-5.6-sol","usage":{"input_tokens":120,"output_tokens":2,"total_tokens":122,"input_tokens_details":{"cached_tokens":100,"cache_write_tokens":0}}}`)

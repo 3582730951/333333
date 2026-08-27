@@ -3,12 +3,37 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/storage"
 )
+
+// claudeProbeBillingRE matches the native billing block; the version is the
+// account-bound fleet-diverse CLI version (any supported release, never a
+// .NNN build suffix), so the wire-shape check matches the regex and verifies
+// membership in the supported pool instead of pinning a single version.
+var claudeProbeBillingRE = regexp.MustCompile(`x-anthropic-billing-header: cc_version=([0-9.]+); cc_entrypoint=(cli|sdk-cli);`)
+
+// assertClaudeProbeBillingVersion verifies the probe's cc_version is a real
+// supported Claude Code release and returns it for reuse.
+func assertClaudeProbeBillingVersion(t *testing.T, text string) string {
+	t.Helper()
+	m := claudeProbeBillingRE.FindStringSubmatch(text)
+	if m == nil {
+		t.Fatalf("billing header not native shape (cc_version + entrypoint): %q", text)
+	}
+	supported := config.SupportedClaudeCLIVersions()
+	for _, v := range supported {
+		if v == m[1] {
+			return m[1]
+		}
+	}
+	t.Fatalf("billing cc_version=%s not a supported Claude Code release %v", m[1], supported)
+	return ""
+}
 
 func assertClaudeCodeIdentityWireShape(t *testing.T, raw, model string) {
 	t.Helper()
@@ -25,7 +50,7 @@ func assertClaudeCodeIdentityWireShape(t *testing.T, raw, model string) {
 	}
 	first, _ := system[0].(map[string]interface{})
 	second, _ := system[1].(map[string]interface{})
-	if !strings.Contains(wireTestString(first["text"]), "x-anthropic-billing-header: cc_version=2.1.226.503; cc_entrypoint=") ||
+	if assertClaudeProbeBillingVersion(t, wireTestString(first["text"])) == "" ||
 		!strings.HasPrefix(wireTestString(second["text"]), claudeCodeProbeIdentityLine) {
 		t.Fatalf("Claude identity prefix is not native billing then SDK identity: %s", raw)
 	}
@@ -85,7 +110,7 @@ func assertClaudeCodeProbeWireShape(t *testing.T, raw, model, promptText string,
 		t.Fatalf("Claude probe message order/content differs from claude-cli: %s", raw)
 	}
 	for _, required := range []string{
-		`x-anthropic-billing-header: cc_version=2.1.226.503; cc_entrypoint=sdk-cli;`,
+		"x-anthropic-billing-header: cc_version=" + assertClaudeProbeBillingVersion(t, raw) + "; cc_entrypoint=sdk-cli;",
 		claudeCodeProbeIdentityLine,
 		`"cache_control":{"type":"ephemeral"}`,
 		`"tools":[]`,

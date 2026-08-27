@@ -32,6 +32,8 @@ func TestCodexFiveVersionsDriveHeadersAndBodyProfile(t *testing.T) {
 		{version: "0.146.1", codeMode: true, cacheKey: rootSession},
 		{version: "0.147.0", codeMode: true, parentTurnID: true, cacheKey: rootSession},
 		{version: "0.148.0", codeMode: true, parentTurnID: true, cacheKey: rootSession},
+		{version: "0.149.0", codeMode: true, parentTurnID: true, cacheKey: rootSession},
+		{version: "0.149.1", codeMode: true, parentTurnID: true, cacheKey: rootSession},
 	}
 	for _, tc := range tests {
 		t.Run(tc.version, func(t *testing.T) {
@@ -182,6 +184,7 @@ func TestCodexSourcePathUsesFrozenVersionProfile(t *testing.T) {
 	}{
 		{version: "0.145.0", cacheKey: "019f2000-0000-7000-8000-000000000001"},
 		{version: "0.148.0", cacheKey: "019f2000-0000-7000-8000-000000000001", wantCodeMode: true, wantParent: true},
+		{version: "0.149.1", cacheKey: "019f2000-0000-7000-8000-000000000001", wantCodeMode: true, wantParent: true},
 	} {
 		t.Run(tc.version, func(t *testing.T) {
 			raw := []byte(`{"model":"gpt-5.6-sol","instructions":"keep","input":"hello","prompt_cache_key":"019f2000-0000-7000-8000-000000000004","client_metadata":{"parent_turn_id":"raw-parent","x-codex-turn-metadata":"{\"code_mode_tool_names\":{\"shell\":\"shell\"},\"parent_turn_id\":\"raw-parent\"}"}}`)
@@ -316,7 +319,7 @@ func TestAnalyzeCodexDownstreamVersionRejectsConflictUnknownAndThirdParty(t *tes
 			wantConflict: true,
 		},
 		{
-			name: "/future version", spec: Request{DownstreamPath: "/v1/responses?client_version=0.149.0"},
+			name: "/future version", spec: Request{DownstreamPath: "/v1/responses?client_version=0.150.0"},
 			wantUnsupported: true,
 		},
 		{

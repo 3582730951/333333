@@ -15,6 +15,71 @@ type codexCacheKeyMetric struct {
 	rpm    int64
 	active int64
 	peak   int64
+	// shards is the ratcheted fan-out for a prefix-load entry (see
+	// codexPromptCachePrefixShards). It is unused on per-key observation entries.
+	shards int
+}
+
+// codexPromptCacheShardRPMPerShard is the request rate one prompt_cache_key is expected
+// to carry before it is worth splitting. OpenAI pins a cache key to a single backend, so
+// a key only needs a second shard once it approaches what one backend serves; below that
+// every extra shard is a separate cache that must be written from cold.
+const codexPromptCacheShardRPMPerShard = 15
+
+// codexPromptCachePrefixShards sizes the shard fan-out for one shared prefix from its
+// MEASURED load, with the configured value as a ceiling rather than a constant.
+//
+// The fan-out exists so that many sibling Codex agents sharing an identical 7-8K
+// system/tool preamble do not pile onto one upstream backend. Applying it unconditionally
+// inverted the trade for everyone below that rate: a low-volume deployment wrote the same
+// large prefix into 4 distinct caches and read back from whichever shard a conversation
+// happened to land on, so most requests paid a cold write instead of taking a hit.
+//
+// The count ratchets up immediately when load justifies it and steps down by at most one
+// shard per quiet minute, so a burst can subside without abandoning the keys it warmed.
+func (s *Server) codexPromptCachePrefixShards(accountID, model, base string, maxShards int, now time.Time) int {
+	if maxShards < 1 {
+		maxShards = 1
+	}
+	base = strings.TrimSpace(base)
+	if base == "" || maxShards == 1 {
+		return maxShards
+	}
+	mac := hmac.New(sha256.New, s.identitySecret())
+	_, _ = mac.Write([]byte("codex-prompt-cache-prefix\x00" + strings.TrimSpace(accountID) + "\x00" + strings.TrimSpace(model) + "\x00" + base))
+	metricKey := hex.EncodeToString(mac.Sum(nil))
+	minute := now.Unix() / 60
+
+	s.codexCacheMetricsMu.Lock()
+	defer s.codexCacheMetricsMu.Unlock()
+	if s.codexCacheMetrics == nil {
+		s.codexCacheMetrics = make(map[string]*codexCacheKeyMetric)
+	}
+	metric := s.codexCacheMetrics[metricKey]
+	if metric == nil {
+		metric = &codexCacheKeyMetric{minute: minute, shards: 1}
+		s.codexCacheMetrics[metricKey] = metric
+	}
+	if metric.minute != minute {
+		// Step down one shard when the minute that just closed no longer justifies the
+		// current width. A hard reset would re-cold-start the prefix after any 60s pause.
+		if metric.shards > 1 && metric.rpm <= int64(codexPromptCacheShardRPMPerShard)*int64(metric.shards-1) {
+			metric.shards--
+		}
+		metric.minute = minute
+		metric.rpm = 0
+	}
+	metric.rpm++
+	if metric.shards < 1 {
+		metric.shards = 1
+	}
+	if want := int((metric.rpm + codexPromptCacheShardRPMPerShard - 1) / codexPromptCacheShardRPMPerShard); want > metric.shards {
+		metric.shards = want
+	}
+	if metric.shards > maxShards {
+		metric.shards = maxShards
+	}
+	return metric.shards
 }
 
 type codexCacheKeyObservation struct {

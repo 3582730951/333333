@@ -55,7 +55,9 @@ func TestMergeBetasPrefersClientBetas(t *testing.T) {
 
 // TestMergeBetasFallsBackToCanonical: when the client sends no Anthropic-Beta
 // (e.g. our own count_tokens / models probe), we present the canonical official
-// Claude Code fingerprint so the request still looks first-party.
+// Claude Code fingerprint so the request still looks first-party. The list is the
+// set captured from real 2.1.226/2.1.236–2.1.241 binaries for a 1M-native model
+// (minus context-1m, which is model-gated and injected separately).
 func TestMergeBetasFallsBackToCanonical(t *testing.T) {
 	got := mergeBetas(claudeOAuthBetas, http.Header{}, false)
 	for _, want := range []string{
@@ -65,12 +67,64 @@ func TestMergeBetasFallsBackToCanonical(t *testing.T) {
 		"thinking-token-count-2026-05-13",
 		"context-management-2025-06-27",
 		"prompt-caching-scope-2026-01-05",
+		"mid-conversation-system-2026-04-07",
 		"effort-2025-11-24",
-		"extended-cache-ttl-2025-04-11",
+		"fallback-credit-2026-06-01",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("canonical fallback missing %q: %s", want, got)
 		}
+	}
+	// extended-cache-ttl was in the old list but never appears on a real Claude Code
+	// wire capture; presenting a beta the official client never sends is a fingerprint.
+	for _, forbidden := range []string{"extended-cache-ttl-2025-04-11", claudeContext1MBeta} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("canonical fallback carries %q (not emitted by the real client here): %s", forbidden, got)
+		}
+	}
+}
+
+// TestClaudeBetasForRequestContext1MGating: context-1m rides only a 1M-capable
+// model AND only when the client sent no betas of its own. A genuine Claude Code
+// client manages context-1m itself (and the pool strips it for the virtual-1M
+// fallback), so injecting over the client's set would undo that decision.
+func TestClaudeBetasForRequestContext1MGating(t *testing.T) {
+	// 1M-native model, no client betas → context-1m injected at its native position.
+	got := claudeBetasForRequest(claudeAPIKeyBetas, Request{
+		Body: testBody([]byte(`{"model":"claude-opus-5","messages":[]}`)),
+	}, true)
+	if want := "claude-code-20250219," + claudeContext1MBeta + ",interleaved-thinking"; !strings.Contains(got, want) {
+		t.Fatalf("context-1m not injected at native position after claude-code beta: %s", got)
+	}
+
+	// Standard 200K model → no context-1m.
+	got = claudeBetasForRequest(claudeAPIKeyBetas, Request{
+		Body: testBody([]byte(`{"model":"claude-haiku-4-5","messages":[]}`)),
+	}, true)
+	if strings.Contains(got, claudeContext1MBeta) {
+		t.Fatalf("context-1m injected for a standard-window model: %s", got)
+	}
+
+	// Client sent its own betas → forwarded verbatim, no injection even for [1m].
+	withClient := http.Header{}
+	withClient.Add("Anthropic-Beta", "fast-mode-2099-01-01")
+	got = claudeBetasForRequest(claudeOAuthBetas, Request{
+		Headers: withClient,
+		Body:    testBody([]byte(`{"model":"claude-opus-4-5[1m]","messages":[]}`)),
+	}, false)
+	if strings.Contains(got, claudeContext1MBeta) {
+		t.Fatalf("must not inject context-1m over a client's own betas: %s", got)
+	}
+	if !strings.Contains(got, "fast-mode-2099-01-01") {
+		t.Fatalf("client betas not forwarded verbatim: %s", got)
+	}
+
+	// [1m] alias also triggers the beta (no client betas).
+	got = claudeBetasForRequest(claudeAPIKeyBetas, Request{
+		Body: testBody([]byte(`{"model":"claude-sonnet-4-5[1m]","messages":[]}`)),
+	}, true)
+	if !strings.Contains(got, claudeContext1MBeta) {
+		t.Fatalf("context-1m not injected for [1m] alias: %s", got)
 	}
 }
 

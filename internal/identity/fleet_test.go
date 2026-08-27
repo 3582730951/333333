@@ -1,44 +1,50 @@
 package identity
 
-import "testing"
+import (
+	"testing"
 
-// TestPerAccountVersionTupleMatchesCapturedRelease ensures independently-derived
-// accounts cannot combine stale version axes into a tuple no real release shipped.
-func TestPerAccountVersionTupleMatchesCapturedRelease(t *testing.T) {
+	"codex-account-pool/internal/config"
+)
+
+// TestPerAccountVersionTupleCoherentWithFingerprintLibrary ensures independently
+// derived accounts can never combine stale version axes into a tuple no real
+// release shipped: the cli→stainless→node tuple must always match a row of the
+// fingerprint library, even though the pool intentionally spans several shipped
+// releases for fleet diversity.
+func TestPerAccountVersionTupleCoherentWithFingerprintLibrary(t *testing.T) {
 	secret := []byte("diversity-test")
-	node := map[string]bool{}
-	cli := map[string]bool{}
-	sdk := map[string]bool{}
+	nodeSet := map[string]bool{}
+	cliSet := map[string]bool{}
 	for i := 0; i < 200; i++ {
 		id := For(secret, accountN(i))
-		node[id.NodeVersion] = true
-		cli[id.ClaudeCLIVersion] = true
-		sdk[id.StainlessPackageVersion] = true
+		nodeSet[id.NodeVersion] = true
+		cliSet[id.ClaudeCLIVersion] = true
+		want := config.ClaudeStainlessVersionForCLI(id.ClaudeCLIVersion, "")
+		if want == "" || want != id.StainlessPackageVersion {
+			t.Fatalf("account %d: incoherent tuple cli=%s stainless=%s (library says %q)", i, id.ClaudeCLIVersion, id.StainlessPackageVersion, want)
+		}
+		if _, ok := config.ClaudeCLIFingerprintForVersion(id.ClaudeCLIVersion); !ok {
+			t.Fatalf("account %d: cli version %q not in fingerprint library", i, id.ClaudeCLIVersion)
+		}
 	}
-	if len(node) != 1 || len(cli) != 1 || len(sdk) != 1 {
-		t.Fatalf("version tuple drift: node=%v cli=%v sdk=%v", node, cli, sdk)
+	if !nodeSet[config.DefaultClaudeNodeVersion] {
+		t.Fatalf("node runtime not the captured ground truth: %v", nodeSet)
 	}
-	if !node["v26.3.0"] || !cli[ClaudeCLIVersion] || !sdk["0.94.0"] {
-		t.Fatalf("version tuple does not match captured 2.1.226 release: node=%v cli=%v sdk=%v", node, cli, sdk)
+	if len(cliSet) < 2 {
+		t.Fatalf("pool should span multiple shipped CLI releases for diversity, got %v", cliSet)
 	}
 }
 
-// TestStainlessVersionPopulated ensures every account gets a non-empty SDK version
-// drawn from the pool (the head being the captured ground truth).
+// TestStainlessVersionPopulated ensures every account's SDK version is coherent
+// with its CLI version via the fingerprint library (the head being the captured
+// ground truth), never a free-running axis that could combine stale tuples.
 func TestStainlessVersionPopulated(t *testing.T) {
 	id := For([]byte("s"), "acc-x")
 	if id.StainlessPackageVersion == "" {
 		t.Fatal("StainlessPackageVersion is empty")
 	}
-	found := false
-	for _, v := range stainlessVersionPool {
-		if v == id.StainlessPackageVersion {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("StainlessPackageVersion %q not from pool", id.StainlessPackageVersion)
+	if want := config.ClaudeStainlessVersionForCLI(id.ClaudeCLIVersion, ""); want != "" && want != id.StainlessPackageVersion {
+		t.Fatalf("StainlessPackageVersion %q not coherent with cli %q (library says %q)", id.StainlessPackageVersion, id.ClaudeCLIVersion, want)
 	}
 }
 

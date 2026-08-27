@@ -194,6 +194,7 @@ func TestSettingsCenterAppliesKiroNoDegradationTemplate(t *testing.T) {
 		"codex_session_mapping_enabled":   true,
 		"codex_cpa_strict":                true,
 		"codex_stateless_passthrough":     false,
+		"codex_gpt56_explicit_cache_mode": "auto",
 		"goal_continuity_enabled":         true,
 		"token_save_enabled":              false,
 		"kiro_version":                    "0.11.107",

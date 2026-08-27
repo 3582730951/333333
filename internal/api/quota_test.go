@@ -134,6 +134,30 @@ func TestParseQuotaSnapshotNoHeaders(t *testing.T) {
 	}
 }
 
+func TestParseQuotaSnapshotThousandsSeparators(t *testing.T) {
+	now := int64(1_700_000_000)
+	h := http.Header{}
+	h.Set("anthropic-ratelimit-tokens-limit", "1,234,567")
+	h.Set("anthropic-ratelimit-tokens-remaining", "987,654")
+	h.Set("anthropic-ratelimit-tokens-reset", "6m0s")
+
+	snap, ok := parseQuotaSnapshot("acc", "claude", h, now)
+	if !ok {
+		t.Fatal("expected snapshot ok")
+	}
+	if snap.Source != "tokens" {
+		t.Fatalf("source = %q, want tokens", snap.Source)
+	}
+	// The old leading-run parse read "1,234,567" as 1; separators must be
+	// stripped before parsing so the full value is kept.
+	if snap.LimitTokens != 1234567 || snap.RemainingTokens != 987654 {
+		t.Fatalf("limit=%d remaining=%d, want 1234567/987654", snap.LimitTokens, snap.RemainingTokens)
+	}
+	if p := snap.UsedPercent; p < 19.9 || p > 20.1 {
+		t.Fatalf("used%% = %v, want ~20", p)
+	}
+}
+
 func TestUsedPercentFromUnknown(t *testing.T) {
 	if v := usedPercentFrom(0, 5); v != -1 {
 		t.Fatalf("limit 0 should be unknown, got %v", v)

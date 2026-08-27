@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/storage"
 )
 
@@ -106,6 +107,27 @@ func capturedProtocolMatrixCall(t *testing.T, h *testHarness, suffix string) cap
 	return capturedRequest{}
 }
 
+// assertProtocolMatrixBillingVersion verifies the upstream body's billing block
+// carries a supported fleet-diverse cc_version (never a .NNN build suffix) and the
+// expected native entrypoint.
+func assertProtocolMatrixBillingVersion(t *testing.T, body, entrypoint string) {
+	t.Helper()
+	m := claudeProbeBillingRE.FindStringSubmatch(body)
+	if m == nil {
+		t.Fatalf("billing block missing or malformed: %s", body)
+	}
+	if m[2] != entrypoint {
+		t.Fatalf("billing entrypoint=%s want %s: %s", m[2], entrypoint, body)
+	}
+	supported := config.SupportedClaudeCLIVersions()
+	for _, v := range supported {
+		if v == m[1] {
+			return
+		}
+	}
+	t.Fatalf("cc_version=%s not a supported Claude Code release %v", m[1], supported)
+}
+
 func TestCustomProtocolMatrixChatToAnthropicMessages(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		name := "json"
@@ -163,8 +185,8 @@ func TestCustomProtocolMatrixChatToAnthropicMessages(t *testing.T) {
 				}
 			}
 			call := capturedProtocolMatrixCall(t, h, "/messages")
+			assertProtocolMatrixBillingVersion(t, call.Body, "cli")
 			for _, want := range []string{
-				`"text":"x-anthropic-billing-header: cc_version=2.1.226.503; cc_entrypoint=cli;"`,
 				`"text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."`,
 				`"text":"Be exact."`, `"type":"tool_use"`, `"type":"tool_result"`, `"input_schema"`,
 			} {
@@ -236,8 +258,8 @@ func TestCustomProtocolMatrixResponsesToAnthropicMessages(t *testing.T) {
 				}
 			}
 			call := capturedProtocolMatrixCall(t, h, "/messages")
+			assertProtocolMatrixBillingVersion(t, call.Body, "cli")
 			for _, want := range []string{
-				`"text":"x-anthropic-billing-header: cc_version=2.1.226.503; cc_entrypoint=cli;"`,
 				`"text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."`,
 				`"text":"Be exact."`, `"type":"tool_use"`, `"type":"tool_result"`, `"input_schema"`,
 			} {

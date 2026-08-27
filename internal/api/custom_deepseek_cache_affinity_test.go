@@ -30,8 +30,12 @@ func TestCustomProviderAffinityUsesOriginalResponsesCacheKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(bridge.Body, []byte("prompt_cache_key")) {
-		t.Fatalf("test precondition failed: bridge retained Responses-only cache key: %s", bridge.Body)
+	// The bridge carries prompt_cache_key into the Chat body: Chat Completions honors the
+	// hint with Responses' semantics, and dropping it cost a relayed conversation the
+	// prefix its previous turn had just warmed. Affinity is still pinned from the original
+	// downstream envelope below, so it does not depend on the key surviving conversion.
+	if got := routing.PromptCacheKey(bridge.Body); got != "codex-root-cache" {
+		t.Fatalf("bridge prompt_cache_key = %q, want the downstream key preserved: %s", got, bridge.Body)
 	}
 	got := customProviderProtocolAffinity(pinned, bridge.Body, "codex")
 	if got.Hash != expected.Hash || got.Source != expected.Source {

@@ -158,6 +158,32 @@ func TestSignedManifestRequiresStrictPayloadAndMatchingTrustSource(t *testing.T)
 	}
 }
 
+func TestAttributionSuffixValidation(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	for _, tc := range []struct {
+		source string
+		suffix string
+		valid  bool
+	}{
+		{"signed_custom", "live", true},   // verified live state → force ON
+		{"signed_custom", "plain", true},  // server turned feature down → force OFF
+		{"signed_custom", "bogus", false}, // arbitrary text must not be injected
+		{"official", "live", false},       // npm never runs the client, cannot assert
+		{"official", "plain", false},
+	} {
+		payload := testPayload(now, 1, "1.2.3")
+		payload.Source = tc.source
+		payload.Claude.AttributionSuffix = tc.suffix
+		err := Validate(payload, now, false)
+		if tc.valid && err != nil {
+			t.Fatalf("%s/%s rejected: %v", tc.source, tc.suffix, err)
+		}
+		if !tc.valid && err == nil {
+			t.Fatalf("%s/%s was accepted", tc.source, tc.suffix)
+		}
+	}
+}
+
 func TestOfficialCodexPrefersNPMAndAvoidsGitHubAPI(t *testing.T) {
 	var npmCalls, githubCalls, claudeCalls atomic.Int64
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
