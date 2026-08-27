@@ -315,10 +315,8 @@ func run() int {
 		}
 		app.StartBackground(activeCtx)
 		app.StartAutomation(activeCtx)
-		app.StartQuotaPoller(activeCtx)
 		app.StartModelQualityMonitor(activeCtx)
 		startActiveLedgerPurge(activeCtx, store, cfg)
-		deferredMigrations.Start(activeCtx)
 		log.Printf("worker role active release=%s fencing_token=%d", releaseID, fencingToken)
 		return nil
 	}
@@ -342,6 +340,14 @@ func run() int {
 	deployment.standbyReady.Store(true)
 	serveHTTPServerAsync(serveErr, func() error { return serveHTTPServerOn(httpServer, unixSocket) })
 	supervisor.Go(ctx, "exception-journal-replay", incidentReporter.Run)
+	// Quota polling and deferred storage migrations are idempotent, marker-gated
+	// background work that must survive active-role lease flaps. Binding them to
+	// activeCtx lets a transient renewal failure (SQLite write-lock contention from
+	// a migration batch) cancel the poller's 30s startup stagger forever, starving
+	// quota-window sampling and the UI's USD estimate. Both write through the shared
+	// SQLite store, so any single worker process may perform them once per process.
+	app.StartQuotaPoller(ctx)
+	deferredMigrations.Start(ctx)
 	supervisor.Go(ctx, "worker-role", roleController.Run)
 
 	stop := make(chan os.Signal, 1)
