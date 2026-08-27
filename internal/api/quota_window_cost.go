@@ -17,9 +17,9 @@ import (
 // calculate_money scheme intends.
 
 type quotaModelPrice struct {
-	inputUSD           float64 // per 1M tokens
-	outputUSD          float64 // per 1M tokens
-	cacheReadFactor    float64 // multiplier of input price for cached reads
+	inputUSD            float64 // per 1M tokens
+	outputUSD           float64 // per 1M tokens
+	cacheReadFactor     float64 // multiplier of input price for cached reads
 	cacheCreationFactor float64 // multiplier of input price for cache creation
 }
 
@@ -100,39 +100,52 @@ func quotaUsageCostUSD(model string, promptTokens, completionTokens, cacheReadTo
 
 // quotaWindowCostRow is one usage record priced into the window basis.
 type quotaWindowCostRow struct {
-	Model             string
-	PromptTokens      int64
-	CompletionTokens  int64
-	CacheReadTokens   int64
+	Model               string
+	PromptTokens        int64
+	CompletionTokens    int64
+	CacheReadTokens     int64
 	CacheCreationTokens int64
-	Estimated         int64
+	Estimated           int64
 }
 
 // sumQuotaWindowCost totals the relay's recorded USD spend for an account inside
-// [windowStart, windowEnd]. Settled (estimated=0) records are authoritative; when
-// a window has none yet, the pre-settlement estimates stand in — an empty window
-// must not read as zero spend.
-func (s *Server) sumQuotaWindowCost(ctx context.Context, accountID string, windowStart, windowEnd int64) float64 {
+// [windowStart, windowEnd] and reports what fraction of that total came from requests
+// whose real upstream usage had not settled yet.
+//
+// Every row is one request and is counted once. `estimated` is a column UPDATED IN
+// PLACE on the same usage_records row when the upstream's real usage settles, so a row
+// is either estimated or settled and there is never an estimate/settled PAIR to
+// de-duplicate.
+//
+// This previously skipped every estimated row as soon as the window held any settled
+// row, on the theory that settled records were authoritative and the estimates were
+// stand-ins. Because the flag is per-row and not a duplicate marker, that dropped the
+// spend of every request still awaiting settlement: a window with one settled request
+// and ninety-nine in flight reported roughly one percent of its actual cost, and the
+// window estimator divided that understated cost by the upstream's used_percent — which
+// is why the USD estimate read low.
+//
+// Counting the unsettled rows is the correct total, but it is a softer number than a
+// fully settled window, so the share is returned rather than hidden: the estimator
+// downgrades confidence on a window built mostly from estimates.
+func (s *Server) sumQuotaWindowCost(ctx context.Context, accountID string, windowStart, windowEnd int64) (float64, float64) {
 	if s == nil || s.store == nil || windowEnd <= windowStart {
-		return 0
+		return 0, 0
 	}
 	rows, err := s.store.AccountUsageCostRows(ctx, accountID, windowStart, windowEnd)
 	if err != nil {
-		return 0
+		return 0, 0
 	}
-	realSeen := false
+	total, unsettled := 0.0, 0.0
 	for _, row := range rows {
-		if row.Estimated == 0 {
-			realSeen = true
-			break
+		cost := quotaUsageCostUSD(row.Model, row.PromptTokens, row.CompletionTokens, row.CacheReadTokens, row.CacheCreationTokens)
+		total += cost
+		if row.Estimated != 0 {
+			unsettled += cost
 		}
 	}
-	total := 0.0
-	for _, row := range rows {
-		if realSeen && row.Estimated != 0 {
-			continue
-		}
-		total += quotaUsageCostUSD(row.Model, row.PromptTokens, row.CompletionTokens, row.CacheReadTokens, row.CacheCreationTokens)
+	if total <= 0 {
+		return total, 0
 	}
-	return total
+	return total, unsettled / total
 }

@@ -22,10 +22,10 @@ const (
 	// discovery and on version-gated live Codex requests. ChatGPT gates the returned
 	// model catalog and some live models by this value, so old preserved config
 	// values are floored to this default during normalization.
-	// Refreshed 2026-08-24 from the official Codex CLI 0.149.1 release published
-	// 2026-08-24. The application-level protocol traits for every accepted
-	// downstream version live in codexCLIFingerprints below.
-	DefaultClientVersion                  = "0.149.1"
+	// Refreshed 2026-08-27 to Codex CLI 0.150.1, whose wire traits were verified
+	// against the codex-rs tree in other/codex. The application-level protocol traits
+	// for every accepted downstream version live in codexCLIFingerprints below.
+	DefaultClientVersion                  = "0.150.1"
 	DefaultStickyWaitMillis               = 100
 	DefaultStrictStickyMaxCooldownSeconds = 60
 	DefaultCooldownWaitMaxSeconds         = 30
@@ -140,12 +140,20 @@ type CodexCLIFingerprint struct {
 	PromptCacheKeyBySession bool
 }
 
-// codexCLIFingerprints is the seven-release fingerprint library verified against
-// the corresponding official Codex releases. Keep newest first. Codex 0.149.1
-// and 0.149.0 retain the 0.147.0/0.148.0 Responses metadata contract while adding
-// client-side CLI features (TUI, app-server, Guardian V2) that do not alter these
-// upstream fields.
+// codexCLIFingerprints is the fingerprint library verified against the corresponding
+// official Codex releases. Keep newest first.
+//
+// 0.150.1 was verified against the codex-rs tree in other/codex: the default
+// x-codex-beta-features value is still exactly "remote_compaction_v2" (the FEATURES
+// table has only two Stage::Experimental entries — network_proxy and prevent_idle_sleep —
+// both default_enabled:false, while RemoteCompactionV2 is Stage::Stable/default_enabled:true
+// and is special-cased into the header), parent_turn_id and the session-scoped
+// prompt_cache_key contract are unchanged, and code_mode_tool_names is now a LEGACY key
+// superseded by tool_namespaces_info. The gateway passes tool_namespaces_info through
+// untouched, so the Responses metadata contract for these four traits is identical to
+// 0.149.1/0.148.0/0.147.0.
 var codexCLIFingerprints = [...]CodexCLIFingerprint{
+	{Version: "0.150.1", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
 	{Version: "0.149.1", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
 	{Version: "0.149.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
 	{Version: "0.148.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
@@ -165,8 +173,8 @@ func SupportedCodexCLIVersions() []string {
 	return versions
 }
 
-// IsSupportedCodexCLIVersion reports whether value is one of the seven official
-// stable versions covered by this build.
+// IsSupportedCodexCLIVersion reports whether value is one of the official stable
+// versions covered by this build.
 func IsSupportedCodexCLIVersion(value string) bool {
 	_, ok := CodexCLIFingerprintForVersion(value)
 	return ok
@@ -476,10 +484,12 @@ type Config struct {
 	// per deployment so profiles are not predictable across installs. When empty
 	// a built-in default is used (still deterministic and per-account unique).
 	IdentitySecret string `json:"identity_secret"`
-	// IdentityConvergenceMode controls only the virtual device fingerprint. "off"
-	// (default) preserves per-account/per-egress derivation; "full" deliberately
-	// converges new virtual devices deployment-wide. Durable native session/thread
-	// mappings remain separate, and existing mappings retain their stored device.
+	// IdentityConvergenceMode controls only the virtual device fingerprint.
+	// "account" (default) derives ONE device per account, stable across every egress,
+	// so rotating exit IP no longer mints a new installation id; "off" preserves the
+	// legacy per-account/per-egress derivation; "full" converges new virtual devices
+	// deployment-wide. Durable native session/thread mappings remain separate, and
+	// existing mappings retain their stored device.
 	IdentityConvergenceMode string `json:"identity_convergence_mode"`
 	// WebSearchEnabled makes the gateway ensure a web_search tool is present on
 	// /v1/responses requests (the "联网搜索" AT path). WebSearchToolType overrides
@@ -1125,7 +1135,7 @@ func Default() Config {
 		TrustedProxyCIDRs:                 []string{"127.0.0.0/8", "::1/128"},
 		SidecarTimeoutSeconds:             120,
 		EgressFingerprintEngine:           "inprocess",
-		IdentityConvergenceMode:           "off",
+		IdentityConvergenceMode:           "account",
 		KiroVersion:                       "0.11.107",
 		KiroNodeVersion:                   "22.22.0",
 		KiroDefaultAuthRegion:             "us-east-1",
@@ -1891,8 +1901,10 @@ func (c *Config) normalize() {
 	switch strings.ToLower(strings.TrimSpace(c.IdentityConvergenceMode)) {
 	case "full":
 		c.IdentityConvergenceMode = "full"
-	default:
+	case "off":
 		c.IdentityConvergenceMode = "off"
+	default:
+		c.IdentityConvergenceMode = "account"
 	}
 	if c.StatefulStickyWaitSeconds < 0 {
 		c.StatefulStickyWaitSeconds = 0

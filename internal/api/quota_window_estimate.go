@@ -31,6 +31,11 @@ const (
 	quotaWindowHuberDisagreement   = 0.15
 	quotaWindowStaleAfterSeconds5h = 30 * 60
 	quotaWindowStaleAfterSeconds7d = 6 * 60 * 60
+	// quotaWindowUnsettledShareLimit is how much of the latest sample's cost may come
+	// from requests still awaiting settlement before the window's confidence is
+	// downgraded. Unsettled rows ARE counted (dropping them understated spend badly),
+	// but a total built mostly from estimates must not read as firm as a settled one.
+	quotaWindowUnsettledShareLimit = 0.5
 )
 
 type quotaWindowSample struct {
@@ -40,6 +45,9 @@ type quotaWindowSample struct {
 	SampleAt    int64
 	UsedPercent float64
 	CostUSD     float64
+	// UnsettledShare is the fraction of CostUSD contributed by usage rows whose real
+	// upstream usage had not settled when the sample was taken.
+	UnsettledShare float64
 }
 
 // quotaWindowCostRange is an estimate interval; the JS original calls it a cost.
@@ -81,22 +89,22 @@ type quotaWindowEstimateEvidence struct {
 }
 
 type quotaWindowEstimate struct {
-	State           string                      `json:"state"`
-	Confidence      string                      `json:"confidence"`
-	Reason          string                      `json:"reason,omitempty"`
-	Method          string                      `json:"method,omitempty"`
-	AlgorithmVersion string                     `json:"algorithm_version"`
-	CostBasis       string                      `json:"cost_basis"`
-	QualityScore    float64                     `json:"quality_score"`
-	Stale           bool                        `json:"stale"`
-	SampleAt        int64                       `json:"sample_at,omitempty"`
-	UsedPercent     float64                     `json:"used_percent,omitempty"`
-	ObservedCost    float64                     `json:"observed_cost,omitempty"`
-	Cost            quotaWindowCostRange        `json:"cost"`
-	USDPerPercent   quotaWindowCostRange        `json:"usd_per_percent"`
-	UsedCost        quotaWindowCostRange        `json:"used_cost"`
-	RemainingCost   quotaWindowCostRange        `json:"remaining_cost"`
-	Evidence        quotaWindowEstimateEvidence `json:"evidence"`
+	State            string                      `json:"state"`
+	Confidence       string                      `json:"confidence"`
+	Reason           string                      `json:"reason,omitempty"`
+	Method           string                      `json:"method,omitempty"`
+	AlgorithmVersion string                      `json:"algorithm_version"`
+	CostBasis        string                      `json:"cost_basis"`
+	QualityScore     float64                     `json:"quality_score"`
+	Stale            bool                        `json:"stale"`
+	SampleAt         int64                       `json:"sample_at,omitempty"`
+	UsedPercent      float64                     `json:"used_percent,omitempty"`
+	ObservedCost     float64                     `json:"observed_cost,omitempty"`
+	Cost             quotaWindowCostRange        `json:"cost"`
+	USDPerPercent    quotaWindowCostRange        `json:"usd_per_percent"`
+	UsedCost         quotaWindowCostRange        `json:"used_cost"`
+	RemainingCost    quotaWindowCostRange        `json:"remaining_cost"`
+	Evidence         quotaWindowEstimateEvidence `json:"evidence"`
 }
 
 func quotaWindowIsFinite(value float64) bool {
@@ -215,13 +223,13 @@ type quotaWindowCandidate struct {
 }
 
 type quotaWindowCandidateFilter struct {
-	inliers  []quotaWindowCandidate
-	outliers []quotaWindowCandidate
-	median   float64
-	medianOK bool
-	mad      float64
-	madOK    bool
-	threshold float64
+	inliers     []quotaWindowCandidate
+	outliers    []quotaWindowCandidate
+	median      float64
+	medianOK    bool
+	mad         float64
+	madOK       bool
+	threshold   float64
 	thresholdOK bool
 }
 
@@ -306,10 +314,10 @@ func quotaWindowRoughCandidate(sample quotaWindowSample) (quotaWindowCandidate, 
 }
 
 type quotaWindowDeltaResult struct {
-	valid      bool
-	external   bool
-	coverage   float64
-	candidate  quotaWindowCandidate
+	valid     bool
+	external  bool
+	coverage  float64
+	candidate quotaWindowCandidate
 }
 
 func quotaWindowDeltaCandidate(previous, current quotaWindowSample) quotaWindowDeltaResult {
@@ -492,7 +500,7 @@ func quotaWindowHuberRegression(rawPoints []quotaWindowPoint, options quotaWindo
 }
 
 type quotaWindowHuberOptions struct {
-	tuning       float64
+	tuning        float64
 	maxIterations int
 }
 
@@ -589,16 +597,16 @@ func estimateQuotaWindowSamples(samples []quotaWindowSample, now, staleAfter int
 			reason = "no_local_cost"
 		}
 		return quotaWindowEstimate{
-			State:           "waiting",
-			Confidence:      "none",
-			Reason:          reason,
+			State:            "waiting",
+			Confidence:       "none",
+			Reason:           reason,
 			AlgorithmVersion: quotaWindowAlgorithmVersion,
-			CostBasis:       "total_cost",
-			UsedPercent:     latest.UsedPercent,
-			SampleAt:        latest.SampleAt,
-			ObservedCost:    quotaWindowFinite(latest.CostUSD),
+			CostBasis:        "total_cost",
+			UsedPercent:      latest.UsedPercent,
+			SampleAt:         latest.SampleAt,
+			ObservedCost:     quotaWindowFinite(latest.CostUSD),
 			Evidence: quotaWindowEstimateEvidence{
-				SampleCount:   len(ordered),
+				SampleCount:       len(ordered),
 				ExternalIntervals: externalIntervals,
 				ExternalCoverage:  externalCoverage,
 			},
@@ -608,16 +616,16 @@ func estimateQuotaWindowSamples(samples []quotaWindowSample, now, staleAfter int
 	cost := quotaWindowMakeCost(candidates)
 	if cost.Center <= 0 {
 		return quotaWindowEstimate{
-			State:           "waiting",
-			Confidence:      "none",
-			Reason:          "no_local_cost",
+			State:            "waiting",
+			Confidence:       "none",
+			Reason:           "no_local_cost",
 			AlgorithmVersion: quotaWindowAlgorithmVersion,
-			CostBasis:       "total_cost",
-			UsedPercent:     latest.UsedPercent,
-			SampleAt:        latest.SampleAt,
-			ObservedCost:    quotaWindowFinite(latest.CostUSD),
+			CostBasis:        "total_cost",
+			UsedPercent:      latest.UsedPercent,
+			SampleAt:         latest.SampleAt,
+			ObservedCost:     quotaWindowFinite(latest.CostUSD),
 			Evidence: quotaWindowEstimateEvidence{
-				SampleCount:   len(ordered),
+				SampleCount:       len(ordered),
 				ExternalIntervals: externalIntervals,
 				ExternalCoverage:  externalCoverage,
 			},
@@ -681,6 +689,9 @@ func estimateQuotaWindowSamples(samples []quotaWindowSample, now, staleAfter int
 	}
 	stale := now-latest.SampleAt > staleAfter
 	if stale {
+		confidence = quotaWindowLowerConfidence(confidence)
+	}
+	if latest.UnsettledShare > quotaWindowUnsettledShareLimit {
 		confidence = quotaWindowLowerConfidence(confidence)
 	}
 

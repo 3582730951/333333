@@ -36,6 +36,10 @@ const (
 	// immutable ReferenceVersion artifact.
 	ReviewedHeadCommit = "6364d9e5eb6811980fccadc413af2c0d11b995f2"
 	defaultBinary      = "/usr/local/lib/codex-pool/releases/docker/cursor-proxy/node_modules/.bin/cursor-api-proxy"
+	// moduleBinaryName is the executable the npm package installs. The container image
+	// symlinks it onto PATH and a global npm install puts it there too, so it is the
+	// fallback that lets a deployment whose release layout differs still resolve.
+	moduleBinaryName = "cursor-api-proxy"
 	defaultUsageURL    = "https://api2.cursor.sh/auth/usage"
 	failedStartTTL     = 30 * time.Second
 	startTimeout       = 20 * time.Second
@@ -153,29 +157,99 @@ func (m *Manager) Available() error {
 		return nil
 	}
 	m.mu.Unlock()
-	if filepath.IsAbs(m.binary) {
-		info, err := os.Stat(m.binary)
-		if err != nil {
-			return fmt.Errorf("Cursor proxy module is not installed at %s", m.binary)
-		}
-		if info.IsDir() || info.Mode()&0o111 == 0 {
-			return fmt.Errorf("Cursor proxy module is not executable at %s", m.binary)
-		}
-	} else if _, err := exec.LookPath(m.binary); err != nil {
-		return fmt.Errorf("Cursor proxy module %q is not on PATH", m.binary)
+	resolved, err := resolveCursorProxyBinary(m.binary)
+	if err != nil {
+		return err
 	}
 	if filepath.IsAbs(m.agentBinary) {
-		info, err := os.Stat(m.agentBinary)
-		if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+		info, statErr := os.Stat(m.agentBinary)
+		if statErr != nil || info.IsDir() || info.Mode()&0o111 == 0 {
 			return fmt.Errorf("Cursor Agent is not executable at %s", m.agentBinary)
 		}
-	} else if _, err := exec.LookPath(m.agentBinary); err != nil {
+	} else if _, lookErr := exec.LookPath(m.agentBinary); lookErr != nil {
 		return fmt.Errorf("Cursor Agent %q is not on PATH", m.agentBinary)
 	}
 	m.mu.Lock()
+	m.binary = resolved
 	m.available = true
 	m.mu.Unlock()
 	return nil
+}
+
+// resolvedBinary reads the module path under the lock. Available() rewrites it with the
+// candidate it resolved, and start() runs on its own goroutine, so the read must be
+// synchronized with that write.
+func (m *Manager) resolvedBinary() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.binary
+}
+
+// cursorProxyCandidate is one place the module binary may live, labelled so a failure
+// can report what was tried instead of naming a single dead path.
+type cursorProxyCandidate struct {
+	source string
+	path   string
+}
+
+// cursorProxyBinaryCandidates lists the resolution order. A configured path is tried
+// first and still wins when it works, but it is no longer the ONLY thing tried: the
+// container image both sets CODEX_CURSOR_PROXY_BIN and symlinks the module onto PATH,
+// so a release whose bundled layout moved (or a non-container install where the
+// /usr/local/lib release tree does not exist at all) used to report "module is not
+// installed" while a perfectly good binary sat on PATH.
+func cursorProxyBinaryCandidates(configured string) []cursorProxyCandidate {
+	out := make([]cursorProxyCandidate, 0, 4)
+	seen := map[string]bool{}
+	add := func(source, path string) {
+		path = strings.TrimSpace(path)
+		if path == "" || seen[path] {
+			return
+		}
+		seen[path] = true
+		out = append(out, cursorProxyCandidate{source: source, path: path})
+	}
+	add("configured", configured)
+	add("bundled release", defaultBinary)
+	add("PATH", moduleBinaryName)
+	if exe, err := os.Executable(); err == nil {
+		add("module dir beside server binary",
+			filepath.Join(filepath.Dir(exe), "modules", "cursor-proxy", "node_modules", ".bin", moduleBinaryName))
+	}
+	return out
+}
+
+// resolveCursorProxyBinary returns the first usable candidate. When none work the error
+// names every location tried with the reason each was rejected, so the operator can see
+// whether the module is missing outright or merely somewhere else.
+func resolveCursorProxyBinary(configured string) (string, error) {
+	candidates := cursorProxyBinaryCandidates(configured)
+	reasons := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		resolved, err := usableCursorProxyBinary(candidate.path)
+		if err == nil {
+			return resolved, nil
+		}
+		reasons = append(reasons, fmt.Sprintf("%s %s (%v)", candidate.source, candidate.path, err))
+	}
+	return "", fmt.Errorf("Cursor proxy module is not installed; tried %s", strings.Join(reasons, "; "))
+}
+
+func usableCursorProxyBinary(path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		return exec.LookPath(path)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return "", errors.New("is a directory")
+	}
+	if info.Mode()&0o111 == 0 {
+		return "", errors.New("not executable")
+	}
+	return path, nil
 }
 
 func ValidateCredential(credential Credential) error {
@@ -395,7 +469,7 @@ func (m *Manager) start(accountID string, item *instance, credential Credential)
 		finish("", fmt.Errorf("secure isolated Cursor runtime: %w", err))
 		return
 	}
-	command = exec.CommandContext(m.ctx, m.binary)
+	command = exec.CommandContext(m.ctx, m.resolvedBinary())
 	command.Env = cursorChildEnvironment(credential, port, m.agentBinary, runtimeHome)
 	command.Stdout = io.Discard
 	command.Stderr = io.Discard

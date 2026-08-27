@@ -264,7 +264,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			r = withAnthropicContext1MBeta(r)
 		}
 		if localCountTokens {
-			writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": virtual.EstimateTokensJSON(raw)})
+			writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": countInputTokens(raw)})
 			return
 		}
 		if effectiveProv.UpstreamProtocol == storage.CustomProviderProtocolChatCompletions {
@@ -462,7 +462,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	if lease.Account.Provider == "antigravity" {
 		if countTokens {
 			lease.Release()
-			writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": virtual.EstimateTokensJSON(raw)})
+			writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": countInputTokens(raw)})
 			return outcomeDone
 		}
 		return s.antigravityMessagesWithLease(w, r, raw, model, lease, exclude)

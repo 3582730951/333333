@@ -26,7 +26,6 @@ import (
 	"codex-account-pool/internal/streamrewrite"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
-	"codex-account-pool/internal/virtual"
 	"github.com/google/uuid"
 	"github.com/tidwall/sjson"
 )
@@ -314,7 +313,7 @@ func (s *Server) kiroCountTokensWithLease(w http.ResponseWriter, r *http.Request
 	s.persistKiroResolvedBinding(r.Context(), affinity, lease, model)
 	// Count the original downstream request. Context planning must never make
 	// /count_tokens look smaller by converting or dropping history first.
-	count := virtual.EstimateTokensJSON(raw)
+	count := countInputTokens(raw)
 	if count < 1 {
 		count = 1
 	}

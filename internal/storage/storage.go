@@ -3348,6 +3348,7 @@ func (s *Store) migrateLifecycle(ctx context.Context) error {
 		`ALTER TABLE accounts ADD COLUMN subscription_expires_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE accounts ADD COLUMN last_validity_check_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE accounts ADD COLUMN registration_task_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE quota_window_samples ADD COLUMN unsettled_share REAL NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {

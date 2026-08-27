@@ -11,7 +11,6 @@ import (
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/streamrewrite"
 	"codex-account-pool/internal/supervisor"
-	"codex-account-pool/internal/virtual"
 )
 
 // isCodexMessagesModel identifies model ids that Claude Code may send through the
@@ -31,7 +30,10 @@ func isCodexMessagesModel(model string) bool {
 // encrypted reasoning, typed content, and tool-call identity across agent turns.
 func (s *Server) handleMessagesViaCodex(w http.ResponseWriter, r *http.Request, raw []byte, model string) {
 	if strings.HasSuffix(r.URL.Path, "/count_tokens") {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": virtual.EstimateTokensJSON(raw)})
+		// This route is served by a GPT-family model, so o200k is the right tokenizer
+		// and an exact count is available locally. The rune/4 estimate it replaces
+		// undercounts CJK several-fold while overcounting tool schemas.
+		writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": countCodexInputTokens(raw)})
 		return
 	}
 

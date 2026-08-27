@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS quota_window_samples(
   sample_at INTEGER NOT NULL,
   used_percent REAL NOT NULL,
   cost_usd REAL NOT NULL,
+  unsettled_share REAL NOT NULL DEFAULT 0,
   PRIMARY KEY(account_id, window_kind, cycle_start, sample_at),
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
@@ -59,6 +60,11 @@ type QuotaWindowSample struct {
 	SampleAt    int64
 	UsedPercent float64
 	CostUSD     float64
+	// UnsettledShare is the fraction of CostUSD that came from usage rows whose real
+	// upstream usage had not settled yet (0 = fully settled, 1 = entirely estimated).
+	// The estimator downgrades confidence on a window built mostly from estimates, so a
+	// soft number reads as soft instead of looking as firm as a settled one.
+	UnsettledShare float64
 }
 
 // QuotaWindowCycle points at the cycle currently being sampled for an account's
@@ -107,11 +113,11 @@ func (s *Store) UpsertQuotaWindowSample(ctx context.Context, sample QuotaWindowS
 		sample.SampleAt = Now()
 	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO quota_window_samples(account_id, window_kind, cycle_start, sample_at, used_percent, cost_usd)
-VALUES(?, ?, ?, ?, ?, ?)
+INSERT INTO quota_window_samples(account_id, window_kind, cycle_start, sample_at, used_percent, cost_usd, unsettled_share)
+VALUES(?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id, window_kind, cycle_start, sample_at) DO UPDATE SET
- used_percent = excluded.used_percent, cost_usd = excluded.cost_usd`,
-		strings.TrimSpace(sample.AccountID), strings.TrimSpace(sample.WindowKind), sample.CycleStart, sample.SampleAt, sample.UsedPercent, sample.CostUSD)
+ used_percent = excluded.used_percent, cost_usd = excluded.cost_usd, unsettled_share = excluded.unsettled_share`,
+		strings.TrimSpace(sample.AccountID), strings.TrimSpace(sample.WindowKind), sample.CycleStart, sample.SampleAt, sample.UsedPercent, sample.CostUSD, sample.UnsettledShare)
 	return err
 }
 
@@ -121,7 +127,7 @@ func (s *Store) QuotaWindowSamples(ctx context.Context, accountID, windowKind st
 		return nil, nil
 	}
 	rows, err := s.rdb.QueryContext(ctx, `
-SELECT account_id, window_kind, cycle_start, sample_at, used_percent, cost_usd
+SELECT account_id, window_kind, cycle_start, sample_at, used_percent, cost_usd, unsettled_share
 FROM quota_window_samples
 WHERE account_id = ? AND window_kind = ? AND cycle_start = ?
 ORDER BY sample_at`, strings.TrimSpace(accountID), strings.TrimSpace(windowKind), cycleStart)
@@ -132,7 +138,7 @@ ORDER BY sample_at`, strings.TrimSpace(accountID), strings.TrimSpace(windowKind)
 	var out []QuotaWindowSample
 	for rows.Next() {
 		var sample QuotaWindowSample
-		if err := rows.Scan(&sample.AccountID, &sample.WindowKind, &sample.CycleStart, &sample.SampleAt, &sample.UsedPercent, &sample.CostUSD); err != nil {
+		if err := rows.Scan(&sample.AccountID, &sample.WindowKind, &sample.CycleStart, &sample.SampleAt, &sample.UsedPercent, &sample.CostUSD, &sample.UnsettledShare); err != nil {
 			return nil, err
 		}
 		out = append(out, sample)
@@ -211,12 +217,12 @@ ON CONFLICT(account_id, window_kind, cycle_start) DO UPDATE SET
 
 // AccountUsageCostRow is one usage record returned for window cost summing.
 type AccountUsageCostRow struct {
-	Model             string
-	PromptTokens      int64
-	CompletionTokens  int64
-	CacheReadTokens   int64
+	Model               string
+	PromptTokens        int64
+	CompletionTokens    int64
+	CacheReadTokens     int64
 	CacheCreationTokens int64
-	Estimated         int64
+	Estimated           int64
 }
 
 // AccountUsageCostRows lists the token accounting rows of an account inside

@@ -218,8 +218,8 @@ func TestLoadKeepsNewerCodexClientVersions(t *testing.T) {
 	}
 }
 
-func TestLoadKeepsSevenSupportedCodexCLIVersions(t *testing.T) {
-	wantVersions := []string{"0.149.1", "0.149.0", "0.148.0", "0.147.0", "0.146.1", "0.146.0", "0.145.0"}
+func TestLoadKeepsSupportedCodexCLIVersions(t *testing.T) {
+	wantVersions := []string{"0.150.1", "0.149.1", "0.149.0", "0.148.0", "0.147.0", "0.146.1", "0.146.0", "0.145.0"}
 	if got := SupportedCodexCLIVersions(); !reflect.DeepEqual(got, wantVersions) {
 		t.Fatalf("SupportedCodexCLIVersions() = %v, want %v", got, wantVersions)
 	}
@@ -243,7 +243,7 @@ func TestLoadKeepsSevenSupportedCodexCLIVersions(t *testing.T) {
 
 func TestCodexCLIFingerprintLibraryMatchesDefaultAndReturnsCopies(t *testing.T) {
 	versions := SupportedCodexCLIVersions()
-	if len(versions) != 7 || versions[0] != DefaultClientVersion {
+	if len(versions) != 8 || versions[0] != DefaultClientVersion {
 		t.Fatalf("fingerprint versions=%v default=%q", versions, DefaultClientVersion)
 	}
 	versions[0] = "mutated"

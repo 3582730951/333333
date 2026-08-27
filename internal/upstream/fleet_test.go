@@ -212,10 +212,15 @@ func TestCodexSessionIDSeededFromCorrelator(t *testing.T) {
 }
 
 func TestCodexMappedDeviceUsesSnapshotOSProfile(t *testing.T) {
-	c, secret := fixedSecretClient(t, config.Default())
+	cfg := config.Default()
+	c, secret := fixedSecretClient(t, cfg)
 	account := storage.Account{ID: "acc-mapped-device"}
 	egress := storage.EgressProfile{ID: "egress-mapped-device", Type: "direct"}
-	mappedDevice := identity.CodexDevice(secret, account.ID, egress.ID, "Mac OS")
+	// Derive the expected device the way the client does — under the deployment's
+	// configured convergence policy, not the legacy per-egress helper. What this test
+	// pins is OS-hint precedence (snapshot wins over the request), which is independent
+	// of how the device seed is scoped.
+	mappedDevice := identity.CodexDeviceWithConvergence(secret, account.ID, egress.ID, "Mac OS", cfg.IdentityConvergenceMode)
 	snapshot := &CodexIdentitySnapshot{
 		InstallationID: mappedDevice.MachineID,
 		DeviceOSHint:   "Mac OS",

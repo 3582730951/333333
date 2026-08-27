@@ -195,3 +195,61 @@ func TestAcquireReadyLeaseIsIdempotentlyReleased(t *testing.T) {
 		t.Fatalf("idempotent release left %d leases", item.leases)
 	}
 }
+
+func TestResolveCursorProxyBinaryFallsBackBeyondConfiguredPath(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, moduleBinaryName)
+	if err := os.WriteFile(real, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// A configured path that exists is authoritative.
+	if got, err := resolveCursorProxyBinary(real); err != nil || got != real {
+		t.Fatalf("configured path = %q, err = %v", got, err)
+	}
+
+	// The reported failure: the configured path does not exist, but the module is on
+	// PATH (the container image symlinks it there). That must resolve, not hard-fail.
+	t.Setenv("PATH", dir)
+	missing := filepath.Join(dir, "absent", "cursor-api-proxy")
+	got, err := resolveCursorProxyBinary(missing)
+	if err != nil {
+		t.Fatalf("PATH fallback failed: %v", err)
+	}
+	if got != real {
+		t.Fatalf("resolved %q, want the PATH entry %q", got, real)
+	}
+
+	// With nothing installed anywhere, the error must name every location tried so the
+	// operator can tell "missing" apart from "somewhere else".
+	t.Setenv("PATH", filepath.Join(dir, "empty"))
+	_, err = resolveCursorProxyBinary(missing)
+	if err == nil {
+		t.Fatal("expected failure when no candidate is installed")
+	}
+	for _, want := range []string{missing, defaultBinary, moduleBinaryName} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not mention candidate %q", err, want)
+		}
+	}
+}
+
+func TestCursorProxyCandidatesDedupeAndPreferConfigured(t *testing.T) {
+	candidates := cursorProxyBinaryCandidates(defaultBinary)
+	if len(candidates) == 0 || candidates[0].path != defaultBinary {
+		t.Fatalf("candidates = %+v, want configured first", candidates)
+	}
+	seen := map[string]int{}
+	for _, candidate := range candidates {
+		seen[candidate.path]++
+		if seen[candidate.path] > 1 {
+			t.Fatalf("candidate %q listed twice: %+v", candidate.path, candidates)
+		}
+	}
+	// An empty configured value must not create a blank candidate.
+	for _, candidate := range cursorProxyBinaryCandidates("  ") {
+		if strings.TrimSpace(candidate.path) == "" {
+			t.Fatalf("blank candidate from empty config: %+v", candidate)
+		}
+	}
+}

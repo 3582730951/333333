@@ -34,7 +34,7 @@ import (
 // Current official client versions. Kept here so a single edit updates the
 // fingerprint everywhere. These should track the real shipping clients.
 // Refreshed 2026-08-24 from the shipping Claude Code 2.1.236–2.1.241 binaries
-// and the official Codex CLI 0.149.1 source/release. Claude's shipping tuple
+// and the official Codex CLI 0.150.1 source/release. Claude's shipping tuple
 // remains Node v26.3.0 with Stainless package 0.112.1 (2.1.226 shipped 0.94.0);
 // the per-version cli↔SDK pairing lives in config.claudeCLIFingerprints.
 const (
@@ -410,20 +410,37 @@ func CodexDevice(secret []byte, accountID, egressID, osName string) Identity {
 }
 
 // CodexDeviceWithConvergence is the Codex installation-id counterpart of
-// ForOSWithConvergence. Off preserves the account+egress boundary; full converges
-// new installations while durable session mappings continue to own independent
-// SessionID/ThreadID values.
+// ForOSWithConvergence. The mode decides what the upstream sees as "a device":
+//
+//	"account" (default) — ONE virtual installation per account, stable across every
+//	    egress. This is what a real user looks like: a laptop keeps its installation
+//	    id when it moves between wifi, cellular and a VPN. Changing exit IP no longer
+//	    mints a new device.
+//	"off" — the legacy account+egress boundary. Every exit an account ever used minted
+//	    a separate virtual installation, so the upstream accumulated one account with
+//	    many devices — and rotating IP to escape a risk flag made the spread worse, not
+//	    better. Kept only for deployments that deliberately want an exit-scoped device.
+//	"full" — every account in the deployment shares one device.
+//
+// Session identity stays account-scoped in every mode: convergence must never make two
+// credentials send the same Claude session or derive the same Codex thread/cache
+// namespace. In "account" mode MachineID is already account-scoped, so the derivation
+// is simply the account's own device and no separate namespace seed is needed.
 func CodexDeviceWithConvergence(secret []byte, accountID, egressID, osName, mode string) Identity {
-	if !strings.EqualFold(strings.TrimSpace(mode), "full") {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "full":
+		device := For(secret, fullConvergenceSubject)
+		logical := CodexDevice(secret, accountID, egressID, osName)
+		device.AccountID = accountID
+		device.SessionID = logical.SessionID
+		device.ClaudeSessionID = logical.ClaudeSessionID
+		device.SessionNamespaceSeed = logical.MachineID
+		return device
+	case "off":
 		return CodexDevice(secret, accountID, egressID, osName)
+	default:
+		return ForOS(secret, accountID, osName)
 	}
-	device := For(secret, fullConvergenceSubject)
-	logical := CodexDevice(secret, accountID, egressID, osName)
-	device.AccountID = accountID
-	device.SessionID = logical.SessionID
-	device.ClaudeSessionID = logical.ClaudeSessionID
-	device.SessionNamespaceSeed = logical.MachineID
-	return device
 }
 
 // NewUUIDv7 creates a time-ordered UUIDv7 for a logical Codex session/thread/turn.

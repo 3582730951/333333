@@ -1719,7 +1719,9 @@ func (m *codexSessionMapping) identitySnapshot(secret []byte, lease scheduler.Le
 		binding.DeviceOSHintSet = true
 	}
 	if strings.TrimSpace(binding.InstallationID) == "" {
-		mode := "off"
+		// An omitted mode converges rather than diverges: a caller that did not state a
+		// policy must not silently mint an exit-scoped device for this account.
+		mode := "account"
 		if len(convergenceMode) > 0 {
 			mode = convergenceMode[0]
 		}

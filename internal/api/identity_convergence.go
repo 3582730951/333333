@@ -7,12 +7,19 @@ import (
 	"codex-account-pool/internal/identity"
 )
 
+// identityConvergenceMode normalizes the operator's device-convergence policy. An
+// unset or unrecognized value means "account": one virtual device per account, stable
+// across egress. Only an explicit "off" restores the legacy per-egress derivation,
+// which mints a fresh installation id for every exit an account touches.
 func (s *Server) identityConvergenceMode(ctx context.Context) string {
-	mode := strings.ToLower(strings.TrimSpace(s.settingString(ctx, "identity_convergence_mode", s.cfg.IdentityConvergenceMode)))
-	if mode == "full" {
-		return mode
+	switch strings.ToLower(strings.TrimSpace(s.settingString(ctx, "identity_convergence_mode", s.cfg.IdentityConvergenceMode))) {
+	case "full":
+		return "full"
+	case "off":
+		return "off"
+	default:
+		return "account"
 	}
-	return "off"
 }
 
 func (s *Server) virtualIdentity(ctx context.Context, accountID, osHint string) identity.Identity {

@@ -77,10 +77,10 @@ func (s *Server) recordQuotaWindowSample(ctx context.Context, accountID, windowK
 	}); err != nil {
 		return
 	}
-	cost := s.sumQuotaWindowCost(ctx, accountID, cycleStart, now)
+	cost, unsettledShare := s.sumQuotaWindowCost(ctx, accountID, cycleStart, now)
 	if err := s.store.UpsertQuotaWindowSample(ctx, storage.QuotaWindowSample{
 		AccountID: accountID, WindowKind: windowKind, CycleStart: cycleStart, SampleAt: now,
-		UsedPercent: usedPercent, CostUSD: cost,
+		UsedPercent: usedPercent, CostUSD: cost, UnsettledShare: unsettledShare,
 	}); err != nil {
 		return
 	}
@@ -141,6 +141,7 @@ func quotaWindowSamplesFromStorage(rows []storage.QuotaWindowSample) []quotaWind
 		out = append(out, quotaWindowSample{
 			AccountID: row.AccountID, WindowKind: row.WindowKind, CycleStart: row.CycleStart,
 			SampleAt: row.SampleAt, UsedPercent: row.UsedPercent, CostUSD: row.CostUSD,
+			UnsettledShare: row.UnsettledShare,
 		})
 	}
 	return out
