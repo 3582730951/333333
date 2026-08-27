@@ -170,6 +170,7 @@ internal/api/context_journal_admin.go
 internal/api/context_journal_admin_test.go
 internal/api/context_loss_incident_test.go
 internal/api/context_state_writer.go
+internal/api/count_tokens.go
 internal/api/country_api.go
 internal/api/credential_retry.go
 internal/api/credential_retry_test.go
@@ -184,6 +185,7 @@ internal/api/custom_provider_admin_probe.go
 internal/api/custom_provider_multi_route_test.go
 internal/api/custom_provider_passthrough.go
 internal/api/custom_provider_passthrough_test.go
+internal/api/custom_provider_prompt_cache_key_test.go
 internal/api/custom_provider_routing_test.go
 internal/api/custom_reasoning_compat_test.go
 internal/api/custom_stream.go
@@ -315,6 +317,7 @@ internal/api/quota_summary.go
 internal/api/quota_summary_test.go
 internal/api/quota_test.go
 internal/api/quota_window_cost.go
+internal/api/quota_window_cost_settle_test.go
 internal/api/quota_window_estimate.go
 internal/api/quota_window_estimate_test.go
 internal/api/quota_window_poll.go
@@ -905,6 +908,9 @@ internal/thinking/suffix.go
 internal/thinking/suffix_test.go
 internal/thinking/types.go
 internal/thinking/validate.go
+internal/tokenizer/request.go
+internal/tokenizer/tokenizer.go
+internal/tokenizer/tokenizer_test.go
 internal/tokensave/anthropic.go
 internal/tokensave/tokensave.go
 internal/tokensave/tokensave_test.go
