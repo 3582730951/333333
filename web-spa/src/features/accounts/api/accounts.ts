@@ -34,6 +34,7 @@ const accountSchema = z.object({
   billing_mode: optionalString,
   api_key_present: optionalBoolean,
   ignore_rate_limit_controls: optionalBoolean,
+  force_codex_429: optionalBoolean,
 	 routing_weight: optionalNumber,
 	 retry_max_attempts: optionalNumber,
   quarantine_until: optionalNumber,

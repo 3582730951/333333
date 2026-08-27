@@ -43,6 +43,7 @@ export default function AccountDrawer({
   const [selectedSidecar, setSelectedSidecar] = useState('');
   const [selectedGroup, setSelectedGroup] = useState('');
   const [ignoreRateLimitControls, setIgnoreRateLimitControls] = useState(false);
+  const [forceCodex429, setForceCodex429] = useState(false);
   const [routingWeight, setRoutingWeight] = useState(100);
   const [retryMaxAttempts, setRetryMaxAttempts] = useState(0);
   const [reauthForm, setReauthForm] = useState({ login_email: '', password: '', otp_url: '', target_workspace_id: '', auto_enabled: false });
@@ -92,6 +93,10 @@ export default function AccountDrawer({
   useEffect(() => {
     setIgnoreRateLimitControls(Boolean(account?.ignore_rate_limit_controls));
   }, [account?.id, account?.ignore_rate_limit_controls]);
+
+  useEffect(() => {
+    setForceCodex429(Boolean(account?.force_codex_429));
+  }, [account?.id, account?.force_codex_429]);
 
   useEffect(() => {
     setRoutingWeight(Number(account?.routing_weight) > 0 ? Number(account.routing_weight) : 100);
@@ -159,6 +164,22 @@ export default function AccountDrawer({
       void onUpdated?.(account.id, saved);
     } catch (err) {
       setIgnoreRateLimitControls(previous);
+      showErrorToast(err);
+    }
+  });
+
+  const { run: saveForceCodex429, running: savingForceCodex429 } = useAsyncAction(async (enabled) => {
+    if (!account) return;
+    const previous = forceCodex429;
+    setForceCodex429(enabled);
+    try {
+      const saved = await post(`/admin/accounts/${encodeURIComponent(account.id)}/force-codex-429`, {
+        force_codex_429: enabled,
+      });
+      Toast.success(enabled ? '此账号已开启强制卡429' : '此账号已关闭强制卡429');
+      void onUpdated?.(account.id, saved);
+    } catch (err) {
+      setForceCodex429(previous);
       showErrorToast(err);
     }
   });
@@ -389,6 +410,19 @@ export default function AccountDrawer({
         <Typography.Text size="small" type="tertiary" as="p" style={{ marginTop: 8, display: 'block' }}>
           手动停用、出口不可用及并发上限仍然有效；关闭后，已有冷却和隔离记录会立即重新生效。
         </Typography.Text>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginTop: 14 }}>
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 13 }}>强制卡429</div>
+            <Typography.Text size="small" type="tertiary">
+              仅限 Codex OAuth 账号。注入合成工具上下文，两次明确 429 后保持同账号重试、不切换账号。
+            </Typography.Text>
+          </div>
+          <Switch
+            checked={forceCodex429}
+            disabled={savingForceCodex429}
+            onChange={saveForceCodex429}
+          />
+        </div>
       </Panel>
 
       <Panel title="分压与凭证内重试" style={{ marginBottom: 14 }}>

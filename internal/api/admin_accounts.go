@@ -747,6 +747,8 @@ func (s *Server) adminAccountAction(w http.ResponseWriter, r *http.Request) {
 		s.adminClearCooldown(w, r, accountID)
 	case "rate-limit-controls":
 		s.adminSetAccountRateLimitControls(w, r, accountID)
+	case "force-codex-429":
+		s.adminSetAccountForceCodex429(w, r, accountID)
 	case "routing-policy":
 		s.adminSetAccountRoutingPolicy(w, r, accountID)
 	case "group":
@@ -951,6 +953,47 @@ func (s *Server) adminSetAccountRateLimitControls(w http.ResponseWriter, r *http
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"account_id":                 accountID,
 		"ignore_rate_limit_controls": req.IgnoreRateLimitControls,
+	})
+}
+
+// adminSetAccountForceCodex429 updates the account-local "强制卡429" opt-in
+// exposed by the account drawer. Like the rate-limit-controls override it does
+// not clear stored cooldown/quarantine state; switching it back off restores the
+// normal protections immediately. The flag only takes effect at runtime for
+// OpenAI OAuth Codex requests (see codexAttempt); API-key accounts ignore it.
+func (s *Server) adminSetAccountForceCodex429(w http.ResponseWriter, r *http.Request, accountID string) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPatch {
+		methodNotAllowed(w)
+		return
+	}
+	var req struct {
+		ForceCodex429 bool `json:"force_codex_429"`
+	}
+	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if _, err := s.store.GetAccount(r.Context(), accountID); err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if err := s.store.SetAccountForceCodex429(r.Context(), accountID, req.ForceCodex429); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if s.scheduler != nil {
+		s.scheduler.RefreshAccountCache()
+		s.scheduler.NotifyStateChanged()
+	}
+	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+		AccountID: accountID,
+		Action:    "set_force_codex_429",
+		State:     "manual",
+		Reason:    strconv.FormatBool(req.ForceCodex429),
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"account_id":      accountID,
+		"force_codex_429": req.ForceCodex429,
 	})
 }
 

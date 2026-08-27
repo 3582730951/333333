@@ -219,6 +219,8 @@ internal/api/email_registration_compat.go
 internal/api/failover_resource_test.go
 internal/api/failure_streak.go
 internal/api/failure_streak_test.go
+internal/api/force_codex_429.go
+internal/api/force_codex_429_test.go
 internal/api/gateway.go
 internal/api/gateway_download.go
 internal/api/gateway_download_test.go
@@ -950,6 +952,8 @@ internal/upstream/custom_claude_wire_shape_test.go
 internal/upstream/drain_test.go
 internal/upstream/egress_client.go
 internal/upstream/fleet_test.go
+internal/upstream/force_codex_429.go
+internal/upstream/force_codex_429_test.go
 internal/upstream/http_client_static_test.go
 internal/upstream/inprocess.go
 internal/upstream/ja3_test.go

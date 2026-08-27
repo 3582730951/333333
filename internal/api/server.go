@@ -126,6 +126,11 @@ type Server struct {
 	// conversation silently leaving its cache shard is explainable. See
 	// prompt_drift.go.
 	promptCacheDrift *promptCacheDriftGuard
+	// forceCodex429Counts tracks the trailing-window explicit-429 count per
+	// account for the opt-in "强制卡429" same-account retention. In-memory only;
+	// see force_codex_429.go.
+	forceCodex429Mu     sync.Mutex
+	forceCodex429Counts map[string]*forceCodex429State
 	// regHandler handles registration API requests
 	regHandler         *Handler
 	teamLifecycle      *teamflow.Coordinator
@@ -1929,6 +1934,17 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 	}
 
+	// 强制卡429 (opt-in, per OpenAI OAuth account): append the synthetic
+	// custom_tool_call + custom_tool_call_output pair so the upstream keeps the
+	// agent tool context alive. Skipped for compaction turns and the
+	// chat→responses bridge; the helper itself dedupes prepared retries and
+	// enforces tail eligibility and the size guard.
+	if !isCompact && !isChat && !upstream.AccountUsesAPIKey(token) && lease.Account.ForceCodex429 {
+		if updated, ok := upstream.AppendForceCodex429SyntheticPair(body); ok {
+			body = updated
+		}
+	}
+
 	// Gateway reliability layer (opt-in, default off): inject the developer rules +
 	// per-turn <gateway_request> envelope, classify task/risk, accumulate
 	// working_state, and derive the risk-based reasoning-effort floor. Skipped for
@@ -2431,6 +2447,31 @@ codexResponse:
 		errorBody = redactAgentIdentityError(token, errorBody)
 		if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error"); ok {
 			return handled
+		}
+		// 强制卡429 (opt-in, per OpenAI OAuth account): after two explicit 429s
+		// within the confirmation window, retain this same account/egress and
+		// retry instead of failing over. The first 429 still falls through to the
+		// ordinary failover/cooldown path below. Unlike the IgnoreRateLimitControls
+		// branch, this recognizes only an explicit 429, not a 200-body usage signal.
+		if lease.Account.ForceCodex429 && resp.StatusCode == http.StatusTooManyRequests && !upstream.AccountUsesAPIKey(token) {
+			if s.confirmForceCodex429(r.Context(), lease.Account.ID) {
+				_ = resp.Body.Close()
+				resp, finalEgress, err = s.retryCodexSameAccountAfterRateLimit(r.Context(), lease, func() upstream.Request {
+					return requestForToken(token)
+				}, resp.StatusCode, resp.Header, errorBody)
+				if err != nil {
+					_ = s.settleBillingHold(r.Context(), holdID, "force_codex_429_retry_interrupted")
+					if r.Context().Err() != nil {
+						return codexAttemptResult{Outcome: outcomeDone}
+					}
+					writeError(w, http.StatusBadGateway, err)
+					return codexAttemptResult{Outcome: outcomeDone}
+				}
+				if resp.StatusCode < http.StatusBadRequest {
+					goto codexSuccess
+				}
+				goto codexResponse
+			}
 		}
 		// Goal's fixed machine terminal is the one signal that must leave the
 		// same-account override immediately. Otherwise an opted-in account loops in
