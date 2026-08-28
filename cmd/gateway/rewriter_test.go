@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"codex-account-pool/internal/identity"
 )
 
 func TestRewriteBodyTargetsOfficialIdentityWithoutChangingContextOrTools(t *testing.T) {
@@ -71,9 +73,10 @@ func TestRewriteBodyTargetsOfficialIdentityWithoutChangingContextOrTools(t *test
 	if err := json.Unmarshal([]byte(encodedIdentity), &identityFields); err != nil {
 		t.Fatalf("metadata.user_id is not valid embedded JSON: %v (%q)", err, encodedIdentity)
 	}
+	expectedSession := identity.DerivedUUID(id.Virtual.SessionID, "real-session-context")
 	if identityFields.DeviceID != id.Virtual.UserID ||
 		identityFields.AccountUUID != "" ||
-		identityFields.SessionID != id.Virtual.SessionID {
+		identityFields.SessionID != expectedSession {
 		t.Fatalf("metadata.user_id fields = %#v", identityFields)
 	}
 
@@ -212,6 +215,54 @@ func TestRewriteMetadataUserIDEscapesVirtualValues(t *testing.T) {
 	if !bytes.Contains(rewritten, []byte(`9007199254740993`)) {
 		t.Fatalf("large integer changed: %s", rewritten)
 	}
+}
+
+func TestRewriteBodyKeepsConvergedDeviceButSeparatesCLIContexts(t *testing.T) {
+	id := gatewayRewriteTestIdentity()
+
+	rewrite := func(session string) (deviceID, sessionID string) {
+		t.Helper()
+		body := []byte(`{"session_id":` + mustRewriteTestJSON(t, session) + `,"metadata":{"user_id":"real"}}`)
+		rewritten, err := rewriteBody(body, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root := decodeRewriteTestObject(t, rewritten)
+		var metadata map[string]json.RawMessage
+		if err := json.Unmarshal(root["metadata"], &metadata); err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]string
+		if err := json.Unmarshal([]byte(decodeRewriteTestString(t, metadata["user_id"])), &fields); err != nil {
+			t.Fatal(err)
+		}
+		return fields["device_id"], fields["session_id"]
+	}
+
+	deviceA, sessionA := rewrite("cli-context-a")
+	deviceA2, sessionA2 := rewrite("cli-context-a")
+	deviceB, sessionB := rewrite("cli-context-b")
+	if deviceA != deviceA2 || deviceA != deviceB || deviceA != id.Virtual.UserID {
+		t.Fatalf("converged device changed across contexts: a=%q a2=%q b=%q", deviceA, deviceA2, deviceB)
+	}
+	if sessionA == "" || sessionA != sessionA2 {
+		t.Fatalf("same CLI context was not stable: first=%q second=%q", sessionA, sessionA2)
+	}
+	if sessionA == sessionB {
+		t.Fatalf("different CLI contexts collapsed onto session %q", sessionA)
+	}
+	if sessionA == "cli-context-a" || sessionB == "cli-context-b" {
+		t.Fatal("raw downstream session leaked into virtual metadata")
+	}
+}
+
+func mustRewriteTestJSON(t *testing.T, value string) string {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }
 
 func gatewayRewriteTestIdentity() *CachedIdentity {

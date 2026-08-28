@@ -128,7 +128,7 @@ func (s *Server) buildEmergencyDiagnosticsArchive(fullExportErr error) ([]byte, 
 		files["goal_continuity.csv"] = codebook.sanitize(csvString(goalHeader, goalRows))
 	}
 	files["http_requests.csv"] = codebook.sanitize(csvString(
-		[]string{"request_id", "method", "route", "status", "request_bytes", "response_bytes", "duration_ms", "created_at"},
+		[]string{"request_id", "method", "route", "status", "request_bytes", "response_bytes", "duration_ms", "time_to_first_byte_ms", "stream_duration_ms", "streaming", "created_at"},
 		httpRequestRows(httpRows),
 	))
 	files["route_attempts.csv"] = codebook.sanitize(csvString(

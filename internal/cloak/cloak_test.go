@@ -2,6 +2,7 @@ package cloak
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -214,6 +215,40 @@ func TestVirtualizeClaudeCodeWithCacheSkipsUnknownShapeAndDisabled(t *testing.T)
 	unknown := VirtualizeClaudeCodeWithCache(body, id, nil, true, "2.1.160", ClaudeCodeCacheOptions{NativeBreakpoints: true})
 	if got := countClaudeCacheControls(mustRoot(t, unknown.Body)); got != 1 {
 		t.Fatalf("unknown message shape should be skipped, marker count = %d", got)
+	}
+}
+
+func TestVirtualizeClaudeCodeSeparatesMetadataSessionsOnConvergedDevice(t *testing.T) {
+	id := identity.ForOSWithConvergence([]byte("cloak-session-isolation"), "shared-account", "Linux", "full")
+	makeBody := func(session string) []byte {
+		t.Helper()
+		incoming := fmt.Sprintf(`{"device_id":"downstream-device","account_uuid":"","session_id":%q}`, session)
+		return []byte(fmt.Sprintf(`{"model":"claude","metadata":{"user_id":%q},"system":[{"type":"text","text":%q}],"messages":[{"role":"user","content":"shared prompt"}]}`,
+			incoming, claudeCodeIdentityLine))
+	}
+	project := func(session string) (deviceID, sessionID string) {
+		t.Helper()
+		result := VirtualizeClaudeCode(makeBody(session), id, nil, true, "")
+		var root map[string]interface{}
+		if err := json.Unmarshal(result.Body, &root); err != nil {
+			t.Fatal(err)
+		}
+		metadata := root["metadata"].(map[string]interface{})
+		var fields map[string]string
+		if err := json.Unmarshal([]byte(metadata["user_id"].(string)), &fields); err != nil {
+			t.Fatal(err)
+		}
+		return fields["device_id"], fields["session_id"]
+	}
+
+	deviceA, sessionA := project("cli-session-a")
+	deviceA2, sessionA2 := project("cli-session-a")
+	deviceB, sessionB := project("cli-session-b")
+	if deviceA != id.UserID || deviceA != deviceA2 || deviceA != deviceB {
+		t.Fatalf("device convergence was lost: a=%q a2=%q b=%q want=%q", deviceA, deviceA2, deviceB, id.UserID)
+	}
+	if sessionA == "" || sessionA != sessionA2 || sessionA == sessionB {
+		t.Fatalf("logical sessions were not stable and isolated: a=%q a2=%q b=%q", sessionA, sessionA2, sessionB)
 	}
 }
 

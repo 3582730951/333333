@@ -555,7 +555,7 @@ func sseFrameAdvancesModel(frame []byte, provider string) bool {
 	switch strings.ToLower(strings.TrimSpace(eventType)) {
 	case "", "ping":
 		return false
-	case "response.in_progress", "response.queued", "response.metadata", "codex.rate_limits":
+	case "response.in_progress", "response.queued", "response.metadata", "codex.rate_limits", "rate_limits.updated":
 		return !strings.EqualFold(strings.TrimSpace(provider), "codex")
 	default:
 		return true

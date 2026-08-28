@@ -145,24 +145,39 @@ func extractGenericTrueAffinityKey(r *http.Request, body []byte) AffinityKey {
 	if v := headerValue(r, "x-codex-turn-state"); v != "" {
 		return newKey("x-codex-turn-state:"+v, "x-codex-turn-state")
 	}
+	// Every source that names the ROOT of the conversation is consulted before the
+	// branch thread. Codex advertises the parent in either the header or the turn
+	// metadata depending on the client and the turn, and checking `thread-id` first
+	// meant a branch turn that carried its parent only in the metadata keyed on the
+	// branch instead: the same conversation then hashed to two different accounts and
+	// every turn after the branch paid a cold prefix. Root first, branch as fallback.
+	//
+	// The full turn-metadata JSON is not a conversation identifier: official Codex
+	// changes turn_id, start time, and workspace state between turns.  Only derive
+	// affinity from its stable hierarchy fields so retries stay together without
+	// allocating a durable binding per turn.
+	// A turn that advertises its parent also teaches the branch->root mapping, so the
+	// turns that advertise nothing can still be attributed to the same conversation.
+	turnMetadata := headerValue(r, "x-codex-turn-metadata")
+	ownThread := headerValue(r, "thread-id")
 	if v := headerValue(r, "x-codex-parent-thread-id"); v != "" {
+		RememberCodexThreadParent(ownThread, v)
 		return codexRootThreadAffinity(v)
 	}
-	if v := headerValue(r, "thread-id"); v != "" {
-		return codexRootThreadAffinity(v)
+	if turnMetadata != "" {
+		if v := JSONStringField([]byte(turnMetadata), "parent_thread_id"); v != "" {
+			RememberCodexThreadParent(ownThread, v)
+			return codexRootThreadAffinity(v)
+		}
 	}
-	// The full turn-metadata JSON is not a conversation identifier: official
-	// Codex changes turn_id, start time, and workspace state between turns.  Only
-	// derive affinity from its stable hierarchy fields so retries stay together
-	// without allocating a durable binding per turn.
-	if raw := headerValue(r, "x-codex-turn-metadata"); raw != "" {
-		if v := JSONStringField([]byte(raw), "parent_thread_id"); v != "" {
-			return codexRootThreadAffinity(v)
+	if ownThread != "" {
+		return codexRootThreadAffinity(CodexRootOrSelf(ownThread))
+	}
+	if turnMetadata != "" {
+		if v := JSONStringField([]byte(turnMetadata), "thread_id"); v != "" {
+			return codexRootThreadAffinity(CodexRootOrSelf(v))
 		}
-		if v := JSONStringField([]byte(raw), "thread_id"); v != "" {
-			return codexRootThreadAffinity(v)
-		}
-		if v := JSONStringField([]byte(raw), "window_id"); v != "" {
+		if v := JSONStringField([]byte(turnMetadata), "window_id"); v != "" {
 			return newKey("x-codex-window-id:"+v, "x-codex-window-id")
 		}
 	}

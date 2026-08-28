@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"codex-account-pool/internal/sessionidentity"
 )
 
 const identityErrorBodyLimit = 64 * 1024
@@ -262,9 +264,14 @@ func (p *Proxy) rewriteRequest(req *http.Request) error {
 	req.Body.Close()
 
 	// 改写 body
-	rewritten, err := rewriteBody(body, identity)
+	rewritten, poolSession, err := rewriteBodyForRequest(body, req.Header, identity)
 	if err != nil {
 		return fmt.Errorf("rewrite body failed: %w", err)
+	}
+	if poolSession != "" {
+		// The value is already pseudonymized with the gateway identity seed. The
+		// pool projects it again with the selected account's session seed.
+		req.Header.Set(sessionidentity.PoolSessionHeader, poolSession)
 	}
 
 	// 替换 body

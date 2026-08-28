@@ -170,7 +170,12 @@ func scanJSONReader(ctx context.Context, r io.Reader, expectedSize int64, hmacKe
 	if meta.StablePrefixBytes > meta.Size {
 		meta.StablePrefixBytes = meta.Size
 	}
-	meta.EstimatedTokens = s.runes/4 + 1
+	// Must match virtual.EstimateTokensJSON exactly: this precomputed value is the fast
+	// path and that function is the fallback for the same request, so a divergence would
+	// make the estimate depend on whether a body-meta scan happened to run. ASCII at
+	// 4 bytes/token, non-ASCII at 3 bytes/token — measured against real upstream counts,
+	// where a single runes/4 rule undercounts CJK by ~3.2x.
+	meta.EstimatedTokens = (s.offset-s.nonASCIIBytes)/4 + s.nonASCIIBytes/3 + 1
 	if prefix != nil {
 		meta.StablePrefixHMAC = hex.EncodeToString(prefix.Sum(nil))
 	}
@@ -186,6 +191,7 @@ type jsonMetaScanner struct {
 	reader        *bufio.Reader
 	offset        int64
 	runes         int64
+	nonASCIIBytes int64
 	prefix        hash.Hash
 	prefixBytes   int64
 	prefixBuf     [4096]byte
@@ -735,6 +741,11 @@ func (s *jsonMetaScanner) consumeScannedBytes(p []byte, runes int64) error {
 	start := s.offset
 	s.offset += int64(len(p))
 	s.runes += runes
+	for _, b := range p {
+		if b >= 0x80 {
+			s.nonASCIIBytes++
+		}
+	}
 	if s.prefix != nil && start < s.prefixBytes {
 		s.flushPrefix()
 		n := s.prefixBytes - start
@@ -915,6 +926,9 @@ func (s *jsonMetaScanner) readByte() (byte, error) {
 	s.offset++
 	if b&0xc0 != 0x80 {
 		s.runes++
+	}
+	if b >= 0x80 {
+		s.nonASCIIBytes++
 	}
 	if s.prefix != nil && s.offset <= s.prefixBytes {
 		s.prefixBuf[s.prefixN] = b

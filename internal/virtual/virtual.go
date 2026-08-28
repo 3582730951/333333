@@ -32,22 +32,69 @@ func NewPlanner(store *storage.Store, cfg config.Config) *Planner {
 	return &Planner{store: store, cfg: cfg}
 }
 
+// Measured against real upstream input_tokens on 2026-08-28 by holding a request
+// constant and varying one block of text (so fixed request overhead cancels):
+//
+//	5920 runes of English prose -> 1040 tokens  = 0.176 tokens/rune (~5.7 runes/token)
+//	4560 runes of Chinese prose -> 3599 tokens  = 0.789 tokens/rune (~1.27 runes/token)
+//
+// A single runes/4 rule therefore overestimates English by ~1.4x but UNDERCOUNTS
+// Chinese by ~3.2x. Undercounting is the harmful direction here: this estimate sizes
+// billing holds and the scheduler's per-request weight, so CJK traffic was held and
+// weighted at a third of its real cost.
+//
+// The rates below are expressed per UTF-8 byte so the whole estimate stays a single
+// allocation-free pass (a CJK rune is 3 bytes, so 1/3 token-per-byte reproduces
+// ~1 token per CJK rune). Both are deliberately rounded to keep a margin above the
+// measurement — 1.42x for ASCII, 1.27x for CJK — because an admission gate must never
+// under-reserve. ASCII arithmetic is unchanged from the previous rule, so only
+// non-ASCII bodies move.
+const (
+	asciiBytesPerToken    = 4
+	nonASCIIBytesPerToken = 3
+)
+
 func EstimateTokensText(s string) int64 {
 	if s == "" {
 		return 0
 	}
-	// Conservative no-tokenizer estimate; sufficient for planning gates and tests.
-	// Count runes without materializing a []rune copy of s (identical to len([]rune(s))).
-	return int64(utf8.RuneCountInString(s)/4 + 1)
+	return estimateTokens(len(s), countNonASCIIBytesString(s))
 }
 
-// EstimateTokensJSON estimates tokens for a raw JSON body. It counts runes directly
-// over the bytes (utf8.RuneCount), avoiding the full string + []rune copies of the
-// whole body that string(raw)/[]rune(...) would allocate — this runs twice per request
-// (route estimate + billing hold) on bodies up to MaxBodyBytes, so the saved allocation
-// is real GC pressure. The returned count is identical to len([]rune(string(raw))).
+// EstimateTokensJSON estimates tokens for a raw JSON body in one pass over the bytes,
+// avoiding the string + []rune copies that string(raw)/[]rune(...) would allocate —
+// this runs twice per request (route estimate + billing hold) on bodies up to
+// MaxBodyBytes, so the saved allocation is real GC pressure.
 func EstimateTokensJSON(raw []byte) int64 {
-	return int64(utf8.RuneCount(raw)/4 + 1)
+	if len(raw) == 0 {
+		return 1
+	}
+	return estimateTokens(len(raw), countNonASCIIBytes(raw))
+}
+
+func estimateTokens(totalBytes, nonASCII int) int64 {
+	ascii := totalBytes - nonASCII
+	return int64(ascii/asciiBytesPerToken + nonASCII/nonASCIIBytesPerToken + 1)
+}
+
+func countNonASCIIBytes(raw []byte) int {
+	n := 0
+	for _, b := range raw {
+		if b >= utf8.RuneSelf {
+			n++
+		}
+	}
+	return n
+}
+
+func countNonASCIIBytesString(s string) int {
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			n++
+		}
+	}
+	return n
 }
 
 // EstimateClaudeTokensJSON is a deliberately conservative boundary estimate for

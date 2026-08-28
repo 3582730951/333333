@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/sessionidentity"
 	"codex-account-pool/internal/storage"
 )
 
@@ -15,10 +16,10 @@ const poolClientInstanceHeader = "X-Pool-Client-ID"
 type downstreamClientScopeKey struct{}
 
 // downstreamClientIdentity returns an identity already emitted by the downstream
-// protocol. Official Codex and Claude Code clients therefore need no custom
-// headers or local identifier file: configuring the pool URL and API key is
-// sufficient. X-Pool-Client-ID remains first because the optional local Claude
-// gateway creates and persists it internally without user configuration.
+// protocol. A logical session must win over the durable gateway/device id: one
+// converged gateway installation commonly serves several simultaneous CLI
+// contexts. The installation id is only a fallback when no session boundary is
+// available.
 func downstreamClientIdentity(r *http.Request) (kind, value string) {
 	if r == nil {
 		return "", ""
@@ -27,12 +28,13 @@ func downstreamClientIdentity(r *http.Request) (kind, value string) {
 		kind   string
 		header string
 	}{
-		{"pool_instance", poolClientInstanceHeader},
-		{"explicit_session", "X-Session-ID"},
 		{"claude_session", "X-Claude-Code-Session-Id"},
+		{"explicit_session", "X-Session-ID"},
 		{"codex_session", "Session-Id"},
 		{"codex_conversation", "Conversation-Id"},
 		{"codex_thread", "Thread-Id"},
+		{"pool_session", sessionidentity.PoolSessionHeader},
+		{"pool_instance", poolClientInstanceHeader},
 	} {
 		if value := strings.TrimSpace(r.Header.Get(candidate.header)); value != "" {
 			return candidate.kind, value

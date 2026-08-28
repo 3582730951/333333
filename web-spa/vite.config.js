@@ -4,6 +4,22 @@ import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { extname, join } from 'node:path';
 import { brotliCompressSync, constants as zlibConstants } from 'node:zlib';
 
+import { computeSourceDigest } from './scripts/source-digest.mjs';
+
+function sourceFreshnessManifest() {
+  return {
+    name: 'pool-source-freshness-manifest',
+    apply: 'build',
+    closeBundle() {
+      const output = join(process.cwd(), '../internal/console/dist/build-meta.json');
+      writeFileSync(output, `${JSON.stringify({
+        schema: 1,
+        source_sha256: computeSourceDigest(),
+      }, null, 2)}\n`);
+    },
+  };
+}
+
 function brotliPrecompress() {
   return {
     name: 'pool-brotli-precompress',
@@ -38,7 +54,7 @@ function brotliPrecompress() {
 // local pool server.
 export default defineConfig({
   base: '/console/',
-  plugins: [react(), brotliPrecompress()],
+  plugins: [react(), sourceFreshnessManifest(), brotliPrecompress()],
   build: {
     target: 'es2022',
     outDir: '../internal/console/dist',

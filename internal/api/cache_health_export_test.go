@@ -45,10 +45,10 @@ func TestCacheAccountHealthRowsAggregatesAndFlags(t *testing.T) {
 	codebook := buildDiagnosticCodebookWithKey([]byte("key"), nil, nil, nil, nil, nil, nil)
 	codeA, codeB, codeC := codebook.code("acc-a"), codebook.code("acc-b"), codebook.code("acc-c")
 	rows := []storage.CacheUsageMetricRow{
-		{AccountID: "acc-a", Provider: "openai", Requests: 10, HitRequests: 9},     // 0.9 healthy
-		{AccountID: "acc-a", Provider: "openai", Requests: 0, HitRequests: 0},      // zero row must not corrupt
-		{AccountID: "acc-b", Provider: "anthropic", Requests: 10, HitRequests: 2},  // 0.2 critical
-		{AccountID: "acc-c", Provider: "openai", Requests: 3, HitRequests: 1},      // insufficient samples
+		{AccountID: "acc-a", Provider: "openai", Requests: 10, HitRequests: 9},    // 0.9 healthy
+		{AccountID: "acc-a", Provider: "openai", Requests: 0, HitRequests: 0},     // zero row must not corrupt
+		{AccountID: "acc-b", Provider: "anthropic", Requests: 10, HitRequests: 2}, // 0.2 critical
+		{AccountID: "acc-c", Provider: "openai", Requests: 3, HitRequests: 1},     // insufficient samples
 	}
 	out := cacheAccountHealthRows(rows, codebook, 0.7, 0.4)
 	byCode := map[string][]string{}
@@ -115,7 +115,7 @@ func TestCacheRebindRowsJoinsFollowupUsage(t *testing.T) {
 	if err := store.InsertAuditLog(ctx, storage.AuditLogRow{
 		AccountID: "acc-b",
 		Action:    "affinity_rebind", State: "recovered", Reason: "sticky_unavailable",
-		Detail: "from=acc-a to=acc-b affinity=aff_1 route_key=route_x group=codex model=gpt-5.6",
+		Detail:    "from=acc-a to=acc-b affinity=aff_1 route_key=route_x group=codex model=gpt-5.6",
 		CreatedAt: rebindAt,
 	}); err != nil {
 		t.Fatal(err)

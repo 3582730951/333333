@@ -28,10 +28,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 
 	"codex-account-pool/internal/anthropicwire"
 	"codex-account-pool/internal/identity"
+	"codex-account-pool/internal/sessionidentity"
 	"codex-account-pool/internal/streamrewrite"
 )
 
@@ -83,6 +85,11 @@ type ClaudeCodeCacheOptions struct {
 	BreakpointPolicy  string
 	TTL               string
 
+	// SessionHeaders carries the downstream's logical CLI-session signals. Device
+	// convergence affects only device fields; metadata.user_id.session_id is
+	// projected independently from these headers (or the request body fallback).
+	SessionHeaders http.Header
+
 	// AttributionFingerprint, when true, appends the real Claude Code attribution
 	// fingerprint to the billing block's cc_version (cc_version=<v>.<3-hex>).
 	// The algorithm is the client's obfuscated attribution hash
@@ -113,12 +120,13 @@ func VirtualizeClaudeCodeWithCache(body []byte, id identity.Identity, sensitiveW
 	rules := make([]streamrewrite.Rule, 0, len(sensitiveWords)+1)
 	out := body
 	nativeClaudeCode := false
+	projectedSession := sessionidentity.Project(identity.SessionSeed(id), id.ClaudeSessionID, cache.SessionHeaders, body)
 
 	var root map[string]interface{}
 	if decodeClaudeJSONObject(body, &root) == nil {
 		nativeClaudeCode = firstSystemIsClaudeCode(root)
 		if md, ok := root["metadata"].(map[string]interface{}); ok {
-			vid := claudeVirtualUserID(id, oauth || nativeClaudeCode)
+			vid := claudeVirtualUserID(id, oauth || nativeClaudeCode, projectedSession)
 			if orig, _ := md["user_id"].(string); orig != "" && orig != vid {
 				rules = append(rules, streamrewrite.Rule{Pattern: orig, Replacement: vid})
 			}
@@ -127,7 +135,7 @@ func VirtualizeClaudeCodeWithCache(body []byte, id identity.Identity, sensitiveW
 			root["metadata"] = md
 		} else if oauth || nativeClaudeCode {
 			root["metadata"] = map[string]interface{}{
-				"user_id": claudeVirtualUserID(id, true),
+				"user_id": claudeVirtualUserID(id, true, projectedSession),
 			}
 		}
 		if oauth {
@@ -350,11 +358,18 @@ func stripMetadataTelemetry(md map[string]interface{}) {
 // account_uuid is empty for the captured third-party relay shape;
 // device_id and session_id are account-bound deterministic values. The key ORDER is
 // preserved to match the real client byte-shape. API-key/SDK callers keep the plain id.
-func claudeVirtualUserID(id identity.Identity, claudeCode bool) string {
+func claudeVirtualUserID(id identity.Identity, claudeCode bool, projectedSession ...string) string {
 	if !claudeCode {
 		return id.UserID
 	}
-	return fmt.Sprintf(`{"device_id":%q,"account_uuid":%q,"session_id":%q}`, id.UserID, "", id.ClaudeSessionID)
+	sessionID := ""
+	if len(projectedSession) > 0 {
+		sessionID = projectedSession[0]
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		sessionID = id.ClaudeSessionID
+	}
+	return fmt.Sprintf(`{"device_id":%q,"account_uuid":%q,"session_id":%q}`, id.UserID, "", sessionID)
 }
 
 // normalizeSystemInfo unifies the "Platform:" and "OS Version:" markers in the
@@ -625,6 +640,7 @@ func capCacheControlBreakpoints(root map[string]interface{}, max int) {
 
 // EnsureClaudeCodeBillingHeader makes the request carry a well-formed Claude Code
 // x-anthropic-billing-header system block as system[0], matching the shipping
+//
 //	2.1.236–2.1.241 wire shape (captured from the official binaries): a text block,
 //	NO cache_control, of the form
 //

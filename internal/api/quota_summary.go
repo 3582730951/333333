@@ -200,7 +200,10 @@ func selectQuotaPrimary(provider string, snapshots []storage.AccountRateLimit) *
 		if limiter == "" {
 			limiter = strings.TrimSpace(snap.Source)
 		}
-		if limiter == "7d_oauth_usage" || limiter == "7d_polled" || limiter == codexResetCreditsLimiterType || limiter == codexCreditsLimiterType || limiter == "quota_poll_error" || strings.HasPrefix(strings.TrimSpace(snap.Status), "error/") {
+		// codexStreamFeaturesLimiterType is a passive observation row (used_percent -1,
+		// status "observed") recording per-feature limit names seen on the wire. It
+		// carries no routable window, so it must never become the primary quota.
+		if limiter == "7d_oauth_usage" || limiter == "7d_polled" || limiter == codexResetCreditsLimiterType || limiter == codexCreditsLimiterType || limiter == codexStreamFeaturesLimiterType || limiter == "quota_poll_error" || strings.HasPrefix(strings.TrimSpace(snap.Status), "error/") {
 			continue
 		}
 		if provider == "claude" && (limiter == "opus" || limiter == "sonnet" || limiter == "haiku") {

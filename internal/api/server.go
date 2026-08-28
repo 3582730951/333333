@@ -1130,7 +1130,16 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// OpenAI-compatible requests targeting a Claude model are transparently
 	// relayed to the Anthropic upstream (format-converted both ways) instead of
 	// Codex; everything else continues down the Codex/Responses path.
-	if !selectedCustomOK && isChat && (userGroupProvider == "claude" || (userGroupProvider == "" && isClaudeModel(model))) {
+	// An explicit user-group provider is the operator's decision and always wins. The
+	// name-based inference below is only a heuristic, so it additionally defers to the
+	// Codex catalog: SetRemoteCodexModels reserves no prefix, so a signed remote
+	// manifest could publish a claude-spelled slug that the Codex channel actually
+	// owns. Routing must follow the catalog rather than the spelling, otherwise such a
+	// model would be sent to a Claude account that cannot serve it.
+	claudeRelayTarget := !selectedCustomOK &&
+		(userGroupProvider == "claude" ||
+			(userGroupProvider == "" && isClaudeModel(model) && !capability.IsCatalogCodexModel(model)))
+	if claudeRelayTarget && isChat {
 		raw, err = s.applyModelInstructionsForEntrypoint(r.Context(), requestUserGroupPolicy(r.Context()), model, path, raw, bodyMetaForView(capturedMeta, originalRaw, raw))
 		if err != nil {
 			writeCodexInstructionConfigurationError(w, err)
@@ -1138,6 +1147,25 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		}
 		raw = s.moderateHistory(r.Context(), raw, "chat")
 		s.handleChatViaClaude(w, r, raw, model, pol)
+		return
+	}
+	// Codex CLI speaks only the Responses protocol, so a Claude model requested there
+	// needs the same relay. Without this branch the request falls into Codex-specific
+	// routing (CPA mapping, Kiro spillover, session mapping), where the scheduler finds
+	// no Codex account able to serve a Claude model and fails with a no-route 503
+	// before any upstream call is made.
+	// Compaction is deliberately excluded: /v1/responses/compact and the native
+	// compaction_trigger form are Codex-native flows with their own header contract and
+	// window-generation accounting, and Claude has its own autocompact path. Such a
+	// request continues down the pre-existing route rather than through this bridge.
+	if claudeRelayTarget && !isChat && !isCompact {
+		raw, err = s.applyModelInstructionsForEntrypoint(r.Context(), requestUserGroupPolicy(r.Context()), model, path, raw, bodyMetaForView(capturedMeta, originalRaw, raw))
+		if err != nil {
+			writeCodexInstructionConfigurationError(w, err)
+			return
+		}
+		raw = s.moderateHistory(r.Context(), raw, "responses")
+		s.handleResponsesViaClaude(w, r, raw, model, pol)
 		return
 	}
 
@@ -3585,7 +3613,7 @@ codexSuccess:
 		// leakfilter dropped downstream) refreshes the 5h/7d quota rows so the quota view
 		// is current between /wham/usage polls.
 		if streamRateLimits.any() {
-			s.captureCodexStreamRateLimits(lease.Account.ID, streamRateLimits)
+			s.captureCodexStreamRateLimits(lease.Account, streamRateLimits)
 		}
 		if hasTerminalFailure {
 			terminalStatus := "terminal_upstream_failure"

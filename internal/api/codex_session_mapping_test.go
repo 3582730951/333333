@@ -2017,4 +2017,3 @@ func TestCodexSessionMappingSafetyRotationPreservesChildBranch(t *testing.T) {
 		t.Fatalf("fork rotation dropped the ancestry marker: pre=%+v committed=%+v", forkSnapshot, forkCommitted)
 	}
 }
-

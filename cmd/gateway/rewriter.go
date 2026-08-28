@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"regexp"
 	"strings"
+
+	"codex-account-pool/internal/sessionidentity"
 )
 
 const (
@@ -22,30 +25,45 @@ var officialEnvBlockRE = regexp.MustCompile(`(?s)<env>.*?</env>`)
 // paths and encrypted/opaque strings are model or client state and must remain
 // byte-for-byte equivalent after JSON decoding.
 func rewriteBody(body []byte, identity *CachedIdentity) ([]byte, error) {
+	rewritten, _, err := rewriteBodyForRequest(body, nil, identity)
+	return rewritten, err
+}
+
+// rewriteBodyForRequest projects the logical CLI session independently from the
+// cached virtual device. The returned poolSession is an opaque internal hint for
+// request paths that do not carry a protocol-native session header.
+func rewriteBodyForRequest(body []byte, headers http.Header, identity *CachedIdentity) ([]byte, string, error) {
 	if identity == nil || identity.Virtual == nil {
-		return body, nil
+		return body, "", nil
+	}
+	signal := sessionidentity.Strongest(headers, body)
+	projectedSession := sessionidentity.ProjectSignal(identity.Virtual.SessionID, identity.Virtual.SessionID, signal)
+	poolSession := ""
+	if signal.SessionScoped() {
+		poolSession = projectedSession
 	}
 
 	root, err := decodeRawJSONObject(body)
 	if err != nil {
 		// Let the upstream endpoint produce its normal JSON error. The gateway
 		// must not turn a malformed client request into an identity failure.
-		return body, nil
+		return body, "", nil
 	}
 
-	metadataChanged, err := rewriteRawMetadataUserID(root, identity)
+	metadataChanged, err := rewriteRawMetadataUserID(root, identity, projectedSession)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	systemChanged, err := rewriteRawOfficialSystem(root, identity)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if !metadataChanged && !systemChanged {
-		return body, nil
+		return body, poolSession, nil
 	}
 
-	return marshalRawJSON(root)
+	rewritten, err := marshalRawJSON(root)
+	return rewritten, poolSession, err
 }
 
 // rewriteMetadataUserID rewrites only metadata.user_id. It is kept separate for
@@ -59,7 +77,9 @@ func rewriteMetadataUserID(body []byte, identity *CachedIdentity) ([]byte, error
 	if err != nil {
 		return body, err
 	}
-	changed, err := rewriteRawMetadataUserID(root, identity)
+	signal := sessionidentity.Strongest(nil, body)
+	projectedSession := sessionidentity.ProjectSignal(identity.Virtual.SessionID, identity.Virtual.SessionID, signal)
+	changed, err := rewriteRawMetadataUserID(root, identity, projectedSession)
 	if err != nil || !changed {
 		return body, err
 	}
@@ -99,7 +119,7 @@ func marshalRawJSON(value interface{}) ([]byte, error) {
 	return bytes.TrimSuffix(out.Bytes(), []byte{'\n'}), nil
 }
 
-func rewriteRawMetadataUserID(root map[string]json.RawMessage, identity *CachedIdentity) (bool, error) {
+func rewriteRawMetadataUserID(root map[string]json.RawMessage, identity *CachedIdentity, sessionID string) (bool, error) {
 	rawMetadata, ok := root["metadata"]
 	if !ok {
 		return false, nil
@@ -123,7 +143,7 @@ func rewriteRawMetadataUserID(root map[string]json.RawMessage, identity *CachedI
 	}{
 		DeviceID:    identity.Virtual.UserID,
 		AccountUUID: "",
-		SessionID:   identity.Virtual.SessionID,
+		SessionID:   sessionID,
 	})
 	if err != nil {
 		return false, err

@@ -537,9 +537,10 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	claudeTTL := s.claudeCacheTTLForRoute(r.Context(), affinity)
 	breakpointPolicy := s.claudeCacheBreakpointPolicy(r.Context(), affinity, lease.Account.ID, group, apiKeyHash)
 	result := cloak.VirtualizeClaudeCodeWithCache(raw, id, wordsForClaude, oauth, billingVer, cloak.ClaudeCodeCacheOptions{
-		NativeBreakpoints:    nativeCacheInject,
-		BreakpointPolicy:     breakpointPolicy,
-		TTL:                  claudeTTL,
+		NativeBreakpoints:      nativeCacheInject,
+		BreakpointPolicy:       breakpointPolicy,
+		TTL:                    claudeTTL,
+		SessionHeaders:         r.Header,
 		AttributionFingerprint: s.cfg.ClaudeAttributionFingerprintEnabled(),
 	})
 	body := result.Body

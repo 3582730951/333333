@@ -261,7 +261,7 @@ func (s *Server) writePublicNoAccountError(ctx context.Context, w http.ResponseW
 	} else {
 		s.routingAuditSuppressed.Add(1)
 	}
-	writePublicUnavailable(w, status)
+	writePublicRoutingUnavailable(w, status, reason)
 }
 
 func (s *Server) routingAuditDiagnostics() map[string]interface{} {
@@ -280,12 +280,59 @@ func (s *Server) routingAuditDiagnostics() map[string]interface{} {
 }
 
 func writePublicUnavailable(w http.ResponseWriter, status int) {
+	writePublicRoutingUnavailable(w, status, "")
+}
+
+// writePublicRoutingUnavailable is the downstream-visible half of a routing
+// failure. The audit row keeps everything diagnosable (group hash, provider list,
+// scheduler counters); this carries only a stable code and a message that tells the
+// caller whether waiting can possibly help.
+//
+// That distinction is the whole point. Every routing failure used to answer
+// "Please retry." with type server_error, including the two that retrying can never
+// fix: a group with no accounts at all, and a model the routed group cannot serve.
+// Claude Code and Codex CLI both retry that shape, so a permanent misconfiguration
+// presented as transient saturation turns into an unbounded retry loop against a
+// request that can never succeed — and the reason was already known here, it was
+// just dropped on the way to the client. Reporting an unservable model as a request
+// error follows the precedent set by model_fallback_required.
+//
+// No pool internals are exposed: reason codes are a fixed vocabulary, and no group
+// name, account identifier or counter appears in the response.
+func writePublicRoutingUnavailable(w http.ResponseWriter, status int, reason string) {
 	if status <= 0 {
 		status = http.StatusServiceUnavailable
 	}
+	errorType, code, message := "server_error", "", "Please retry."
+	switch reason {
+	case "model_unsupported":
+		status, errorType, code = http.StatusBadRequest, "invalid_request_error", "model_unsupported"
+		message = "The requested model is not available for this credential's group. " +
+			"Select a different model, or ask the operator to enable it for the group."
+		w.Header().Del("Retry-After")
+	case "group_has_no_accounts":
+		code = "no_accounts_configured"
+		message = "No upstream account is configured for this credential's group. " +
+			"This needs operator action; retrying will not resolve it."
+		// Advertising a retry delay for a condition only an operator can clear is what
+		// produced the unbounded retry loop.
+		w.Header().Del("Retry-After")
+	default:
+		switch status {
+		case http.StatusTooManyRequests:
+			code, message = "capacity_saturated",
+				"All upstream accounts for this credential's group are rate limited. Please retry."
+		case http.StatusConflict:
+			code, message = "sticky_route_unavailable",
+				"The pinned upstream account for this session is temporarily unavailable. Please retry."
+		default:
+			code = "service_unavailable"
+		}
+	}
 	errorBody := map[string]interface{}{
-		"message": "Please retry.",
-		"type":    "server_error",
+		"message": message,
+		"type":    errorType,
+		"code":    code,
 	}
 	if requestID := strings.TrimSpace(w.Header().Get(requestIDHeader)); requestID != "" {
 		errorBody["request_id"] = requestID

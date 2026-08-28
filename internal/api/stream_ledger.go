@@ -526,9 +526,12 @@ func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
 		if completedResponseText(r.completed) != "" {
 			r.text.Reset()
 		}
-	case "codex.rate_limits":
+	// Both spellings carry quota: codex.rate_limits is the full window frame and
+	// rate_limits.updated is the plan-only follow-up. Merging (not overwriting)
+	// keeps the earlier complete windows when the later frame only revises plan.
+	case "codex.rate_limits", "rate_limits.updated":
 		if rl, ok := parseCodexRateLimitsEvent(ev); ok {
-			r.rateLimits = rl
+			r.rateLimits = mergeCodexStreamRateLimits(r.rateLimits, rl)
 		}
 	}
 }

@@ -35,6 +35,14 @@ const (
 	diskGuardRouteCleanupTimeout      = 1500 * time.Millisecond
 	diskGuardGoalCleanupTimeout       = 3 * time.Second
 	diskGuardGoalBudgetTimeout        = 3 * time.Second
+	// A cleanup stage that lost a race for the single writer connection is retried
+	// inside the same maintenance run rather than being abandoned until the next one
+	// five minutes later. Only the "busy" class is retried, and that failure returns
+	// immediately, so the extra attempts cost a bounded pause instead of another full
+	// stage deadline. Every attempt still derives its context from the overall
+	// maintenance budget, so retries can never extend the run.
+	diskCleanupMaxAttempts  = 3
+	diskCleanupRetryBackoff = 120 * time.Millisecond
 	// Headroom maintenance leaves below the new-goal admission ceiling, so a fresh
 	// session is admitted without a foreground reclaim. Bounded on both sides: large
 	// enough for several ordinary turns, small enough to stay a rounding-scale slice
@@ -78,6 +86,8 @@ type DiskGuardSnapshot struct {
 	LargeRequestsPaused        bool                     `json:"large_requests_paused"`
 	AdmissionBlocked           bool                     `json:"admission_blocked"`
 	CleanupFailureEvents       uint64                   `json:"cleanup_failure_events,omitempty"`
+	CleanupRetries             uint64                   `json:"cleanup_retries,omitempty"`
+	CleanupRetrySuccesses      uint64                   `json:"cleanup_retry_successes,omitempty"`
 	CleanupErrorOperation      string                   `json:"cleanup_error_operation,omitempty"`
 	CleanupErrorClass          string                   `json:"cleanup_error_class,omitempty"`
 	LastCleanupErrorAt         int64                    `json:"last_cleanup_error_at,omitempty"`
@@ -178,6 +188,8 @@ func (s *Server) runDiskGuardCycle(ctx context.Context, forceCleanup bool) {
 		JournalWritable:            s.journalWritable(),
 		SpoolWritable:              s.managedDirectoryWritable(s.cfg.BodySpoolDir),
 		CleanupFailureEvents:       previous.CleanupFailureEvents,
+		CleanupRetries:             previous.CleanupRetries,
+		CleanupRetrySuccesses:      previous.CleanupRetrySuccesses,
 		CleanupErrorOperation:      previous.CleanupErrorOperation,
 		CleanupErrorClass:          previous.CleanupErrorClass,
 		LastCleanupErrorAt:         previous.LastCleanupErrorAt,
@@ -277,91 +289,162 @@ func (s *Server) runSafeDiskCleanup(ctx context.Context, snap *DiskGuardSnapshot
 	maintenanceCtx, maintenanceCancel := context.WithTimeout(ctx, diskGuardCleanupTimeout)
 	defer maintenanceCancel()
 
-	contextCtx, contextCancel := context.WithTimeout(maintenanceCtx, diskGuardContextCleanupTimeout)
-	deleted, err := s.store.CleanupContextJournal(contextCtx)
-	contextCancel()
-	if err != nil {
-		noteDiskCleanupFailure(snap, "context_cleanup", "context_cleanup_failed", err)
-	} else {
-		snap.ContextsDeleted += deleted
-	}
+	runDiskCleanupStage(maintenanceCtx, snap, "context_cleanup", "context_cleanup_failed",
+		diskGuardContextCleanupTimeout, func(stageCtx context.Context) error {
+			deleted, err := s.store.CleanupContextJournal(stageCtx)
+			if err != nil {
+				return err
+			}
+			snap.ContextsDeleted += deleted
+			return nil
+		})
 
 	// Session/affinity retention used to run after as many as sixteen Goal
 	// reclamation transactions under one shared deadline. A busy continuity store
 	// therefore consumed the entire maintenance budget before mapping cleanup could
 	// start. Run small metadata retention first and give every stage its own cap.
-	if maintenanceCtx.Err() == nil {
-		mappingCtx, mappingCancel := context.WithTimeout(maintenanceCtx, diskGuardMappingCleanupTimeout)
-		mappings, mappingErr := s.store.CleanupCodexSessionMappings(mappingCtx)
-		mappingCancel()
-		if mappingErr != nil {
-			noteDiskCleanupFailure(snap, "mapping_cleanup", "mapping_cleanup_failed", mappingErr)
-		} else {
+	runDiskCleanupStage(maintenanceCtx, snap, "mapping_cleanup", "mapping_cleanup_failed",
+		diskGuardMappingCleanupTimeout, func(stageCtx context.Context) error {
+			mappings, err := s.store.CleanupCodexSessionMappings(stageCtx)
+			if err != nil {
+				return err
+			}
 			snap.CodexMappingsDeleted += mappings
-		}
-	}
+			return nil
+		})
 
-	if maintenanceCtx.Err() == nil {
-		routeCtx, routeCancel := context.WithTimeout(maintenanceCtx, diskGuardRouteCleanupTimeout)
-		bindings, routeErr := s.store.CleanupInactiveRouteBindings(routeCtx, 256)
-		routeCancel()
-		if routeErr != nil {
-			noteDiskCleanupFailure(snap, "route_binding_cleanup", "route_binding_cleanup_failed", routeErr)
-		} else {
+	runDiskCleanupStage(maintenanceCtx, snap, "route_binding_cleanup", "route_binding_cleanup_failed",
+		diskGuardRouteCleanupTimeout, func(stageCtx context.Context) error {
+			bindings, err := s.store.CleanupInactiveRouteBindings(stageCtx, 256)
+			if err != nil {
+				return err
+			}
 			snap.RouteBindingsDeleted += bindings.Total()
-		}
-	}
+			return nil
+		})
 
 	// Advance multiple bounded phases for expired goals. One step removes at most
 	// 64 rows/8 MiB, so a single step every five minutes left large abandoned tool
 	// sessions visible for hours after expiry.
-	if maintenanceCtx.Err() == nil {
-		goalCtx, goalCancel := context.WithTimeout(maintenanceCtx, diskGuardGoalCleanupTimeout)
-		for step := 0; step < goalStorageMaintenanceStepsPerRun && goalCtx.Err() == nil; step++ {
-			reclaimed, reclaimErr := s.store.CleanupGoalContinuityStep(goalCtx)
-			if reclaimErr != nil {
-				noteDiskCleanupFailure(snap, "goal_cleanup", "goal_cleanup_failed", reclaimErr)
-				break
+	//
+	// A retry re-enters this loop from the top, which is correct: every step is an
+	// independent bounded transaction, and the progress already accumulated into snap
+	// is kept rather than replayed.
+	runDiskCleanupStage(maintenanceCtx, snap, "goal_cleanup", "goal_cleanup_failed",
+		diskGuardGoalCleanupTimeout, func(stageCtx context.Context) error {
+			for step := 0; step < goalStorageMaintenanceStepsPerRun && stageCtx.Err() == nil; step++ {
+				reclaimed, err := s.store.CleanupGoalContinuityStep(stageCtx)
+				if err != nil {
+					return err
+				}
+				snap.GoalBytesReclaimed += reclaimed.BytesFreed
+				snap.GoalsDeleted += reclaimed.Goals
+				if !reclaimed.Progressed {
+					return nil
+				}
 			}
-			snap.GoalBytesReclaimed += reclaimed.BytesFreed
-			snap.GoalsDeleted += reclaimed.Goals
-			if !reclaimed.Progressed {
-				break
-			}
-		}
-		goalCancel()
-	}
+			return nil
+		})
 
 	// Converge below the target, not to it. See goalStorageMaintenanceFloor: the
 	// target doubles as CommitGoalTurn's admission ceiling for a new goal.
 	if maintenanceCtx.Err() == nil {
 		maintenanceFloor := goalStorageMaintenanceFloor(s.goalStorageMaxBytes(maintenanceCtx))
-		budgetCtx, budgetCancel := context.WithTimeout(maintenanceCtx, diskGuardGoalBudgetTimeout)
-		for step := 0; step < goalStorageMaintenanceStepsPerRun && budgetCtx.Err() == nil; step++ {
-			used, usedErr := s.store.GoalStorageBytes(budgetCtx)
-			if usedErr != nil {
-				noteDiskCleanupFailure(snap, "goal_budget_measure", "goal_budget_measure_failed", usedErr)
-				break
-			}
-			if used <= maintenanceFloor {
-				break
-			}
-			reclaimed, reclaimErr := s.store.EnforceGoalStorageBudgetStep(budgetCtx, maintenanceFloor)
-			if reclaimErr != nil {
-				noteDiskCleanupFailure(snap, "goal_budget_cleanup", "goal_budget_cleanup_failed", reclaimErr)
-				break
-			}
-			snap.GoalBytesReclaimed += reclaimed.BytesFreed
-			snap.GoalsDeleted += reclaimed.Goals
-			if !reclaimed.Progressed {
-				break
-			}
-		}
-		budgetCancel()
+		runDiskCleanupStage(maintenanceCtx, snap, "goal_budget_cleanup", "goal_budget_cleanup_failed",
+			diskGuardGoalBudgetTimeout, func(stageCtx context.Context) error {
+				for step := 0; step < goalStorageMaintenanceStepsPerRun && stageCtx.Err() == nil; step++ {
+					used, usedErr := s.store.GoalStorageBytes(stageCtx)
+					if usedErr != nil {
+						return &cleanupStageError{"goal_budget_measure", "goal_budget_measure_failed", usedErr}
+					}
+					if used <= maintenanceFloor {
+						return nil
+					}
+					reclaimed, reclaimErr := s.store.EnforceGoalStorageBudgetStep(stageCtx, maintenanceFloor)
+					if reclaimErr != nil {
+						return reclaimErr
+					}
+					snap.GoalBytesReclaimed += reclaimed.BytesFreed
+					snap.GoalsDeleted += reclaimed.Goals
+					if !reclaimed.Progressed {
+						return nil
+					}
+				}
+				return nil
+			})
 	}
 
 	if maintenanceCtx.Err() == nil {
 		s.cleanupExpiredDiagnosticJobs(maintenanceCtx)
+	}
+}
+
+// cleanupStageError lets a multi-step stage attribute a failure to the specific
+// operation that produced it, so a measurement failure is not reported under the
+// reclamation code that a responder would act on differently.
+type cleanupStageError struct {
+	operation string
+	code      string
+	err       error
+}
+
+func (e *cleanupStageError) Error() string { return e.err.Error() }
+func (e *cleanupStageError) Unwrap() error { return e.err }
+
+// retryableCleanupFailure reports whether re-running a stage inside the same
+// maintenance run can plausibly succeed.
+//
+// Only lock contention qualifies. A timeout means the stage never got the writer
+// within its slice, and re-entering the queue behind the same holder would spend a
+// second full deadline to fail the same way — while consuming budget the later
+// stages need. "readonly", "full" and a malformed image are properties of the
+// volume, not of this attempt, so retrying them is pure waste.
+func retryableCleanupFailure(class string) bool { return class == "busy" }
+
+// runDiskCleanupStage executes one bounded cleanup stage, retrying only the failure
+// class a short pause actually fixes, and records the outcome.
+//
+// Before this existed the four stages each ran once and, on failure, incremented a
+// counter and moved on: the failure was recorded but never handled, so a stage that
+// lost one race waited a full maintenance interval while the data it was supposed
+// to reclaim kept accumulating — which is itself what produces the write pressure
+// that caused the lost race.
+func runDiskCleanupStage(parent context.Context, snap *DiskGuardSnapshot,
+	operation, code string, budget time.Duration, attempt func(context.Context) error) {
+
+	for try := 0; try < diskCleanupMaxAttempts; try++ {
+		if parent.Err() != nil {
+			return
+		}
+		stageCtx, cancel := context.WithTimeout(parent, budget)
+		err := attempt(stageCtx)
+		cancel()
+		if err == nil {
+			if try > 0 && snap != nil {
+				snap.CleanupRetrySuccesses++
+			}
+			return
+		}
+		failedOperation, failedCode := operation, code
+		var staged *cleanupStageError
+		if errors.As(err, &staged) {
+			failedOperation, failedCode = staged.operation, staged.code
+		}
+		if !retryableCleanupFailure(classifyStorageFailure(err)) || try == diskCleanupMaxAttempts-1 {
+			noteDiskCleanupFailure(snap, failedOperation, failedCode, err)
+			return
+		}
+		if snap != nil {
+			snap.CleanupRetries++
+		}
+		// Back off before re-entering the writer queue, so the retry does not simply
+		// re-collide with whatever still holds the connection.
+		select {
+		case <-parent.Done():
+			noteDiskCleanupFailure(snap, failedOperation, failedCode, err)
+			return
+		case <-time.After(diskCleanupRetryBackoff << try):
+		}
 	}
 }
 
@@ -720,6 +803,8 @@ func (s *Server) recordDiskGuardEvent(ctx context.Context, previous, current Dis
 		"database_error_class":         current.DatabaseErrorClass,
 		"database_backpressure_events": current.DatabaseBackpressureEvents,
 		"cleanup_failure_events":       current.CleanupFailureEvents,
+		"cleanup_retries":              current.CleanupRetries,
+		"cleanup_retry_successes":      current.CleanupRetrySuccesses,
 		"cleanup_error_operation":      current.CleanupErrorOperation,
 		"cleanup_error_class":          current.CleanupErrorClass,
 		"journal_writable":             current.JournalWritable,

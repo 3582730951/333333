@@ -20,8 +20,14 @@ import (
 )
 
 const (
-	claudeCodeE2EVersion       = "2.1.226"
-	claudeCodeE2EDefaultBytes  = 896 << 10
+	claudeCodeE2EVersion = "2.1.226"
+	// 384 KiB is the largest prompt Claude Code will actually send for a gpt-* id.
+	// The client budgets against its own built-in 200K window (Anthropic's /v1/models
+	// schema has no context-window field, so the pool's 272K/372K capability values
+	// never reach it) and reserves its max output tokens on top. A larger default is
+	// rejected client-side with "Prompt is too long" before any request is issued, so
+	// the bridge under test is never exercised.
+	claudeCodeE2EDefaultBytes  = 384 << 10
 	claudeCodeE2EMaxBytes      = 8 << 20
 	claudeCodeE2EBeginSentinel = "CLAUDE_CODE_LONG_CONTEXT_BEGIN_71A0E0F3"
 	claudeCodeE2EMidSentinel   = "CLAUDE_CODE_LONG_CONTEXT_MIDDLE_5B329DC1"
@@ -39,10 +45,9 @@ const (
 //	CLAUDE_CODE_DOCKER_E2E=1 go test ./internal/api \
 //	  -run '^TestClaudeCodeDockerEndToEnd$' -count=1 -v
 //
-// CLAUDE_CODE_E2E_CONTEXT_BYTES may raise the default 896 KiB prompt up to
-// 8 MiB for dedicated large-context hosts. The default leaves room beneath the
-// gateway's 372K GPT context ceiling for Claude Code's system prompt and tool
-// schemas.
+// CLAUDE_CODE_E2E_CONTEXT_BYTES may raise the default 384 KiB prompt up to
+// 8 MiB, but only for a client/model pair whose own context budget accepts it:
+// Claude Code rejects an oversized prompt locally, before the gateway sees it.
 func TestClaudeCodeDockerEndToEnd(t *testing.T) {
 	if os.Getenv("CLAUDE_CODE_DOCKER_E2E") != "1" {
 		t.Skip("set CLAUDE_CODE_DOCKER_E2E=1 to run the Docker Claude Code end-to-end test")
@@ -418,7 +423,13 @@ func claudeCodeE2EToolResponse() string {
 		"event: response.output_item.done\n" +
 		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_read","call_id":"call_read","name":"Read","arguments":` + strconv.Quote(arguments) + `}}` + "\n\n" +
 		"event: response.completed\n" +
-		`data: {"type":"response.completed","response":{"id":"resp_read","model":"gpt-5.5","status":"completed","usage":{"input_tokens":220000,"output_tokens":8,"total_tokens":220008}}}` + "\n\n"
+		// Claude Code enforces its own context budget against the usage the upstream
+		// reports. Anthropic's /v1/models schema carries no context-window field, so the
+		// client uses its built-in 200K default for a gpt-* id no matter what the pool's
+		// capability table says. A fabricated count above that window makes the client
+		// abort the next turn with "Prompt is too long" before sending it, which tests
+		// the client's budget math rather than this bridge's protocol fidelity.
+		`data: {"type":"response.completed","response":{"id":"resp_read","model":"gpt-5.5","status":"completed","usage":{"input_tokens":24000,"output_tokens":8,"total_tokens":24008}}}` + "\n\n"
 }
 
 func claudeCodeE2ETextResponse(id, text string) string {

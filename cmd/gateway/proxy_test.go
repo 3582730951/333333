@@ -555,6 +555,33 @@ func TestRewriteRequestPreservesClaudeCodeToolAndOpaquePayloads(t *testing.T) {
 	}
 }
 
+func TestRewriteRequestAddsOpaquePoolSessionForBodyOnlyCLIContexts(t *testing.T) {
+	virtual := gatewayRewriteTestIdentity()
+	cache := NewIdentityCache("http://pool.invalid", "cap_secret", time.Hour, nil)
+	cache.cache["claude"] = virtual
+	proxy := &Proxy{cache: cache}
+
+	rewrite := func(contextID string) string {
+		t.Helper()
+		body := strings.NewReader(`{"session_id":` + mustRewriteTestJSON(t, contextID) + `,"metadata":{"user_id":"real"}}`)
+		req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", body)
+		if err := proxy.rewriteRequest(req); err != nil {
+			t.Fatal(err)
+		}
+		return req.Header.Get("X-Pool-Session-ID")
+	}
+
+	a1 := rewrite("body-only-context-a")
+	a2 := rewrite("body-only-context-a")
+	b := rewrite("body-only-context-b")
+	if a1 == "" || a1 != a2 || a1 == b {
+		t.Fatalf("gateway session hint is not stable and isolated: a=%q a2=%q b=%q", a1, a2, b)
+	}
+	if a1 == "body-only-context-a" || b == "body-only-context-b" {
+		t.Fatal("gateway forwarded a raw body session in X-Pool-Session-ID")
+	}
+}
+
 func TestGatewayTargetPolicyBlocksNonessentialTraffic(t *testing.T) {
 	poolURL := "https://pool.example:1455"
 	for _, host := range []string{

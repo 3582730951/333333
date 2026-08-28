@@ -30,15 +30,34 @@ func affinityWithMeta(r *http.Request, raw []byte, meta *bodysource.BodyMeta) ro
 	if value := header("x-codex-turn-state"); value != "" {
 		return routing.AffinityFromKey("x-codex-turn-state:"+value, "x-codex-turn-state")
 	}
-	if value := firstNonEmpty(header("x-codex-parent-thread-id"), header("thread-id")); value != "" {
+	// Root before branch. `firstNonEmpty(parent-header, thread-id)` collapsed the
+	// branch fallback into the parent step, so it returned the branch id before the
+	// turn metadata — which is where Codex puts the parent on some turns — was ever
+	// read. One conversation then hashed to two accounts across its branch point and
+	// every later turn paid a cold prefix. Mirrors routing.extractGenericTrueAffinityKey.
+	// A turn that advertises its parent also teaches the branch->root mapping, so the
+	// turns that advertise nothing can still be attributed to the same conversation.
+	turnMetadata := header("x-codex-turn-metadata")
+	ownThread := header("thread-id")
+	rootThread := func(value string) routing.AffinityKey {
 		return routing.AffinityFromKey(routing.CodexRootThreadAffinitySource+":"+value, routing.CodexRootThreadAffinitySource)
 	}
-	if turnMetadata := header("x-codex-turn-metadata"); turnMetadata != "" {
+	if value := header("x-codex-parent-thread-id"); value != "" {
+		routing.RememberCodexThreadParent(ownThread, value)
+		return rootThread(value)
+	}
+	if turnMetadata != "" {
 		if value := routing.JSONStringField([]byte(turnMetadata), "parent_thread_id"); value != "" {
-			return routing.AffinityFromKey(routing.CodexRootThreadAffinitySource+":"+value, routing.CodexRootThreadAffinitySource)
+			routing.RememberCodexThreadParent(ownThread, value)
+			return rootThread(value)
 		}
+	}
+	if ownThread != "" {
+		return rootThread(routing.CodexRootOrSelf(ownThread))
+	}
+	if turnMetadata != "" {
 		if value := routing.JSONStringField([]byte(turnMetadata), "thread_id"); value != "" {
-			return routing.AffinityFromKey(routing.CodexRootThreadAffinitySource+":"+value, routing.CodexRootThreadAffinitySource)
+			return rootThread(routing.CodexRootOrSelf(value))
 		}
 		if value := routing.JSONStringField([]byte(turnMetadata), "window_id"); value != "" {
 			return routing.AffinityFromKey("x-codex-window-id:"+value, "x-codex-window-id")

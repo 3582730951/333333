@@ -97,12 +97,20 @@ func (i codexDownstreamIdentity) stateAliases() []storage.CodexSessionAlias {
 // aliasesForBinding keeps hierarchy aliases with the binding they actually
 // identify. A child carries the root session id on every request, but persisting
 // that root alias on the child would make valid root+child requests ambiguous.
+//
+// The root/session pair is only persistable when this identity actually owns a root
+// (RootID != ""), which a child never does. A sub-agent whose parent thread has not
+// itself contacted the pool has no anchor, so it is bound as an upstream root even
+// though it is a child downstream; its own concrete thread is then the only alias
+// that can name it. Testing the binding shape alone used to leave that case with no
+// hierarchy alias at all, so its next turn resolved only through the turn-state
+// pointer, failed the mandatory parent lookup, recovered into a second binding, and
+// from then on the concrete thread and the state pointer named two different
+// bindings — the permanent "aliases resolve to more than one internal session".
 func (i codexDownstreamIdentity) aliasesForBinding(binding storage.CodexSessionBinding, responseID, responseTurnState string) []storage.CodexSessionAlias {
 	aliases := append([]storage.CodexSessionAlias(nil), i.stateAliases()...)
-	if binding.ThreadID == binding.RootSessionID {
-		if i.RootID != "" {
-			aliases = append(aliases, storage.CodexSessionAlias{Type: "root", Value: i.RootID})
-		}
+	if binding.ThreadID == binding.RootSessionID && i.RootID != "" {
+		aliases = append(aliases, storage.CodexSessionAlias{Type: "root", Value: i.RootID})
 		if i.durableSessionAlias() {
 			aliases = append(aliases, storage.CodexSessionAlias{Type: "session", Value: i.SessionID})
 		}
@@ -1281,13 +1289,20 @@ func (s *Server) resolveCodexSessionMappingInNamespace(ctx context.Context, r *h
 		}
 		if id.ParentID != "" && id.ParentID != id.ThreadID {
 			parent, lookupErr := lookupBranchOrRoot(id.ParentID)
-			if lookupErr != nil {
+			switch {
+			case errors.Is(lookupErr, storage.ErrCodexSessionMappingNotFound):
+				// An unbound parent is an absent relation, not a conflicting one, and
+				// the state alias above already named this tree exactly. A sub-agent's
+				// parent thread need never issue a request of its own: `codex review`
+				// and remote compaction drive only the sub-agent thread, so its root
+				// thread has no binding to agree with. Rejecting that as unidentified
+				// sent every such turn through context recovery, which minted a second
+				// binding in the same namespace.
+			case lookupErr != nil:
 				return mapping, lookupErr
-			}
-			if parent.State != "active" {
+			case parent.State != "active":
 				return mapping, storage.ErrCodexSessionEpochRetired
-			}
-			if parent.TreeID != binding.TreeID {
+			case parent.TreeID != binding.TreeID:
 				return mapping, storage.ErrCodexSessionMappingAmbiguous
 			}
 		}
@@ -1314,13 +1329,16 @@ func (s *Server) resolveCodexSessionMappingInNamespace(ctx context.Context, r *h
 			}
 			if id.ParentID != "" && id.ParentID != id.ThreadID {
 				parent, parentErr := lookupBranchOrRoot(id.ParentID)
-				if parentErr != nil {
+				switch {
+				case errors.Is(parentErr, storage.ErrCodexSessionMappingNotFound):
+					// Same absent-parent tolerance as the stateful path above: this
+					// branch alias is the sub-agent's own concrete thread, so it
+					// already identifies the tree without the parent.
+				case parentErr != nil:
 					return mapping, parentErr
-				}
-				if parent.State != "active" {
+				case parent.State != "active":
 					return mapping, storage.ErrCodexSessionEpochRetired
-				}
-				if parent.TreeID != branch.TreeID || branch.ParentThreadID != parent.ThreadID {
+				case parent.TreeID != branch.TreeID || branch.ParentThreadID != parent.ThreadID:
 					return mapping, storage.ErrCodexSessionMappingAmbiguous
 				}
 			}

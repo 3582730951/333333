@@ -3,6 +3,7 @@ package upstream
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,7 +17,7 @@ import (
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
-	"codex-account-pool/internal/routing"
+	"codex-account-pool/internal/sessionidentity"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream/tlsclient"
 )
@@ -1131,7 +1132,7 @@ func sanitizeClaudeHistory(root map[string]interface{}) bool {
 				out = append(out, block)
 				continue
 			}
-			if isEmptyClaudeThinkingBlock(bm) {
+			if isEmptyClaudeThinkingBlock(bm) || isUnusableClaudeThinkingBlock(bm) {
 				changed = true
 				continue
 			}
@@ -1157,6 +1158,86 @@ func isEmptyClaudeThinkingBlock(block map[string]interface{}) bool {
 	text, _ := block["text"].(string)
 	signature, _ := block["signature"].(string)
 	return strings.TrimSpace(text) == "" && strings.TrimSpace(signature) == ""
+}
+
+// isUnusableClaudeThinkingBlock reports whether a replayed thinking block carries a
+// signature Anthropic cannot possibly accept.
+//
+// The pool routes one conversation across providers (Kiro spillover, the antigravity
+// and custom-provider adapters, the Claude relay), so replayed history can arrive
+// carrying a thinking signature that some *other* backend produced — a `gemini#`
+// prefixed value, a provider-encoded reasoning blob, a Kiro placeholder. Forwarding
+// one to api.anthropic.com fails the turn on an invalid signature, and it is also a
+// tampering signal: a first-party client never sends a foreign signature.
+//
+// Emptiness alone was checked before, which let every non-empty foreign value
+// through. Shape validation is deliberately shallow — the payload stays opaque, only
+// the envelope is checked — so a genuine signature is never rewritten or rejected on
+// a guess about its contents.
+func isUnusableClaudeThinkingBlock(block map[string]interface{}) bool {
+	typ, _ := block["type"].(string)
+	if typ != "thinking" {
+		return false
+	}
+	signature, _ := block["signature"].(string)
+	if strings.TrimSpace(signature) == "" {
+		// Handled by isEmptyClaudeThinkingBlock, which additionally requires empty text.
+		return false
+	}
+	return !isClaudeThinkingSignature(signature)
+}
+
+// isClaudeThinkingSignature reports whether a signature has a Claude envelope.
+//
+// Three envelopes are in service, distinguishable by the first base64 character
+// because the first 6 bits of the decoded payload determine it:
+//
+//   - E: single-layer base64, decoded[0] == 0x12 (top-level protobuf field 2).
+//   - R: double-layer base64 whose inner string is an E-form.
+//   - C: single-layer base64, decoded[0] == 0x08 — the CAIS envelope the newest
+//     Claude Code models (Opus 5, Fable 5) wrap the channel block in. Its top-level
+//     field 1 is an envelope-version varint instead of the field-2 container, which
+//     is the only structural difference.
+//
+// A historical cache-mode `modelGroup#` prefix is stripped first, and only a
+// claude/anthropic prefix is accepted there — any other prefix names a different
+// provider's channel.
+func isClaudeThinkingSignature(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if prefix, payload, ok := strings.Cut(raw, "#"); ok {
+		prefix = strings.TrimSpace(prefix)
+		if !strings.EqualFold(prefix, "claude") && !strings.EqualFold(prefix, "anthropic") {
+			return false
+		}
+		raw = strings.TrimSpace(payload)
+	}
+	if raw == "" || len(raw) > 32*1024*1024 {
+		return false
+	}
+	decodeFirstByte := func(s string) (byte, bool) {
+		decoded, err := base64.StdEncoding.DecodeString(s)
+		if err != nil || len(decoded) == 0 {
+			return 0, false
+		}
+		return decoded[0], true
+	}
+	switch raw[0] {
+	case 'E':
+		first, ok := decodeFirstByte(raw)
+		return ok && first == 0x12
+	case 'C':
+		first, ok := decodeFirstByte(raw)
+		return ok && first == 0x08
+	case 'R':
+		inner, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil || len(inner) == 0 || inner[0] != 'E' {
+			return false
+		}
+		first, ok := decodeFirstByte(string(inner))
+		return ok && first == 0x12
+	default:
+		return false
+	}
 }
 
 func stripClaudeToolUseProvenance(block map[string]interface{}) bool {
@@ -1390,16 +1471,9 @@ func removeOutputConfigEffort(root map[string]interface{}) bool {
 // SessionSeed stays per-account even when the optional device fingerprint is
 // converged, and never leaks the real value.
 func claudeSessionID(downstream http.Header, body []byte, id identity.Identity) string {
-	seed := identity.SessionSeed(id)
-	if downstream != nil {
-		if v := strings.TrimSpace(downstream.Get("X-Claude-Code-Session-Id")); v != "" {
-			return identity.DerivedUUID(seed, v)
-		}
-	}
-	if anchor := routing.ConversationAnchor(body); anchor != "" {
-		return identity.DerivedUUID(seed, "claude-session-anchor\x00"+anchor)
-	}
-	return id.ClaudeSessionID
+	return sessionidentity.ResolveProjected(
+		identity.SessionSeed(id), id.ClaudeSessionID, downstream, body, id.UserID,
+	)
 }
 
 func bodyStreamTrue(body []byte) bool {

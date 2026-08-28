@@ -82,14 +82,17 @@ type diagnosticProviderAttempt struct {
 }
 
 type diagnosticHTTPRequest struct {
-	RequestID     string
-	Method        string
-	Route         string
-	Status        int
-	RequestBytes  int64
-	ResponseBytes int64
-	DurationMS    int64
-	CreatedAt     int64
+	RequestID        string
+	Method           string
+	Route            string
+	Status           int
+	RequestBytes     int64
+	ResponseBytes    int64
+	DurationMS       int64
+	TTFBMS           int64
+	StreamDurationMS int64
+	Streaming        bool
+	CreatedAt        int64
 }
 
 // Diagnostic supervisor snapshots intentionally omit LastMessage, LastPanic,
@@ -309,13 +312,31 @@ func (s *Server) recordProviderAttempt(requestID, accountID, provider, phase str
 }
 
 func (s *Server) recordHTTPRequest(requestID, method, route string, status int, requestBytes, responseBytes int64, duration time.Duration) {
+	s.recordHTTPRequestTiming(requestID, method, route, status, requestBytes, responseBytes, duration, duration, false)
+}
+
+func (s *Server) recordHTTPRequestTiming(requestID, method, route string, status int, requestBytes, responseBytes int64, duration, ttfb time.Duration, streaming bool) {
 	if s == nil {
 		return
+	}
+	if duration < 0 {
+		duration = 0
+	}
+	if ttfb < 0 {
+		ttfb = 0
+	} else if ttfb > duration {
+		ttfb = duration
+	}
+	streamDuration := time.Duration(0)
+	if streaming {
+		streamDuration = duration - ttfb
 	}
 	row := diagnosticHTTPRequest{
 		RequestID: strings.TrimSpace(requestID), Method: strings.TrimSpace(method), Route: strings.TrimSpace(route),
 		Status: status, RequestBytes: requestBytes, ResponseBytes: responseBytes,
-		DurationMS: duration.Milliseconds(), CreatedAt: storage.Now(),
+		DurationMS: duration.Milliseconds(), TTFBMS: ttfb.Milliseconds(),
+		StreamDurationMS: streamDuration.Milliseconds(), Streaming: streaming,
+		CreatedAt: storage.Now(),
 	}
 	s.diagnostics.mu.Lock()
 	s.diagnostics.httpRequests = appendBounded(s.diagnostics.httpRequests, &s.diagnostics.httpRequestHead, row)
@@ -412,7 +433,9 @@ func httpRequestRows(rows []diagnosticHTTPRequest) [][]string {
 		out = append(out, []string{
 			row.RequestID, row.Method, row.Route, strconv.Itoa(row.Status),
 			strconv.FormatInt(row.RequestBytes, 10), strconv.FormatInt(row.ResponseBytes, 10),
-			strconv.FormatInt(row.DurationMS, 10), strconv.FormatInt(row.CreatedAt, 10),
+			strconv.FormatInt(row.DurationMS, 10), strconv.FormatInt(row.TTFBMS, 10),
+			strconv.FormatInt(row.StreamDurationMS, 10), strconv.FormatBool(row.Streaming),
+			strconv.FormatInt(row.CreatedAt, 10),
 		})
 	}
 	return out

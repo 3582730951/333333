@@ -23,9 +23,9 @@ var anthropicHostMarkers = []string{
 // IP with a Go TLS fingerprint, while that same account's inference traffic leaves from its
 // bound egress with an impersonated fingerprint. Anthropic sees both on one account.
 var oauthClientCallees = map[string]bool{
-	"oauthHTTPClient":        true,
-	"apiExternalHTTPClient":  true,
-	"http.DefaultClient":     true,
+	"oauthHTTPClient":         true,
+	"apiExternalHTTPClient":   true,
+	"http.DefaultClient":      true,
 	"defaultHTTPClientForAPI": true,
 }
 
@@ -37,7 +37,7 @@ var oauthClientCallees = map[string]bool{
 // name here, which forces the author to state which host it talks to.
 var functionsAllowedToUseThePlainClient = map[string]string{
 	// The accessor itself: it returns the client and issues no request.
-	"oauthHTTPClient": "accessor for the plain client; issues no request of its own",
+	"oauthHTTPClient":           "accessor for the plain client; issues no request of its own",
 	"refreshCodexToken":         "auth.openai.com / chatgpt.com token endpoint",
 	"fetchChatGPTSessionToken":  "chatgpt.com session endpoint",
 	"runCodexReauthJob":         "operator-triggered Codex reauth worker (OpenAI hosts)",

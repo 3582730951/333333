@@ -114,11 +114,11 @@ func cacheAccountHealthRows(rows []storage.CacheUsageMetricRow, codebook diagnos
 type cacheIntervalBucket string
 
 const (
-	intervalUnder1m  cacheIntervalBucket = "<1m"
-	interval1To5m    cacheIntervalBucket = "1-5m"
-	interval5To10m   cacheIntervalBucket = "5-10m"
-	interval10To30m  cacheIntervalBucket = "10-30m"
-	intervalOver30m  cacheIntervalBucket = ">30m"
+	intervalUnder1m cacheIntervalBucket = "<1m"
+	interval1To5m   cacheIntervalBucket = "1-5m"
+	interval5To10m  cacheIntervalBucket = "5-10m"
+	interval10To30m cacheIntervalBucket = "10-30m"
+	intervalOver30m cacheIntervalBucket = ">30m"
 )
 
 func cacheIntervalBucketFor(seconds int64) cacheIntervalBucket {

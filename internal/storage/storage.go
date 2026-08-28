@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	pathpkg "path"
@@ -72,6 +73,14 @@ type Store struct {
 	cryptoStrict bool
 	cryptoErrMu  sync.Mutex
 	cryptoErr    error
+	// undecryptable names the accounts whose stored secrets could not be opened with
+	// the current key. cryptoErr keeps only the first error and no identity, which is
+	// enough to gate a migration but not to fix anything: after a key rotation an
+	// operator otherwise sees one generic failure while N accounts silently present
+	// empty credentials and fail at routing time. Bounded so a fully unreadable
+	// database cannot grow it without limit.
+	undecryptableMu sync.Mutex
+	undecryptable   map[string]int
 
 	// settings snapshot cache: a hot request reads ~15-20 distinct settings keys, each
 	// previously its own SELECT against the small WAL read pool. This caches the whole
@@ -5981,6 +5990,10 @@ func (s *Store) loadToken(ctx context.Context, accountID string, cache bool) (Ac
 	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, auth_method, credential_mode, access_token, refresh_token, openai_api_key, id_token_raw, agent_runtime_id, agent_private_key, agent_task_id, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at FROM account_auth_tokens WHERE account_id = ?`, accountID)
 	var t AccountToken
 	err := row.Scan(&t.AccountID, &t.AuthMethod, &t.CredentialMode, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.AgentRuntimeID, &t.AgentPrivateKey, &t.AgentTaskID, &t.LastRefresh, &t.ExpiresAt, &t.Scopes, &t.OAuthRateLimitTier, &t.CreatedAt, &t.UpdatedAt)
+	// A field that was stored non-empty but opens empty was rejected by the current
+	// key. openToken has no identity to report, but this call site does.
+	sealed := []string{t.AccessToken, t.RefreshToken, t.OpenAIAPIKey, t.IDTokenRaw,
+		t.AgentRuntimeID, t.AgentPrivateKey, t.AgentTaskID}
 	t.AccessToken = s.openToken(t.AccessToken)
 	t.RefreshToken = s.openToken(t.RefreshToken)
 	t.OpenAIAPIKey = s.openToken(t.OpenAIAPIKey)
@@ -5988,6 +6001,14 @@ func (s *Store) loadToken(ctx context.Context, accountID string, cache bool) (Ac
 	t.AgentRuntimeID = s.openToken(t.AgentRuntimeID)
 	t.AgentPrivateKey = s.openToken(t.AgentPrivateKey)
 	t.AgentTaskID = s.openToken(t.AgentTaskID)
+	opened := []string{t.AccessToken, t.RefreshToken, t.OpenAIAPIKey, t.IDTokenRaw,
+		t.AgentRuntimeID, t.AgentPrivateKey, t.AgentTaskID}
+	for i := range sealed {
+		if sealed[i] != "" && opened[i] == "" {
+			s.noteUndecryptableAccount(accountID)
+			break
+		}
+	}
 	if err == nil && cache {
 		s.tokenCache.Store(accountID, t)
 	}
@@ -6363,6 +6384,58 @@ func (s *Store) CryptoError() error {
 	s.cryptoErrMu.Lock()
 	defer s.cryptoErrMu.Unlock()
 	return s.cryptoErr
+}
+
+// maxUndecryptableAccountsTracked bounds the identity list. Past this many distinct
+// accounts the problem is the key, not the accounts, and the list has already told
+// the operator everything it can.
+const maxUndecryptableAccountsTracked = 512
+
+// noteUndecryptableAccount records that an account's stored secret failed to open.
+func (s *Store) noteUndecryptableAccount(accountID string) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return
+	}
+	s.undecryptableMu.Lock()
+	defer s.undecryptableMu.Unlock()
+	if s.undecryptable == nil {
+		s.undecryptable = make(map[string]int, 8)
+	}
+	_, seen := s.undecryptable[accountID]
+	if !seen && len(s.undecryptable) >= maxUndecryptableAccountsTracked {
+		return
+	}
+	s.undecryptable[accountID]++
+	if !seen {
+		// Once per account, not per read: this is discovered lazily on every token load,
+		// so logging each occurrence would bury the signal it exists to raise. The
+		// startup CryptoError gate cannot catch these — it runs before any account token
+		// is read.
+		log.Printf("[SECURITY] account %s has stored secrets that cannot be decrypted with the current key; it will present empty credentials until re-imported or re-authorized", accountID)
+	}
+}
+
+// UndecryptableAccountIDs returns the accounts whose stored secrets could not be
+// opened with the current key, sorted. Empty is the healthy case.
+//
+// This is the actionable half of CryptoError: that reports *that* decryption failed,
+// this reports *what* to re-import or re-authorize. A rotated or per-boot-generated
+// key turns every affected account into one that looks configured but presents empty
+// credentials, so without the list the failure surfaces only as unexplained routing
+// errors.
+func (s *Store) UndecryptableAccountIDs() []string {
+	s.undecryptableMu.Lock()
+	defer s.undecryptableMu.Unlock()
+	if len(s.undecryptable) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(s.undecryptable))
+	for id := range s.undecryptable {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // sealToken never falls back to plaintext after a master key is installed.

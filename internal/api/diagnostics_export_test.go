@@ -300,7 +300,7 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		}
 	}
 	httpCSV := files["http_requests.csv"]
-	for _, want := range []string{"request_id,method,route,status,request_bytes,response_bytes,duration_ms,created_at", "REQ-89C6735FD8ABC561", "admin.email-pool", ",200,0,84,12,"} {
+	for _, want := range []string{"request_id,method,route,status,request_bytes,response_bytes,duration_ms,time_to_first_byte_ms,stream_duration_ms,streaming,created_at", "REQ-89C6735FD8ABC561", "admin.email-pool", ",200,0,84,12,12,0,false,"} {
 		if !strings.Contains(httpCSV, want) {
 			t.Fatalf("http_requests.csv missing %q:\n%s", want, httpCSV)
 		}

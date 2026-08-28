@@ -15,6 +15,7 @@ import (
 
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/plantier"
 	"codex-account-pool/internal/storage"
 )
 
@@ -424,12 +425,19 @@ func KiroContextWindow(model string) int64 {
 // handled separately by the scheduler; this guard stops a stale static capability
 // row from granting a model that the current plan cannot use. KIRO FREE is known
 // not to include Opus.
+//
+// The plan is matched on its normalized tier rather than by searching for "FREE" in
+// the raw name. A substring search also fires on any paid plan whose name happens
+// to contain the word — `business_free`, `free_trial_enterprise` — and the result is
+// a silent Opus denial for a paying account with nothing logged to explain it. An
+// unrecognized plan is treated as permitting bootstrap: the scheduler still has
+// runtime verification behind this, so a vocabulary gap should not deny a model.
 func KiroPlanAllowsBootstrap(plan, model string) bool {
 	canonical, ok := KiroCanonicalModel(model)
 	if !ok {
 		return false
 	}
-	if strings.Contains(strings.ToUpper(strings.TrimSpace(plan)), "FREE") && strings.Contains(canonical, "-opus-") {
+	if plantier.Normalize(plan) == plantier.Free && strings.Contains(canonical, "-opus-") {
 		return false
 	}
 	return true
@@ -747,7 +755,10 @@ func MergeClaudeStatic(accountID string, probeCaps []storage.ModelCapability) []
 // evidence and OAuth credentials still use plan-specific entitlement.
 func ApplyClaudeAccountPolicy(caps []storage.ModelCapability, account storage.Account, token storage.AccountToken) []storage.ModelCapability {
 	method := accountprovider.EffectiveAuthMethod("claude", token)
+	// Authorize on the normalized tier, but keep the raw plan for the source string
+	// an operator reads back.
 	plan := strings.ToLower(strings.TrimSpace(account.PlanType))
+	tier := plantier.Normalize(account.PlanType)
 	for i := range caps {
 		c := &caps[i]
 		if claudeDefault1M(c.ModelSlug) {
@@ -771,11 +782,11 @@ func ApplyClaudeAccountPolicy(caps []storage.ModelCapability, account storage.Ac
 			continue
 		}
 		switch {
-		case strings.Contains(plan, "pro") && !strings.Contains(plan, "enterprise"):
+		case tier == plantier.Pro:
 			c.Context1MState, c.Context1MSource = Context1MUnsupported, "plan:pro"
-		case claudeOAuthPlanAllows1M(plan) && claudeOpusSupports1M(c.ModelSlug, c.NativeMaxContextWindow):
+		case claudeOAuthPlanAllows1M(tier) && claudeOpusSupports1M(c.ModelSlug, c.NativeMaxContextWindow):
 			c.Context1MState, c.Context1MSource = Context1MSupported, "plan:"+plan
-		case plan != "" && claudeOAuthPlanAllows1M(plan):
+		case claudeOAuthPlanAllows1M(tier):
 			c.Context1MState, c.Context1MSource = Context1MUnsupported, "model_not_eligible"
 		default:
 			c.Context1MState, c.Context1MSource = Context1MUnknown, "plan:unknown"
@@ -784,8 +795,18 @@ func ApplyClaudeAccountPolicy(caps []storage.ModelCapability, account storage.Ac
 	return caps
 }
 
-func claudeOAuthPlanAllows1M(plan string) bool {
-	return strings.Contains(plan, "max") || strings.Contains(plan, "team") || strings.Contains(plan, "enterprise")
+// claudeOAuthPlanAllows1M keys off the normalized tier so that a plan name merely
+// containing a tier word cannot flip the entitlement: `Contains(plan, "pro")` also
+// matched `provisional`, and because the pro branch is evaluated first it beat an
+// explicit `max` appearing later in the same string. Business is deliberately
+// absent, matching the previous behaviour for `self_serve_business_usage_based`.
+func claudeOAuthPlanAllows1M(tier plantier.Tier) bool {
+	switch tier {
+	case plantier.Max, plantier.Team, plantier.Enterprise:
+		return true
+	default:
+		return false
+	}
 }
 
 func claudeOpusSupports1M(model string, technicalMax int64) bool {
@@ -983,6 +1004,20 @@ func codexStaticModelForSlug(slug string) (codexStaticModel, bool) {
 		}
 	}
 	return codexStaticModel{}, false
+}
+
+// IsCatalogCodexModel reports whether a slug is present in the effective Codex model
+// catalog (bundled entries plus any published remote fallback manifest). It is the
+// authoritative answer to "does the Codex channel own this model", as opposed to
+// guessing from the slug's spelling.
+//
+// Request dispatch needs this because SetRemoteCodexModels normalizes and dedupes
+// slugs but does not reserve any prefix. A signed manifest may therefore publish a
+// slug that a name-based Claude/Codex heuristic would classify the other way, and
+// routing must follow the catalog rather than the spelling.
+func IsCatalogCodexModel(slug string) bool {
+	_, ok := codexStaticModelForSlug(slug)
+	return ok
 }
 
 // NormalizeCodexModelAlias resolves only aliases documented by the direct

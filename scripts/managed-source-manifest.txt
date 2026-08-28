@@ -199,6 +199,7 @@ internal/api/diagnostic_incident_test.go
 internal/api/diagnostic_jobs.go
 internal/api/diagnostic_jobs_test.go
 internal/api/diagnostic_runtime.go
+internal/api/diagnostic_timing_test.go
 internal/api/diagnostics_csv_formula_guard_test.go
 internal/api/diagnostics_emergency.go
 internal/api/diagnostics_export.go
@@ -466,8 +467,8 @@ internal/console/console.go
 internal/console/console_test.go
 internal/console/dist/assets/AISettings-CVAAqTkP.js
 internal/console/dist/assets/AISettings-CVAAqTkP.js.br
-internal/console/dist/assets/Accounts-C0LY83mI.js
-internal/console/dist/assets/Accounts-C0LY83mI.js.br
+internal/console/dist/assets/Accounts-DXQQ6W-j.js
+internal/console/dist/assets/Accounts-DXQQ6W-j.js.br
 internal/console/dist/assets/AppErrorBoundary-Bihc1Nee.js
 internal/console/dist/assets/AppErrorBoundary-Bihc1Nee.js.br
 internal/console/dist/assets/AtmosphereLayer-Bm_Qi8b8.js
@@ -547,11 +548,11 @@ internal/console/dist/assets/Users-XuoG8H9J.js
 internal/console/dist/assets/Users-XuoG8H9J.js.br
 internal/console/dist/assets/VendorLogo-CGDJSkD6.js
 internal/console/dist/assets/VendorLogo-CGDJSkD6.js.br
-internal/console/dist/assets/accounts-Bw1nS2IZ.js
-internal/console/dist/assets/accounts-Cb-L9glH.js
-internal/console/dist/assets/accounts-DJjnKSQg.js
-internal/console/dist/assets/accounts-DJjnKSQg.js.br
-internal/console/dist/assets/accounts-Y3FZiLWb.js
+internal/console/dist/assets/accounts-32bxkTAS.js
+internal/console/dist/assets/accounts-32bxkTAS.js.br
+internal/console/dist/assets/accounts-CuSMMUfC.js
+internal/console/dist/assets/accounts-DVXGbW3M.js
+internal/console/dist/assets/accounts-zoOgf_yl.js
 internal/console/dist/assets/api-vTxWY5Pr.js
 internal/console/dist/assets/api-vTxWY5Pr.js.br
 internal/console/dist/assets/browserAbort-QypQ3bBT.js
@@ -586,10 +587,10 @@ internal/console/dist/assets/hooks-BRtsxPDY.js
 internal/console/dist/assets/hooks-BRtsxPDY.js.br
 internal/console/dist/assets/i18n-DYjhMICW.js
 internal/console/dist/assets/i18n-DYjhMICW.js.br
+internal/console/dist/assets/index-CRfLVdWx.js
+internal/console/dist/assets/index-CRfLVdWx.js.br
 internal/console/dist/assets/index-Dx6oKrpV.css
 internal/console/dist/assets/index-Dx6oKrpV.css.br
-internal/console/dist/assets/index-fBmbX2w5.js
-internal/console/dist/assets/index-fBmbX2w5.js.br
 internal/console/dist/assets/jsx-runtime-B2iFcflP.js
 internal/console/dist/assets/jsx-runtime-B2iFcflP.js.br
 internal/console/dist/assets/keys-DPPtpvKM.js
@@ -625,6 +626,7 @@ internal/console/dist/assets/useQuery-BNkK_uTW.js.br
 internal/console/dist/assets/useResponsiveLayout-BOxvMDs8.js
 internal/console/dist/assets/zh-xheTm74O.js
 internal/console/dist/assets/zh-xheTm74O.js.br
+internal/console/dist/build-meta.json
 internal/console/dist/index.html
 internal/console/dist/index.html.br
 internal/corestate/corestate.go
@@ -797,6 +799,8 @@ internal/scheduler/testonly_fake_account_routing_test.go
 internal/scheduler/unbounded_test.go
 internal/secretbox/secretbox.go
 internal/secretbox/secretbox_test.go
+internal/sessionidentity/session.go
+internal/sessionidentity/session_test.go
 internal/storage/account_backup.go
 internal/storage/account_backup_test.go
 internal/storage/account_group_batch_test.go
@@ -1124,6 +1128,7 @@ web-spa/scripts/check-codex-reauth-ui.mjs
 web-spa/scripts/check-dashboard-resources.mjs
 web-spa/scripts/check-dom-boundaries.mjs
 web-spa/scripts/check-egress-wizard-contracts.mjs
+web-spa/scripts/check-embedded-build-freshness.mjs
 web-spa/scripts/check-error-boundary.mjs
 web-spa/scripts/check-import-boundaries.mjs
 web-spa/scripts/check-import-egress-contracts.mjs
@@ -1152,6 +1157,7 @@ web-spa/scripts/check-visual-smoke.mjs
 web-spa/scripts/check-workflow-contracts.mjs
 web-spa/scripts/class-drift-baseline.json
 web-spa/scripts/measure-edge-proximity.mjs
+web-spa/scripts/source-digest.mjs
 web-spa/src/App.tsx
 web-spa/src/api.js
 web-spa/src/api/contracts.ts

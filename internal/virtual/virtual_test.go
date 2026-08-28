@@ -102,29 +102,49 @@ func TestMaterializeLeavesResponsesAttachmentsVerbatim(t *testing.T) {
 // (utf8.RuneCount / utf8.RuneCountInString) returns EXACTLY the same estimate as the
 // previous len([]rune(...)) implementation across ASCII, multi-byte UTF-8, emoji, and
 // invalid UTF-8 bytes — so the perf change does not alter any planning/billing gate.
-func TestEstimateTokensRuneCountEquivalence(t *testing.T) {
-	cases := []string{
+// This used to assert that the estimate equalled runes/4+1 for every input, which was
+// the contract of the allocation-avoiding refactor. That equality is now deliberately
+// broken for non-ASCII: measured against the live upstream, runes/4 undercounts Chinese
+// by ~3.2x, and this estimate sizes billing holds and scheduler weight, so it must not
+// come in under the real cost (see token_estimate_test.go for the measurements).
+//
+// ASCII must still match exactly — that is what keeps the fix from moving English
+// routing — and non-ASCII must now estimate strictly higher than the old rule.
+func TestEstimateTokensRuneRuleKeptForASCIIAndRaisedForNonASCII(t *testing.T) {
+	asciiOnly := []string{
 		"",
 		"hello world",
+		strings.Repeat("A", 20000),
+		`{"model":"claude","messages":[{"role":"user","content":"plain"}]}`,
+	}
+	for _, s := range asciiOnly {
+		want := int64(0)
+		if s != "" {
+			want = int64(len([]rune(s))/4 + 1)
+		}
+		if got := EstimateTokensText(s); got != want {
+			t.Errorf("ASCII EstimateTokensText(%.20q) = %d, want the unchanged %d", s, got, want)
+		}
+	}
+
+	nonASCII := []string{
 		"日本語のテキスト",
 		"emoji 😀🚀 mix",
-		"\xff\xfe invalid bytes \x80",
-		strings.Repeat("A", 20000),
 		strings.Repeat("漢", 5000),
 		`{"model":"claude","messages":[{"role":"user","content":"café ☕"}]}`,
 	}
-	for _, s := range cases {
-		oldText := int64(0)
-		if s != "" {
-			oldText = int64(len([]rune(s))/4 + 1)
+	for _, s := range nonASCII {
+		oldRule := int64(len([]rune(s))/4 + 1)
+		got := EstimateTokensText(s)
+		if got <= oldRule {
+			t.Errorf("non-ASCII EstimateTokensText(%.20q) = %d, which is not above the old "+
+				"runes/4 rule (%d); the undercount is the defect being fixed", s, got, oldRule)
 		}
-		if got := EstimateTokensText(s); got != oldText {
-			t.Fatalf("EstimateTokensText(%q) = %d, old impl = %d", s, got, oldText)
-		}
-		oldJSON := int64(len([]rune(string([]byte(s))))/4 + 1)
-		if got := EstimateTokensJSON([]byte(s)); got != oldJSON {
-			t.Fatalf("EstimateTokensJSON(%q) = %d, old impl = %d", s, got, oldJSON)
-		}
+	}
+
+	// Invalid UTF-8 must not panic or produce a negative estimate.
+	if got := EstimateTokensText("\xff\xfe invalid bytes \x80"); got <= 0 {
+		t.Errorf("invalid UTF-8 produced estimate %d", got)
 	}
 }
 

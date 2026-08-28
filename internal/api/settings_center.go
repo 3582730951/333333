@@ -1204,14 +1204,14 @@ func optimalStableModelsTemplateValues() map[string]interface{} {
 		// the profitability ratio, so unprobed or unprofitable traffic is untouched
 		// and the mutation is metadata-only (verified by codexCacheOnlyMutation).
 		"codex_gpt56_explicit_cache_mode": "auto",
-		"goal_continuity_enabled":              true,
-		"goal_retention_days":                  float64(7),
-		"context_journal_ttl_seconds":          float64(7 * 24 * 60 * 60),
-		"conversation_isolation":               true,
-		"rate_limit_guard_enabled":             true,
-		"seamless_failover":                    true,
-		"failover_max_attempts":                float64(3),
-		"leak_scrub":                           true,
+		"goal_continuity_enabled":         true,
+		"goal_retention_days":             float64(7),
+		"context_journal_ttl_seconds":     float64(7 * 24 * 60 * 60),
+		"conversation_isolation":          true,
+		"rate_limit_guard_enabled":        true,
+		"seamless_failover":               true,
+		"failover_max_attempts":           float64(3),
+		"leak_scrub":                      true,
 		// Keep both Claude transport escape hatches explicitly closed. Empty
 		// claude_ja3 currently resolves to native too, but spelling it out in the
 		// recommended template prevents a future default change from silently

@@ -6,7 +6,7 @@ import (
 
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/identity"
-	"codex-account-pool/internal/routing"
+	"codex-account-pool/internal/sessionidentity"
 	"codex-account-pool/internal/storage"
 )
 
@@ -145,25 +145,9 @@ func (c *Client) applyClaudeCodeCustomHeaders(dst http.Header, spec Request, id 
 // conversations. Real values are never forwarded — each is replaced by a deterministic
 // per-account UUID, so the downstream's own identifiers do not reach the upstream.
 func customClaudeSessionID(spec Request, id identity.Identity) string {
-	seed := identity.SessionSeed(id)
-	if spec.Headers != nil {
-		for _, header := range []string{"X-Claude-Code-Session-Id", "X-Session-ID"} {
-			if value := strings.TrimSpace(spec.Headers.Get(header)); value != "" {
-				return identity.DerivedUUID(seed, value)
-			}
-		}
-	}
-	if anchor := routing.ConversationAnchor(requestBody(spec)); anchor != "" {
-		return identity.DerivedUUID(seed, "claude-session-anchor\x00"+anchor)
-	}
-	if spec.Headers != nil {
-		for _, header := range []string{"X-Client-ID", "X-Pool-Client-ID"} {
-			if value := strings.TrimSpace(spec.Headers.Get(header)); value != "" {
-				return identity.DerivedUUID(seed, "claude-client\x00"+value)
-			}
-		}
-	}
-	return id.ClaudeSessionID
+	return sessionidentity.ResolveProjected(
+		identity.SessionSeed(id), id.ClaudeSessionID, spec.Headers, requestBody(spec), id.UserID,
+	)
 }
 
 // customClaudeCookieJarKey narrows the cookie jar from per-account to per-conversation

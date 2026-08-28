@@ -191,24 +191,33 @@ func (w *codexMessagesResponseWriter) finish() {
 	w.downstream.Header().Del("Content-Length")
 	responsesBody, err := responseSpoolBytes(w.buffer)
 	if err != nil {
-		writeError(w.downstream, http.StatusBadGateway, err)
+		writeAnthropicBridgeError(w.downstream, http.StatusBadGateway, err)
 		return
 	}
 	if w.status < 200 || w.status >= 300 {
+		// The gateway already leak-filtered this body as provider "codex", which yields
+		// the bare OpenAI {"error":{...}} shape. Claude Code parses only Anthropic's
+		// envelope, so forwarding it verbatim is what makes the CLI print a generic
+		// "API Error" instead of the upstream reason. Convert the shape here; the text
+		// itself is already sanitized and stays intact so the reason survives.
+		w.downstream.Header().Set("Content-Type", "application/json")
 		w.downstream.WriteHeader(w.status)
-		_, _ = w.downstream.Write(responsesBody)
+		_, _ = w.downstream.Write(responsesErrorToAnthropicEnvelope(w.status, responsesBody))
 		return
 	}
 	if strings.Contains(strings.ToLower(w.header.Get("Content-Type")), "text/event-stream") {
 		responsesBody = codexSSEToResponseJSON(responsesBody)
 		if len(responsesBody) == 0 {
-			writeError(w.downstream, http.StatusBadGateway, io.ErrUnexpectedEOF)
+			writeAnthropicBridgeError(w.downstream, http.StatusBadGateway, io.ErrUnexpectedEOF)
 			return
 		}
 	}
+	// A terminal response.failed/incomplete surfaces here as a conversion error. It is
+	// a real upstream failure, not a malformed body, and must reach Claude Code as an
+	// Anthropic envelope rather than the pool's OpenAI-shaped error.
 	out, err := prompt.ResponsesToAnthropicResponse(responsesBody, w.model, w.toolNames, w.inheritModelTools)
 	if err != nil {
-		writeError(w.downstream, http.StatusBadGateway, err)
+		writeAnthropicBridgeError(w.downstream, http.StatusBadGateway, err)
 		return
 	}
 	if w.streamRequested {

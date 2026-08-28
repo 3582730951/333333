@@ -207,13 +207,19 @@ type GoalSegment struct {
 }
 
 const (
-	goalPayloadFormatV2     = int64(2)
-	goalPayloadChunkSize    = 64 << 10
-	goalChunkCheckpoint     = "checkpoint"
-	goalChunkSegment        = "segment"
-	goalReclaimRowsPerStep  = 64
-	goalReclaimBytesPerStep = 8 << 20
-	goalReclaimingState     = "reclaiming"
+	goalPayloadFormatV2  = int64(2)
+	goalPayloadChunkSize = 64 << 10
+	// goalCheckpointPrepareAheadMinBytes is the checkpoint size above which it pays to
+	// predict whether the checkpoint will be inserted and compress it before opening
+	// the write transaction. Below it the compression is a few milliseconds, so the
+	// extra read probe would cost more than it saves on the common append turn — which
+	// never inserts a checkpoint at all.
+	goalCheckpointPrepareAheadMinBytes = 1 << 20
+	goalChunkCheckpoint                = "checkpoint"
+	goalChunkSegment                   = "segment"
+	goalReclaimRowsPerStep             = 64
+	goalReclaimBytesPerStep            = 8 << 20
+	goalReclaimingState                = "reclaiming"
 	// A tool-heavy goal spends most of its idle lifetime in awaiting_tool_result.
 	// Treating that state as permanently unreclaimable lets a small number of
 	// abandoned sessions pin the entire global budget forever. Fresh waits retain a
@@ -222,6 +228,52 @@ const (
 	goalAwaitingToolReclaimGrace = 30 * time.Minute
 )
 
+// preparedGoalChunk is one chunk's fully computed ciphertext, ready to INSERT. The
+// compression and sealing that produce it are pure CPU work with no database
+// involvement, so they are deliberately done BEFORE the write transaction opens.
+type preparedGoalChunk struct {
+	index       int
+	payloadHash string
+	plainBytes  int
+	encrypted   string
+}
+
+// prepareGoalChunks compresses and seals a payload into insert-ready chunks and
+// reports the exact stored size.
+//
+// This exists because compression used to run twice per commit: once in
+// estimateGoalChunkStorage for the headroom check before BeginTx, and again in
+// insertGoalChunks inside the transaction. For a large goal that is thousands of
+// compress+seal operations performed while holding SQLite's single writer lock, which
+// serializes every other foreground commit and the disk_guard write probe behind it.
+// Preparing once, outside the transaction, both halves the CPU work and removes all of
+// it from the lock window.
+func (s *Store) prepareGoalChunks(payload string) ([]preparedGoalChunk, int64) {
+	if payload == "" {
+		return nil, 0
+	}
+	chunks := make([]preparedGoalChunk, 0, (len(payload)+goalPayloadChunkSize-1)/goalPayloadChunkSize)
+	var stored int64
+	for offset, index := 0, 0; offset < len(payload); index++ {
+		end := offset + goalPayloadChunkSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+		part := payload[offset:end]
+		encrypted := s.sealToken(compressContextPayload(part))
+		chunks = append(chunks, preparedGoalChunk{
+			index: index, payloadHash: hashGoalPayload(part),
+			plainBytes: len(part), encrypted: encrypted,
+		})
+		stored += int64(len(encrypted))
+		offset = end
+	}
+	return chunks, stored
+}
+
+// estimateGoalChunkStorage reports the ciphertext-aware stored size of a payload
+// without retaining the ciphertext. Callers that will also insert the payload should
+// use prepareGoalChunks instead and reuse its chunks, so the work happens once.
 func (s *Store) estimateGoalChunkStorage(payload string) int64 {
 	var stored int64
 	for offset := 0; offset < len(payload); {
@@ -241,23 +293,23 @@ func (s *Store) estimateGoalChunkStorage(payload string) int64 {
 	return stored
 }
 
-func (s *Store) insertGoalChunks(ctx context.Context, tx *sql.Tx, goalID, kind string, segmentSequence, createdAt int64, payload string) (int64, error) {
+// insertPreparedGoalChunks writes already-sealed chunks. The transaction holds the
+// writer lock only for the INSERTs themselves.
+func (s *Store) insertPreparedGoalChunks(ctx context.Context, tx *sql.Tx, goalID, kind string, segmentSequence, createdAt int64, chunks []preparedGoalChunk) (int64, error) {
 	var stored int64
-	for offset, index := 0, 0; offset < len(payload); index++ {
-		end := offset + goalPayloadChunkSize
-		if end > len(payload) {
-			end = len(payload)
-		}
-		part := payload[offset:end]
-		encrypted := s.sealToken(compressContextPayload(part))
+	for _, chunk := range chunks {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO goal_payload_chunk(goal_id,payload_kind,segment_sequence,chunk_index,payload_hash,payload_bytes,encrypted_payload,created_at) VALUES(?,?,?,?,?,?,?,?)`,
-			goalID, kind, segmentSequence, index, hashGoalPayload(part), len(part), encrypted, createdAt); err != nil {
+			goalID, kind, segmentSequence, chunk.index, chunk.payloadHash, chunk.plainBytes, chunk.encrypted, createdAt); err != nil {
 			return stored, err
 		}
-		stored += int64(len(encrypted))
-		offset = end
+		stored += int64(len(chunk.encrypted))
 	}
 	return stored, nil
+}
+
+func (s *Store) insertGoalChunks(ctx context.Context, tx *sql.Tx, goalID, kind string, segmentSequence, createdAt int64, payload string) (int64, error) {
+	chunks, _ := s.prepareGoalChunks(payload)
+	return s.insertPreparedGoalChunks(ctx, tx, goalID, kind, segmentSequence, createdAt, chunks)
 }
 
 func (s *Store) readGoalChunks(ctx context.Context, goalID, kind string, segmentSequence int64) (string, error) {
@@ -689,6 +741,18 @@ func (s *Store) ResolveGoalAliasSetsForFamily(ctx context.Context, aliasSets [][
 	return s.resolveGoalAliasSets(ctx, s.rdb, aliasSets, family)
 }
 
+// goalProbablyAbsent reports whether the goal for these alias sets appears not to
+// exist yet. It is a hint, never a decision — the authoritative answer is the
+// in-transaction resolve in CommitGoalTurn, which still runs unchanged.
+//
+// It queries the reader connection, so it never queues behind the writer. Any error
+// is reported as "present", which degrades to the previous behaviour (prepare inside
+// the transaction) instead of speculating on every turn when the probe is broken.
+func (s *Store) goalProbablyAbsent(ctx context.Context, aliasSets [][]GoalAlias, family string) bool {
+	_, err := s.resolveGoalAliasSets(ctx, s.rdb, aliasSets, family)
+	return errors.Is(err, ErrGoalNotFound)
+}
+
 func (s *Store) resolveGoalAliasSets(ctx context.Context, q sqlQueryer, aliasSets [][]GoalAlias, family string) (GoalResolution, error) {
 	for _, aliases := range aliasSets {
 		aliases = normalizedGoalAliases(aliases)
@@ -804,15 +868,19 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 		aliases = normalizedGoalAliases(aliases)
 	}
 	now := Now()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return GoalSession{}, err
-	}
-	defer tx.Rollback()
+	// The segment is appended on every turn, so its ciphertext is always needed. Compute
+	// it before the transaction opens: compression and sealing are pure CPU work, and
+	// doing them here keeps thousands of chunk operations out of SQLite's single writer
+	// lock, where they would serialize every other foreground commit and the disk_guard
+	// write probe behind this one request.
+	segmentChunks, segmentEstimatedBytes := s.prepareGoalChunks(turn.SegmentPayload)
 
 	// A Codex child branch always resolves by its own concrete thread first.  The
 	// parent/root alias remains owned by the root session and is relationship data,
 	// never an instruction to merge a child's raw segment stream into its parent.
+	//
+	// Building the sets touches no database, so it happens before BeginTx and lets the
+	// checkpoint speculation below reuse the result.
 	resolutionSets := turn.ResolutionAliasSets
 	if len(resolutionSets) == 0 {
 		// Backward-compatible storage callers did not supply priority sets. A
@@ -830,6 +898,38 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 			}
 		}
 	}
+
+	// The checkpoint is inserted only when the goal is created or history is being
+	// replaced. Preparing chunks is a pure function of the payload — compress and
+	// seal, no transaction state — so preparing early is never *wrong*, only
+	// potentially wasted. That makes it safe to do speculatively and keep a large
+	// compression out of SQLite's single writer lock:
+	//
+	//   - ReplaceHistory is a field on the turn, so that half is certain here.
+	//   - Creation is not known until the in-transaction resolve, so it is predicted
+	//     with a read-only probe. The probe runs on the reader connection and so does
+	//     not contend for the writer. If it is wrong in either direction the
+	//     transaction still does the right thing: an unused preparation is discarded,
+	//     and a missed one is prepared below exactly as before.
+	//
+	// Only worth it for payloads large enough that the lock hold time dominates; below
+	// the threshold the compression is milliseconds and the probe would be pure
+	// overhead on the common append turn.
+	var checkpointChunks []preparedGoalChunk
+	var checkpointEstimatedBytes int64
+	checkpointPrepared := false
+	if len(turn.CheckpointPayload) >= goalCheckpointPrepareAheadMinBytes &&
+		(turn.ReplaceHistory || s.goalProbablyAbsent(ctx, resolutionSets, family)) {
+		checkpointChunks, checkpointEstimatedBytes = s.prepareGoalChunks(turn.CheckpointPayload)
+		checkpointPrepared = true
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return GoalSession{}, err
+	}
+	defer tx.Rollback()
+
 	resolution, resolveErr := s.resolveGoalAliasSets(ctx, tx, resolutionSets, family)
 	if resolveErr != nil && !errors.Is(resolveErr, ErrGoalNotFound) {
 		return GoalSession{}, resolveErr
@@ -840,10 +940,19 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 	if created && strings.TrimSpace(turn.ExpectedCurrentCheckpoint) != "" {
 		return GoalSession{}, ErrGoalInProgress
 	}
-	segmentEstimatedBytes := s.estimateGoalChunkStorage(turn.SegmentPayload)
-	var checkpointEstimatedBytes int64
-	if created || turn.ReplaceHistory {
-		checkpointEstimatedBytes = s.estimateGoalChunkStorage(turn.CheckpointPayload)
+	// Fallback for the cases the speculation above did not cover: a payload below the
+	// prepare-ahead threshold, or a probe that guessed wrong (the goal was reclaimed
+	// between the probe and this transaction). Preparing once here still halves the
+	// cost even when it happens under the lock, because the estimate below and the
+	// inserts further down share this single result instead of compressing twice.
+	//
+	// Whenever either checkpoint insert site runs, checkpointChunks is populated:
+	// their guards are exactly `created` and `turn.ReplaceHistory`, the same condition
+	// tested here. A narrower fill than the insert guard would silently write zero
+	// chunks, which is data loss rather than a slowdown.
+	if (created || turn.ReplaceHistory) && !checkpointPrepared {
+		checkpointChunks, checkpointEstimatedBytes = s.prepareGoalChunks(turn.CheckpointPayload)
+		checkpointPrepared = true
 	}
 	if !created {
 		// Serialize this foreground append with the maintenance CAS that changes a
@@ -930,7 +1039,7 @@ FROM goal_session WHERE id=? AND state<>'reclaiming'`, resolution.Session.ID).Sc
 			checkpoint.ID, checkpoint.GoalID, checkpoint.Sequence, 0, checkpoint.PayloadHash, checkpoint.PayloadBytes, "", checkpoint.FormatVersion, checkpoint.CreatedAt); err != nil {
 			return GoalSession{}, err
 		}
-		checkpointStoredBytes, insertErr := s.insertGoalChunks(ctx, tx, session.ID, goalChunkCheckpoint, 0, now, turn.CheckpointPayload)
+		checkpointStoredBytes, insertErr := s.insertPreparedGoalChunks(ctx, tx, session.ID, goalChunkCheckpoint, 0, now, checkpointChunks)
 		if insertErr != nil {
 			return GoalSession{}, insertErr
 		}
@@ -980,7 +1089,7 @@ FROM goal_session WHERE id=? AND state<>'reclaiming'`, resolution.Session.ID).Sc
 				checkpoint.PayloadHash, checkpoint.PayloadBytes, "", checkpoint.FormatVersion, checkpoint.CreatedAt); err != nil {
 				return GoalSession{}, err
 			}
-			checkpointStoredBytes, insertErr := s.insertGoalChunks(ctx, tx, session.ID, goalChunkCheckpoint, 0, now, turn.CheckpointPayload)
+			checkpointStoredBytes, insertErr := s.insertPreparedGoalChunks(ctx, tx, session.ID, goalChunkCheckpoint, 0, now, checkpointChunks)
 			if insertErr != nil {
 				return GoalSession{}, insertErr
 			}
@@ -1012,7 +1121,7 @@ FROM goal_session WHERE id=? AND state<>'reclaiming'`, resolution.Session.ID).Sc
 		segment.ID, segment.GoalID, segment.Sequence, segment.PayloadHash, segment.PayloadBytes, "", segment.FormatVersion, segment.State, segment.CreatedAt); err != nil {
 		return GoalSession{}, err
 	}
-	segmentStoredBytes, err := s.insertGoalChunks(ctx, tx, session.ID, goalChunkSegment, segment.Sequence, now, turn.SegmentPayload)
+	segmentStoredBytes, err := s.insertPreparedGoalChunks(ctx, tx, session.ID, goalChunkSegment, segment.Sequence, now, segmentChunks)
 	if err != nil {
 		return GoalSession{}, err
 	}

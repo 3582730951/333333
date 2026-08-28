@@ -46,6 +46,7 @@ type responseRecorder struct {
 	wrote              bool
 	hijacked           bool
 	bytes              int64
+	firstResponseAt    time.Time
 	diagnosticErrClass string
 }
 
@@ -83,9 +84,21 @@ func (r *responseRecorder) WriteHeader(status int) {
 	if r.wrote {
 		return
 	}
+	r.markFirstResponse()
 	r.status = status
 	r.wrote = true
 	r.ResponseWriter.WriteHeader(status)
+}
+
+// markFirstResponse captures when the downstream can first observe a response.
+// Keeping that point separate from the handler lifetime is essential for SSE and
+// WebSocket requests: a healthy stream may stay open for minutes even though its
+// headers reached the CLI immediately.
+func (r *responseRecorder) markFirstResponse() {
+	if r == nil || !r.firstResponseAt.IsZero() {
+		return
+	}
+	r.firstResponseAt = time.Now()
 }
 
 func (r *responseRecorder) Write(p []byte) (int, error) {
@@ -113,6 +126,7 @@ func (r *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	}
 	conn, rw, err := h.Hijack()
 	if err == nil {
+		r.markFirstResponse()
 		r.hijacked = true
 	}
 	return conn, rw, err
@@ -176,7 +190,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		duration := time.Since(start)
 		s.httpMetrics.finish(metricRoute, rec.status, requestBytes, rec.bytes, duration)
-		s.recordHTTPRequest(requestID, r.Method, routeName, rec.status, requestBytes, rec.bytes, duration)
+		ttfb := duration
+		if !rec.firstResponseAt.IsZero() {
+			ttfb = rec.firstResponseAt.Sub(start)
+			if ttfb < 0 {
+				ttfb = 0
+			} else if ttfb > duration {
+				ttfb = duration
+			}
+		}
+		contentType := strings.ToLower(strings.TrimSpace(rec.Header().Get("Content-Type")))
+		streaming := rec.hijacked || strings.Contains(contentType, "text/event-stream")
+		s.recordHTTPRequestTiming(requestID, r.Method, routeName, rec.status, requestBytes, rec.bytes, duration, ttfb, streaming)
 		if rec.status >= http.StatusInternalServerError && !panicRecovered {
 			errorClass := strings.TrimSpace(rec.diagnosticErrClass)
 			if errorClass == "" {

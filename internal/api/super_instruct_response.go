@@ -30,9 +30,9 @@ const (
 	// client: the stream degrades to raw passthrough once the window is exhausted.
 	// The byte cap and idle deadline below remain as backstops for streams that
 	// never emit a terminal frame and outgrow the window's safety margins.
-	superInstructStreamBufferLimit     = 4 << 20
-	superInstructStreamIdleTimeout     = 60 * time.Second
-	superInstructKeepaliveInterval     = 500 * time.Millisecond
+	superInstructStreamBufferLimit        = 4 << 20
+	superInstructStreamIdleTimeout        = 60 * time.Second
+	superInstructKeepaliveInterval        = 500 * time.Millisecond
 	superInstructStreamFrontWindowTimeout = 20 * time.Second
 	superInstructStreamFrontWindowBytes   = 256 << 10
 )
@@ -312,7 +312,7 @@ func wrapSuperInstructAnthropicSSE(text string) []byte {
 	}
 	blockStop := map[string]interface{}{"type": "content_block_stop", "index": 0}
 	messageDelta := map[string]interface{}{
-		"type": "message_delta",
+		"type":  "message_delta",
 		"delta": map[string]interface{}{"stop_reason": "end_turn", "stop_sequence": nil},
 		"usage": map[string]interface{}{"output_tokens": 0},
 	}

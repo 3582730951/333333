@@ -10,9 +10,9 @@ import (
 
 func TestDeepSeekCodexClaudeRewrite(t *testing.T) {
 	cases := []struct {
-		model    string
-		want     string
-		rewrite  bool
+		model   string
+		want    string
+		rewrite bool
 	}{
 		{"gpt-5.6", "deepseek-chat", true},
 		{"gpt-5.6-sol", "deepseek-chat", true},

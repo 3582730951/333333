@@ -378,6 +378,37 @@ func TestGoalNamespaceUsesNativeClaudeAndCodexHeadersWithoutExtraConfig(t *testi
 	}
 }
 
+func TestGoalNamespacePrefersCLIContextOverConvergedGatewayDevice(t *testing.T) {
+	const keyHash = "shared-converged-device-key"
+	scope := func(session string) string {
+		req, _ := http.NewRequest(http.MethodPost, "/v1/messages", nil)
+		// One gateway installation/device serves both CLI processes.
+		req.Header.Set("X-Pool-Client-ID", "same-converged-gateway-device")
+		req.Header.Set("X-Claude-Code-Session-Id", session)
+		return downstreamClientScope(keyHash, req)
+	}
+
+	a1 := scope("claude-cli-context-a")
+	a2 := scope("claude-cli-context-a")
+	b := scope("claude-cli-context-b")
+	if a1 == "" || a1 != a2 {
+		t.Fatalf("same CLI context was not stable: first=%q second=%q", a1, a2)
+	}
+	if a1 == b {
+		t.Fatalf("different CLI contexts crossed under one converged gateway device: %q", a1)
+	}
+
+	poolScope := func(session string) string {
+		req, _ := http.NewRequest(http.MethodPost, "/v1/messages", nil)
+		req.Header.Set("X-Pool-Client-ID", "same-converged-gateway-device")
+		req.Header.Set("X-Pool-Session-ID", session)
+		return downstreamClientScope(keyHash, req)
+	}
+	if poolScope("opaque-body-context-a") == poolScope("opaque-body-context-b") {
+		t.Fatal("gateway-projected body-only contexts collapsed onto the device fallback")
+	}
+}
+
 func TestGoalClientNamespaceMigratesOnlyExactLegacyStateAlias(t *testing.T) {
 	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
 	h.app.cfg.GoalContinuityEnabled = true

@@ -1086,12 +1086,15 @@ func (f *SSEFilter) shouldDropCodex(frame []byte) bool {
 		return false
 	}
 	switch jsonStringField(data, "type") {
-	case "codex.rate_limits":
+	// Both spellings carry the pool account's own quota windows and plan. The
+	// websocket transport uses rate_limits.updated; dropping only the SSE
+	// spelling would forward pool state to the downstream CLI.
+	case "codex.rate_limits", "rate_limits.updated":
 		return true
 	case "response.metadata":
 		return asciiContainsFold(data, "openai_verification_recommendation")
 	}
-	if eventType == "codex.rate_limits" {
+	if eventType == "codex.rate_limits" || eventType == "rate_limits.updated" {
 		return true
 	}
 	return false

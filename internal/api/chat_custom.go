@@ -613,6 +613,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 			NativeBreakpoints: nativeCacheInject,
 			BreakpointPolicy:  breakpointPolicy,
 			TTL:               claudeTTL,
+			SessionHeaders:    r.Header,
 			// AttributionFingerprint is deliberately left off. It is a wire-realism knob,
 			// not a cache control, and enabling it here would change the cc_version a relay
 			// sees without improving hit rate.

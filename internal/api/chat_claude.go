@@ -159,7 +159,10 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	cacheInject := s.cacheInjectEnabled(r.Context())
 	claudeTTL := s.claudeCacheTTLForRoute(r.Context(), affinity)
 	breakpointPolicy := s.claudeCacheBreakpointPolicy(r.Context(), affinity, lease.Account.ID, routeGroup, pol.KeyHash)
-	result := cloak.VirtualizeClaudeCodeWithCache(anthBody, id, s.cfg.SensitiveWordsFor("claude"), claudeIsOAuth(token), "", cloak.ClaudeCodeCacheOptions{TTL: claudeTTL})
+	result := cloak.VirtualizeClaudeCodeWithCache(anthBody, id, s.cfg.SensitiveWordsFor("claude"), claudeIsOAuth(token), "", cloak.ClaudeCodeCacheOptions{
+		TTL:            claudeTTL,
+		SessionHeaders: r.Header,
+	})
 	// The OpenAI→Anthropic conversion emits no cache_control, so without this the
 	// compat path is billed at full input price every turn. Inject the standard
 	// Claude Code breakpoints on stable prefixes (system/tools/history, ≤4) so it
