@@ -122,6 +122,7 @@ internal/api/claude_probe_wire_test.go
 internal/api/claude_refresh.go
 internal/api/claude_route_policy.go
 internal/api/claude_route_policy_test.go
+internal/api/cli_context_isolation_test.go
 internal/api/client_error_limiter.go
 internal/api/client_error_limiter_test.go
 internal/api/codex_agent_message_ciphertext_test.go
@@ -146,11 +147,13 @@ internal/api/codex_reauth.go
 internal/api/codex_reauth_test.go
 internal/api/codex_reset_credits.go
 internal/api/codex_reset_credits_test.go
+internal/api/codex_root_thread_affinity_test.go
 internal/api/codex_session_across_repro_test.go
 internal/api/codex_session_mapping.go
 internal/api/codex_session_mapping_test.go
 internal/api/codex_session_recovery_test.go
 internal/api/codex_session_stability_test.go
+internal/api/codex_subagent_grouping_test.go
 internal/api/compat_capability_test.go
 internal/api/compat_classifier.go
 internal/api/compat_doctor.go
@@ -208,6 +211,7 @@ internal/api/diagnostics_export_test.go
 internal/api/diagnostics_passive_health_test.go
 internal/api/diagnostics_ws_regression_test.go
 internal/api/disk_guard.go
+internal/api/disk_guard_retry_test.go
 internal/api/disk_guard_test.go
 internal/api/downstream_client_namespace.go
 internal/api/downstream_key_lifecycle_test.go
@@ -269,6 +273,10 @@ internal/api/mailbox_config.go
 internal/api/mailbox_config_test.go
 internal/api/messages.go
 internal/api/messages_codex.go
+internal/api/messages_codex_error.go
+internal/api/messages_codex_error_test.go
+internal/api/messages_codex_error_unit_test.go
+internal/api/messages_codex_terminal_test.go
 internal/api/messages_codex_test.go
 internal/api/messages_stream_test.go
 internal/api/middleware.go
@@ -310,6 +318,7 @@ internal/api/quarantine_test.go
 internal/api/quota.go
 internal/api/quota_claude_usage_test.go
 internal/api/quota_codex_stream.go
+internal/api/quota_codex_stream_plan_tier_test.go
 internal/api/quota_codex_stream_test.go
 internal/api/quota_e2e_test.go
 internal/api/quota_estimate.go
@@ -353,6 +362,11 @@ internal/api/request_metrics_test.go
 internal/api/resource_exhausted_test.go
 internal/api/responses_anthropic_sse.go
 internal/api/responses_anthropic_sse_test.go
+internal/api/responses_claude.go
+internal/api/responses_claude_bridge_test.go
+internal/api/responses_claude_route_guard_test.go
+internal/api/responses_claude_wire_test.go
+internal/api/responses_claude_ws_test.go
 internal/api/responses_compat.go
 internal/api/responses_lite_tools_test.go
 internal/api/responses_sse.go
@@ -362,6 +376,7 @@ internal/api/responses_ws_test.go
 internal/api/route_availability.go
 internal/api/route_availability_lifecycle_test.go
 internal/api/routing_audit_test.go
+internal/api/routing_unavailable_downstream_test.go
 internal/api/scheduler_wait.go
 internal/api/scheduler_wait_test.go
 internal/api/search_passthrough.go
@@ -444,9 +459,11 @@ internal/bodysource/preallocate_linux.go
 internal/bodysource/preallocate_other.go
 internal/bodysource/source.go
 internal/bodysource/source_test.go
+internal/capability/codex_claude_prefix_test.go
 internal/capability/compatibility_models_test.go
 internal/capability/models.go
 internal/capability/models_test.go
+internal/capability/plan_tier_policy_test.go
 internal/cf/cf.go
 internal/cf/cf_test.go
 internal/cfsolve/solver.go
@@ -666,6 +683,8 @@ internal/leakfilter/leakfilter.go
 internal/leakfilter/leakfilter_test.go
 internal/passivehealth/monitor.go
 internal/passivehealth/monitor_test.go
+internal/plantier/plantier.go
+internal/plantier/plantier_test.go
 internal/prewarm/prewarm.go
 internal/prewarm/prewarm_test.go
 internal/prompt/anthropic.go
@@ -770,6 +789,8 @@ internal/reliability/state.go
 internal/reliability/state_test.go
 internal/responsefilter/filter.go
 internal/responsefilter/filter_test.go
+internal/routing/codex_thread_parents.go
+internal/routing/codex_thread_parents_test.go
 internal/routing/routing.go
 internal/routing/routing_test.go
 internal/scheduler/across.go
@@ -838,6 +859,8 @@ internal/storage/egress_sidecar_test.go
 internal/storage/email_pool.go
 internal/storage/email_pool_test.go
 internal/storage/encryption_test.go
+internal/storage/goal_checkpoint_prepare_ahead_test.go
+internal/storage/goal_chunk_prepare_bench_test.go
 internal/storage/goal_continuity.go
 internal/storage/goal_continuity_test.go
 internal/storage/kiro_catalog.go
@@ -878,6 +901,7 @@ internal/storage/team_lifecycle.go
 internal/storage/team_lifecycle_test.go
 internal/storage/team_management.go
 internal/storage/turbo_gpt_register_compat.go
+internal/storage/undecryptable_accounts_test.go
 internal/storage/upstream_error_rules_test.go
 internal/storage/usage_completeness_test.go
 internal/storage/usage_event_test.go
@@ -936,6 +960,7 @@ internal/upstream/claude_relay_leak_test.go
 internal/upstream/claude_sidecar_shape_test.go
 internal/upstream/claude_sidecar_test.go
 internal/upstream/claude_stdlib_alpn_test.go
+internal/upstream/claude_thinking_signature_test.go
 internal/upstream/client.go
 internal/upstream/codex_metadata.go
 internal/upstream/codex_metadata_test.go
@@ -984,6 +1009,7 @@ internal/usage/usage.go
 internal/usage/usage_test.go
 internal/usagejournal/journal.go
 internal/usagejournal/journal_test.go
+internal/virtual/token_estimate_test.go
 internal/virtual/virtual.go
 internal/virtual/virtual_test.go
 internal/warp/manager.go
