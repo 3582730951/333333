@@ -691,7 +691,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 	attemptBodyHash := diagnosticBodyHash(body)
 	replaySafe := !pinnedNoFallback && !routing.HasServerSideState(upstreamPath, r, body) && !routing.IsStrictSticky(upstreamPath, r, body)
 	resp, requestErr, _ := s.doAccountCredentialRetry(r.Context(), lease.Account, replaySafe, func() (*upstream.Response, error) {
-		return s.upstream.Do(r.Context(), upstream.Request{
+		return s.doAccountUpstreamAttempt(r.Context(), upstream.Request{
 			Method:           http.MethodPost,
 			Provider:         provider.ID,
 			BaseURL:          resolvedBaseURL,

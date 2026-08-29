@@ -220,7 +220,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	defer func() { _ = s.settleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()
 	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
 	resp, err, _ := s.doAccountCredentialRetry(r.Context(), lease.Account, true, func() (*upstream.Response, error) {
-		return s.upstream.Do(r.Context(), requestForToken(token))
+		return s.doAccountUpstreamAttempt(r.Context(), requestForToken(token))
 	})
 	releaseFlight()
 	if err != nil {
@@ -239,7 +239,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 			if refreshed, rerr := s.forceRefreshClaudeTokenWithHeartbeat(r.Context(), lease.Account, "auth_error", refreshHeartbeat.beat); rerr == nil {
 				token = refreshed
 				resp.Body.Close()
-				resp, err = s.upstream.Do(r.Context(), requestForToken(token))
+				resp, err = s.doAccountUpstreamAttempt(r.Context(), requestForToken(token))
 				if err != nil {
 					_ = s.settleBillingHold(r.Context(), holdID, "failed_after_refresh")
 					if writeClaudeWaitError(r.Context(), refreshHeartbeat, err) {

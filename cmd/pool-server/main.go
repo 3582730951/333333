@@ -17,6 +17,7 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"codex-account-pool/internal/api"
 	"codex-account-pool/internal/cfsolve"
 	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/corestate"
 	"codex-account-pool/internal/datadir"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/incident"
@@ -53,11 +55,15 @@ func run() int {
 	var releaseID string
 	var deploymentRole string
 	var selfTest bool
+	var migrateOnly bool
+	var expandOnly bool
 	flag.StringVar(&configPath, "config", "", "path to JSON configuration file")
 	flag.StringVar(&unixSocket, "unix-socket", "", "serve on a private Unix socket instead of the configured TCP address")
 	flag.StringVar(&releaseID, "release-id", strings.TrimSpace(os.Getenv("CODEX_POOL_RELEASE_ID")), "deployed release identifier exposed by /readyz")
 	flag.StringVar(&deploymentRole, "deployment-role", strings.TrimSpace(os.Getenv("CODEX_POOL_DEPLOYMENT_ROLE")), "worker role: auto, active, or standby")
 	flag.BoolVar(&selfTest, "self-test", false, "verify that the worker binary can start")
+	flag.BoolVar(&migrateOnly, "migrate-only", false, "apply storage migrations and exit without opening listeners")
+	flag.BoolVar(&expandOnly, "expand-only", false, "with --migrate-only, permit additive/compatible schema expansion only")
 	flag.Parse()
 	if selfTest {
 		fmt.Println("codex-pool-server self-test ok")
@@ -66,17 +72,35 @@ func run() int {
 	if releaseID == "" {
 		releaseID = "development"
 	}
-	// An A/B candidate must be observable before it competes with the active
-	// generation for SQLite migrations or runtime leases. In auto mode, an existing
-	// active-worker link that points elsewhere means this process is a staged
-	// candidate: serve only the private deployment contract until the installer
-	// atomically promotes this socket, then exec the same binary into full startup.
-	if handled, standbyErr := runPreinitStandby(unixSocket, releaseID, deploymentRole); handled {
-		if standbyErr != nil {
-			log.Printf("pre-init standby: %v", standbyErr)
-			return 1
+	if expandOnly && !migrateOnly {
+		log.Printf("--expand-only requires --migrate-only")
+		return 2
+	}
+	if migrateOnly {
+		if !expandOnly {
+			log.Printf("hot-update migrations require --expand-only")
+			return 2
 		}
-		return 0
+		return runExpandOnlyMigration(configPath)
+	}
+	warmStandby, standbyErr := warmStandbyRequested(unixSocket, deploymentRole)
+	if standbyErr != nil {
+		log.Printf("detect warm standby: %v", standbyErr)
+		return 1
+	}
+	// Full warm standby is the default: a staged worker loads config/keys, validates
+	// storage, builds the router and binds its private socket before traffic moves.
+	// Pollers, automation and singleton writers remain fenced by the active-role
+	// context below. The old database-free exec-on-promote path remains only as an
+	// explicit compatibility escape hatch for constrained legacy deployments.
+	if strings.TrimSpace(os.Getenv("CODEX_POOL_PREINIT_STANDBY")) == "1" {
+		if handled, standbyErr := runPreinitStandby(unixSocket, releaseID, deploymentRole); handled {
+			if standbyErr != nil {
+				log.Printf("pre-init standby: %v", standbyErr)
+				return 1
+			}
+			return 0
+		}
 	}
 
 	cfg, err := config.Load(configPath)
@@ -176,20 +200,31 @@ func run() int {
 	}
 	defer store.Close()
 
-	if err := initStorageWithLockRetry(ctx, store.InitWithProgress, func(phase string) {
+	storageInitializer := store.InitWithProgress
+	if warmStandby {
+		storageInitializer = func(initCtx context.Context, progress func(string)) error {
+			if progress != nil {
+				progress("standby_schema_validation")
+			}
+			return store.PrepareWarmStandby(initCtx)
+		}
+	}
+	if err := initStorageWithLockRetry(ctx, storageInitializer, func(phase string) {
 		log.Printf("startup: storage phase=%s elapsed=%s", phase, time.Since(storageInitStarted).Round(time.Millisecond))
 	}, log.Printf); err != nil {
 		log.Printf("init storage: %v", err)
 		reportStartupFailure("init_storage", err)
 		return 1
 	}
-	log.Printf("startup: storage initialized in %s", time.Since(storageInitStarted).Round(time.Millisecond))
+	log.Printf("startup: storage initialized in %s warm_standby=%t", time.Since(storageInitStarted).Round(time.Millisecond), warmStandby)
 	incidentReporter.SetStore(store)
-	if replayed, replayErr := incidentReporter.Replay(ctx); replayErr != nil && !errors.Is(replayErr, incident.ErrPrimaryUnavailable) {
-		log.Printf("replay exception diagnostics: %v", replayErr)
-		supervisor.ReportError("exception-reporter", "startup_replay", replayErr)
-	} else if replayed > 0 {
-		log.Printf("startup: replayed %d durable exception event(s)", replayed)
+	if !warmStandby {
+		if replayed, replayErr := incidentReporter.Replay(ctx); replayErr != nil && !errors.Is(replayErr, incident.ErrPrimaryUnavailable) {
+			log.Printf("replay exception diagnostics: %v", replayErr)
+			supervisor.ReportError("exception-reporter", "startup_replay", replayErr)
+		} else if replayed > 0 {
+			log.Printf("startup: replayed %d durable exception event(s)", replayed)
+		}
 	}
 	// Keep the former host/config-derived key readable for exactly this migration
 	// window. Every value is then rewritten with the independent persistent master.
@@ -203,17 +238,23 @@ func run() int {
 		reportStartupFailure("configure_storage_encryption", err)
 		return 1
 	}
-	if err := store.ValidateEncryptionSentinel(ctx); err != nil {
+	validateSentinel := store.ValidateEncryptionSentinel
+	if warmStandby {
+		validateSentinel = store.ValidateEncryptionSentinelReadOnly
+	}
+	if err := validateSentinel(ctx); err != nil {
 		log.Printf("[SECURITY] encryption sentinel: %v", err)
 		reportStartupFailure("validate_encryption_sentinel", err)
 		return 1
 	}
-	if n, err := store.EncryptExistingTokens(ctx); err != nil {
-		log.Printf("[SECURITY] encrypt existing tokens at rest: %v", err)
-		reportStartupFailure("encrypt_existing_tokens", err)
-		return 1
-	} else if n > 0 {
-		log.Printf("[SECURITY] encrypted %d plaintext account token row(s) at rest", n)
+	if !warmStandby {
+		if n, err := store.EncryptExistingTokens(ctx); err != nil {
+			log.Printf("[SECURITY] encrypt existing tokens at rest: %v", err)
+			reportStartupFailure("encrypt_existing_tokens", err)
+			return 1
+		} else if n > 0 {
+			log.Printf("[SECURITY] encrypted %d plaintext account token row(s) at rest", n)
+		}
 	}
 	store.EnableStrictEncryption()
 	if err := store.CryptoError(); err != nil {
@@ -221,13 +262,16 @@ func run() int {
 		reportStartupFailure("validate_credentials", err)
 		return 1
 	}
-	coreStateWriter, coreStateErr := openCoreStateWriter(layout)
-	if coreStateErr != nil {
+	var coreStateWriter *corestate.Writer
+	if !warmStandby {
+		coreStateWriter, err = openCoreStateWriter(layout)
+	}
+	if err != nil {
 		// The relay can keep using either previously committed A/B snapshot. A
 		// state-writer outage reduces future failover freshness but must not make
 		// the worker or its existing contexts unavailable.
-		log.Printf("core state writer unavailable: %v", coreStateErr)
-		supervisor.ReportError("core-state-writer", "open", coreStateErr)
+		log.Printf("core state writer unavailable: %v", err)
+		supervisor.ReportError("core-state-writer", "open", err)
 	}
 	up := upstream.NewClient(cfg)
 	// WARP CF-fallback manager. The prober wraps ProbeEgress so the manager can refresh
@@ -247,6 +291,7 @@ func run() int {
 	}
 	app := api.NewServer(api.Dependencies{
 		Config:            cfg,
+		ReleaseID:         releaseID,
 		Store:             store,
 		IncidentReporter:  incidentReporter,
 		Scheduler:         scheduler.NewWithLeaseCoordinator(store, cfg, leaseCoordinator),
@@ -258,6 +303,19 @@ func run() int {
 	})
 
 	deployment := newDeploymentHandler(app, releaseID, unixSocket)
+	deployment.rateStatus = app.RateMeterStatus
+	deployment.warm.Store(warmStandby)
+	deployment.schemaCompatible.Store(true)
+	deployment.writeSideEffects.Store(!warmStandby)
+	deployment.standbyCheck = func(checkCtx context.Context) error {
+		if !store.WarmStandbyReadOnly() {
+			return errors.New("standby storage is not read-only")
+		}
+		if err := store.CheckWarmStandby(checkCtx); err != nil {
+			return err
+		}
+		return store.ValidateEncryptionSentinelReadOnly(checkCtx)
+	}
 	deployment.check = func(checkCtx context.Context) error {
 		if err := datadir.RecoverDirectory(cfg.BodySpoolDir); err != nil {
 			return err
@@ -280,7 +338,43 @@ func run() int {
 		return nil
 	}
 	deferredMigrations := newDeferredMigrationTask(store.RunDeferredMigrations, log.Printf)
+	activeStorageReady := !warmStandby
+	var activeStorageMu sync.Mutex
+	ensureActiveStorage := func(activeCtx context.Context) error {
+		activeStorageMu.Lock()
+		defer activeStorageMu.Unlock()
+		if activeStorageReady {
+			return nil
+		}
+		if err := store.PromoteWarmStandby(activeCtx); err != nil {
+			return err
+		}
+		if err := store.ValidateEncryptionSentinel(activeCtx); err != nil {
+			return err
+		}
+		if n, err := store.EncryptExistingTokens(activeCtx); err != nil {
+			return err
+		} else if n > 0 {
+			log.Printf("[SECURITY] encrypted %d plaintext account token row(s) at promotion", n)
+		}
+		if replayed, replayErr := incidentReporter.Replay(activeCtx); replayErr != nil && !errors.Is(replayErr, incident.ErrPrimaryUnavailable) {
+			return replayErr
+		} else if replayed > 0 {
+			log.Printf("promotion: replayed %d durable exception event(s)", replayed)
+		}
+		var openErr error
+		coreStateWriter, openErr = openCoreStateWriter(layout)
+		if openErr != nil {
+			log.Printf("core state writer unavailable at promotion: %v", openErr)
+			supervisor.ReportError("core-state-writer", "open_on_promotion", openErr)
+		}
+		activeStorageReady = true
+		return nil
+	}
 	startActive := func(activeCtx context.Context, fencingToken int64) error {
+		if err := ensureActiveStorage(activeCtx); err != nil {
+			return fmt.Errorf("promote active storage: %w", err)
+		}
 		if err := commitActiveWorker(coreStateWriter, releaseID, unixSocket, fencingToken); err != nil {
 			log.Printf("core state commit unavailable release=%s fencing_token=%d: %v", releaseID, fencingToken, err)
 			supervisor.ReportError("core-state-writer", "commit_active_worker", err)
@@ -316,6 +410,9 @@ func run() int {
 		app.StartBackground(activeCtx)
 		app.StartAutomation(activeCtx)
 		app.StartModelQualityMonitor(activeCtx)
+		app.StartQuotaPoller(activeCtx)
+		deferredMigrations.Start(activeCtx)
+		supervisor.Go(activeCtx, "exception-journal-replay", incidentReporter.Run)
 		startActiveLedgerPurge(activeCtx, store, cfg)
 		log.Printf("worker role active release=%s fencing_token=%d", releaseID, fencingToken)
 		return nil
@@ -339,15 +436,10 @@ func run() int {
 	serveErr := make(chan error, 1)
 	deployment.standbyReady.Store(true)
 	serveHTTPServerAsync(serveErr, func() error { return serveHTTPServerOn(httpServer, unixSocket) })
-	supervisor.Go(ctx, "exception-journal-replay", incidentReporter.Run)
-	// Quota polling and deferred storage migrations are idempotent, marker-gated
-	// background work that must survive active-role lease flaps. Binding them to
-	// activeCtx lets a transient renewal failure (SQLite write-lock contention from
-	// a migration batch) cancel the poller's 30s startup stagger forever, starving
-	// quota-window sampling and the UI's USD estimate. Both write through the shared
-	// SQLite store, so any single worker process may perform them once per process.
-	app.StartQuotaPoller(ctx)
-	deferredMigrations.Start(ctx)
+	// Singleton/background writers are started from startActive and inherit the
+	// fencing lease context. A demoted worker keeps serving its admitted business
+	// requests and flushing their writes, but stops quota polling, migrations,
+	// automation and journal replay before the promoted generation starts them.
 	supervisor.Go(ctx, "worker-role", roleController.Run)
 
 	stop := make(chan os.Signal, 1)
@@ -424,13 +516,19 @@ func (h *preinitStandbyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		})
 	case "/standbyz":
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"ok":               true,
-			"standby_ready":    true,
-			"release_id":       h.releaseID,
-			"deployment_state": "preinit_standby",
-			"started_at":       h.startedAt.Format(time.RFC3339Nano),
-			"worker_socket":    h.workerAddr,
-			"checks":           map[string]bool{"storage": false},
+			"ok":                 true,
+			"standby_ready":      true,
+			"release_id":         h.releaseID,
+			"deployment_state":   "preinit_standby",
+			"started_at":         h.startedAt.Format(time.RFC3339Nano),
+			"worker_socket":      h.workerAddr,
+			"checks":             map[string]bool{"storage": false},
+			"critical_inflight":  0,
+			"resumable_inflight": 0,
+			"rate_meter":         "unavailable",
+			"warm":               false,
+			"schema_compatible":  false,
+			"write_side_effects": false,
 			"capabilities": map[string]string{
 				"preinit_promotion": "exec_on_active_link",
 			},
@@ -440,6 +538,8 @@ func (h *preinitStandbyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"ok": false, "ready": false, "release_id": h.releaseID,
 			"deployment_state": "preinit_standby", "checks": map[string]bool{"storage": false},
+			"critical_inflight": 0, "resumable_inflight": 0, "rate_meter": "unavailable",
+			"warm": false, "schema_compatible": false, "write_side_effects": false,
 		})
 	default:
 		writeWorkerUnavailable(w)
@@ -528,6 +628,34 @@ func runPreinitStandby(unixSocket, releaseID, deploymentRole string) (bool, erro
 	}
 }
 
+func warmStandbyRequested(unixSocket, deploymentRole string) (bool, error) {
+	mode := strings.ToLower(strings.TrimSpace(deploymentRole))
+	if mode == "" {
+		mode = "auto"
+	}
+	switch mode {
+	case "active":
+		return false, nil
+	case "standby":
+		return true, nil
+	case "auto":
+	default:
+		return false, fmt.Errorf("deployment role must be auto, active, or standby")
+	}
+	workerSocket := filepath.Clean(strings.TrimSpace(unixSocket))
+	if workerSocket == "" || workerSocket == "." {
+		return false, nil
+	}
+	activeLink := filepath.Join(filepath.Dir(workerSocket), "active-worker.sock")
+	if _, err := os.Lstat(activeLink); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("inspect active worker link: %w", err)
+	}
+	return !workerLinkTargets(activeLink, workerSocket), nil
+}
+
 func startActiveLedgerPurge(ctx context.Context, store *storage.Store, cfg config.Config) {
 	supervisor.Go(ctx, "virtual-ledger-purge", func(ctx context.Context) {
 		ticker := time.NewTicker(5 * time.Minute)
@@ -558,20 +686,56 @@ func startActiveLedgerPurge(ctx context.Context, store *storage.Store, cfg confi
 // stable handoff process. It deliberately lives outside the API router so readiness
 // remains available while normal admission middleware is saturated.
 type deploymentHandler struct {
-	next         http.Handler
-	releaseID    string
-	workerAddr   string
-	startedAt    time.Time
-	ready        atomic.Bool
-	standbyReady atomic.Bool
-	draining     atomic.Bool
-	inflight     atomic.Int64
-	fencingToken atomic.Int64
-	check        func(context.Context) error
+	next             http.Handler
+	releaseID        string
+	workerAddr       string
+	startedAt        time.Time
+	ready            atomic.Bool
+	standbyReady     atomic.Bool
+	draining         atomic.Bool
+	inflight         atomic.Int64
+	critical         atomic.Int64
+	resumable        atomic.Int64
+	fencingToken     atomic.Int64
+	check            func(context.Context) error
+	standbyCheck     func(context.Context) error
+	rateStatus       func() string
+	warm             atomic.Bool
+	schemaCompatible atomic.Bool
+	writeSideEffects atomic.Bool
+	handoffMu        sync.RWMutex
+	handoff          *deploymentHandoffState
+}
+
+type deploymentHandoffState struct {
+	done   chan struct{}
+	once   sync.Once
+	closed atomic.Bool
+	target atomic.Value
+}
+
+func newDeploymentHandoffState() *deploymentHandoffState {
+	state := &deploymentHandoffState{done: make(chan struct{})}
+	state.target.Store("")
+	return state
 }
 
 func newDeploymentHandler(next http.Handler, releaseID, workerAddr string) *deploymentHandler {
-	return &deploymentHandler{next: next, releaseID: releaseID, workerAddr: workerAddr, startedAt: time.Now().UTC()}
+	return &deploymentHandler{
+		next: next, releaseID: releaseID, workerAddr: workerAddr, startedAt: time.Now().UTC(),
+		handoff: newDeploymentHandoffState(),
+	}
+}
+
+func (h *deploymentHandler) accountRateStatus() string {
+	if h == nil || h.rateStatus == nil {
+		return "unavailable"
+	}
+	status := strings.TrimSpace(h.rateStatus())
+	if status != "live" && status != "stale" && status != "unavailable" {
+		return "unavailable"
+	}
+	return status
 }
 
 func (h *deploymentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -596,8 +760,41 @@ func (h *deploymentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	h.inflight.Add(1)
 	defer h.inflight.Add(-1)
+	if isResumableAdminStream(r) {
+		h.resumable.Add(1)
+		defer h.resumable.Add(-1)
+		r = r.WithContext(api.ContextWithDeploymentHandoff(r.Context(), h.streamHandoffSignal()))
+	} else {
+		h.critical.Add(1)
+		defer h.critical.Add(-1)
+	}
 	w.Header().Set("X-Codex-Pool-Release", h.releaseID)
 	h.next.ServeHTTP(w, r)
+}
+
+func isResumableAdminStream(r *http.Request) bool {
+	if r == nil || r.Method != http.MethodGet || r.URL == nil {
+		return false
+	}
+	switch r.URL.Path {
+	case "/admin/stream/ambient", "/admin/stream/account-rates":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *deploymentHandler) streamHandoffSignal() api.DeploymentHandoffSignal {
+	h.handoffMu.RLock()
+	state := h.handoff
+	h.handoffMu.RUnlock()
+	return api.DeploymentHandoffSignal{
+		Done: state.done,
+		TargetRelease: func() string {
+			value, _ := state.target.Load().(string)
+			return value
+		},
+	}
 }
 
 func isWorkerEmergencyDiagnosticRequest(r *http.Request) bool {
@@ -617,9 +814,13 @@ func (h *deploymentHandler) serveReady(w http.ResponseWriter, r *http.Request) {
 	standby := h.standbyReady.Load()
 	ready := active && !draining
 	var checkErr error
-	if ready && h.check != nil {
+	check := h.standbyCheck
+	if active {
+		check = h.check
+	}
+	if ready && check != nil {
 		checkCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		checkErr = h.check(checkCtx)
+		checkErr = check(checkCtx)
 		cancel()
 		ready = checkErr == nil
 	}
@@ -640,16 +841,22 @@ func (h *deploymentHandler) serveReady(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Codex-Pool-Release", h.releaseID)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"ok":               ready,
-		"ready":            ready,
-		"release_id":       h.releaseID,
-		"deployment_state": state,
-		"inflight":         h.inflight.Load(),
-		"started_at":       h.startedAt.Format(time.RFC3339Nano),
-		"worker_socket":    h.workerAddr,
-		"fencing_token":    fencingToken,
-		"checks":           map[string]bool{"storage": checkErr == nil},
-		"capabilities":     map[string]string{"idle_websocket_drain_signal": "SIGUSR1"},
+		"ok":                 ready,
+		"ready":              ready,
+		"release_id":         h.releaseID,
+		"deployment_state":   state,
+		"inflight":           h.inflight.Load(),
+		"critical_inflight":  h.critical.Load(),
+		"resumable_inflight": h.resumable.Load(),
+		"rate_meter":         h.accountRateStatus(),
+		"warm":               h.warm.Load(),
+		"schema_compatible":  h.schemaCompatible.Load() && checkErr == nil,
+		"write_side_effects": h.writeSideEffects.Load(),
+		"started_at":         h.startedAt.Format(time.RFC3339Nano),
+		"worker_socket":      h.workerAddr,
+		"fencing_token":      fencingToken,
+		"checks":             map[string]bool{"storage": checkErr == nil},
+		"capabilities":       map[string]string{"idle_websocket_drain_signal": "SIGUSR1"},
 	})
 }
 
@@ -660,9 +867,13 @@ func (h *deploymentHandler) serveStandbyReady(w http.ResponseWriter, r *http.Req
 	standby := h.standbyReady.Load()
 	ready := !draining && (standby || active)
 	var checkErr error
-	if ready && h.check != nil {
+	check := h.standbyCheck
+	if active {
+		check = h.check
+	}
+	if ready && check != nil {
 		checkCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		checkErr = h.check(checkCtx)
+		checkErr = check(checkCtx)
 		cancel()
 		ready = checkErr == nil
 	}
@@ -683,21 +894,33 @@ func (h *deploymentHandler) serveStandbyReady(w http.ResponseWriter, r *http.Req
 	w.Header().Set("X-Codex-Pool-Release", h.releaseID)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"ok":               ready,
-		"standby_ready":    ready,
-		"release_id":       h.releaseID,
-		"deployment_state": state,
-		"inflight":         h.inflight.Load(),
-		"started_at":       h.startedAt.Format(time.RFC3339Nano),
-		"worker_socket":    h.workerAddr,
-		"fencing_token":    fencingToken,
-		"checks":           map[string]bool{"storage": checkErr == nil},
-		"capabilities":     map[string]string{"idle_websocket_drain_signal": "SIGUSR1"},
+		"ok":                 ready,
+		"standby_ready":      ready,
+		"release_id":         h.releaseID,
+		"deployment_state":   state,
+		"inflight":           h.inflight.Load(),
+		"critical_inflight":  h.critical.Load(),
+		"resumable_inflight": h.resumable.Load(),
+		"rate_meter":         h.accountRateStatus(),
+		"warm":               h.warm.Load(),
+		"schema_compatible":  h.schemaCompatible.Load() && checkErr == nil,
+		"write_side_effects": h.writeSideEffects.Load(),
+		"started_at":         h.startedAt.Format(time.RFC3339Nano),
+		"worker_socket":      h.workerAddr,
+		"fencing_token":      fencingToken,
+		"checks":             map[string]bool{"storage": checkErr == nil},
+		"capabilities":       map[string]string{"idle_websocket_drain_signal": "SIGUSR1"},
 	})
 }
 
 func (h *deploymentHandler) markActive(fencingToken int64) {
+	h.handoffMu.Lock()
+	if h.handoff == nil || h.handoff.closed.Load() {
+		h.handoff = newDeploymentHandoffState()
+	}
+	h.handoffMu.Unlock()
 	h.fencingToken.Store(fencingToken)
+	h.writeSideEffects.Store(true)
 	h.standbyReady.Store(true)
 	h.draining.Store(false)
 	h.ready.Store(true)
@@ -706,6 +929,33 @@ func (h *deploymentHandler) markActive(fencingToken int64) {
 func (h *deploymentHandler) beginDraining() {
 	h.ready.Store(false)
 	h.draining.Store(true)
+	h.handoffMu.RLock()
+	state := h.handoff
+	h.handoffMu.RUnlock()
+	if state != nil {
+		state.target.Store(nextWorkerReleaseID(h.workerAddr, h.releaseID))
+		state.once.Do(func() {
+			state.closed.Store(true)
+			close(state.done)
+		})
+	}
+}
+
+func nextWorkerReleaseID(workerAddr, currentRelease string) string {
+	workerAddr = strings.TrimSpace(workerAddr)
+	if workerAddr == "" {
+		return ""
+	}
+	target, err := os.Readlink(filepath.Join(filepath.Dir(workerAddr), "active-worker.sock"))
+	if err != nil {
+		return ""
+	}
+	base := filepath.Base(target)
+	base = strings.TrimSuffix(strings.TrimPrefix(base, "worker-"), ".sock")
+	if base == "" || base == strings.TrimSpace(currentRelease) {
+		return ""
+	}
+	return base
 }
 
 func (h *deploymentHandler) markStandby() {

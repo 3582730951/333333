@@ -225,6 +225,7 @@ echo
 # MIGRATE_USER_GROUPS=0/1.
 migration_choice_set=0
 help_requested=0
+status_requested=0
 sidecar_prompt_enabled=1
 warp_prompt_enabled=1
 for arg in "$@"; do
@@ -237,8 +238,13 @@ for arg in "$@"; do
     --without-sidecar) sidecar_prompt_enabled=0 ;;
     --without-warp) warp_prompt_enabled=0 ;;
     -h|--help) help_requested=1 ;;
+    --status) status_requested=1 ;;
   esac
 done
+
+if [[ "$status_requested" == "1" ]]; then
+  exec bash scripts/install.sh "$@"
+fi
 
 if [[ -v WITH_SIDECAR ]] && ! [[ "${WITH_SIDECAR}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
   sidecar_prompt_enabled=0

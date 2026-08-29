@@ -126,9 +126,18 @@ func (c *workerRoleController) reconcile(ctx context.Context) {
 	}
 
 	acquireCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	if err := c.store.PromoteWarmStandby(acquireCtx); err != nil {
+		cancel()
+		log.Printf("worker role: promote warm standby storage: %v", err)
+		c.deployment.markStandby()
+		return
+	}
 	lease, acquired, err := c.store.AcquireMaintenanceLease(acquireCtx, activeWorkerLeaseName, c.ownerID, c.leaseTTL)
 	cancel()
 	if err != nil || !acquired {
+		restoreCtx, restoreCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = c.store.RestoreWarmStandby(restoreCtx)
+		restoreCancel()
 		c.deployment.markStandby()
 		return
 	}
@@ -139,6 +148,9 @@ func (c *workerRoleController) reconcile(ctx context.Context) {
 		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = c.store.ReleaseMaintenanceLease(releaseCtx, lease)
 		releaseCancel()
+		restoreCtx, restoreCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = c.store.RestoreWarmStandby(restoreCtx)
+		restoreCancel()
 		c.deployment.markStandby()
 		return
 	}

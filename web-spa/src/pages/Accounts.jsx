@@ -13,12 +13,16 @@ import MobileResourceCell from '../components/MobileResourceCell.jsx';
 import { TextClamp, TinyMeter } from '../components/DisplayPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
+import useInstantMutation from '../hooks/useInstantMutation.ts';
 import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
 import useResponsiveLayout from '../hooks/useResponsiveLayout.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
 import { fmtInt, fmtRelative, fmtTokens, fmtUSD, middleEllipsis } from '../lib/format.js';
 import { accountQueryKeys, useAccountsPage } from '../features/accounts/queries/accounts.ts';
 import { fetchAccountArchive, fetchAccountsPage, importAccountArchive } from '../features/accounts/api/accounts.ts';
+import {
+  seedAccountRates, subscribeAccountRateBatches, subscribeAccountRateFeed, useAccountRequestRate,
+} from '../features/accounts/live/accountRates.ts';
 import { abortController, abortSignal, createAbortController } from '../lib/browserAbort.js';
 import { downloadBlob } from '../lib/browserDownload.js';
 import { clearBrowserTimeout, setBrowserTimeout } from '../lib/browserLifecycle.js';
@@ -69,6 +73,46 @@ const ACCOUNT_ACTION_LABEL = {
 
 function accountUsage(account) {
   return account?.usage || {};
+}
+
+const REQUEST_RATE_STATE = {
+  live: { label: '实时', hint: '滚动 60 秒' },
+  stale: { label: '数据延迟', hint: '持久化暂时延迟' },
+  unavailable: { label: '暂不可用', hint: '等待采样器恢复' },
+};
+
+function AccountRateMetric({ account, compact = false }) {
+  const rate = useAccountRequestRate(account.id, account.request_rate);
+  const state = REQUEST_RATE_STATE[rate.state] || REQUEST_RATE_STATE.unavailable;
+  const known = rate.state === 'live' || rate.state === 'stale';
+  const active = known && rate.rpm > 0;
+  if (compact) {
+    return (
+      <Tag
+        size="small"
+        color={active ? 'blue' : rate.state === 'stale' ? 'amber' : 'grey'}
+        className={active ? 'pool-account-rpm-chip pool-account-rpm-chip--active' : 'pool-account-rpm-chip'}
+        title={`${state.label} · ${state.hint}`}
+      >
+        {known ? `${fmtInt(rate.rpm)} RPM` : 'RPM —'}
+      </Tag>
+    );
+  }
+  return (
+    <div
+      className={`pool-account-rpm${active ? ' pool-account-rpm--active' : ''}`}
+      aria-label={known ? `${fmtInt(rate.rpm)} RPM，${state.hint}，${state.label}` : `RPM ${state.label}`}
+    >
+      <strong>{known ? fmtInt(rate.rpm) : '—'} <span>RPM</span></strong>
+      <small>{rate.state === 'live' ? '滚动 60 秒' : state.label}</small>
+    </div>
+  );
+}
+
+function AccountRateDetail({ account }) {
+  const rate = useAccountRequestRate(account.id, account.request_rate);
+  if (rate.state === 'unavailable') return '暂不可用 · 等待采样器恢复';
+  return `${fmtInt(rate.rpm)} RPM · ${rate.state === 'stale' ? '数据延迟' : '滚动 60 秒'} · ${rate.sampled_at ? `${fmtRelative(rate.sampled_at)}采样` : '刚刚采样'}`;
 }
 
 export function accountCredentialPresentation(account) {
@@ -291,6 +335,14 @@ export default function Accounts() {
   const rows = data.rows || [];
   const total = data.total || 0;
   const groups = data.groups || [];
+	const accountRateIDs = rows.map((account) => account.id).join(',');
+	useEffect(() => {
+		seedAccountRates(rows);
+	}, [rows]);
+	useEffect(() => subscribeAccountRateFeed(accountRateIDs ? accountRateIDs.split(',') : []), [accountRateIDs]);
+	useEffect(() => subscribeAccountRateBatches((batch) => {
+		queryClient.setQueryData(['pool', 'account-rates', 'live'], (current = {}) => ({ ...current, ...batch }));
+	}), [queryClient]);
   const loadError = error || data.error;
   const accountByID = new Map(rows.map((account) => [account.id, account]));
   const selectedAccounts = selected.map((id) => accountByID.get(id) || selectedAccountMeta[id] || { id });
@@ -387,6 +439,13 @@ export default function Accounts() {
     activeKeys: activeAccountActionKeys,
     isRunning: isAccountActionKeyRunning,
   } = useKeyedAsyncAction(async (_key, id, act, requestBody = {}) => {
+    const before = accountByID.get(id) || selectedAccountMeta[id] || (drawerAcct?.id === id ? drawerAcct : null);
+    const optimisticPatch = act === 'clear-quarantine'
+      ? { status: 'active', quarantine_until: 0, quarantine_reason: '' }
+      : act === 'clear-cooldown'
+        ? clearedCooldownPatch
+        : null;
+    if (optimisticPatch) updateCachedAccount(id, optimisticPatch);
     try {
       const result = await post(`/admin/accounts/${encodeURIComponent(id)}/${act}`, requestBody);
       if (act === 'health-test') {
@@ -409,6 +468,7 @@ export default function Accounts() {
       }).catch(() => {});
       return true;
     } catch (e) {
+      if (optimisticPatch && before) updateCachedAccount(id, before);
       showErrorToast(e);
       return false;
     }
@@ -455,24 +515,38 @@ export default function Accounts() {
     void load();
   });
 
-  const { run: bulkMove, running: bulkMoveRunning } = useAsyncAction(async () => {
-    const ids = moveIDs.length ? moveIDs : selected;
-    if (!ids.length) return;
-    try {
-      await post('/admin/accounts/assign-group', { ids, group: moveGroup });
+  const { run: runBulkMove, pending: bulkMoveRunning } = useInstantMutation({
+    mutationFn: ({ ids, group }) => post('/admin/accounts/assign-group', { ids, group }),
+    optimistic: ({ ids, group }) => {
       const moved = new Set(ids);
-      queryClient.setQueryData(accountQueryKeys.list({ page, pageSize, search, authType, group: groupFilter === 'all' ? '' : groupFilter }), (current) => current ? {
+      const queries = queryClient.getQueriesData({ queryKey: accountQueryKeys.all });
+      const drawer = drawerAcct;
+      queryClient.setQueriesData({ queryKey: accountQueryKeys.all }, (current) => current ? {
         ...current,
-        rows: (current.rows || []).map((account) => moved.has(account.id) ? { ...account, group_name: moveGroup } : account),
+        rows: (current.rows || []).map((account) => moved.has(account.id) ? { ...account, group_name: group } : account),
       } : current);
-      setDrawerAcct((current) => current && moved.has(current.id) ? { ...current, group_name: moveGroup } : current);
-      Toast.success(`已移动 ${ids.length} 个账号到「${moveGroup || '默认'}」`);
+      setDrawerAcct((current) => current && moved.has(current.id) ? { ...current, group_name: group } : current);
+      return { queries, drawer };
+    },
+    rollback: (snapshot) => {
+      snapshot.queries.forEach(([key, value]) => queryClient.setQueryData(key, value));
+      setDrawerAcct(snapshot.drawer);
+    },
+    onSuccess: (_result, { ids, group }) => {
+      Toast.success(`已移动 ${ids.length} 个账号到「${group || '默认'}」`);
       setMoveOpen(false);
       setMoveIDs([]);
       setSelected([]);
       void load();
-    } catch (e) { showErrorToast(e); }
+    },
   });
+  const bulkMove = () => {
+    const ids = moveIDs.length ? moveIDs : selected;
+    if (!ids.length) return Promise.resolve();
+    return runBulkMove({ ids, group: moveGroup }).catch((error) => {
+      showErrorToast(error);
+    });
+  };
 
   const { run: exportAccountBackup, running: accountExportRunning } = useAsyncAction(async (ids = []) => {
     abortController(accountArchiveAbortRef.current);
@@ -619,6 +693,7 @@ export default function Accounts() {
       { title: 'provider', get: (r) => r.provider }, { title: 'group', get: (r) => r.group_name },
       { title: 'plan', get: (r) => r.plan_type }, { title: 'auth_method', get: (r) => `${r.auth_method || ''} ${r.credential_mode || ''}` },
       { title: 'billing_mode', get: (r) => r.billing_mode }, { title: 'status', get: (r) => r.status },
+		{ title: 'rpm_60s', get: (r) => r.request_rate?.state === 'unavailable' ? '' : r.request_rate?.rpm },
     ];
     const ok = downloadCSV('accounts.csv', toCSV(filtered, cols));
     if (!ok) Toast.error('导出失败，请检查浏览器下载权限');
@@ -709,6 +784,13 @@ export default function Accounts() {
       },
     },
     {
+		title: <span title="账号最近滚动 60 秒内真正发往上游的请求尝试数">实时负载</span>,
+		key: 'request_rate',
+		width: 136,
+		align: 'right',
+		render: (_, r) => <AccountRateMetric account={r} />,
+	},
+	{
       title: '用量 / 额度',
       key: 'usage',
       width: 220,
@@ -760,6 +842,7 @@ export default function Accounts() {
           {r.plan_type ? <Tag size="small">{r.plan_type}</Tag> : null}
           {r.billing_mode === 'pay_as_you_go' ? <Tag size="small" color="violet">按量计费</Tag> : null}
           <Tag size="small" color="blue" title={route.primary}>{middleEllipsis(route.primary, 14, 8)}</Tag>
+			<AccountRateMetric account={r} compact />
         </>}
         details={[
           {
@@ -767,6 +850,10 @@ export default function Accounts() {
             value: `${tokens == null ? 'Token 未同步' : `${fmtTokens(tokens)} Token`}${requests == null ? '' : ` · ${fmtInt(requests)} 次请求`}`,
           },
           { label: '额度', value: <AccountQuota account={r} compact /> },
+			{
+				label: '实时负载',
+				value: <AccountRateDetail account={r} />,
+			},
         ]}
         actions={!selectMode ? renderAccountActions(r) : null}
       />
@@ -868,7 +955,7 @@ export default function Accounts() {
         rowSelection={!responsive.isMobile || selectMode ? { selectedRowKeys: selected, onChange: handleSelectionChange } : undefined}
         className="pool-mobile-table pool-accounts-table"
         density="account"
-        minScrollX={1274}
+		minScrollX={1410}
         rowHeight={72}
         mobileRenderer={mobileAccountCell}
         mobileListLabel="账号列表"

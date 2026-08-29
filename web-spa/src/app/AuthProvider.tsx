@@ -1,8 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, type ReactNode } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { clearToken, isUnauthorizedError, logout as apiLogout, me } from '../api.js';
+import { clearToken, getToken, isUnauthorizedError, logout as apiLogout, me } from '../api.js';
 import { addWindowListener } from '../lib/browserLifecycle.js';
 import { Toast } from '../components/pool/index.jsx';
+import { consoleBootstrap } from './bootstrap';
 
 export interface AuthUser {
   id?: string;
@@ -37,8 +38,27 @@ async function loadCurrentUser(): Promise<AuthUser | null> {
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const queryClient = useQueryClient();
-  const query = useQuery({ queryKey: AUTH_QUERY_KEY, queryFn: loadCurrentUser, staleTime: 30_000 });
+	const queryClient = useQueryClient();
+	const bootstrap = consoleBootstrap();
+	const serverBootstrapAuth = bootstrap && Object.prototype.hasOwnProperty.call(bootstrap, 'auth')
+		? (bootstrap.auth ?? null)
+		: undefined;
+	// A top-level document request cannot carry the admin bearer token stored by the
+	// SPA. Use only its presence (never its value) to paint the authenticated shell
+	// immediately; the stale timestamp below still validates /me in the background.
+	// An invalid token therefore falls back to Login as soon as the server rejects it.
+	const initialAuth: AuthUser | null | undefined = serverBootstrapAuth === null && getToken()
+		? { id: '', email: 'admin', name: 'Admin', role: 'admin', via: 'admin_token', authed: true, optimistic: true }
+		: serverBootstrapAuth;
+	const query = useQuery({
+		queryKey: AUTH_QUERY_KEY,
+		queryFn: loadCurrentUser,
+		staleTime: 30_000,
+		initialData: initialAuth,
+		// Timestamp zero makes the injected identity immediately usable while React
+		// Query validates it in the background instead of blocking the shell.
+		initialDataUpdatedAt: initialAuth === undefined ? undefined : 0,
+	});
   const refetch = query.refetch;
 
   useEffect(() => addWindowListener('pool-unauthorized', () => {

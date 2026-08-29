@@ -2,7 +2,7 @@ import { z } from 'zod';
 import api from '../../../api.js';
 import { get } from '../../../api.js';
 import { createApiError, parseApiResponse } from '../../../api/contracts';
-import type { AccountGroup, AccountRow, AccountsBundle, AccountsPageParams } from '../model/types';
+import type { AccountGroup, AccountRequestRate, AccountRow, AccountsBundle, AccountsPageParams } from '../model/types';
 
 const accountArchiveTimeoutMs = 30 * 60 * 1_000;
 
@@ -21,6 +21,13 @@ const optionalNumber = z.preprocess(
   z.coerce.number().finite().optional(),
 );
 
+export const accountRequestRateSchema = z.object({
+  rpm: z.coerce.number().int().nonnegative().catch(0),
+  window_seconds: z.coerce.number().int().positive().catch(60),
+  sampled_at: z.coerce.number().int().nonnegative().catch(0),
+  state: z.enum(['live', 'stale', 'unavailable']).catch('unavailable'),
+});
+
 const accountSchema = z.object({
   id: z.preprocess((value) => typeof value === 'number' ? String(value) : value, z.string().min(1)),
   label: optionalString,
@@ -35,8 +42,8 @@ const accountSchema = z.object({
   api_key_present: optionalBoolean,
   ignore_rate_limit_controls: optionalBoolean,
   force_codex_429: optionalBoolean,
-	 routing_weight: optionalNumber,
-	 retry_max_attempts: optionalNumber,
+	routing_weight: optionalNumber,
+	retry_max_attempts: optionalNumber,
   quarantine_until: optionalNumber,
   quarantine_reason: optionalString,
   capabilities: z.array(z.object({
@@ -49,6 +56,7 @@ const accountSchema = z.object({
     source: z.string().optional(),
   }).passthrough()).nullable().optional().transform((value) => value ?? []),
   usage: z.record(z.string(), z.unknown()).nullable().optional(),
+  request_rate: accountRequestRateSchema.optional(),
 }).passthrough();
 
 const accountPageObjectSchema = z.object({
@@ -144,6 +152,29 @@ export async function fetchAccountsPage(params: AccountsPageParams, signal?: Abo
 export async function fetchAccountGroups(signal?: AbortSignal) {
   const response = await get('/admin/groups', undefined, { signal });
   return parseApiResponse(accountGroupsResponseSchema, response) as AccountGroup[];
+}
+
+const accountRatesResponseSchema = z.object({
+  sampled_at: z.coerce.number().int().nonnegative(),
+  window_seconds: z.coerce.number().int().positive().catch(60),
+  accounts: z.record(z.string(), accountRequestRateSchema),
+});
+
+export async function fetchAccountRates(ids: string[], signal?: AbortSignal): Promise<{
+  sampled_at: number;
+  window_seconds: number;
+  accounts: Record<string, AccountRequestRate>;
+}> {
+  const normalized = [...new Set(ids.map((id) => String(id || '').trim()).filter(Boolean))].slice(0, 100);
+  if (!normalized.length) {
+    return { sampled_at: Math.floor(Date.now() / 1000), window_seconds: 60, accounts: {} };
+  }
+  const response = await get('/admin/accounts/rates', { ids: normalized.join(',') }, { signal });
+  return parseApiResponse(accountRatesResponseSchema, response) as {
+    sampled_at: number;
+    window_seconds: number;
+    accounts: Record<string, AccountRequestRate>;
+  };
 }
 
 export async function fetchAccountsBundle(params: AccountsPageParams, signal?: AbortSignal): Promise<AccountsBundle> {

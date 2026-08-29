@@ -78,6 +78,34 @@ export interface CompatibilityManifestStatus {
   model_count?: number;
 }
 
+export interface DeploymentReaperStatus {
+  release_id: string;
+  pid?: number;
+  bytes?: number;
+  age_seconds?: number;
+  critical_inflight?: number;
+  resumable_inflight?: number;
+  state?: string;
+  heartbeat_at?: number;
+  last_error?: string;
+}
+
+export interface DeploymentStorageStatus {
+  current_release?: string;
+  total_release_bytes?: number;
+  release_budget_bytes?: number;
+  free_bytes?: number;
+  free_reserve_bytes?: number;
+  predicted_peak_bytes?: number;
+  backup_bytes?: number;
+  console_generation_bytes?: number;
+  admission_pause_duration_ms?: number;
+  draining?: DeploymentReaperStatus[];
+  reaper_heartbeat_at?: number;
+  last_reclaim_error?: string;
+  updated_at?: number;
+}
+
 export interface SystemMetrics {
   supported: boolean;
   uptime_seconds?: number;
@@ -114,5 +142,6 @@ export interface SystemMetrics {
   supervisor_modules?: SupervisorModule[];
   compatibility_manifest?: CompatibilityManifestStatus;
   passive_provider_health?: PassiveProviderHealth;
+  deployment_storage?: DeploymentStorageStatus;
   [key: string]: unknown;
 }

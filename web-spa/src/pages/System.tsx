@@ -11,6 +11,12 @@ import { heatCells, hourlyBuckets } from '../lib/timeSeries.js';
 import { t } from '../lib/i18n.js';
 import { useSystemMetricsData } from '../features/observability/queries/system';
 import type { PassiveHealthSeries, SupervisorEvent, SupervisorModule, SystemProcess } from '../features/observability/model/system';
+import {
+  exportFrontendPerformanceTrace, useFrontendPerformanceSnapshot,
+} from '../app/frontendPerformance';
+import { downloadTextFile } from '../lib/browserDownload.js';
+import { dispatchBrowserEvent } from '../lib/browserEvents.js';
+import { getLocalItem, setLocalItem } from '../lib/browserStorage.js';
 
 const { HeatStrip, RadialGauge, RankedBars, StackedMeter } = MicroCharts as any;
 const ErrorBanner = LoadErrorBanner as any;
@@ -112,11 +118,19 @@ export function CompactSystemRecord({
 
 export default function System() {
   const { data: system, loading, error, lastRefresh, reload } = useSystemMetricsData();
+  const frontendPerformance = useFrontendPerformanceSnapshot();
+  const [visualQuality, setVisualQuality] = React.useState(() => getLocalItem('pool.visual_quality', 'auto') || 'auto');
   const [detail, setDetail] = React.useState<SystemDetail | null>(null);
   const [modulePage, setModulePage] = React.useState(1);
   const [eventPage, setEventPage] = React.useState(1);
   const [processPage, setProcessPage] = React.useState(1);
   const [passiveHealthPage, setPassiveHealthPage] = React.useState(1);
+  const changeVisualQuality = (value: string) => {
+    const next = ['auto', 'high', 'balanced', 'low', 'still', 'off'].includes(value) ? value : 'auto';
+    setLocalItem('pool.visual_quality', next);
+    setVisualQuality(next);
+    dispatchBrowserEvent('pool-visual-quality-change', next);
+  };
 
   if (error && !lastRefresh && !loading) {
     return (
@@ -142,6 +156,7 @@ export default function System() {
   const disk = system?.disk || {};
   const network = system?.network || {};
   const diskGuard = system?.disk_guard;
+	const deploymentStorage = system?.deployment_storage;
   const registration = system?.registration || {};
   const go = system?.go || {};
   const events = (system?.supervisor_events || []).map((event, index) => ({
@@ -475,6 +490,77 @@ export default function System() {
             {diskGuard.last_error ? <div className="pool-sys-guard__error">{diskGuard.last_error}</div> : null}
           </div>
         ) : null}
+
+		{deploymentStorage ? (
+			<div className="pool-chart-card pool-sys-deployment-storage">
+				<div className="head">
+					<div>
+						<div className="t">{t('system.deployment_storage', '热更新存储')}</div>
+						<div className="s">{t('system.deployment_storage_desc', 'Release、备份与兼容前端资产的有界占用')}</div>
+					</div>
+					<Tag color={(deploymentStorage.draining?.length || 0) > 1 ? 'amber' : 'green'}>
+						{fmtInt(deploymentStorage.draining?.length || 0)} {t('system.draining', '排空中')}
+					</Tag>
+				</div>
+				<dl className="pool-system-detail__grid">
+					<div><dt>{t('system.current_release', '当前版本')}</dt><dd title={deploymentStorage.current_release}>{deploymentStorage.current_release || '—'}</dd></div>
+					<div><dt>{t('system.release_usage', 'Release 占用')}</dt><dd>{fmtBytes(deploymentStorage.total_release_bytes)} / {fmtBytes(deploymentStorage.release_budget_bytes)}</dd></div>
+					<div><dt>{t('system.free_reserve', '可用 / 保留')}</dt><dd>{fmtBytes(deploymentStorage.free_bytes)} / {fmtBytes(deploymentStorage.free_reserve_bytes)}</dd></div>
+					<div><dt>{t('system.predicted_peak', '预估更新峰值')}</dt><dd>{fmtBytes(deploymentStorage.predicted_peak_bytes)}</dd></div>
+					<div><dt>{t('system.backup_usage', '备份占用')}</dt><dd>{fmtBytes(deploymentStorage.backup_bytes)}</dd></div>
+					<div><dt>{t('system.console_generation_usage', '兼容前端资产')}</dt><dd>{fmtBytes(deploymentStorage.console_generation_bytes)}</dd></div>
+					<div><dt>{t('system.admission_pause', '准入暂停')}</dt><dd>{fmtInt(deploymentStorage.admission_pause_duration_ms)} ms</dd></div>
+				</dl>
+				{deploymentStorage.draining?.length ? (
+					<div className="pool-sys-deployment-storage__draining">
+						{deploymentStorage.draining.map((worker) => (
+							<div key={worker.release_id}>
+								<code>{worker.release_id}</code>
+								<span>{worker.state || 'draining'} · {fmtBytes(worker.bytes)} · critical {fmtInt(worker.critical_inflight)} · resumable {fmtInt(worker.resumable_inflight)}</span>
+							</div>
+						))}
+					</div>
+				) : null}
+				{deploymentStorage.last_reclaim_error ? <div className="pool-sys-guard__error">{deploymentStorage.last_reclaim_error}</div> : null}
+			</div>
+		) : null}
+      </section>
+
+      <section className="pool-sys-modules">
+        <div className="pool-chart-card pool-frontend-performance">
+          <div className="head">
+            <div>
+              <div className="t">{t('system.frontend_performance', '前端会话性能')}</div>
+              <div className="s">{t('system.frontend_performance_desc', '仅聚合本会话指标，不采集输入、账号标签或凭据')}</div>
+            </div>
+            <Tag color={frontendPerformance.inp_ms > 500 ? 'red' : frontendPerformance.inp_ms > 200 ? 'amber' : 'green'}>
+              INP {frontendPerformance.inp_ms ? `${Math.round(frontendPerformance.inp_ms)} ms` : '—'}
+            </Tag>
+          </div>
+          <dl className="pool-system-detail__grid">
+            <div><dt>LCP</dt><dd>{frontendPerformance.lcp_ms ? `${Math.round(frontendPerformance.lcp_ms)} ms` : '—'}</dd></div>
+            <div><dt>CLS</dt><dd>{frontendPerformance.cls ? frontendPerformance.cls.toFixed(3) : '0'}</dd></div>
+            <div><dt>TTFB</dt><dd>{frontendPerformance.ttfb_ms ? `${Math.round(frontendPerformance.ttfb_ms)} ms` : '—'}</dd></div>
+            <div><dt>{t('system.long_tasks', '长任务')}</dt><dd>{fmtInt(frontendPerformance.long_task_count)}</dd></div>
+            <div><dt>{t('system.route_response', '路由响应')}</dt><dd>{frontendPerformance.route_intent_commit_ms ? `${Math.round(frontendPerformance.route_intent_commit_ms)} ms` : '—'}</dd></div>
+            <div><dt>{t('system.data_ready', '数据就绪')}</dt><dd>{frontendPerformance.route_commit_data_ready_ms ? `${Math.round(frontendPerformance.route_commit_data_ready_ms)} ms` : '—'}</dd></div>
+          </dl>
+          <div className="pool-frontend-performance__controls">
+            <label>
+              <span>{t('system.visual_quality', '光效质量')}</span>
+              <select value={visualQuality} onChange={(event) => changeVisualQuality(event.target.value)}>
+                {['auto', 'high', 'balanced', 'low', 'still', 'off'].map((quality) => (
+                  <option key={quality} value={quality}>{quality}</option>
+                ))}
+              </select>
+            </label>
+            {import.meta.env.DEV || import.meta.env.MODE === 'test' ? (
+              <Button onClick={() => downloadTextFile('pool-frontend-performance.json', exportFrontendPerformanceTrace(), 'application/json')}>
+                {t('system.export_trace', '导出 Trace')}
+              </Button>
+            ) : null}
+          </div>
+        </div>
       </section>
 
       <section className="pool-sys-modules">

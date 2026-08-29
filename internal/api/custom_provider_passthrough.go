@@ -128,7 +128,7 @@ func (s *Server) handleCustomProviderPassthroughWithModel(
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	response, err := s.upstream.Do(r.Context(), upstream.Request{
+	response, err := s.doAccountUpstreamAttempt(r.Context(), upstream.Request{
 		Method:           r.Method,
 		Provider:         provider.ID,
 		BaseURL:          strings.TrimSpace(provider.BaseURL),

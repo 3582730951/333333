@@ -263,6 +263,8 @@ func configFields() []configField {
 			Help: "开=为非 compact 请求注入 web_search 工具。", boot: func(c config.Config) interface{} { return c.WebSearchEnabled }},
 		{Key: "require_downstream_key", Label: "要求下游密钥", Category: catBehavior, Type: fieldBool, Effect: effectHot,
 			Help: "开=下游请求必须带有效 API Key，否则 401。", boot: func(c config.Config) interface{} { return c.RequireDownstreamKey }},
+		{Key: "ui_experience_v2", Label: "即时交互与动态光效 v2", Category: catBehavior, Type: fieldBool, Effect: effectHot,
+			Help: "热开关。关闭时保留完整功能和基础 CSS，仅停用增强动效与 WebGL 交互光效；新安装默认开启。", boot: func(config.Config) interface{} { return true }},
 
 		// ── 模型质量 / 降智检测 ──────────────────────────────────────────────
 		{Key: "model_quality_monitor_enabled", Label: "启用分组模型降智检测", Category: catQuality, Type: fieldBool, Effect: effectHot,

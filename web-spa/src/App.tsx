@@ -15,6 +15,7 @@ import { useTheme } from './app/useTheme';
 import { useAmbientSignal } from './app/useAmbientSignal';
 import useScrollReveal from './hooks/useScrollReveal';
 import useMagneticPointer from './hooks/useMagneticPointer';
+import useInstantFeedback from './hooks/useInstantFeedback';
 import { useAdminDensity } from './app/useAdminDensity';
 import useResponsiveLayout from './hooks/useResponsiveLayout.js';
 import { getLocale, setLocale, t } from './lib/i18n.js';
@@ -22,7 +23,10 @@ import { addDocumentListener, addWindowListener, cancelBrowserIdleCallback, requ
 import { prefersReducedNetworkData } from './lib/browserNetwork.js';
 import { resetDocumentOverlayLocks } from './lib/browserDocument.js';
 import type { RouteDefinition } from './model/contracts';
-import { warmAdminData } from './app/adminDataWarmup';
+import { warmAdminData, warmAdminRouteData } from './app/adminDataWarmup';
+import {
+  markRouteCommit, markRouteDataReady, markRouteIntent, startFrontendPerformance,
+} from './app/frontendPerformance';
 
 const { Header, Sider, Content } = Layout;
 const SIDEBAR_EXPANDED_WIDTH = 248;
@@ -128,7 +132,10 @@ function StablePageReady({ routeKey, children }: { routeKey: string; children: R
     // by another route's bounded warm-up must never hold this page in a pending
     // state, while visible route skeletons are still detected above.
     if (contentBusy) return undefined;
-    const frame = window.requestAnimationFrame(() => setReady(true));
+    const frame = window.requestAnimationFrame(() => {
+      setReady(true);
+      markRouteDataReady();
+    });
     return () => {
       window.cancelAnimationFrame(frame);
     };
@@ -273,6 +280,8 @@ export default function App() {
   // Magnetic pull on the primary action. One delegated listener; no-op on touch,
   // coarse pointers and reduced motion.
   useMagneticPointer(auth.ready);
+  useInstantFeedback(auth.ready);
+  useEffect(() => (auth.ready ? startFrontendPerformance() : undefined), [auth.ready]);
 
   useEffect(() => {
     if (!auth.authed || !isAdmin) return undefined;
@@ -451,6 +460,9 @@ export default function App() {
   const pendingCommittedViewRef = useRef<CommittedViewPayload | null>(null);
   const expectedViewIdentityRef = useRef(currentViewIdentity);
   const previousRequestedShellViewRef = useRef(shellViewIdentity);
+  const intentPrefetchQueueRef = useRef<Array<{ route: RouteDefinition; reduced: boolean }>>([]);
+  const intentPrefetchActiveRef = useRef(0);
+  const intentPrefetchSeenRef = useRef(new Set<string>());
   expectedViewIdentityRef.current = currentViewIdentity;
 
   useEffect(() => {
@@ -462,6 +474,7 @@ export default function App() {
     if (lastCommittedViewRef.current === payload.identity) return;
     const isInitialCommit = lastCommittedViewRef.current === null;
     lastCommittedViewRef.current = payload.identity;
+    markRouteCommit();
     if (isInitialCommit) return;
 
     setRouteAnnouncement(t('app.page_changed').replace('{title}', payload.title));
@@ -510,9 +523,41 @@ export default function App() {
     if (target === `${location.pathname}${location.search}` || target === location.pathname) return;
     if (aiSettingsDirty && !window.confirm(t('ai_settings.leave_description'))) return;
     setAISettingsDirty(false);
+    markRouteIntent();
     navigate(target);
     if (responsive.isMobile && isAdmin) setMobileOpen(false);
   };
+  const drainIntentPrefetch = useCallback(() => {
+    const drain = () => {
+      while (intentPrefetchActiveRef.current < 2 && intentPrefetchQueueRef.current.length) {
+        const task = intentPrefetchQueueRef.current.shift();
+        if (!task) return;
+        intentPrefetchActiveRef.current += 1;
+        const dataWarmup = isAdmin && !task.reduced
+          ? warmAdminRouteData(queryClient, task.route.path)
+          : Promise.resolve();
+        void Promise.all([task.route.lazyLoader(), dataWarmup])
+          .catch((error) => {
+            intentPrefetchSeenRef.current.delete(task.route.path);
+            reportPrefetchError(error, task.route);
+          })
+          .finally(() => {
+            intentPrefetchActiveRef.current -= 1;
+            drain();
+          });
+      }
+    };
+    drain();
+  }, [isAdmin, queryClient]);
+  const prefetchRouteIntent = useCallback((target: string) => {
+    const pathname = target.split('?', 1)[0];
+    if (!pathname || pathname === location.pathname || intentPrefetchSeenRef.current.has(pathname)) return;
+    const route = (isAdmin ? adminRoutes : portalRoutes).find((candidate) => candidate.path === pathname);
+    if (!route) return;
+    intentPrefetchSeenRef.current.add(pathname);
+    intentPrefetchQueueRef.current.push({ route, reduced: prefersReducedNetworkData() });
+    drainIntentPrefetch();
+  }, [drainIntentPrefetch, isAdmin, location.pathname]);
   const commandItems = useMemo<CommandPaletteItem[]>(() => {
     if (!isAdmin) return [];
     const pages = adminRoutes
@@ -631,6 +676,7 @@ export default function App() {
             if (group && navCollapsed && !responsive.isMobile) { setCollapsed(false); return; }
             if (itemKey?.startsWith('/')) navigateFromShell(itemKey);
           }}
+          onIntent={({ itemKey }: { itemKey: string }) => prefetchRouteIntent(itemKey)}
           className="pool-nav-scroll"
           key={`${locale}:${currentNavKey}:${navCollapsed}`}
         />
@@ -654,7 +700,7 @@ export default function App() {
               <Avatar size="extra-small">P</Avatar><span>{t('app.portal')}</span>
             </button>
             {!responsive.isMobile ? <nav className="pool-portal-nav" aria-label={t('app.navigation')}>
-              {navigation.map((item) => <button type="button" key={item.itemKey} className="pool-portal-nav__item" aria-label={item.text} aria-current={currentNavKey === item.itemKey ? 'page' : undefined} onClick={() => navigateFromShell(item.itemKey)}>{item.icon}<span>{item.text}</span></button>)}
+              {navigation.map((item) => <button type="button" key={item.itemKey} className="pool-portal-nav__item" aria-label={item.text} aria-current={currentNavKey === item.itemKey ? 'page' : undefined} onPointerEnter={() => prefetchRouteIntent(item.itemKey)} onFocus={() => prefetchRouteIntent(item.itemKey)} onTouchStart={() => prefetchRouteIntent(item.itemKey)} onClick={() => navigateFromShell(item.itemKey)}>{item.icon}<span>{item.text}</span></button>)}
             </nav> : <div className="pool-portal-mobile-title">{activeRoute ? t(activeRoute.titleKey) : t('app.portal')}</div>}
           </>}
           <div className="pool-topbar-actions">
@@ -674,7 +720,7 @@ export default function App() {
         </Header>
         <Content id="main-content" tabIndex={-1} className="pool-content"><div className="pool-shell" ref={setShellContentNode}><AppRoutes admin={isAdmin} routeIdentity={routeIdentity} routeTitle={routeTitle} onViewCommit={handleViewCommit} /></div></Content>
         {!isAdmin && responsive.isMobile ? <nav className="pool-portal-tabbar" aria-label={t('app.navigation')}>
-          {navigation.map((item) => <button type="button" key={item.itemKey} className="pool-portal-tabbar__item" aria-label={item.text} aria-current={currentNavKey === item.itemKey ? 'page' : undefined} onClick={() => navigateFromShell(item.itemKey)}>{item.icon}<span>{item.text}</span></button>)}
+          {navigation.map((item) => <button type="button" key={item.itemKey} className="pool-portal-tabbar__item" aria-label={item.text} aria-current={currentNavKey === item.itemKey ? 'page' : undefined} onPointerEnter={() => prefetchRouteIntent(item.itemKey)} onFocus={() => prefetchRouteIntent(item.itemKey)} onTouchStart={() => prefetchRouteIntent(item.itemKey)} onClick={() => navigateFromShell(item.itemKey)}>{item.icon}<span>{item.text}</span></button>)}
         </nav> : null}
       </Layout>
       {isAdmin ? <CommandPalette

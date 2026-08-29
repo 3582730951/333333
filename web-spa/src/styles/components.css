@@ -1393,6 +1393,75 @@ so the mark owns the size
   gap: 5px;
 }
 
+.pool-account-rpm {
+  display: inline-grid;
+  min-width: 92px;
+  justify-items: end;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+}
+
+.pool-account-rpm strong {
+  color: var(--pool-text-primary);
+  font-size: 16px;
+  letter-spacing: -0.02em;
+}
+
+.pool-account-rpm strong span {
+  color: var(--pool-text-tertiary);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.pool-account-rpm small {
+  margin-top: 4px;
+  color: var(--pool-text-tertiary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.pool-account-rpm--active strong,
+.pool-account-rpm-value--active {
+  color: var(--pool-accent);
+}
+
+.pool-account-rpm-chip {
+  min-width: 66px;
+  justify-content: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.pool-account-rpm--active::before,
+.pool-account-rpm-chip--active::before {
+  width: 5px;
+  height: 5px;
+  margin-right: 5px;
+  border-radius: 999px;
+  background: var(--pool-accent);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--pool-accent) 35%, transparent);
+  content: '';
+  animation: pool-rpm-pulse 2.4s ease-out infinite;
+}
+
+.pool-account-rpm--active {
+  grid-template-columns: auto 1fr;
+}
+
+.pool-account-rpm--active strong,
+.pool-account-rpm--active small {
+  grid-column: 2;
+}
+
+@keyframes pool-rpm-pulse {
+  45%, 100% { box-shadow: 0 0 0 7px transparent; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pool-account-rpm--active::before,
+  .pool-account-rpm-chip--active::before { animation: none; }
+}
+
 .pool-resource-summary__meta,
 .pool-account-metaline,
 .pool-muted {

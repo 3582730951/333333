@@ -299,6 +299,7 @@ func (s *Server) doAntigravityWithEgressRetry(ctx context.Context, req upstream.
 		if strings.TrimSpace(cookieJarKey) == "" {
 			cookieJarKey = lease.Account.ID + ":" + egress.ID
 		}
+		s.ObserveAccountRequestAttempt(lease.Account.ID, "antigravity", "messages")
 		return s.upstream.DoAntigravity(ctx, egress, cookieJarKey, wireReq)
 	}
 

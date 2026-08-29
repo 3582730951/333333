@@ -139,7 +139,7 @@ func (s *Server) handleCodexPassthroughWithPolicy(
 			CookieJarKey:   lease.Binding.CookieJarKey,
 		}
 	}
-	response, err := s.upstream.Do(r.Context(), requestForToken(token))
+	response, err := s.doAccountUpstreamAttempt(r.Context(), requestForToken(token))
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -155,7 +155,7 @@ func (s *Server) handleCodexPassthroughWithPolicy(
 			if refreshed, refreshErr := s.refreshCodexToken(r.Context(), token); refreshErr == nil && refreshed.Refreshed {
 				token = refreshed.Token
 				response.Body.Close()
-				response, err = s.upstream.Do(r.Context(), requestForToken(token))
+				response, err = s.doAccountUpstreamAttempt(r.Context(), requestForToken(token))
 				if err != nil {
 					writeError(w, http.StatusBadGateway, err)
 					return

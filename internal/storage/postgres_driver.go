@@ -19,6 +19,11 @@ import (
 
 const postgresDriverName = "codex-pgx-rebind"
 
+const (
+	postgresActiveMaxOpenConns = 64
+	postgresActiveMaxIdleConns = 16
+)
+
 var registerPostgresDriver sync.Once
 
 func ensurePostgresDriver() {
@@ -56,10 +61,7 @@ func openPostgres(dsn string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(64)
-	db.SetMaxIdleConns(16)
-	db.SetConnMaxIdleTime(90 * time.Second)
-	db.SetConnMaxLifetime(30 * time.Minute)
+	configurePostgresActivePool(db)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err = db.PingContext(ctx); err != nil {
@@ -67,6 +69,50 @@ func openPostgres(dsn string) (*Store, error) {
 		return nil, fmt.Errorf("open PostgreSQL: %w", err)
 	}
 	return &Store{path: strings.TrimSpace(dsn), driver: "postgres", db: db, rdb: db}, nil
+}
+
+func configurePostgresActivePool(db *sql.DB) {
+	if db == nil {
+		return
+	}
+	db.SetMaxOpenConns(postgresActiveMaxOpenConns)
+	db.SetMaxIdleConns(postgresActiveMaxIdleConns)
+	db.SetConnMaxIdleTime(90 * time.Second)
+	db.SetConnMaxLifetime(30 * time.Minute)
+}
+
+// configurePostgresStandbyPool collapses the candidate onto one freshly opened
+// session and enables PostgreSQL's own transaction-level write guard. Keeping the
+// pool at one connection while standby is important: SET is session scoped, so a
+// newly opened second connection would otherwise inherit the server's writable
+// default and defeat the fail-closed warm-standby contract.
+func configurePostgresStandbyPool(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return errors.New("postgres warm standby database is unavailable")
+	}
+	// Drop any idle sessions created by the startup ping before constraining the
+	// pool. An in-use session is closed when returned if it exceeds the new limit;
+	// startup is single-threaded here, so the SET below owns the only session.
+	db.SetMaxIdleConns(0)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, err := db.ExecContext(ctx, `SET default_transaction_read_only = on`); err != nil {
+		return fmt.Errorf("enable PostgreSQL warm standby read-only mode: %w", err)
+	}
+	return nil
+}
+
+func promotePostgresPool(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return errors.New("postgres warm standby database is unavailable")
+	}
+	// Disable the guard on the sole standby session before allowing the pool to
+	// create ordinary read/write sessions for the active worker.
+	if _, err := db.ExecContext(ctx, `SET default_transaction_read_only = off`); err != nil {
+		return fmt.Errorf("disable PostgreSQL warm standby read-only mode: %w", err)
+	}
+	configurePostgresActivePool(db)
+	return nil
 }
 
 type rebindDriver struct{ underlying driver.Driver }
@@ -419,7 +465,7 @@ func splitSQLStatements(source string) []string {
 	return statements
 }
 
-func (s *Store) initPostgres(ctx context.Context) error {
+func (s *Store) initPostgres(ctx context.Context, expandOnly bool) error {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return err
@@ -494,21 +540,23 @@ VALUES('postgres',?,?,?) ON CONFLICT(driver,version) DO NOTHING`,
 			return fmt.Errorf("apply PostgreSQL mailbox health schema: %w", err)
 		}
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES('usage_accuracy_cutover_at',?,?)
+	if !expandOnly {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES('usage_accuracy_cutover_at',?,?)
 ON CONFLICT(key) DO NOTHING`, fmt.Sprint(now), now); err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO groups(name,system_prompt,prompt_mode,system_prompt_apply_to_compaction,virtual_2m_enabled,created_at,updated_at)
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO groups(name,system_prompt,prompt_mode,system_prompt_apply_to_compaction,virtual_2m_enabled,created_at,updated_at)
 VALUES ('cyber','','prepend',1,0,?,?),('kiro','','prepend',0,0,?,?),('antigravity','','prepend',0,0,?,?)
 ON CONFLICT(name) DO NOTHING`, now, now, now, now, now, now); err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO egress_profiles(id,name,type,endpoint,region,stream_capable,health,latency_millis,cf_score,last_cf_ray,cooldown_until,max_concurrency,created_at,updated_at)
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO egress_profiles(id,name,type,endpoint,region,stream_capable,health,latency_millis,cf_score,last_cf_ray,cooldown_until,max_concurrency,created_at,updated_at)
 VALUES(?,'direct','direct','','',1,'healthy',0,0,'',0,0,?,?) ON CONFLICT(id) DO NOTHING`, DefaultDirectEgressID, now, now); err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE egress_profiles SET max_concurrency=0,updated_at=? WHERE id=? AND type='direct' AND max_concurrency=128`, now, DefaultDirectEgressID); err != nil {
-		return err
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE egress_profiles SET max_concurrency=0,updated_at=? WHERE id=? AND type='direct' AND max_concurrency=128`, now, DefaultDirectEgressID); err != nil {
+			return err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return err
@@ -518,6 +566,9 @@ VALUES(?,'direct','direct','','',1,'healthy',0,0,'',0,0,?,?) ON CONFLICT(id) DO 
 	}
 	if err = s.applyCheckedPostgresMigrations(ctx); err != nil {
 		return err
+	}
+	if expandOnly {
+		return nil
 	}
 	if err = removeUnusedLegacySeedProviders(ctx, s.db); err != nil {
 		return err
@@ -532,6 +583,10 @@ type checkedPostgresMigration struct {
 }
 
 var checkedPostgresMigrations = []checkedPostgresMigration{
+	{
+		version:    "20260829_account_request_rate_v1",
+		statements: splitSQLStatements(postgresSchema(accountRequestRateSchemaSQL)),
+	},
 	{
 		version: "20260815_actual_model_audit_v1",
 		statements: []string{

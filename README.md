@@ -417,7 +417,7 @@ export DO_NOT_TRACK=1                               # 额外关会话质量问�
 把整个项目文件夹重新上传到 VPS 覆盖后，在项目目录里执行：
 
 ```bash
-sudo ./update.sh             # 清空编译缓存 + 全量重编译 + 重装(含内嵌 UI/sidecar) + 原子热切换
+sudo ./update.sh             # 复用构建缓存 + 全量重编译 + 重装(含内嵌 UI/sidecar) + 原子热切换
 sudo ./update.sh --minimal   # 只更新 Go 网关
 sudo ./update.sh --no-tests  # 跳过 go test，加快更新
 sudo ./update.sh --open-firewall  # 顺便在 ufw/firewalld 放行监听端口
@@ -425,7 +425,8 @@ sudo ./update.sh --open-firewall  # 顺便在 ufw/firewalld 放行监听端口
 
 - **零配置对外访问**：不带参数时默认绑定 `0.0.0.0`（复用当前端口，新装默认 8787），更新结束会自动
   探测公网 IP 并打印面板地址 `http://<公网IP>:<端口>/`。如需仅本机/反代：`LISTEN_ADDR=127.0.0.1:8787 sudo ./update.sh`。
-- **保留账号 + 防丢**：更新前对账号库做**在线 gzip 压缩快照**（默认 `<data-dir>/backups/`，留最近 10 份），
+- **保留账号 + 防丢**：更新前对账号库做**在线 gzip 压缩快照**（默认 `<data-dir>/backups/`，最多 3 份、
+  30 天、合计 1 GiB），
   更新后校验账号数未减少；它从不写数据库。即使池里有几百上千个账号也无压力——账号本身在 SQLite 里只是
   少量行，占空间的是用量/账本历史，压缩后通常只剩零头。备份前会做**磁盘空间预检**：空间不足会直接中止
   （不会半途部署或塞满磁盘），可按提示清盘、`BACKUP_DIR=<更大分区>`、或 `SKIP_BACKUP=1` 后重试。
@@ -434,10 +435,22 @@ sudo ./update.sh --open-firewall  # 顺便在 ufw/firewalld 放行监听端口
   admission barrier 内原子切换，新请求立即进入新版本。切换前已经建立的 HTTP/SSE/WebSocket 连接继续由旧
   worker 完成，`install.sh` 不等待它们；独立的 systemd reaper 在后台确认旧 worker 的 inflight 稳定归零后，
   再优雅停止旧进程并删除旧 socket、unit 状态、release 目录和失效的 `previous` 链接，全程不使用强制终止。
-- **可调环境变量**：`LISTEN_ADDR`、`BACKUP_DIR`、`BACKUP_KEEP`（默认 10）、`SKIP_BACKUP=1`、
-  `CLEAN_MODCACHE=1`、`DATA_DIR`/`DATABASE_PATH`/`SERVICE_NAME`（一般无需设置，脚本会从 systemd 单元自动发现）。
+- **更新占用有硬边界**：默认最多保留 2 个仍在排空的旧 release，并同时约束 release 总字节、前端兼容
+  generation（默认 256 MiB）、备份峰值和文件系统保留空间（至少 512 MiB 或总量 10%，取较大值）。达到门槛时
+  安装器会在构建/切流前拒绝更新并列出占用者，不会强杀仍承载请求的 worker。查看当前预算与 reaper 状态：
+  ```bash
+  sudo ./install.sh --status
+  ```
+- **前端与实时负载**：账号桌面表格、移动卡片和详情抽屉均显示逐账号 `RPM · 滚动 60 秒`；控制台遥测在热切换时
+  主动 handoff 并立即重连。WebGL 蓝光层按设备能力、减动和省流设置自动分级，也可在“系统”页切换
+  `auto/high/balanced/low/still/off`，不会进入首屏静态依赖图。
+- **可调环境变量**：`LISTEN_ADDR`、`BACKUP_DIR`、`BACKUP_KEEP`（默认 3）、`BACKUP_MAX_AGE_DAYS`、
+  `BACKUP_MAX_BYTES`、`SKIP_BACKUP=1`、
+  `CLEAN_BUILD_CACHE=1`、`CLEAN_MODCACHE=1`、`MAX_DRAINING_RELEASES`、`INSTALL_FREE_RESERVE_MIN_BYTES`、
+  `INSTALL_FREE_RESERVE_PERCENT`、`RELEASE_STORAGE_MAX_BYTES`、`CONSOLE_GENERATION_MAX_BYTES`、
+  `BUILD_CACHE_MAX_BYTES`、`DATA_DIR`/`DATABASE_PATH`/`SERVICE_NAME`（一般无需设置，脚本会从 systemd 单元自动发现）。
 
-**为什么以后加新功能也不用改 `update.sh`**：它是**通用脚本**——只做「备份账号 → 清缓存 → 调用项目内的
+**为什么以后加新功能也不用改 `update.sh`**：它是**通用脚本**——只做「备份账号 → 复用或按磁盘压力回收构建缓存 → 调用项目内的
 `scripts/install.sh` 从源码重编译重装 → 重启 → 校验」。新功能随文件夹一起上传即可，因为：①二进制每次从
 当前源码全量重编译（含内嵌 UI）；②新增的数据库表/列由启动时的**幂等增量迁移**自动建好，新增配置项由
 `normalize()` 自动填默认值；③构建/部署、原子切流与后台回收都集中在随项目上传的 `install.sh` 里。所以无论日后加什么

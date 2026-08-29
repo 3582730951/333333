@@ -56,7 +56,7 @@ function Content({ children, className, ...props }) {
 
 export const Layout = Object.assign(LayoutRoot, { Header, Sider, Content });
 
-function NavItem({ item, selected, collapsed, onClick }) {
+function NavItem({ item, selected, collapsed, onClick, onIntent }) {
   const groupLabelId = React.useId();
   if (item.items?.length) {
     const label = <>{item.icon}<span className="pool-nav-text">{item.text}</span></>;
@@ -71,7 +71,7 @@ function NavItem({ item, selected, collapsed, onClick }) {
         ) : <h2 id={groupLabelId} className="pool-nav-group-label pool-nav-group-label--static">{label}</h2>}
         <div className="pool-nav-children" role="group" aria-labelledby={groupLabelId}>
           {item.items.map((child) => (
-            <NavItem key={child.itemKey} item={child} selected={selected} collapsed={collapsed} onClick={onClick} />
+            <NavItem key={child.itemKey} item={child} selected={selected} collapsed={collapsed} onClick={onClick} onIntent={onIntent} />
           ))}
         </div>
       </section>
@@ -85,6 +85,9 @@ function NavItem({ item, selected, collapsed, onClick }) {
       aria-current={current ? 'page' : undefined}
       aria-label={collapsed ? item.text : undefined}
       onClick={() => onClick?.({ itemKey: item.itemKey })}
+      onPointerEnter={() => onIntent?.({ itemKey: item.itemKey })}
+      onFocus={() => onIntent?.({ itemKey: item.itemKey })}
+      onTouchStart={() => onIntent?.({ itemKey: item.itemKey })}
     >
       {item.icon}
       <span className="pool-nav-text">{item.text}</span>
@@ -93,10 +96,10 @@ function NavItem({ item, selected, collapsed, onClick }) {
   return collapsed ? <PoolTooltip content={item.text}>{button}</PoolTooltip> : button;
 }
 
-export function Nav({ items = [], selectedKeys = [], isCollapsed, onClick, className, style }) {
+export function Nav({ items = [], selectedKeys = [], isCollapsed, onClick, onIntent, className, style }) {
   return (
     <nav className={cx('pool-nav', className)} style={style}>
-      {items.map((item) => <NavItem key={item.itemKey} item={item} selected={selectedKeys} collapsed={isCollapsed} onClick={onClick} />)}
+      {items.map((item) => <NavItem key={item.itemKey} item={item} selected={selectedKeys} collapsed={isCollapsed} onClick={onClick} onIntent={onIntent} />)}
     </nav>
   );
 }

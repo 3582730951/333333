@@ -179,6 +179,7 @@ function json(body) {
 }
 
 async function installMocks(page) {
+  let accountRateStreamResponses = 0;
   await page.setRequestInterception(true);
   page.on('request', (req) => {
     const requestPath = new URL(req.url()).pathname;
@@ -203,6 +204,28 @@ async function installMocks(page) {
         body: 'retry: 60000\n\nevent: snapshot\ndata: '
       + JSON.stringify({ total: 8, active: 6, cooling: 1, quarantined: 1, recheck: 0, codex: 6, claude: 2, cpu_pct: 18.4, mem_pct: 41.2, energy: 0.29 })
       + '\n\n',
+      });
+      return;
+    }
+    if (requestPath === '/admin/stream/account-rates') {
+      accountRateStreamResponses += 1;
+      if (accountRateStreamResponses > 1) {
+        req.respond({ status: 204, body: '' });
+        return;
+      }
+      const sampledAt = Math.floor(Date.now() / 1000);
+      const accounts = Object.fromEntries(accountRows.map((account) => [account.id, {
+        rpm: account.request_rate?.rpm || 0,
+        window_seconds: 60,
+        sampled_at: sampledAt,
+        state: 'live',
+      }]));
+      req.respond({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: 'retry: 60000\n\nevent: snapshot\ndata: '
+          + JSON.stringify({ sampled_at: sampledAt, window_seconds: 60, accounts })
+          + '\n\n',
       });
       return;
     }

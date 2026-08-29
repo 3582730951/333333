@@ -7,15 +7,23 @@ package console
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"mime"
 	"net/http"
+	"os"
 	"path"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 //go:embed all:dist
@@ -57,12 +65,45 @@ const consoleBuildErrorHTML = `<!doctype html>
 </body>
 </html>`
 
-var consoleAssetReferenceRE = regexp.MustCompile(`(?i)(?:src|href)\s*=\s*["'](/console/[^"'?#]+)`)
+var (
+	consoleAssetReferenceRE = regexp.MustCompile(`(?i)(?:src|href)\s*=\s*["'](/console/[^"'?#]+)`)
+	consoleGenerationNameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+)
+
+type Options struct {
+	// GenerationDir contains installer-captured immutable assets from superseded
+	// releases. It is consulted only after the current embedded bundle misses.
+	GenerationDir string
+	ReleaseID     string
+	// Bootstrap returns request-scoped, non-secret shell state. It is serialized
+	// directly into index.html so the SPA can render authentication and route chrome
+	// before its first API round trip. Callers must never include credentials.
+	Bootstrap func(*http.Request) map[string]interface{}
+}
+
+type releaseManifestAsset struct {
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+}
+
+type releaseManifest struct {
+	ReleaseID      string                 `json:"release_id,omitempty"`
+	BuildSignature string                 `json:"build_signature"`
+	Assets         []releaseManifestAsset `json:"assets"`
+}
 
 // Handler serves the SPA under /console/. Real assets are served from the embedded FS;
 // any other sub-path falls back to index.html so react-router (basename /console) handles
 // deep links and refreshes client-side.
 func Handler() http.Handler {
+	return HandlerWithOptions(Options{
+		GenerationDir: strings.TrimSpace(os.Getenv("CODEX_POOL_CONSOLE_GENERATIONS_DIR")),
+		ReleaseID:     strings.TrimSpace(os.Getenv("CODEX_POOL_RELEASE_ID")),
+	})
+}
+
+func HandlerWithOptions(options Options) http.Handler {
 	sub, err := fs.Sub(distFS, "dist")
 	if err != nil {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -74,6 +115,8 @@ func Handler() http.Handler {
 		ixErr = validateConsoleIndexAssets(sub, index)
 	}
 	compressedAssets := buildCompressedAssets(sub)
+	manifest := buildReleaseManifest(sub, options.ReleaseID)
+	buildSignature := releaseManifestSignature(manifest)
 	fileServer := http.StripPrefix("/console/", http.FileServer(http.FS(sub)))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if ixErr != nil {
@@ -81,8 +124,14 @@ func Handler() http.Handler {
 			return
 		}
 		rel := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/console/"), "/")
+		if rel == ".release-manifest.json" {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+			_, _ = w.Write(manifest)
+			return
+		}
 		if rel == "" || rel == "index.html" {
-			serveIndex(w, index)
+			serveIndex(w, r, index, options, buildSignature)
 			return
 		}
 		if st, err := fs.Stat(sub, rel); err == nil && !st.IsDir() {
@@ -97,6 +146,13 @@ func Handler() http.Handler {
 			return
 		}
 		if strings.HasPrefix(rel, "assets/") {
+			// Generations can be captured after this warm-standby process booted but
+			// before it is promoted. Resolve the tiny generation directory set only
+			// on a current-bundle miss so the newly captured closure is immediately
+			// visible without restarting the candidate.
+			if serveGenerationAsset(w, r, consoleGenerationDirs(options.GenerationDir), rel) {
+				return
+			}
 			// A missing immutable asset is never a client-side route. Returning the
 			// SPA shell here produces a misleading 200 text/html response and a blank
 			// page when the browser enforces module MIME types.
@@ -104,8 +160,128 @@ func Handler() http.Handler {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		serveIndex(w, index) // SPA deep link → client-side route
+		serveIndex(w, r, index, options, buildSignature) // SPA deep link → client-side route
 	})
+}
+
+func releaseManifestSignature(raw []byte) string {
+	var manifest releaseManifest
+	if json.Unmarshal(raw, &manifest) != nil {
+		return ""
+	}
+	return manifest.BuildSignature
+}
+
+func buildReleaseManifest(sub fs.FS, releaseID string) []byte {
+	assets := make([]releaseManifestAsset, 0, 64)
+	_ = fs.WalkDir(sub, "assets", func(rel string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() || strings.HasSuffix(rel, ".br") {
+			return nil
+		}
+		body, readErr := fs.ReadFile(sub, rel)
+		if readErr != nil {
+			return nil
+		}
+		digest := sha256.Sum256(body)
+		assets = append(assets, releaseManifestAsset{
+			Path:   "/console/" + rel,
+			Size:   int64(len(body)),
+			SHA256: hex.EncodeToString(digest[:]),
+		})
+		return nil
+	})
+	sort.Slice(assets, func(i, j int) bool { return assets[i].Path < assets[j].Path })
+	signatureHash := sha256.New()
+	for _, asset := range assets {
+		_, _ = io.WriteString(signatureHash, asset.Path)
+		_, _ = io.WriteString(signatureHash, "\x00")
+		_, _ = io.WriteString(signatureHash, asset.SHA256)
+		_, _ = io.WriteString(signatureHash, "\n")
+	}
+	payload, err := json.Marshal(releaseManifest{
+		ReleaseID:      strings.TrimSpace(releaseID),
+		BuildSignature: hex.EncodeToString(signatureHash.Sum(nil)),
+		Assets:         assets,
+	})
+	if err != nil {
+		return []byte(`{"build_signature":"","assets":[]}`)
+	}
+	return payload
+}
+
+type consoleGenerationDir struct {
+	path    string
+	modTime time.Time
+}
+
+func consoleGenerationDirs(root string) []consoleGenerationDir {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	dirs := make([]consoleGenerationDir, 0, len(entries))
+	for _, entry := range entries {
+		// The installer writes .staging-* and renames only after every asset has
+		// passed size/digest/MIME validation. Never expose an incomplete staging
+		// closure, or an unrelated directory that appeared below the data root.
+		if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !consoleGenerationNameRE.MatchString(entry.Name()) {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			continue
+		}
+		dirs = append(dirs, consoleGenerationDir{path: filepath.Join(root, entry.Name()), modTime: info.ModTime()})
+	}
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i].modTime.After(dirs[j].modTime) })
+	return dirs
+}
+
+func serveGenerationAsset(w http.ResponseWriter, r *http.Request, generations []consoleGenerationDir, rel string) bool {
+	if !strings.HasPrefix(rel, "assets/") || !fs.ValidPath(rel) {
+		return false
+	}
+	for _, generation := range generations {
+		candidate := filepath.Join(generation.path, filepath.FromSlash(rel))
+		encoding := ""
+		if canServeEncoding(r, "br") {
+			if st, err := os.Stat(candidate + ".br"); err == nil && !st.IsDir() {
+				candidate += ".br"
+				encoding = "br"
+			}
+		}
+		resolvedRoot, rootErr := filepath.EvalSymlinks(generation.path)
+		resolvedCandidate, candidateErr := filepath.EvalSymlinks(candidate)
+		if rootErr != nil || candidateErr != nil {
+			continue
+		}
+		rootPrefix := filepath.Clean(resolvedRoot) + string(os.PathSeparator)
+		if !strings.HasPrefix(filepath.Clean(resolvedCandidate), rootPrefix) {
+			continue
+		}
+		file, err := os.Open(resolvedCandidate)
+		if err != nil {
+			continue
+		}
+		info, statErr := file.Stat()
+		if statErr != nil || !info.Mode().IsRegular() {
+			_ = file.Close()
+			continue
+		}
+		setAssetCacheHeaders(w, rel)
+		w.Header().Set("Content-Type", contentTypeForAsset(rel, nil))
+		if encoding != "" {
+			w.Header().Set("Content-Encoding", encoding)
+		}
+		http.ServeContent(w, r, path.Base(rel), info.ModTime(), file)
+		_ = file.Close()
+		return true
+	}
+	return false
 }
 
 func validateConsoleIndexAssets(sub fs.FS, index []byte) error {
@@ -143,12 +319,37 @@ func serveConsoleBuildError(w http.ResponseWriter) {
 	_, _ = w.Write([]byte(consoleBuildErrorHTML))
 }
 
-func serveIndex(w http.ResponseWriter, index []byte) {
+func serveIndex(w http.ResponseWriter, r *http.Request, index []byte, options Options, buildSignature string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
-	_, _ = w.Write(index)
+	payload := map[string]interface{}{
+		"release_id":      strings.TrimSpace(options.ReleaseID),
+		"build_signature": strings.TrimSpace(buildSignature),
+		"route":           r.URL.Path,
+		"theme":           "dark",
+	}
+	if options.Bootstrap != nil {
+		for key, value := range options.Bootstrap(r) {
+			payload[key] = value
+		}
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		_, _ = w.Write(index)
+		return
+	}
+	bootstrap := append([]byte(`<script id="pool-bootstrap">(()=>{const b=`), encoded...)
+	bootstrap = append(bootstrap, []byte(`;try{const p=localStorage.getItem("pool_theme")||"dark";b.theme=p;const t=p==="auto"?(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"):p;document.documentElement.dataset.theme=t;document.documentElement.dataset.themePreference=p}catch{}window.__POOL_BOOTSTRAP__=b})()</script>`)...)
+	marker := []byte("</head>")
+	if offset := bytes.Index(index, marker); offset >= 0 {
+		_, _ = w.Write(index[:offset])
+		_, _ = w.Write(bootstrap)
+		_, _ = w.Write(index[offset:])
+		return
+	}
+	_, _ = w.Write(append(bootstrap, index...))
 }
 
 func setAssetCacheHeaders(w http.ResponseWriter, rel string) {

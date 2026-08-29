@@ -82,6 +82,7 @@ func ambientStreamInterval(raw string) time.Duration {
 
 func (s *Server) ambientSample(ctx context.Context) ambientSample {
 	sample := ambientSample{}
+	sample["ui_experience_v2"] = s.flagEnabled(ctx, "ui_experience_v2", true)
 	summary, err := s.store.AccountPoolSummary(ctx, storage.Now())
 	if err == nil {
 		sample["total"] = summary.Total
@@ -155,6 +156,11 @@ func (s *Server) adminAmbientStream(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "retry: %d\n\n", interval.Milliseconds())
 
 	ctx := r.Context()
+	handoff, hasHandoff := DeploymentHandoffFromContext(ctx)
+	var handoffDone <-chan struct{}
+	if hasHandoff {
+		handoffDone = handoff.Done
+	}
 	seen := map[string]string{}
 	write := func(event string, payload ambientSample) bool {
 		encoded, err := json.Marshal(payload)
@@ -180,6 +186,16 @@ func (s *Server) adminAmbientStream(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-handoffDone:
+			target := ""
+			if handoff.TargetRelease != nil {
+				target = handoff.TargetRelease()
+			}
+			_ = write("handoff", ambientSample{
+				"release_id":         target,
+				"reconnect_after_ms": 0,
+			})
 			return
 		case <-heartbeat.C:
 			if _, err := fmt.Fprint(w, ": keep-alive\n\n"); err != nil {

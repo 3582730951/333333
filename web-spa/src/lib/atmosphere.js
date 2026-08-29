@@ -39,6 +39,20 @@ const IDLE_AFTER_MS = 4_000;
 // not held open forever by an asymptote it never mathematically reaches.
 const SETTLED_EPSILON = 0.002;
 
+export const VISUAL_QUALITY_VALUES = ['auto', 'high', 'balanced', 'low', 'still', 'off'];
+
+export function normalizeVisualQuality(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return VISUAL_QUALITY_VALUES.includes(normalized) ? normalized : 'auto';
+}
+
+const QUALITY_PROFILES = {
+  high: { dprCap: 1.5, renderScale: 0.78, activeFrameMs: 16, idleFrameMs: 33, shaderQuality: 1 },
+  balanced: { dprCap: 1.25, renderScale: 0.7, activeFrameMs: 33, idleFrameMs: 33, shaderQuality: 0.68 },
+  low: { dprCap: 1, renderScale: 0.62, activeFrameMs: 50, idleFrameMs: 66, shaderQuality: 0.28 },
+  still: { dprCap: 1, renderScale: 0.62, activeFrameMs: Infinity, idleFrameMs: Infinity, shaderQuality: 0.28 },
+};
+
 export const VERTEX_SOURCE = `#version 300 es
 // Fullscreen triangle, no vertex buffer: gl_VertexID drives the three corners.
 // Cheaper than a quad (no diagonal seam, three vertices instead of six) and it
@@ -63,7 +77,12 @@ in vec2 vUv;
 uniform vec2 uResolution;
 uniform float uTime;
 uniform vec2 uPointer;
+uniform vec2 uFocus;
 uniform float uEnergy;
+uniform float uActivity;
+uniform float uScroll;
+uniform float uVelocity;
+uniform float uQuality;
 uniform float uAlpha;
 uniform float uGrain;
 uniform vec3 uVoid;
@@ -96,6 +115,8 @@ float fbm(vec2 p) {
   float value = 0.0;
   float amplitude = 0.5;
   for (int i = 0; i < 4; i++) {
+    if (i >= 2 && uQuality < 0.5) break;
+    if (i >= 3 && uQuality < 0.82) break;
     value += amplitude * vnoise(p);
     p *= 2.03;
     amplitude *= 0.5;
@@ -137,12 +158,13 @@ void main() {
   // Strength scales with radius because that is where a lens actually disperses,
   // and it stays off in the middle third of the screen where the content sits.
   vec2 parallax = uPointer * 0.055;
+  parallax += vec2(0.0, uScroll * 0.026);
   vec2 nearC = vec2(-0.34, 0.20) + parallax * 1.7 + vec2(sin(t * 1.7) * 0.05, cos(t * 1.3) * 0.04);
   vec2 farC  = vec2( 0.38, -0.16) + parallax * 0.9 + vec2(cos(t * 1.1) * 0.06, sin(t * 1.6) * 0.05);
-  vec2 glowC = vec2( 0.02, -0.40) + parallax * 0.4 + vec2(sin(t * 0.9) * 0.08, 0.0);
+  vec2 glowC = mix(vec2(0.02, -0.40), uFocus, 0.22) + parallax * 0.4 + vec2(sin(t * 0.9) * 0.08, 0.0);
 
   float radial = smoothstep(0.28, 1.05, length(p));
-  vec2 disperse = normalize(p + vec2(1e-5)) * radial * 0.018;
+  vec2 disperse = normalize(p + vec2(1e-5)) * radial * 0.018 * smoothstep(0.45, 0.9, uQuality);
 
   vec3 colour = uVoid;
   vec3 nearRGB = vec3(0.0);
@@ -168,8 +190,25 @@ void main() {
   // The accent is the only saturated thing on screen and it stays scarce: its
   // weight is driven by live pool energy, so the field brightens under load and
   // settles when the pool is idle. That is the whole "show, don't tell" of it.
-  vec3 accent = glowRGB * (0.04 + uEnergy * 0.20);
+  vec3 accent = glowRGB * (0.04 + uEnergy * 0.16 + uActivity * 0.10);
   colour = mix(colour, uGlow, accent);
+
+  // Event-driven volumetric light and a restrained metallic sweep. Both reuse the
+  // same single pass and palette uniforms: no framebuffer, texture or brand colour
+  // is hidden in the shader. Velocity/activity fade to zero after interaction, so
+  // an idle operations screen becomes genuinely still.
+  float beamAxis = abs((p.x - uFocus.x * 0.28) + p.y * 0.24);
+  float beam = exp(-beamAxis * (7.0 + 4.0 * (1.0 - uQuality)));
+  beam *= smoothstep(-0.62, 0.54, p.y) * (0.015 + uVelocity * 0.055 + uActivity * 0.035);
+  colour = mix(colour, uGlow, clamp(beam, 0.0, 0.12));
+
+  float causticPhase = q.x * 8.0 + q.y * 5.0 + t * 5.0;
+  float caustic = pow(max(0.0, sin(causticPhase) * 0.5 + 0.5), 8.0);
+  caustic *= uQuality * (0.008 + uActivity * 0.025) * (1.0 - radial * 0.45);
+  colour += uNear * caustic;
+
+  float metalSweep = smoothstep(0.035, 0.0, abs(q.x + q.y * 0.42 - sin(t * 1.8) * 0.7));
+  colour = mix(colour, uFar, metalSweep * uVelocity * uQuality * 0.055);
 
   // Depth ramp plus vignette. Both exist to protect legibility: content sits on
   // this layer, so the corners and the top must fall back toward the void.
@@ -271,7 +310,8 @@ export function parseColorChannels(value) {
 }
 
 export const UNIFORM_NAMES = [
-  'uResolution', 'uTime', 'uPointer', 'uEnergy', 'uAlpha', 'uGrain',
+  'uResolution', 'uTime', 'uPointer', 'uFocus', 'uEnergy', 'uActivity',
+  'uScroll', 'uVelocity', 'uQuality', 'uAlpha', 'uGrain',
   'uVoid', 'uNear', 'uFar', 'uGlow',
 ];
 
@@ -282,9 +322,11 @@ export const UNIFORM_NAMES = [
  * the caller's signal to leave the CSS fallback in place. Never throws.
  *
  * @param {HTMLCanvasElement | null} canvas
- * @param {{ onDiagnostic?: (message: string) => void }} [options]
+ * @param {{ onDiagnostic?: (message: string) => void, quality?: 'high'|'balanced'|'low'|'still', onQualityChange?: (quality: string, reason: string) => void }} [options]
  */
-export function createAtmosphere(canvas, { onDiagnostic = () => {} } = {}) {
+export function createAtmosphere(canvas, {
+  onDiagnostic = () => {}, quality = 'balanced', onQualityChange = () => {},
+} = {}) {
   if (!canvas || typeof canvas.getContext !== 'function') return null;
   // Asked before getContext so a jsdom test run does not trip its "not implemented"
   // warning on every mount, and so a browser without WebGL2 costs no context probe.
@@ -299,7 +341,7 @@ export function createAtmosphere(canvas, { onDiagnostic = () => {} } = {}) {
       // The layer is painted once per frame and never read back, so the browser is
       // free to discard it after compositing.
       preserveDrawingBuffer: false,
-      powerPreference: 'low-power',
+      powerPreference: quality === 'high' ? 'high-performance' : 'low-power',
     });
   } catch (error) {
     onDiagnostic(`webgl2 context refused: ${error}`);
@@ -316,6 +358,8 @@ export function createAtmosphere(canvas, { onDiagnostic = () => {} } = {}) {
   const uniforms = {};
   for (const name of UNIFORM_NAMES) uniforms[name] = gl.getUniformLocation(program, name);
 
+  let effectiveQuality = QUALITY_PROFILES[quality] ? quality : 'balanced';
+  let profile = QUALITY_PROFILES[effectiveQuality];
   const state = {
     width: 0,
     height: 0,
@@ -325,6 +369,14 @@ export function createAtmosphere(canvas, { onDiagnostic = () => {} } = {}) {
     targetEnergy: 0,
     pointer: [0, 0],
     targetPointer: [0, 0],
+    focus: [0, 0],
+    targetFocus: [0, 0],
+    scroll: 0,
+    targetScroll: 0,
+    velocity: 0,
+    targetVelocity: 0,
+    activity: 0,
+    targetActivity: 0,
     alpha: 1,
     grain: 0.05,
     colours: { uVoid: [0, 0, 0], uNear: [0, 0, 0], uFar: [0, 0, 0], uGlow: [0, 0, 0] },
@@ -332,15 +384,20 @@ export function createAtmosphere(canvas, { onDiagnostic = () => {} } = {}) {
 
   let frame = null;
   let running = false;
+  let enabled = true;
   let disposed = false;
   let lastStamp = 0;
   let activeUntil = 0;
   let clock = 0;
+  let cssSize = [0, 0, 1];
+  let lastDrawStamp = 0;
+  let slowWindows = 0;
+  let frameCosts = [];
 
   // Anything that changes what should be on screen extends the active window and
   // restarts the loop if it had parked.
   const wake = () => {
-    if (disposed) return;
+    if (disposed || !enabled) return;
     activeUntil = clock + IDLE_AFTER_MS;
     if (!running) start();
   };
@@ -349,14 +406,20 @@ export function createAtmosphere(canvas, { onDiagnostic = () => {} } = {}) {
     Math.abs(state.targetEnergy - state.energy) < SETTLED_EPSILON
     && Math.abs(state.targetPointer[0] - state.pointer[0]) < SETTLED_EPSILON
     && Math.abs(state.targetPointer[1] - state.pointer[1]) < SETTLED_EPSILON
+    && Math.abs(state.targetFocus[0] - state.focus[0]) < SETTLED_EPSILON
+    && Math.abs(state.targetFocus[1] - state.focus[1]) < SETTLED_EPSILON
+    && Math.abs(state.targetScroll - state.scroll) < SETTLED_EPSILON
+    && Math.abs(state.targetVelocity - state.velocity) < SETTLED_EPSILON
+    && Math.abs(state.targetActivity - state.activity) < SETTLED_EPSILON
   );
 
   const resize = (cssWidth, cssHeight, pixelRatio) => {
     if (disposed) return;
+    cssSize = [cssWidth, cssHeight, pixelRatio];
     // Rendering below device resolution is invisible on a field this soft and is
     // the single biggest lever on fill cost -- this shader is entirely
     // fragment-bound. Capped so a 3x phone does not render a 3x background.
-    const ratio = Math.min(Math.max(pixelRatio || 1, 1), 2) * 0.62;
+    const ratio = Math.min(Math.max(pixelRatio || 1, 1), profile.dprCap) * profile.renderScale;
     const width = Math.max(1, Math.round(cssWidth * ratio));
     const height = Math.max(1, Math.round(cssHeight * ratio));
     if (width === state.width && height === state.height) return;
@@ -400,6 +463,52 @@ export function createAtmosphere(canvas, { onDiagnostic = () => {} } = {}) {
     wake();
   };
 
+  const setFocus = (x, y) => {
+    const next = [
+      Math.min(1, Math.max(-1, Number(x) || 0)),
+      Math.min(1, Math.max(-1, Number(y) || 0)),
+    ];
+    if (next[0] === state.targetFocus[0] && next[1] === state.targetFocus[1]) return;
+    state.targetFocus = next;
+    wake();
+  };
+  const setScroll = (position, velocity = 0) => {
+    state.targetScroll = Math.min(1, Math.max(-1, Number(position) || 0));
+    state.targetVelocity = Math.min(1, Math.max(0, Number(velocity) || 0));
+    wake();
+  };
+  const setActivity = (value) => {
+    if (!Number.isFinite(value)) return;
+    const next = Math.min(1, Math.max(0, value));
+    if (next === state.targetActivity) return;
+    state.targetActivity = next;
+    wake();
+  };
+
+  const applyQuality = (next, reason = 'preference') => {
+    if (!QUALITY_PROFILES[next] || next === effectiveQuality) return;
+    effectiveQuality = next;
+    profile = QUALITY_PROFILES[next];
+    frameCosts = [];
+    slowWindows = 0;
+    resize(cssSize[0], cssSize[1], cssSize[2]);
+    onQualityChange(next, reason);
+    if (next === 'still') renderStill();
+    else wake();
+  };
+
+  const recordFrameCost = (cost) => {
+    if (!Number.isFinite(cost) || effectiveQuality === 'low' || effectiveQuality === 'still') return;
+    frameCosts.push(cost);
+    if (frameCosts.length < 45) return;
+    const ordered = [...frameCosts].sort((a, b) => a - b);
+    const p95 = ordered[Math.min(ordered.length - 1, Math.floor(ordered.length * 0.95))];
+    frameCosts = [];
+    slowWindows = p95 > 8 ? slowWindows + 1 : 0;
+    if (slowWindows < 3) return;
+    applyQuality(effectiveQuality === 'high' ? 'balanced' : 'low', 'frame-budget');
+  };
+
   const draw = (stamp) => {
     if (disposed || !running) return;
     // A driver reset, a backgrounded GPU process, or a tab restore can take the
@@ -410,6 +519,12 @@ export function createAtmosphere(canvas, { onDiagnostic = () => {} } = {}) {
       frame = null;
       return;
     }
+    const frameInterval = clock < activeUntil ? profile.activeFrameMs : profile.idleFrameMs;
+    if (lastDrawStamp && stamp - lastDrawStamp < frameInterval) {
+      frame = requestBrowserAnimationFrame(draw);
+      return;
+    }
+    lastDrawStamp = stamp;
     const delta = lastStamp ? Math.min(64, stamp - lastStamp) : 16;
     lastStamp = stamp;
     clock += delta;
@@ -419,13 +534,26 @@ export function createAtmosphere(canvas, { onDiagnostic = () => {} } = {}) {
     state.energy += (state.targetEnergy - state.energy) * ease;
     state.pointer[0] += (state.targetPointer[0] - state.pointer[0]) * ease;
     state.pointer[1] += (state.targetPointer[1] - state.pointer[1]) * ease;
+    state.focus[0] += (state.targetFocus[0] - state.focus[0]) * ease;
+    state.focus[1] += (state.targetFocus[1] - state.focus[1]) * ease;
+    state.scroll += (state.targetScroll - state.scroll) * ease;
+    state.velocity += (state.targetVelocity - state.velocity) * ease;
+    state.activity += (state.targetActivity - state.activity) * ease;
+    state.targetVelocity *= Math.pow(0.12, delta / 1000);
+    state.targetActivity *= Math.pow(0.55, delta / 1000);
 
+    const drawStarted = typeof performance !== 'undefined' ? performance.now() : 0;
     gl.useProgram(program);
     gl.bindVertexArray(vao);
     gl.uniform2f(uniforms.uResolution, state.width, state.height);
     gl.uniform1f(uniforms.uTime, state.time);
     gl.uniform2f(uniforms.uPointer, state.pointer[0], state.pointer[1]);
+    gl.uniform2f(uniforms.uFocus, state.focus[0], state.focus[1]);
     gl.uniform1f(uniforms.uEnergy, state.energy);
+    gl.uniform1f(uniforms.uActivity, state.activity);
+    gl.uniform1f(uniforms.uScroll, state.scroll);
+    gl.uniform1f(uniforms.uVelocity, state.velocity);
+    gl.uniform1f(uniforms.uQuality, profile.shaderQuality);
     gl.uniform1f(uniforms.uAlpha, state.alpha);
     gl.uniform1f(uniforms.uGrain, state.grain);
     gl.uniform3fv(uniforms.uVoid, state.colours.uVoid);
@@ -433,6 +561,7 @@ export function createAtmosphere(canvas, { onDiagnostic = () => {} } = {}) {
     gl.uniform3fv(uniforms.uFar, state.colours.uFar);
     gl.uniform3fv(uniforms.uGlow, state.colours.uGlow);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (drawStarted) recordFrameCost(performance.now() - drawStarted);
 
     // Park once the active window has elapsed and every eased value has arrived --
     // stopping mid-ease would freeze the field visibly part-way through a move.
@@ -445,9 +574,10 @@ export function createAtmosphere(canvas, { onDiagnostic = () => {} } = {}) {
   };
 
   function start() {
-    if (disposed || running || gl.isContextLost()) return;
+    if (disposed || !enabled || running || gl.isContextLost() || effectiveQuality === 'still') return;
     running = true;
     lastStamp = 0;
+    lastDrawStamp = 0;
     if (activeUntil <= clock) activeUntil = clock + IDLE_AFTER_MS;
     frame = requestBrowserAnimationFrame(draw);
   }
@@ -458,11 +588,23 @@ export function createAtmosphere(canvas, { onDiagnostic = () => {} } = {}) {
     frame = null;
   };
 
+  const setEnabled = (value) => {
+    enabled = Boolean(value);
+    if (!enabled) stop();
+    else wake();
+  };
+
   /** Renders exactly one frame. Used for the reduced-motion still. */
   const renderStill = () => {
-    if (disposed) return;
+    if (disposed || !enabled) return;
     state.energy = state.targetEnergy;
     state.pointer = [...state.targetPointer];
+    state.focus = [...state.targetFocus];
+    state.scroll = state.targetScroll;
+    state.velocity = 0;
+    state.activity = state.targetActivity;
+    lastStamp = 0;
+    lastDrawStamp = 0;
     running = true;
     draw(0);
     stop();
@@ -492,5 +634,8 @@ export function createAtmosphere(canvas, { onDiagnostic = () => {} } = {}) {
     // from the DOM and collected with its context.
   };
 
-  return { resize, setPalette, setEnergy, setPointer, start, stop, renderStill, dispose };
+  return {
+    resize, setPalette, setEnergy, setPointer, setFocus, setScroll, setActivity,
+    setQuality: applyQuality, setEnabled, start, stop, renderStill, dispose,
+  };
 }

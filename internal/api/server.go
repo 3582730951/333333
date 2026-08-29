@@ -55,6 +55,7 @@ import (
 
 type Dependencies struct {
 	Config            config.Config
+	ReleaseID         string
 	Store             *storage.Store
 	IncidentReporter  *incident.Reporter
 	Scheduler         *scheduler.Scheduler
@@ -73,7 +74,10 @@ type Dependencies struct {
 
 type Server struct {
 	cfg               config.Config
+	releaseID         string
 	store             *storage.Store
+	accountRateMeter  *storage.AccountRateMeter
+	accountRateHub    *accountRateHub
 	incidentReporter  *incident.Reporter
 	scheduler         *scheduler.Scheduler
 	routeAvailability *routeAvailabilityIndex
@@ -109,6 +113,9 @@ type Server struct {
 	// clientErrors throttles browser-side error reports so the diagnostics endpoint
 	// cannot amplify a frontend fault or unauthenticated request flood into log spam.
 	clientErrors *clientErrorLimiter
+	// clientPerformance separately throttles aggregate Web Vitals reports so a
+	// noisy performance session cannot consume the browser-error reporting budget.
+	clientPerformance *clientErrorLimiter
 	// routingAudits coalesces repeated non-409 availability audits. Per-attempt
 	// routing facts remain in diagnosticRuntime; strict identity failures bypass it.
 	routingAudits          *clientErrorLimiter
@@ -227,6 +234,9 @@ type Server struct {
 	codexNativeContinues        uint64
 	codexEOFCompensations       uint64
 	diskGuard                   atomic.Value // DiskGuardSnapshot
+	deploymentStorageMu         sync.Mutex
+	deploymentStorageCachedAt   time.Time
+	deploymentStorageCached     deploymentStorageStatus
 	goalPolicyDefaultsMigrated  atomic.Bool
 	storageAdmissionBlocked     atomic.Bool
 	storageLargeRequestsPaused  atomic.Bool
@@ -255,7 +265,9 @@ func NewServer(dep Dependencies) *Server {
 	responseBodyBudget.SetDiskReserver(bodyDiskReserver)
 	s := &Server{
 		cfg:              dep.Config,
+		releaseID:        strings.TrimSpace(dep.ReleaseID),
 		store:            dep.Store,
+		accountRateMeter: storage.NewAccountRateMeter(dep.Store, dep.ReleaseID),
 		incidentReporter: dep.IncidentReporter,
 		scheduler:        dep.Scheduler,
 		upstream:         dep.Upstream,
@@ -271,6 +283,11 @@ func NewServer(dep Dependencies) *Server {
 			clientErrorLogLimit,
 			clientErrorLogWindow,
 			clientErrorLogMaxClients,
+		),
+		clientPerformance: newClientErrorLimiter(
+			clientPerformanceLimit,
+			clientPerformanceWindow,
+			clientPerformanceMaxClients,
 		),
 		routingAudits: newClientErrorLimiter(
 			routingAuditLogLimit,
@@ -302,6 +319,7 @@ func NewServer(dep Dependencies) *Server {
 		codexCacheMetrics:     map[string]*codexCacheKeyMetric{},
 		codexCachePolicyCache: map[string]codexCachePolicySnapshot{},
 	}
+	s.accountRateHub = newAccountRateHub(s.accountRateMeter, s.releaseID)
 	if dep.Store != nil {
 		connector := dep.TeamLifecycleConnector
 		if connector == nil {
@@ -450,6 +468,8 @@ func (s *Server) StartRuntime() error {
 			}
 		}
 		s.startAsyncWriter()
+		s.accountRateMeter.Start(s.runtimeTaskCtx)
+		s.accountRateHub.Start(s.runtimeTaskCtx)
 		s.startGoalCompactionWorkers()
 		s.startUpstreamEgressPrewarm()
 	})
@@ -542,6 +562,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/auth/logout", s.handleAuthLogout)
 	s.mux.HandleFunc("/auth/me", s.handleAuthMe)
 	s.mux.HandleFunc("/client/errors", s.handleClientError)
+	s.mux.HandleFunc("/client/performance", s.handleClientPerformance)
 
 	// Public no-login browser chat. Administrators create a link and bind it to a
 	// user/account-pool group; visitors only need the /chat/<slug> URL.
@@ -566,6 +587,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/user/models", s.handleUserModels)
 	s.mux.HandleFunc("/user/profile", s.handleUserProfile)
 	s.mux.HandleFunc("/admin/accounts", s.adminAccounts)
+	s.mux.HandleFunc("/admin/accounts/rates", s.adminAccountRates)
+	s.mux.HandleFunc("/admin/stream/account-rates", s.adminAccountRatesStream)
 	s.mux.HandleFunc("/admin/models", s.handleAdminModels)
 	s.mux.HandleFunc("/admin/accounts/summary", s.adminAccountsSummary)
 	s.mux.HandleFunc("/admin/accounts/export", s.adminAccountsExport)
@@ -719,7 +742,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/upstream-error-rules/", s.adminUpstreamErrorRuleAction)
 
 	// Embedded admin UI (catch-all; more specific API routes above take precedence).
-	s.mux.Handle("/console/", console.Handler())
+	s.mux.Handle("/console/", console.HandlerWithOptions(console.Options{
+		GenerationDir: filepath.Join(deploymentInstallDataDir(s.cfg.DataDir), "console-generations"),
+		ReleaseID:     s.releaseID,
+		Bootstrap:     s.consoleBootstrap,
+	}))
 	// The new SPA console is now the primary UI: root redirects to it. The legacy
 	// vanilla-JS UI stays reachable at /legacy/ as a fallback (not deleted).
 	s.mux.Handle("/legacy/", http.StripPrefix("/legacy", web.Handler()))
@@ -3902,6 +3929,7 @@ func (s *Server) doCodexUpstream(ctx context.Context, req upstream.Request) (*up
 	if s == nil || s.upstreamDo == nil {
 		return nil, fmt.Errorf("%w: client is unavailable", errInvalidUpstreamResponse)
 	}
+	s.ObserveAccountRequestAttempt(req.Account.ID, req.Provider, req.DownstreamPath)
 	resp, err := s.upstreamDo(ctx, req)
 	if err != nil {
 		return resp, err

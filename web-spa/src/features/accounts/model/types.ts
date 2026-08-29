@@ -18,6 +18,15 @@ export interface AccountModelCapability {
   [key: string]: unknown;
 }
 
+export type AccountRequestRateState = 'live' | 'stale' | 'unavailable';
+
+export interface AccountRequestRate {
+  rpm: number;
+  window_seconds: number;
+  sampled_at: number;
+  state: AccountRequestRateState;
+}
+
 export interface AccountRow {
   id: string;
   label?: string;
@@ -32,12 +41,13 @@ export interface AccountRow {
   api_key_present?: boolean;
   ignore_rate_limit_controls?: boolean;
   force_codex_429?: boolean;
-	 routing_weight?: number;
-	 retry_max_attempts?: number;
+	routing_weight?: number;
+	retry_max_attempts?: number;
   quarantine_until?: number;
   quarantine_reason?: string;
   capabilities?: AccountModelCapability[];
   usage?: AccountUsage | null;
+  request_rate?: AccountRequestRate;
   [key: string]: unknown;
 }
 

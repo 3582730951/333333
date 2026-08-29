@@ -53,6 +53,7 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 		ExceptionJournal   interface{}                 `json:"exception_journal"`
 		Compatibility      interface{}                 `json:"compatibility_manifest"`
 		PassiveHealth      interface{}                 `json:"passive_provider_health"`
+		DeploymentStorage  deploymentStorageStatus     `json:"deployment_storage"`
 	}{
 		Metrics:   sysmetrics.Collect(dataDir),
 		Admission: s.scheduler.AdmissionSnapshot(),
@@ -103,6 +104,7 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 			}
 			return s.passiveHealth.Snapshot()
 		}(),
+		DeploymentStorage: s.deploymentStorageStatus(),
 	}
 	writeJSON(w, http.StatusOK, payload)
 }

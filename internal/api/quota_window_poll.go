@@ -196,6 +196,13 @@ func (s *Server) attachQuotaWindowEstimate(ctx context.Context, account storage.
 	if estimate == nil {
 		return
 	}
+	applyQuotaWindowEstimate(summary, estimate)
+}
+
+func applyQuotaWindowEstimate(summary *QuotaSummary, estimate *quotaWindowEstimate) {
+	if summary == nil || summary.Estimate == nil || estimate == nil {
+		return
+	}
 	existing := summary.Estimate
 	existing.Estimated = true
 	existing.Method = "window_cost_estimate"
@@ -209,6 +216,52 @@ func (s *Server) attachQuotaWindowEstimate(ctx context.Context, account storage.
 	if estimate.Evidence.CandidateCount > 0 {
 		existing.Note = fmt.Sprintf("empirical window estimate: %d candidates over %d samples, %s confidence (%s)", estimate.Evidence.DeltaCandidateCount, estimate.Evidence.SampleCount, estimate.Confidence, estimate.Method)
 	}
+}
+
+// attachQuotaWindowEstimates batches current-cycle samples for the account list.
+// The storage query is chunked at 100 ids and estimation remains ordinary Go work.
+func (s *Server) attachQuotaWindowEstimates(ctx context.Context, accounts []storage.Account, summaries []QuotaSummary, now int64) error {
+	if s == nil || s.store == nil || len(accounts) == 0 || len(summaries) != len(accounts) {
+		return nil
+	}
+	byKind := make(map[string][]string)
+	indices := make(map[string][]int)
+	for index := range accounts {
+		if summaries[index].Estimate == nil {
+			continue
+		}
+		kind := quotaWindowKindForProvider(summaries[index].Provider)
+		if kind == "" {
+			continue
+		}
+		byKind[kind] = append(byKind[kind], accounts[index].ID)
+		indices[accounts[index].ID] = append(indices[accounts[index].ID], index)
+	}
+	for kind, ids := range byKind {
+		for offset := 0; offset < len(ids); offset += 100 {
+			end := offset + 100
+			if end > len(ids) {
+				end = len(ids)
+			}
+			samplesByAccount, err := s.store.QuotaWindowCurrentSamplesByAccountIDs(ctx, ids[offset:end], kind)
+			if err != nil {
+				return err
+			}
+			for accountID, samples := range samplesByAccount {
+				if len(samples) == 0 {
+					continue
+				}
+				estimate := quotaWindowSelectBest(quotaWindowSamplesFromStorage(samples), now, quotaWindowStaleAfter(kind))
+				if estimate.State != "estimated" {
+					continue
+				}
+				for _, index := range indices[accountID] {
+					applyQuotaWindowEstimate(&summaries[index], &estimate)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func quotaWindowKindForProvider(provider string) string {

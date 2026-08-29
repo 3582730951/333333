@@ -578,7 +578,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	}
 	if countTokens {
 		resp, requestErr, _ := s.doAccountCredentialRetry(r.Context(), lease.Account, movable && !strict, func() (*upstream.Response, error) {
-			return s.upstream.Do(r.Context(), requestForToken(token))
+			return s.doAccountUpstreamAttempt(r.Context(), requestForToken(token))
 		})
 		if requestErr != nil {
 			if allowRetry && movable {
@@ -594,7 +594,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 				if refreshed, refreshErr := s.forceRefreshClaudeToken(r.Context(), lease.Account, "count_tokens_auth_error"); refreshErr == nil {
 					token = refreshed
 					resp.Body.Close()
-					resp, requestErr = s.upstream.Do(r.Context(), requestForToken(token))
+					resp, requestErr = s.doAccountUpstreamAttempt(r.Context(), requestForToken(token))
 					if requestErr != nil {
 						if allowRetry && movable {
 							return retry()
@@ -657,7 +657,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	// Session 33: Carry the billing hold id in the request context for usage fallback.
 	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
 	resp, err, _ := s.doAccountCredentialRetry(r.Context(), lease.Account, movable && !strict, func() (*upstream.Response, error) {
-		return s.upstream.Do(r.Context(), requestForToken(token))
+		return s.doAccountUpstreamAttempt(r.Context(), requestForToken(token))
 	})
 	emptyEndTurnContinued := false
 	releaseFlight()
@@ -680,7 +680,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			if refreshed, rerr := s.forceRefreshClaudeTokenWithHeartbeat(r.Context(), lease.Account, "auth_error", refreshHeartbeat.beat); rerr == nil {
 				token = refreshed
 				resp.Body.Close()
-				resp, err = s.upstream.Do(r.Context(), requestForToken(token))
+				resp, err = s.doAccountUpstreamAttempt(r.Context(), requestForToken(token))
 				if err != nil {
 					_ = s.settleBillingHold(r.Context(), holdID, "failed_after_refresh")
 					if allowRetry && movable {
@@ -801,7 +801,7 @@ claudeSuccess:
 				if continuationBody, ok := buildClaudeContinueBody(body, "", s.autoContinueText(r.Context())); ok {
 					body = continuationBody
 					emptyEndTurnContinued = true
-					resp, err = s.upstream.Do(r.Context(), requestForToken(token))
+					resp, err = s.doAccountUpstreamAttempt(r.Context(), requestForToken(token))
 					if err != nil {
 						_ = s.settleBillingHold(r.Context(), holdID, "empty_end_turn_continuation_failed")
 						if allowRetry && movable {
@@ -931,7 +931,7 @@ claudeSuccess:
 					reissue := func(cctx context.Context, cbody []byte) (io.ReadCloser, error) {
 						creq := requestForToken(token)
 						creq.SetBodyBytes(cbody)
-						cresp, cerr := s.upstream.Do(cctx, creq)
+						cresp, cerr := s.doAccountUpstreamAttempt(cctx, creq)
 						if cerr != nil {
 							return nil, cerr
 						}

@@ -11,6 +11,7 @@ import {
   healthTestRequestBody, isKiroAccount, isKiroSuspended, isProtectedProbeQuarantine,
   isProviderAPIKeyAccount, requiresPaidHealthTest,
 } from '../features/accounts/model/healthTest.ts';
+import { useAccountRequestRate } from '../features/accounts/live/accountRates.ts';
 
 const Row = ({ k, v }) => (
   <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, padding: '5px 0', fontSize: 13 }}>
@@ -24,6 +25,25 @@ const EMPTY_ACCOUNT_DETAIL = { audit: [] };
 function formatResetCredits(credits) {
   if (!credits || credits.status !== 'ok' || credits.available_count == null) return '未知';
   return `${credits.available_count} 次`;
+}
+
+function AccountRatePanel({ account }) {
+  const rate = useAccountRequestRate(account.id, account.request_rate);
+  const known = rate.state === 'live' || rate.state === 'stale';
+  const state = rate.state === 'live' ? '实时' : rate.state === 'stale' ? '延迟' : '不可用';
+  const reason = rate.state === 'live'
+    ? '最近 60 秒真实上游请求尝试'
+    : rate.state === 'stale'
+      ? '持久桶或查询暂时延迟，展示最近可用值'
+      : '采样器尚未就绪或存储暂不可用';
+  return (
+    <Panel title="实时负载" style={{ marginBottom: 14 }}>
+      <Row k="滚动 60 秒" v={known ? <b className={rate.rpm > 0 ? 'pool-account-rpm-value--active' : ''}>{fmtInt(rate.rpm)} RPM</b> : '—'} />
+      <Row k="状态" v={<Tag size="small" color={rate.state === 'live' ? 'blue' : rate.state === 'stale' ? 'amber' : 'grey'}>{state}</Tag>} />
+      <Row k="最近采样" v={rate.sampled_at ? fmtDateTime(rate.sampled_at) : '—'} />
+      <Typography.Text size="small" type="tertiary">{reason}</Typography.Text>
+    </Panel>
+  );
 }
 
 // Account detail drawer: identity, egress binding, usage, recent audit + quick actions.
@@ -609,6 +629,8 @@ export default function AccountDrawer({
           <Row k="总 Token" v={<b>{fmtTokens(u.total_tokens)}</b>} />
         </Panel>
       ) : null}
+
+		<AccountRatePanel account={account} />
 
       <Panel title="近期审计" style={{ marginBottom: 14 }}>
         {loading ? <Spin /> : !audit.length ? <Typography.Text type="tertiary">暂无审计记录</Typography.Text> : audit.map((a, i) => (

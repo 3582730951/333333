@@ -40,6 +40,7 @@
 #   BACKUP_DIR (default <db-dir>/backups), BACKUP_KEEP (default 3),
 #   BACKUP_MAX_AGE_DAYS (default 30), BACKUP_MAX_BYTES (default 1 GiB),
 #   SKIP_BACKUP=1 (skip the DB backup — only if you back up yourself),
+#   CLEAN_BUILD_CACHE=1 (wipe the Go build cache even without disk pressure),
 #   CLEAN_MODCACHE=1 (also wipe the Go module cache),
 #   CLEAN_NPM_CACHE=1 (also wipe the npm download cache for the node registrar).
 set -Eeuo pipefail
@@ -53,6 +54,7 @@ CONFIG_FILE_EXPLICIT=0
 [[ -n "${CONFIG_FILE:-}" ]] && CONFIG_FILE_EXPLICIT=1
 DATA_DIR="${DATA_DIR:-/var/lib/codex-pool}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/codex-pool/config.json}"
+DEPLOY_LOCK_FILE="${DEPLOY_LOCK_FILE:-/var/lock/codex-pool-install.lock}"
 BACKUP=""
 BEFORE=""
 AFTER=""
@@ -82,6 +84,21 @@ run_root() {
   else
     die "root privileges are required for: $*"
   fi
+}
+
+acquire_deployment_lock() {
+  command -v flock >/dev/null 2>&1 || die "flock is required for serialized updates"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    install -d -m 0755 "$(dirname "$DEPLOY_LOCK_FILE")"
+    exec 8>"$DEPLOY_LOCK_FILE"
+  else
+    run_root install -d -m 0755 "$(dirname "$DEPLOY_LOCK_FILE")"
+    run_root touch "$DEPLOY_LOCK_FILE"
+    run_root chown "$(id -u):$(id -g)" "$DEPLOY_LOCK_FILE"
+    exec 8>"$DEPLOY_LOCK_FILE"
+  fi
+  flock -n 8 || die "another codex-pool deployment is already running"
+  export CODEX_POOL_DEPLOY_LOCK_FD=8
 }
 
 # discover_*_from_systemd read the effective env out of the installed unit so the
@@ -248,11 +265,17 @@ remove_backup_pair() {
 }
 
 prune_backups() {
-  local dir="$1" keep="${BACKUP_KEEP:-3}" max_age="${BACKUP_MAX_AGE_DAYS:-30}" max_bytes="${BACKUP_MAX_BYTES:-1073741824}"
+  local dir="$1" mode="${2:-normal}" keep="${BACKUP_KEEP:-3}" max_age="${BACKUP_MAX_AGE_DAYS:-30}" max_bytes="${BACKUP_MAX_BYTES:-1073741824}"
   local now cutoff file total=0 pair_size
   local -a files=()
   [[ "$keep" =~ ^[0-9]+$ ]] || keep=3
   (( keep >= 1 )) || keep=1
+  if [[ "$mode" == "precreate" && "$keep" -gt 1 ]]; then
+    # Make room before creating the new snapshot so the transient backup count
+    # never exceeds the configured stable-state bound. The newest old snapshot is
+    # always retained until the replacement has completed successfully.
+    keep=$((keep - 1))
+  fi
   [[ "$max_age" =~ ^[0-9]+$ ]] || max_age=30
   [[ "$max_bytes" =~ ^[0-9]+$ ]] || max_bytes=1073741824
 
@@ -307,7 +330,7 @@ prune_backups() {
 # than risk filling the disk or deploying without a safety net. 200-300 accounts is
 # tiny for SQLite; this guard matters when the history DB grows large.
 backup_db() {
-  local db="$1" dir ts tmp dest dbsize wal free need previous
+  local db="$1" dir ts tmp dest dbsize wal free need previous fs_total reserve reserve_percent
   if [[ ! -f "$db" ]]; then
     warn "no existing database at ${db} — treating this as a fresh install (nothing to back up)"
     return 0
@@ -319,13 +342,27 @@ backup_db() {
   dir="${BACKUP_DIR:-$(dirname "$db")/backups}"
   run_root install -d -m 0750 "$dir"
 
+  # Prune first, not after allocating another full SQLite snapshot. This bounds
+  # repeated updates even when an earlier backup already reached the count/age cap.
+  prune_backups "$dir" precreate
+
   dbsize=$(file_size "$db")
   wal=$(file_size "${db}-wal")
   dbsize=$(( dbsize + wal ))
   free=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2{printf "%.0f", $4*1024}')
+  fs_total=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2{printf "%.0f", $2*1024}')
   need=$(( dbsize * 13 / 10 + 1048576 )) # temp .backup (~1x) + gzip output + 1MB headroom
-  if [[ -n "$free" && "$free" -gt 0 && "$free" -lt "$need" ]]; then
-    die "备份空间不足：账号库≈$(human "$dbsize")，需≈$(human "$need")，可用$(human "$free")。请清磁盘、或 BACKUP_DIR=<更大分区路径> sudo ./update.sh、或 SKIP_BACKUP=1（自担风险）后重试。"
+  reserve="${INSTALL_FREE_RESERVE_MIN_BYTES:-536870912}"
+  reserve_percent="${INSTALL_FREE_RESERVE_PERCENT:-10}"
+  [[ "$reserve" =~ ^[0-9]+$ ]] || die "INSTALL_FREE_RESERVE_MIN_BYTES must be a non-negative integer"
+  [[ "$reserve_percent" =~ ^[0-9]+$ ]] && (( reserve_percent <= 90 )) ||
+    die "INSTALL_FREE_RESERVE_PERCENT must be between 0 and 90"
+  if [[ "$fs_total" =~ ^[0-9]+$ ]]; then
+    local percent_bytes=$(( fs_total * reserve_percent / 100 ))
+    (( percent_bytes <= reserve )) || reserve="$percent_bytes"
+  fi
+  if [[ -n "$free" && "$free" -gt 0 && "$free" -lt $((need + reserve)) ]]; then
+    die "备份空间不足：账号库≈$(human "$dbsize")，快照峰值≈$(human "$need")，更新后必须保留$(human "$reserve")，当前可用$(human "$free")。请先清理磁盘或把 BACKUP_DIR 指向更大分区。"
   fi
 
   ts="$(date -u +%Y%m%d-%H%M%S)-$(date +%N 2>/dev/null || printf '%09d' "$$")"
@@ -356,8 +393,12 @@ backup_db() {
 clean_build() {
   rm -rf "${PROJECT_ROOT}/.build" 2>/dev/null || true
   if command -v go >/dev/null 2>&1; then
-    log "Clearing Go build cache (go clean -cache) for a clean recompile"
-    go clean -cache 2>/dev/null || warn "go clean -cache failed (continuing)"
+    if bool_enabled "${CLEAN_BUILD_CACHE:-0}"; then
+      log "Clearing Go build cache (CLEAN_BUILD_CACHE=1)"
+      go clean -cache 2>/dev/null || warn "go clean -cache failed (continuing)"
+    else
+      log "Preserving the Go build cache for a faster update; the installer reclaims it only under disk pressure"
+    fi
     if bool_enabled "${CLEAN_MODCACHE:-0}"; then
       log "Clearing Go module cache (go clean -modcache)"
       go clean -modcache 2>/dev/null || warn "go clean -modcache failed (continuing)"
@@ -517,6 +558,7 @@ main() {
 
   resolve_listen_addr "$@"
   resolve_db_path "$@"
+  acquire_deployment_lock
   BEFORE="$(count_accounts "$DB")"
   [[ -n "$BEFORE" ]] && log "Accounts before update: ${BEFORE} (db: ${DB})"
 

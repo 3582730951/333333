@@ -744,6 +744,7 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 	send := func(accessToken string, requestBody []byte) (*upstream.Response, error) {
 		headers := requestHeaders.Clone()
 		headers.Set("authorization", "Bearer "+accessToken)
+		s.ObserveAccountRequestAttempt(lease.Account.ID, "kiro", "generate")
 		return s.upstream.DoRawSourceObserved(r.Context(), lease.Egress, http.MethodPost, target, headers, bodysource.Bytes(requestBody), lease.Binding.CookieJarKey, "kiro", converted.Model)
 	}
 	response, err := send(bearer, body)

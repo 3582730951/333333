@@ -257,6 +257,33 @@ func (s *Server) adminMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&out, "codex_pool_http_request_duration_seconds_count{route=%q} %d\n",
 			route.Route, route.Requests)
 	}
+
+	deployment := s.deploymentStorageStatus()
+	var draining int
+	var reaperFailure int
+	for _, release := range deployment.Draining {
+		switch release.State {
+		case "complete", "cancelled":
+		default:
+			draining++
+		}
+		if strings.TrimSpace(release.LastError) != "" {
+			reaperFailure = 1
+		}
+	}
+	out.WriteString("# HELP codex_pool_deployment_draining_releases Releases still protected by a drain/reaper lifecycle.\n")
+	out.WriteString("# TYPE codex_pool_deployment_draining_releases gauge\n")
+	fmt.Fprintf(&out, "codex_pool_deployment_draining_releases %d\n", draining)
+	out.WriteString("# HELP codex_pool_deployment_release_bytes Immutable release storage bytes.\n")
+	out.WriteString("# TYPE codex_pool_deployment_release_bytes gauge\n")
+	fmt.Fprintf(&out, "codex_pool_deployment_release_bytes %d\n", deployment.TotalReleaseBytes)
+	out.WriteString("# HELP codex_pool_deployment_reaper_failure Whether a retained reaper reports an error.\n")
+	out.WriteString("# TYPE codex_pool_deployment_reaper_failure gauge\n")
+	fmt.Fprintf(&out, "codex_pool_deployment_reaper_failure %d\n", reaperFailure)
+	out.WriteString("# HELP codex_pool_deployment_admission_pause_duration_seconds Last deployment admission-pause duration.\n")
+	out.WriteString("# TYPE codex_pool_deployment_admission_pause_duration_seconds gauge\n")
+	fmt.Fprintf(&out, "codex_pool_deployment_admission_pause_duration_seconds %s\n",
+		strconv.FormatFloat(float64(deployment.AdmissionPauseMillis)/1000, 'f', 3, 64))
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)

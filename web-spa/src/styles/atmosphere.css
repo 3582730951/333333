@@ -45,6 +45,13 @@
   width: 100%;
   height: 100%;
   display: block;
+  opacity: 1;
+  transition: opacity var(--pool-motion-fast) var(--pool-motion-ease);
+}
+
+.pool-atmosphere[data-quality='off'] .pool-atmosphere__canvas,
+.pool-atmosphere[data-experience='base'] .pool-atmosphere__canvas {
+  opacity: 0;
 }
 
 /* Grain over the gradient. Large gradients on an 8-bit display band visibly; a
@@ -57,7 +64,10 @@
   opacity: var(--pool-grain-alpha);
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
   will-change: transform;
-  animation: pool-grain-drift 7s steps(6, end) infinite;
+  /* The procedural canvas already supplies device-pixel texture. The CSS fallback
+     is intentionally static: an idle or reduced-motion page must consume no
+     perpetual animation frames. */
+  animation: none;
 }
 
 @keyframes pool-grain-drift {
@@ -74,6 +84,20 @@
  */
 .pool-atmosphere[data-webgl='true'] .pool-atmosphere__grain {
   display: none;
+}
+
+.pool-atmosphere[data-quality='low'] .pool-atmosphere__grain,
+.pool-atmosphere[data-quality='off'] .pool-atmosphere__grain,
+.pool-atmosphere[data-experience='base'] .pool-atmosphere__grain {
+  opacity: calc(var(--pool-grain-alpha) * 0.55);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pool-atmosphere__canvas,
+  .pool-atmosphere__grain {
+    transition: none;
+    animation: none;
+  }
 }
 
 /*
@@ -231,6 +255,27 @@
     background-color var(--pool-motion-fast) var(--pool-motion-ease),
     box-shadow var(--pool-motion-fast) var(--pool-motion-ease),
     color var(--pool-motion-fast) var(--pool-motion-ease);
+}
+
+/* Delegated pointer/keyboard intent feedback. `scale` is an independent transform
+   property, so it can coexist with the magnetic primary-button transform without
+   waiting for React or fighting its inline style. */
+:where(button, [role='button'], a[href], input[type='submit'])[data-pool-pressed='true'] {
+  scale: 0.985;
+  filter: brightness(1.08);
+  box-shadow: inset 0 0 0 1px var(--pool-glass-sheen), var(--pool-shadow-focus);
+  transition: none;
+}
+
+:where(button, [role='button'], a[href], input[type='submit']):focus-visible {
+  outline: 2px solid var(--pool-focus-ring);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :where(button, [role='button'], a[href], input[type='submit'])[data-pool-pressed='true'] {
+    scale: 1;
+  }
 }
 
 

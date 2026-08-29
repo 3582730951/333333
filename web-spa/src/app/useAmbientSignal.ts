@@ -16,6 +16,8 @@ export type AmbientSample = {
   cpu_pct?: number;
   mem_pct?: number;
   energy?: number;
+  rpm_activity?: number;
+  ui_experience_v2?: boolean;
 };
 
 export type AmbientStatus = 'idle' | 'connecting' | 'live' | 'fallback';
@@ -129,7 +131,28 @@ export function useAmbientSignal(enabled: boolean) {
       });
       opened.addEventListener('snapshot', (event) => merge((event as MessageEvent).data));
       opened.addEventListener('delta', (event) => merge((event as MessageEvent).data));
+      opened.addEventListener('handoff', (event) => {
+        if (disposed || source !== opened) return;
+        let delay = 0;
+        try {
+          const payload = JSON.parse((event as MessageEvent).data) as { reconnect_after_ms?: number };
+          delay = Math.max(0, Math.min(5_000, Number(payload?.reconnect_after_ms) || 0));
+        } catch {
+          delay = 0;
+        }
+        // A deployment handoff is an intentional resumable boundary, not a failed
+        // stream: reconnect immediately without consuming the failure budget or
+        // surfacing a red error state.
+        closeEventSource(opened);
+        source = null;
+        failures = 0;
+        openedAt = 0;
+        clearBrowserTimeout(retryTimer);
+        setStatus('connecting');
+        retryTimer = setBrowserTimeout(connect, delay);
+      });
       opened.addEventListener('error', () => {
+        if (source !== opened) return;
         // EventSource retries on its own, but with a fixed delay and forever. Take
         // the connection over so the backoff is exponential and so a stream that is
         // never going to authenticate stops costing a request every few seconds.

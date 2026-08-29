@@ -52,6 +52,18 @@ GO_INSTALL_VERSION="${GO_INSTALL_VERSION:-1.25.12}"
 GO_INSTALL_ROOT="${GO_INSTALL_ROOT:-/usr/local}"
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/.build}"
 SKIP_OS_PACKAGES="${SKIP_OS_PACKAGES:-0}"
+# Deployment storage is bounded before any candidate can take traffic. The
+# defaults intentionally favor preserving live releases and a healthy filesystem
+# reserve over forcing another update through a nearly full disk.
+MAX_DRAINING_RELEASES="${MAX_DRAINING_RELEASES:-2}"
+INSTALL_FREE_RESERVE_MIN_BYTES="${INSTALL_FREE_RESERVE_MIN_BYTES:-536870912}"
+INSTALL_FREE_RESERVE_PERCENT="${INSTALL_FREE_RESERVE_PERCENT:-10}"
+RELEASE_STORAGE_MAX_BYTES="${RELEASE_STORAGE_MAX_BYTES:-0}"
+CONSOLE_GENERATION_MAX_BYTES="${CONSOLE_GENERATION_MAX_BYTES:-268435456}"
+BUILD_CACHE_MAX_BYTES="${BUILD_CACHE_MAX_BYTES:-2147483648}"
+CONSOLE_GENERATION_KEEP="${CONSOLE_GENERATION_KEEP:-2}"
+CONSOLE_GENERATION_MAX_AGE_SECONDS="${CONSOLE_GENERATION_MAX_AGE_SECONDS:-86400}"
+STATUS_ONLY=0
 SIDECAR_ADDR="${SIDECAR_ADDR:-127.0.0.1:8790}"
 ADMIN_PORT_OVERRIDE=""
 EGRESS_TCP_PORT_OVERRIDE=""
@@ -74,12 +86,26 @@ RELEASE_ID=""
 RELEASE_DIR=""
 PREVIOUS_RELEASE_ID=""
 HANDOFF_PAUSED=0
+HANDOFF_PAUSE_STARTED_MS=0
 LEGACY_SERVICE_ACTIVE=0
 ACTIVATION_PENDING=0
 ACTIVATION_OLD_RELEASE=""
 ACTIVATION_OLD_SOCKET=""
 ACTIVATION_OLD_WORKER_RELEASE=""
 ACTIVATION_NEW_RELEASE=""
+DEPLOY_CURRENT_RELEASE=""
+DEPLOY_TOTAL_RELEASE_BYTES=0
+DEPLOY_RELEASE_BUDGET_BYTES=0
+DEPLOY_FREE_BYTES=0
+DEPLOY_RESERVE_BYTES=0
+DEPLOY_PREDICTED_PEAK_BYTES=0
+DEPLOY_BACKUP_BYTES=0
+DEPLOY_CONSOLE_BYTES=0
+DEPLOY_CANDIDATE_ESTIMATE_BYTES=0
+DEPLOY_DRAINING_COUNT=0
+DEPLOY_DRAINING_JSON=""
+DEPLOY_LAST_RECLAIM_ERROR=""
+DEPLOY_ADMISSION_PAUSE_DURATION_MS=0
 # Set by install_sidecar: 1 when the sidecar source changed (or first install), 0 when
 # unchanged — lets the restart block skip a needless sidecar restart that would sever
 # in-flight upstream streams.
@@ -186,6 +212,13 @@ Options:
   --sidecar-addr ADDR       Sidecar listen address. Default: ${SIDECAR_ADDR}
   --without-go-install      Fail instead of installing Go when Go is missing/too old
   --go-version VERSION      Go version to install when needed. Default: ${GO_INSTALL_VERSION}
+  --max-draining-releases N Refuse an update when N old releases are still draining. Default: ${MAX_DRAINING_RELEASES}
+  --install-free-reserve-min-bytes N Minimum filesystem reserve. Default: ${INSTALL_FREE_RESERVE_MIN_BYTES}
+  --install-free-reserve-percent N  Filesystem reserve percentage (0-90). Default: ${INSTALL_FREE_RESERVE_PERCENT}
+  --release-storage-max-bytes N  Release byte ceiling; 0 selects the automatic budget
+  --console-generation-max-bytes N  Old console asset ceiling. Default: ${CONSOLE_GENERATION_MAX_BYTES}
+  --build-cache-max-bytes N Build/npm cache pressure ceiling. Default: ${BUILD_CACHE_MAX_BYTES}
+  --status                  Print deployment/reaper/disk storage status and exit
   -h, --help                Show this help
 
 Environment overrides:
@@ -198,6 +231,9 @@ Environment overrides:
   INSTALL_GO, GO_INSTALL_VERSION, GO_INSTALL_ROOT, GO_BIN, HEALTH_TIMEOUT,
   WORKER_START_RESTART_LIMIT,
   DRAIN_TIMEOUT (ordinary post-switch background drain log interval),
+  MAX_DRAINING_RELEASES, INSTALL_FREE_RESERVE_MIN_BYTES,
+  INSTALL_FREE_RESERVE_PERCENT, RELEASE_STORAGE_MAX_BYTES,
+  CONSOLE_GENERATION_MAX_BYTES, BUILD_CACHE_MAX_BYTES,
   SKIP_OS_PACKAGES, GO_TARBALL_SHA256,
   WITH_REGISTRATION, NODE_MIN_MAJOR, NODE_INSTALL_MAJOR, NODE_BIN, CHROME_BIN,
   REGISTRAR_SOURCE, REGISTRAR_INSTALL, PY_REGISTRAR_SOURCE,
@@ -475,6 +511,58 @@ while [[ $# -gt 0 ]]; do
       GO_INSTALL_VERSION="${1#*=}"
       shift
       ;;
+    --max-draining-releases)
+      MAX_DRAINING_RELEASES="${2:?missing value for --max-draining-releases}"
+      shift 2
+      ;;
+    --max-draining-releases=*)
+      MAX_DRAINING_RELEASES="${1#*=}"
+      shift
+      ;;
+    --free-reserve-min-bytes|--install-free-reserve-min-bytes)
+      INSTALL_FREE_RESERVE_MIN_BYTES="${2:?missing value for $1}"
+      shift 2
+      ;;
+    --free-reserve-min-bytes=*|--install-free-reserve-min-bytes=*)
+      INSTALL_FREE_RESERVE_MIN_BYTES="${1#*=}"
+      shift
+      ;;
+    --free-reserve-percent|--install-free-reserve-percent)
+      INSTALL_FREE_RESERVE_PERCENT="${2:?missing value for $1}"
+      shift 2
+      ;;
+    --free-reserve-percent=*|--install-free-reserve-percent=*)
+      INSTALL_FREE_RESERVE_PERCENT="${1#*=}"
+      shift
+      ;;
+    --release-storage-max-bytes)
+      RELEASE_STORAGE_MAX_BYTES="${2:?missing value for --release-storage-max-bytes}"
+      shift 2
+      ;;
+    --release-storage-max-bytes=*)
+      RELEASE_STORAGE_MAX_BYTES="${1#*=}"
+      shift
+      ;;
+    --console-generation-max-bytes)
+      CONSOLE_GENERATION_MAX_BYTES="${2:?missing value for --console-generation-max-bytes}"
+      shift 2
+      ;;
+    --console-generation-max-bytes=*)
+      CONSOLE_GENERATION_MAX_BYTES="${1#*=}"
+      shift
+      ;;
+    --build-cache-max-bytes)
+      BUILD_CACHE_MAX_BYTES="${2:?missing value for --build-cache-max-bytes}"
+      shift 2
+      ;;
+    --build-cache-max-bytes=*)
+      BUILD_CACHE_MAX_BYTES="${1#*=}"
+      shift
+      ;;
+    --status)
+      STATUS_ONLY=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -509,6 +597,18 @@ run_root() {
     sudo "$@"
   else
     die "root privileges are required for: $*"
+  fi
+}
+
+run_service() {
+  if [[ "$(id -un)" == "$SERVICE_USER" ]]; then
+    "$@"
+  elif [[ "$(id -u)" -eq 0 ]] && command -v runuser >/dev/null 2>&1; then
+    runuser -u "$SERVICE_USER" -- "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo -u "$SERVICE_USER" -- "$@"
+  else
+    die "cannot execute as service user ${SERVICE_USER}: $*"
   fi
 }
 
@@ -1207,6 +1307,8 @@ ensure_absolute_paths() {
   require_absolute_path "REGISTRAR_SOURCE" "$REGISTRAR_SOURCE"
   require_absolute_path "REGISTRAR_INSTALL" "$REGISTRAR_INSTALL"
   require_absolute_path "PY_REGISTRAR_SOURCE" "$PY_REGISTRAR_SOURCE"
+  [[ "$BUILD_DIR" != "/" && "$APP_DIR" != "/" && "$DATA_DIR" != "/" ]] ||
+    die "BUILD_DIR, APP_DIR, and DATA_DIR must not be the filesystem root"
 }
 
 ensure_system_deps() {
@@ -1403,6 +1505,20 @@ EOF
   fi
 }
 
+run_expand_only_migration() {
+  local binary="${RELEASE_DIR%/}/${APP_NAME}"
+  [[ -x "$binary" ]] || die "expand-only migration binary is missing: ${binary}"
+  log "Applying additive expand-only storage migrations before standby startup"
+  run_service env \
+    CODEX_POOL_DATABASE="$DATABASE_PATH" \
+    CODEX_POOL_DATA_DIR="${DATA_DIR%/}/data" \
+    CODEX_POOL_MASTER_KEY_FILE="${DATA_DIR%/}/data/keys/master.key" \
+    CODEX_POOL_IDENTITY_KEY_FILE="${DATA_DIR%/}/data/keys/identity.key" \
+    CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE="${DATA_DIR%/}/data/keys/diagnostic-alias.key" \
+    "$binary" --config "$CONFIG_FILE" --migrate-only --expand-only ||
+    die "expand-only migration failed; the active release and traffic links were not changed"
+}
+
 systemd_requested() {
   case "$INSTALL_SYSTEMD" in
     1|true|TRUE|yes|YES|on|ON) return 0 ;;
@@ -1441,6 +1557,18 @@ remove_legacy_auxiliary_units() {
 
 acquire_deploy_lock() {
   command -v flock >/dev/null 2>&1 || die "flock is required for serialized deployments"
+  if [[ "${CODEX_POOL_DEPLOY_LOCK_FD:-}" =~ ^[0-9]+$ ]] &&
+      [[ -e "/proc/$$/fd/${CODEX_POOL_DEPLOY_LOCK_FD}" ]]; then
+    local inherited_target
+    inherited_target="$(readlink -f "/proc/$$/fd/${CODEX_POOL_DEPLOY_LOCK_FD}" 2>/dev/null || true)"
+    if [[ "$inherited_target" == "$(readlink -f "$DEPLOY_LOCK_FILE" 2>/dev/null || true)" ]] &&
+        flock -n "$CODEX_POOL_DEPLOY_LOCK_FD"; then
+      exec 9>&"$CODEX_POOL_DEPLOY_LOCK_FD"
+      log "Reusing the update wrapper's deployment lock"
+      return 0
+    fi
+    die "inherited deployment lock descriptor is invalid"
+  fi
   if [[ "$(id -u)" -eq 0 ]]; then
     install -d -m 0755 "$(dirname "$DEPLOY_LOCK_FILE")"
     exec 9>"$DEPLOY_LOCK_FILE"
@@ -1522,14 +1650,20 @@ restore_codex_reauth_worker_after_rollback() {
 }
 
 wait_worker_ready() {
-  local socket="$1" expected="$2" max="$3" started="$SECONDS" payload="" unit
+  local socket="$1" expected="$2" max="$3" require_warm="${4:-1}" started="$SECONDS" payload="" unit
   local elapsed=0 next_report=0 state="unknown" substate="unknown" pid="0" restarts="0" result=""
   unit="${SERVICE_NAME}-worker@${expected}.service"
   [[ "$WORKER_START_RESTART_LIMIT" =~ ^[1-9][0-9]*$ ]] || die "WORKER_START_RESTART_LIMIT must be a positive integer: ${WORKER_START_RESTART_LIMIT}"
   while (( SECONDS - started < max )); do
     payload="$(curl --noproxy '*' --silent --show-error --max-time 2 --unix-socket "$socket" http://localhost/standbyz 2>&1 || true)"
     if [[ "$payload" == *'"standby_ready":true'* && "$payload" == *"\"release_id\":\"${expected}\""* ]]; then
-      return 0
+      if [[ "$require_warm" == "0" ]]; then
+        [[ "$payload" == *'"schema_compatible":true'* ]] && return 0
+      elif [[ "$payload" == *'"warm":true'* && "$payload" == *'"schema_compatible":true'* && "$payload" == *'"write_side_effects":false'* ]]; then
+        return 0
+      else
+        payload="${payload} (candidate did not prove warm=true, schema_compatible=true, write_side_effects=false)"
+      fi
     fi
 
     elapsed=$((SECONDS - started))
@@ -1679,6 +1813,7 @@ pause_handoff_admission() {
   payload="$(handoff_control_post pause 2>/dev/null || true)"
   [[ "$payload" == *'"admission_paused":true'* ]] || return 1
   HANDOFF_PAUSED=1
+  HANDOFF_PAUSE_STARTED_MS="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
   log "New request admission is paused; established HTTP/SSE/WebSocket connections continue"
 }
 
@@ -1705,6 +1840,7 @@ EOF
   run_root install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$tmp" "$HANDOFF_PAUSE_STATE"
   rm -f "$tmp"
   HANDOFF_PAUSED=1
+  HANDOFF_PAUSE_STARTED_MS="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
 }
 
 resume_handoff_admission() {
@@ -1712,6 +1848,11 @@ resume_handoff_admission() {
   (( HANDOFF_PAUSED == 1 )) || return 0
   payload="$(handoff_control_post resume 2>/dev/null || true)"
   if [[ "$payload" == *'"admission_paused":false'* ]]; then
+    local resumed_ms
+    resumed_ms="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
+    if [[ "$HANDOFF_PAUSE_STARTED_MS" =~ ^[0-9]+$ && "$resumed_ms" =~ ^[0-9]+$ && "$resumed_ms" -ge "$HANDOFF_PAUSE_STARTED_MS" ]]; then
+      DEPLOY_ADMISSION_PAUSE_DURATION_MS=$((resumed_ms - HANDOFF_PAUSE_STARTED_MS))
+    fi
     HANDOFF_PAUSED=0
     log "New request admission resumed on release ${RELEASE_ID}"
     return 0
@@ -1728,6 +1869,592 @@ resume_handoff_admission() {
 
 valid_worker_release_id() {
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+}
+
+human_bytes() {
+  awk -v bytes="${1:-0}" 'BEGIN {
+    split("B KiB MiB GiB TiB", units, " "); unit = 1
+    while (bytes >= 1024 && unit < 5) { bytes /= 1024; unit++ }
+    if (unit == 1) printf "%d %s", bytes, units[unit]
+    else printf "%.1f %s", bytes, units[unit]
+  }'
+}
+
+validate_deployment_limits() {
+  local name value
+  for name in MAX_DRAINING_RELEASES INSTALL_FREE_RESERVE_MIN_BYTES \
+    INSTALL_FREE_RESERVE_PERCENT RELEASE_STORAGE_MAX_BYTES \
+    CONSOLE_GENERATION_MAX_BYTES BUILD_CACHE_MAX_BYTES \
+    CONSOLE_GENERATION_KEEP CONSOLE_GENERATION_MAX_AGE_SECONDS; do
+    value="${!name}"
+    [[ "$value" =~ ^[0-9]+$ ]] || die "${name} must be a non-negative integer: ${value}"
+  done
+  (( MAX_DRAINING_RELEASES >= 1 )) || die "MAX_DRAINING_RELEASES must be at least 1"
+  (( INSTALL_FREE_RESERVE_PERCENT <= 90 )) || die "INSTALL_FREE_RESERVE_PERCENT must be between 0 and 90"
+  (( CONSOLE_GENERATION_KEEP >= 1 )) || die "CONSOLE_GENERATION_KEEP must be at least 1"
+}
+
+directory_bytes() {
+  local path="$1" size
+  [[ -e "$path" ]] || { printf '0\n'; return 0; }
+  size="$(run_root du -sb -- "$path" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+  printf '%s\n' "$size"
+}
+
+file_bytes() {
+  local size
+  size="$(run_root stat -c %s -- "$1" 2>/dev/null || true)"
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+  printf '%s\n' "$size"
+}
+
+filesystem_probe_path() {
+  local path="$1"
+  while [[ ! -e "$path" && "$path" != "/" ]]; do
+    path="$(dirname "$path")"
+  done
+  [[ -e "$path" ]] || path="/"
+  printf '%s\n' "$path"
+}
+
+filesystem_total_free() {
+  local probe="$1"
+  run_root df -Pk "$probe" 2>/dev/null | awk 'END {printf "%.0f %.0f\n", $2 * 1024, $4 * 1024}'
+}
+
+release_process_ids() {
+  local release_dir="$1" exe target pid first=1
+  for exe in "${PROC_ROOT%/}"/[0-9]*/exe; do
+    [[ -L "$exe" ]] || continue
+    target="$(readlink "$exe" 2>/dev/null || true)"
+    target="${target% (deleted)}"
+    [[ "$target" == "${release_dir%/}/"* ]] || continue
+    pid="${exe%/exe}"
+    pid="${pid##*/}"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    (( first == 1 )) || printf ','
+    printf '%s' "$pid"
+    first=0
+  done
+  printf '\n'
+}
+
+json_integer_field() {
+  local payload="$1" field="$2" value
+  value="$(printf '%s' "$payload" | sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9][0-9]*\).*/\1/p" | head -1)"
+  [[ "$value" =~ ^-?[0-9]+$ ]] || return 1
+  printf '%s\n' "$value"
+}
+
+json_string_field() {
+  local payload="$1" field="$2"
+  printf '%s' "$payload" | sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+collect_deployment_storage() {
+  local phase="${1:-status}" current_target releases_root path release bytes age mtime now
+  local pids first_pid unit_pid socket payload critical resumable state heartbeat error state_file
+  local fs_probe fs_total fs_free reserve_percent automatic_budget hard_budget effective_budget
+  local source_estimate candidate_base backup_peak database_live_bytes console_estimate predicted_extra
+  local draining_json="" details="" is_draining=0
+
+  releases_root="${APP_DIR%/}/releases"
+  current_target=""
+  if run_root test -L "${APP_DIR%/}/current"; then
+    current_target="$(run_root readlink -f "${APP_DIR%/}/current" 2>/dev/null || true)"
+  fi
+  DEPLOY_CURRENT_RELEASE="${current_target##*/}"
+  [[ -n "$current_target" ]] || DEPLOY_CURRENT_RELEASE=""
+  DEPLOY_TOTAL_RELEASE_BYTES="$(directory_bytes "$releases_root")"
+  DEPLOY_CONSOLE_BYTES="$(directory_bytes "${DATA_DIR%/}/console-generations")"
+  DEPLOY_BACKUP_BYTES="$(directory_bytes "${BACKUP_DIR:-$(dirname "$DATABASE_PATH")/backups}")"
+  DEPLOY_DRAINING_COUNT=0
+  DEPLOY_DRAINING_JSON=""
+  DEPLOY_DRAINING_DETAILS=""
+  now="$(date +%s)"
+
+  if [[ -d "$releases_root" ]]; then
+    while IFS= read -r path; do
+      [[ -n "$path" && "$path" != "$current_target" ]] || continue
+      release="${path##*/}"
+      [[ "$release" != .staging-* ]] || continue
+      valid_worker_release_id "$release" || continue
+      bytes="$(directory_bytes "$path")"
+      mtime="$(run_root stat -c %Y -- "$path" 2>/dev/null || printf '%s' "$now")"
+      [[ "$mtime" =~ ^[0-9]+$ ]] || mtime="$now"
+      age=$(( now - mtime )); (( age >= 0 )) || age=0
+      pids="$(release_process_ids "$path")"
+      first_pid="${pids%%,*}"
+      [[ "$first_pid" =~ ^[1-9][0-9]*$ ]] || first_pid=0
+      unit_pid=0
+      if command -v systemctl >/dev/null 2>&1; then
+        unit_pid="$(run_root systemctl show "${SERVICE_NAME}-worker@${release}.service" --property=MainPID --value 2>/dev/null || true)"
+        [[ "$unit_pid" =~ ^[1-9][0-9]*$ ]] || unit_pid=0
+      fi
+      if (( first_pid == 0 && unit_pid > 0 )); then first_pid="$unit_pid"; pids="$unit_pid"; fi
+      socket="${DATA_DIR%/}/run/worker-${release}.sock"
+      payload="$(curl --noproxy '*' --silent --max-time 1 --unix-socket "$socket" http://localhost/readyz 2>/dev/null || true)"
+      critical="$(json_integer_field "$payload" critical_inflight 2>/dev/null || true)"
+      resumable="$(json_integer_field "$payload" resumable_inflight 2>/dev/null || true)"
+      [[ "$critical" =~ ^[0-9]+$ ]] || critical=-1
+      [[ "$resumable" =~ ^[0-9]+$ ]] || resumable=-1
+      state_file="${DATA_DIR%/}/run/reapers/${release}.json"
+      state=""; heartbeat=0; error=""
+      if [[ -r "$state_file" ]]; then
+        payload="$(run_root cat "$state_file" 2>/dev/null || true)"
+        state="$(json_string_field "$payload" state || true)"
+        heartbeat="$(json_integer_field "$payload" heartbeat_at 2>/dev/null || true)"
+        error="$(json_string_field "$payload" last_error || true)"
+      fi
+      [[ "$heartbeat" =~ ^[0-9]+$ ]] || heartbeat=0
+      [[ -n "$state" ]] || { if (( first_pid > 0 )); then state="draining"; else state="orphaned"; fi; }
+      is_draining=0
+      if (( first_pid > 0 || unit_pid > 0 || critical > 0 || resumable > 0 )); then
+        is_draining=1
+      fi
+      case "$state" in starting|waiting|draining|stopping) is_draining=1 ;; esac
+      (( is_draining == 0 )) || DEPLOY_DRAINING_COUNT=$((DEPLOY_DRAINING_COUNT + 1))
+      [[ -z "$draining_json" ]] || draining_json+=" ,"
+      draining_json+="{\"release_id\":\"$(json_escape "$release")\",\"pid\":${first_pid},\"bytes\":${bytes},\"age_seconds\":${age},\"critical_inflight\":${critical},\"resumable_inflight\":${resumable},\"state\":\"$(json_escape "$state")\",\"heartbeat_at\":${heartbeat},\"last_error\":\"$(json_escape "$error")\"}"
+      details+=$'\n'
+      details+="  - ${release}: size=$(human_bytes "$bytes"), age=${age}s, pid=${pids:-none}, critical=${critical}, resumable=${resumable}, reaper=${state}, error=${error:-none}"
+    done < <(run_root find "$releases_root" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort)
+  fi
+  DEPLOY_DRAINING_JSON="$draining_json"
+  DEPLOY_DRAINING_DETAILS="$details"
+
+  fs_probe="$(filesystem_probe_path "$APP_DIR")"
+  read -r fs_total fs_free < <(filesystem_total_free "$fs_probe")
+  [[ "$fs_total" =~ ^[0-9]+$ && "$fs_free" =~ ^[0-9]+$ ]] || die "could not calculate filesystem capacity for ${fs_probe}"
+  DEPLOY_FREE_BYTES="$fs_free"
+  reserve_percent=$(( fs_total * INSTALL_FREE_RESERVE_PERCENT / 100 ))
+  DEPLOY_RESERVE_BYTES="$INSTALL_FREE_RESERVE_MIN_BYTES"
+  (( reserve_percent <= DEPLOY_RESERVE_BYTES )) || DEPLOY_RESERVE_BYTES="$reserve_percent"
+
+  source_estimate="$(directory_bytes "$BUILD_DIR")"
+  if (( source_estimate == 0 )) && [[ -n "$current_target" ]]; then
+    source_estimate="$(directory_bytes "$current_target")"
+  fi
+  # Fresh installs have no previous immutable release from which to estimate the
+  # stripped binaries. Keep a conservative floor until the post-build check can use
+  # the exact staged output size.
+  (( source_estimate >= 134217728 )) || source_estimate=134217728
+  candidate_base="$source_estimate"
+  if [[ -n "$current_target" ]]; then
+    bytes="$(directory_bytes "$current_target")"
+    (( bytes <= candidate_base )) || candidate_base="$bytes"
+  fi
+  if [[ -n "$RELEASE_DIR" && -d "$RELEASE_DIR" ]]; then
+    bytes="$(directory_bytes "$RELEASE_DIR")"
+    (( bytes <= candidate_base )) || candidate_base="$bytes"
+  fi
+  DEPLOY_CANDIDATE_ESTIMATE_BYTES=$(( (candidate_base * 125 + 99) / 100 ))
+  automatic_budget=$(( DEPLOY_CANDIDATE_ESTIMATE_BYTES * 3 ))
+  (( automatic_budget >= 1073741824 )) || automatic_budget=1073741824
+  database_live_bytes=$(( $(file_bytes "$DATABASE_PATH") + $(file_bytes "${DATABASE_PATH}-wal") ))
+  backup_peak=$(( database_live_bytes * 13 / 10 + 1048576 ))
+  hard_budget=$(( fs_total - DEPLOY_RESERVE_BYTES - backup_peak ))
+  (( hard_budget > 0 )) || hard_budget=0
+  if (( RELEASE_STORAGE_MAX_BYTES > 0 )); then
+    effective_budget="$RELEASE_STORAGE_MAX_BYTES"
+  else
+    effective_budget="$automatic_budget"
+  fi
+  (( effective_budget <= hard_budget )) || effective_budget="$hard_budget"
+  DEPLOY_RELEASE_BUDGET_BYTES="$effective_budget"
+
+  console_estimate="$(directory_bytes "${PROJECT_ROOT}/internal/console/dist")"
+  (( console_estimate >= 16777216 )) || console_estimate=16777216
+  (( console_estimate <= CONSOLE_GENERATION_MAX_BYTES )) || console_estimate="$CONSOLE_GENERATION_MAX_BYTES"
+  case "$phase" in
+    prebuild)
+      predicted_extra=$(( DEPLOY_CANDIDATE_ESTIMATE_BYTES * 2 + backup_peak + console_estimate ))
+      ;;
+    poststage)
+      predicted_extra=$(( backup_peak + console_estimate ))
+      ;;
+    *) predicted_extra=0 ;;
+  esac
+  DEPLOY_PREDICTED_PEAK_BYTES=$(( DEPLOY_TOTAL_RELEASE_BYTES + predicted_extra ))
+}
+
+write_deployment_storage_state() {
+  local state_dir state_file tmp now
+  state_dir="${DATA_DIR%/}/run"
+  run_root install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$state_dir"
+  state_file="${state_dir}/deployment-storage.json"
+  now="$(date +%s)"
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
+{"current_release":"$(json_escape "$DEPLOY_CURRENT_RELEASE")","total_release_bytes":${DEPLOY_TOTAL_RELEASE_BYTES},"release_budget_bytes":${DEPLOY_RELEASE_BUDGET_BYTES},"free_bytes":${DEPLOY_FREE_BYTES},"free_reserve_bytes":${DEPLOY_RESERVE_BYTES},"predicted_peak_bytes":${DEPLOY_PREDICTED_PEAK_BYTES},"backup_bytes":${DEPLOY_BACKUP_BYTES},"console_generation_bytes":${DEPLOY_CONSOLE_BYTES},"admission_pause_duration_ms":${DEPLOY_ADMISSION_PAUSE_DURATION_MS},"draining":[${DEPLOY_DRAINING_JSON}],"last_reclaim_error":"$(json_escape "$DEPLOY_LAST_RECLAIM_ERROR")","updated_at":${now}}
+EOF
+  run_root install -m 0640 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$tmp" "${state_file}.next"
+  run_root mv -f "${state_file}.next" "$state_file"
+  rm -f "$tmp"
+}
+
+print_deployment_storage_status() {
+  log "Deployment storage: current=${DEPLOY_CURRENT_RELEASE:-none}, releases=$(human_bytes "$DEPLOY_TOTAL_RELEASE_BYTES")/$(human_bytes "$DEPLOY_RELEASE_BUDGET_BYTES"), free=$(human_bytes "$DEPLOY_FREE_BYTES"), reserve=$(human_bytes "$DEPLOY_RESERVE_BYTES"), predicted-peak=$(human_bytes "$DEPLOY_PREDICTED_PEAK_BYTES")"
+  log "Deployment storage: draining=${DEPLOY_DRAINING_COUNT}/${MAX_DRAINING_RELEASES}, backups=$(human_bytes "$DEPLOY_BACKUP_BYTES"), console-generations=$(human_bytes "$DEPLOY_CONSOLE_BYTES")/$(human_bytes "$CONSOLE_GENERATION_MAX_BYTES")"
+  if [[ -n "$DEPLOY_DRAINING_DETAILS" ]]; then
+    printf 'Draining/reclaimable releases:%s\n' "$DEPLOY_DRAINING_DETAILS"
+  fi
+}
+
+deployment_budget_failure() {
+  local reason="$1"
+  print_deployment_storage_status >&2
+  printf 'ERROR: deployment storage preflight failed: %s\n' "$reason" >&2
+  if [[ -n "$DEPLOY_DRAINING_DETAILS" ]]; then
+    printf 'Protected release diagnostics:%s\n' "$DEPLOY_DRAINING_DETAILS" >&2
+  fi
+  printf 'Suggested action: let critical streams finish, close stale consoles, inspect reaper state, or raise an explicit budget only after adding disk capacity. Live releases are never force-deleted.\n' >&2
+  return 1
+}
+
+enforce_deployment_budget() {
+  local phase="$1" projected_release_bytes free_after
+  collect_deployment_storage "$phase"
+  print_deployment_storage_status
+  if [[ "$phase" == "prebuild" ]] && (( DEPLOY_DRAINING_COUNT >= MAX_DRAINING_RELEASES )); then
+    deployment_budget_failure "${DEPLOY_DRAINING_COUNT} releases are still draining; limit is ${MAX_DRAINING_RELEASES}" || return 1
+  fi
+  projected_release_bytes="$DEPLOY_TOTAL_RELEASE_BYTES"
+  if [[ "$phase" == "prebuild" ]]; then
+    projected_release_bytes=$(( projected_release_bytes + DEPLOY_CANDIDATE_ESTIMATE_BYTES ))
+  fi
+  if (( DEPLOY_RELEASE_BUDGET_BYTES <= 0 || projected_release_bytes > DEPLOY_RELEASE_BUDGET_BYTES )); then
+    deployment_budget_failure "projected release storage $(human_bytes "$projected_release_bytes") exceeds effective budget $(human_bytes "$DEPLOY_RELEASE_BUDGET_BYTES")" || return 1
+  fi
+  free_after="$DEPLOY_FREE_BYTES"
+  if [[ "$phase" == "prebuild" ]]; then
+    free_after=$(( DEPLOY_FREE_BYTES - (DEPLOY_PREDICTED_PEAK_BYTES - DEPLOY_TOTAL_RELEASE_BYTES) ))
+  else
+    # At the post-stage gate the candidate and build tree already occupy disk; only
+    # the remaining backup/snapshot peak needs to fit above the reserve.
+    free_after=$(( DEPLOY_FREE_BYTES - $(file_bytes "$DATABASE_PATH") - 16777216 ))
+  fi
+  if (( free_after < DEPLOY_RESERVE_BYTES )); then
+    deployment_budget_failure "predicted free space $(human_bytes "$free_after") would fall below reserve $(human_bytes "$DEPLOY_RESERVE_BYTES")" || return 1
+  fi
+  if user_exists "$SERVICE_USER"; then
+    write_deployment_storage_state
+  fi
+}
+
+cleanup_abandoned_deployment_artifacts() {
+  local path release active_socket socket payload unit_pid current_target previous_target
+  if [[ -d "${APP_DIR%/}/releases" ]]; then
+    while IFS= read -r path; do
+      [[ -n "$path" ]] || continue
+      release="${path##*/.staging-}"
+      valid_worker_release_id "$release" || continue
+      if [[ -n "$(release_process_ids "$path")" ]]; then
+        warn "Preserving interrupted staging still used by a process: ${path}"
+        continue
+      fi
+      log "Removing abandoned release staging ${path}"
+      run_root rm -rf -- "$path"
+    done < <(run_root find "${APP_DIR%/}/releases" -mindepth 1 -maxdepth 1 -type d -name '.staging-*' -print 2>/dev/null || true)
+
+    current_target="$(run_root readlink -f "${APP_DIR%/}/current" 2>/dev/null || true)"
+    previous_target="$(run_root readlink -f "${APP_DIR%/}/previous" 2>/dev/null || true)"
+    while IFS= read -r path; do
+      [[ -n "$path" && "$path" != "$current_target" ]] || continue
+      release="${path##*/}"
+      [[ "$release" != .staging-* ]] || continue
+      valid_worker_release_id "$release" || continue
+      [[ -z "$(release_process_ids "$path")" ]] || continue
+      unit_pid="$(run_root systemctl show "${SERVICE_NAME}-worker@${release}.service" --property=MainPID --value 2>/dev/null || true)"
+      [[ ! "$unit_pid" =~ ^[1-9][0-9]*$ ]] || continue
+      socket="${DATA_DIR%/}/run/worker-${release}.sock"
+      payload="$(curl --noproxy '*' --silent --max-time 1 --unix-socket "$socket" http://localhost/readyz 2>/dev/null || true)"
+      [[ -z "$payload" ]] || continue
+      log "Reclaiming inactive release with no process, worker, or request owner: ${release}"
+      run_root systemctl disable "${SERVICE_NAME}-worker@${release}.service" >/dev/null 2>&1 || true
+      run_root systemctl disable "${SERVICE_NAME}-reaper@${release}.service" >/dev/null 2>&1 || true
+      run_root rm -f -- "$socket"
+      if [[ "$previous_target" == "$path" ]]; then
+        run_root rm -f -- "${APP_DIR%/}/previous"
+      fi
+      run_root rm -rf -- "$path"
+      run_root rm -f -- "${DATA_DIR%/}/run/reapers/${release}.json"
+    done < <(run_root find "${APP_DIR%/}/releases" -mindepth 1 -maxdepth 1 -type d ! -name '.staging-*' -print 2>/dev/null | sort)
+  fi
+  active_socket="$(run_root readlink "${DATA_DIR%/}/run/active-worker.sock" 2>/dev/null || true)"
+  if [[ -d "${DATA_DIR%/}/run" ]]; then
+    while IFS= read -r socket; do
+      [[ -n "$socket" && "$socket" != "$active_socket" ]] || continue
+      release="${socket##*/worker-}"; release="${release%.sock}"
+      valid_worker_release_id "$release" || continue
+      unit_pid="$(run_root systemctl show "${SERVICE_NAME}-worker@${release}.service" --property=MainPID --value 2>/dev/null || true)"
+      [[ "$unit_pid" =~ ^[1-9][0-9]*$ ]] && continue
+      payload="$(curl --noproxy '*' --silent --max-time 1 --unix-socket "$socket" http://localhost/livez 2>/dev/null || true)"
+      [[ -z "$payload" ]] || continue
+      log "Removing orphan worker socket ${socket}"
+      run_root rm -f -- "$socket"
+    done < <(run_root find "${DATA_DIR%/}/run" -maxdepth 1 \( -type s -o -type l \) -name 'worker-*.sock' -print 2>/dev/null || true)
+  fi
+  if [[ -d "${DATA_DIR%/}/run/reapers" ]]; then
+    run_root find "${DATA_DIR%/}/run/reapers" -maxdepth 1 -type f \
+      \( -name '*.json.next.*' -o -name '*.json' -mtime +1 \) -delete 2>/dev/null || true
+  fi
+}
+
+prune_console_generations() {
+  local protected="${1:-}" root="${DATA_DIR%/}/console-generations" now path name mtime age total
+  local -a generations=()
+  [[ -d "$root" ]] || return 0
+  now="$(date +%s)"
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    name="${path##*/}"
+    if [[ "$name" == .staging-* ]]; then
+      log "Removing abandoned console generation staging ${path}"
+      run_root rm -rf -- "$path"
+      continue
+    fi
+    generations+=("$path")
+  done < <(run_root find "$root" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort)
+
+  for path in "${generations[@]}"; do
+    name="${path##*/}"
+    [[ "$name" != "$protected" ]] || continue
+    mtime="$(run_root stat -c %Y -- "$path" 2>/dev/null || printf '%s' "$now")"
+    [[ "$mtime" =~ ^[0-9]+$ ]] || mtime="$now"
+    age=$(( now - mtime ))
+    if (( age > CONSOLE_GENERATION_MAX_AGE_SECONDS )); then
+      log "Pruning expired console generation ${name} (${age}s old)"
+      run_root rm -rf -- "$path"
+    fi
+  done
+
+  mapfile -t generations < <(
+    run_root find "$root" -mindepth 1 -maxdepth 1 -type d ! -name '.staging-*' \
+      -printf '%T@ %p\n' 2>/dev/null | sort -nr | cut -d' ' -f2-
+  )
+  while (( ${#generations[@]} > CONSOLE_GENERATION_KEEP )); do
+    path="${generations[${#generations[@]}-1]}"
+    name="${path##*/}"
+    if [[ "$name" == "$protected" ]]; then
+      # The protected snapshot is normally newest; if clock skew made it oldest,
+      # discard the next-oldest generation instead.
+      if (( ${#generations[@]} <= 1 )); then break; fi
+      path="${generations[${#generations[@]}-2]}"
+      unset "generations[$((${#generations[@]} - 2))]"
+      generations=("${generations[@]}")
+    else
+      unset "generations[$((${#generations[@]} - 1))]"
+    fi
+    log "Pruning excess console generation ${path##*/}"
+    run_root rm -rf -- "$path"
+    generations=("${generations[@]}")
+  done
+
+  total="$(directory_bytes "$root")"
+  while (( total > CONSOLE_GENERATION_MAX_BYTES && ${#generations[@]} > 0 )); do
+    path="${generations[${#generations[@]}-1]}"
+    name="${path##*/}"
+    if [[ "$name" == "$protected" ]]; then
+      if (( ${#generations[@]} == 1 )); then
+        warn "Protected console generation ${protected} alone exceeds CONSOLE_GENERATION_MAX_BYTES"
+        return 1
+      fi
+      path="${generations[${#generations[@]}-2]}"
+      unset "generations[$((${#generations[@]} - 2))]"
+    else
+      unset "generations[$((${#generations[@]} - 1))]"
+    fi
+    log "Pruning console generation ${path##*/} to honor byte budget"
+    run_root rm -rf -- "$path"
+    generations=("${generations[@]}")
+    total="$(directory_bytes "$root")"
+  done
+}
+
+console_asset_path_valid() {
+  local path="$1" rel
+  [[ "$path" == /console/assets/* ]] || return 1
+  rel="${path#/console/}"
+  [[ "$rel" =~ ^assets/[A-Za-z0-9._/-]+$ ]] || return 1
+  [[ "/$rel/" != *"/../"* && "/$rel/" != *"/./"* && "$rel" != */ ]] || return 1
+}
+
+console_asset_mime_valid() {
+  local path="$1" content_type="${2%%;*}" extension
+  content_type="${content_type,,}"
+  extension="${path##*.}"; extension="${extension,,}"
+  case "$extension" in
+    js|mjs) [[ "$content_type" == "text/javascript" || "$content_type" == "application/javascript" || "$content_type" == "application/octet-stream" ]] ;;
+    css) [[ "$content_type" == "text/css" ]] ;;
+    json|map) [[ "$content_type" == "application/json" || "$content_type" == "application/octet-stream" ]] ;;
+    wasm) [[ "$content_type" == "application/wasm" || "$content_type" == "application/octet-stream" ]] ;;
+    svg) [[ "$content_type" == "image/svg+xml" ]] ;;
+    png) [[ "$content_type" == "image/png" ]] ;;
+    jpg|jpeg) [[ "$content_type" == "image/jpeg" ]] ;;
+    webp) [[ "$content_type" == "image/webp" ]] ;;
+    gif) [[ "$content_type" == "image/gif" ]] ;;
+    ico) [[ "$content_type" == "image/x-icon" || "$content_type" == "image/vnd.microsoft.icon" ]] ;;
+    woff) [[ "$content_type" == "font/woff" || "$content_type" == "application/font-woff" || "$content_type" == "application/octet-stream" ]] ;;
+    woff2) [[ "$content_type" == "font/woff2" || "$content_type" == "application/octet-stream" ]] ;;
+    ttf) [[ "$content_type" == "font/ttf" || "$content_type" == "application/x-font-ttf" || "$content_type" == "application/octet-stream" ]] ;;
+    *) [[ -n "$content_type" && "$content_type" != "text/html" ]] ;;
+  esac
+}
+
+fetch_old_console_path() {
+  local socket="$1" path="$2" output="$3" headers="${4:-}"
+  local -a args=(--noproxy '*' --fail --silent --show-error --max-time 20 --header 'Accept-Encoding: identity')
+  [[ -z "$headers" ]] || args+=(--dump-header "$headers")
+  if [[ -n "$socket" && ( -S "$socket" || -L "$socket" ) ]]; then
+    if curl "${args[@]}" --unix-socket "$socket" "http://localhost${path}" --output "$output"; then
+      return 0
+    fi
+  fi
+  curl "${args[@]}" "$(handoff_public_base_url)${path}" --output "$output"
+}
+
+download_console_asset() {
+  local socket="$1" path="$2" staging="$3" expected_size="${4:-}" expected_sha="${5:-}"
+  local rel target headers actual_size actual_sha content_type
+  console_asset_path_valid "$path" || die "old console manifest contains an unsafe path: ${path}"
+  rel="${path#/console/}"
+  target="${staging%/}/${rel}"
+  headers="${target}.headers"
+  run_root install -d -m 0755 "$(dirname "$target")"
+  fetch_old_console_path "$socket" "$path" "$target" "$headers" || return 1
+  actual_size="$(file_bytes "$target")"
+  if [[ -n "$expected_size" && "$actual_size" != "$expected_size" ]]; then
+    warn "old console asset size mismatch: ${path} expected=${expected_size} actual=${actual_size}"
+    return 1
+  fi
+  actual_sha="$(sha256sum "$target" | awk '{print $1}')"
+  if [[ -n "$expected_sha" && "$actual_sha" != "$expected_sha" ]]; then
+    warn "old console asset digest mismatch: ${path}"
+    return 1
+  fi
+  content_type="$(tr -d '\r' <"$headers" | awk 'BEGIN{IGNORECASE=1} /^Content-Type:/ {sub(/^[^:]*:[[:space:]]*/, ""); value=$0} END{print value}')"
+  rm -f "$headers"
+  case "$content_type" in
+    text/html*) warn "old console asset unexpectedly returned HTML: ${path}"; return 1 ;;
+  esac
+  if ! console_asset_mime_valid "$path" "$content_type"; then
+    warn "old console asset MIME mismatch: ${path} content-type=${content_type:-missing}"
+    return 1
+  fi
+  [[ -s "$target" ]] || { warn "old console asset is empty: ${path}"; return 1; }
+  return 0
+}
+
+snapshot_legacy_console_closure() {
+  local socket="$1" staging="$2" index queue path rel target found=0
+  local -A seen=()
+  index="${staging%/}/.legacy-index.html"
+  fetch_old_console_path "$socket" "/console/" "$index" || return 1
+  queue="${staging%/}/.asset-queue"
+  : >"$queue"
+  grep -Eo '/console/assets/[A-Za-z0-9._/-]+' "$index" | sort -u >>"$queue" || true
+  while IFS= read -r path; do
+    [[ -n "$path" && -z "${seen[$path]:-}" ]] || continue
+    seen["$path"]=1
+    console_asset_path_valid "$path" || return 1
+    download_console_asset "$socket" "$path" "$staging" || return 1
+    found=$((found + 1))
+    rel="${path#/console/}"
+    target="${staging%/}/${rel}"
+    grep -Eo '/console/assets/[A-Za-z0-9._/-]+' "$target" 2>/dev/null | sort -u >>"$queue" || true
+    while IFS= read -r rel; do
+      [[ -n "$rel" ]] || continue
+      printf '/console/assets/%s\n' "${rel#./}" >>"$queue"
+    done < <(grep -Eo '\./[A-Za-z0-9._-]+\.(js|css|json|wasm|svg|png|jpg|jpeg|webp|gif|woff|woff2|ttf|ico)' "$target" 2>/dev/null | sort -u || true)
+  done <"$queue"
+  rm -f "$index" "$queue"
+  (( found > 0 ))
+}
+
+snapshot_old_console_generation() {
+  local socket="$1" suggested_release="$2" root manifest staging generation release manifest_assets=0
+  local record path size sha total meta
+  [[ -n "$socket" || -n "$suggested_release" || LEGACY_SERVICE_ACTIVE == 1 ]] || return 0
+  root="${DATA_DIR%/}/console-generations"
+  run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$root"
+  prune_console_generations || die "could not prune old console generations before snapshot"
+  manifest="$(mktemp)"
+  release="$suggested_release"
+  if fetch_old_console_path "$socket" "/console/.release-manifest.json" "$manifest" 2>/dev/null && \
+      grep -q '"assets"[[:space:]]*:' "$manifest"; then
+    generation="$(json_string_field "$(cat "$manifest")" release_id || true)"
+    [[ -n "$generation" ]] || generation="$release"
+    valid_worker_release_id "$generation" || generation="legacy-$(date -u +%Y%m%dT%H%M%SZ)"
+    staging="${root}/.staging-${generation}-$$"
+    run_root rm -rf -- "$staging"
+    run_root install -d -m 0755 "$staging"
+    while IFS= read -r record; do
+      [[ "$record" == *'"path"'* ]] || continue
+      path="$(json_string_field "$record" path || true)"
+      size="$(json_integer_field "$record" size 2>/dev/null || true)"
+      sha="$(json_string_field "$record" sha256 || true)"
+      [[ "$size" =~ ^[0-9]+$ && "$sha" =~ ^[a-f0-9]{64}$ ]] || die "old console manifest contains an invalid asset record"
+      download_console_asset "$socket" "$path" "$staging" "$size" "$sha" || die "could not validate old console asset ${path}"
+      manifest_assets=$((manifest_assets + 1))
+    done < <(sed 's/{"path"/\n{"path"/g' "$manifest")
+    (( manifest_assets > 0 )) || die "old console manifest did not contain any assets"
+  else
+    generation="$release"
+    valid_worker_release_id "$generation" || generation="legacy-$(date -u +%Y%m%dT%H%M%SZ)"
+    staging="${root}/.staging-${generation}-$$"
+    run_root rm -rf -- "$staging"
+    run_root install -d -m 0755 "$staging"
+    log "Old release has no console manifest; resolving its index/import closure"
+    snapshot_legacy_console_closure "$socket" "$staging" || die "could not capture the legacy console asset closure"
+  fi
+  rm -f "$manifest"
+  total="$(directory_bytes "$staging")"
+  (( total <= CONSOLE_GENERATION_MAX_BYTES )) || die "old console generation $(human_bytes "$total") exceeds CONSOLE_GENERATION_MAX_BYTES"
+  meta="$(mktemp)"
+  cat >"$meta" <<EOF
+{"release_id":"$(json_escape "$generation")","captured_at":$(date +%s),"bytes":${total},"manifest_assets":${manifest_assets}}
+EOF
+  run_root install -m 0644 "$meta" "${staging}/generation.json"
+  rm -f "$meta"
+  run_root chown -R "root:${SERVICE_GROUP}" "$staging"
+  run_root chmod -R u=rwX,g=rX,o= "$staging"
+  if [[ -d "${root}/${generation}" ]]; then
+    run_root rm -rf -- "$staging"
+    log "Console generation ${generation} is already retained"
+  else
+    run_root mv "$staging" "${root}/${generation}"
+    log "Captured old console generation ${generation} ($(human_bytes "$total"))"
+  fi
+  prune_console_generations "$generation" || die "captured console generation cannot fit its configured byte budget"
+}
+
+reclaim_build_caches_under_pressure() {
+  local phase="$1" cache path bytes total=0
+  collect_deployment_storage "$phase"
+  if (( DEPLOY_FREE_BYTES >= DEPLOY_RESERVE_BYTES + DEPLOY_CANDIDATE_ESTIMATE_BYTES )); then
+    return 0
+  fi
+  warn "Filesystem is under deployment reserve pressure; reclaiming bounded build caches"
+  if command -v go >/dev/null 2>&1; then
+    cache="$(go env GOCACHE 2>/dev/null || true)"
+    if [[ -n "$cache" && "$cache" == /* && "$cache" != "/" ]]; then
+      bytes="$(directory_bytes "$cache")"; total=$((total + bytes))
+      if (( bytes > BUILD_CACHE_MAX_BYTES || DEPLOY_FREE_BYTES < DEPLOY_RESERVE_BYTES )); then
+        go clean -cache >/dev/null 2>&1 || warn "could not reclaim Go build cache"
+      fi
+    fi
+  fi
+  if command -v npm >/dev/null 2>&1; then
+    path="$(npm config get cache 2>/dev/null || true)"
+    if [[ -n "$path" && "$path" == /* && "$path" != "/" ]]; then
+      bytes="$(directory_bytes "$path")"; total=$((total + bytes))
+      if (( bytes > BUILD_CACHE_MAX_BYTES || total > BUILD_CACHE_MAX_BYTES )); then
+        npm cache clean --force >/dev/null 2>&1 || warn "could not reclaim npm cache"
+      fi
+    fi
+  fi
 }
 
 schedule_release_reaper() {
@@ -2113,6 +2840,7 @@ activate_staged_release() {
   local new_socket="${DATA_DIR%/}/run/worker-${RELEASE_ID}.sock"
   local new_unit="${SERVICE_NAME}-worker@${RELEASE_ID}.service" startup_started failure_hint=""
   local old_socket old_release old_release_id="" old_worker_release="" protected_release="" health_url had_handoff=0
+  local warm_required=0 legacy_warm_marker="${DATA_DIR%/}/run/legacy-worker.sock"
   [[ "$DRAIN_TIMEOUT" =~ ^[0-9]+$ ]] || die "DRAIN_TIMEOUT must be a non-negative integer: ${DRAIN_TIMEOUT}"
   [[ "$WORKER_DESTROY_TIMEOUT" =~ ^[0-9]+$ ]] || die "WORKER_DESTROY_TIMEOUT must be a non-negative integer: ${WORKER_DESTROY_TIMEOUT}"
   (( ${#new_socket} < 104 )) || die "worker Unix socket path is too long: ${new_socket}"
@@ -2125,7 +2853,18 @@ activate_staged_release() {
   if [[ -n "$old_socket" && "$old_socket" != "$new_socket" ]]; then
     old_worker_release="${old_socket##*/worker-}"
     old_worker_release="${old_worker_release%.sock}"
-    valid_worker_release_id "$old_worker_release" || die "malformed active worker socket target: ${old_socket}"
+    if [[ "$old_socket" == "$legacy_warm_marker" ]]; then
+      old_worker_release=""
+    else
+      valid_worker_release_id "$old_worker_release" || die "malformed active worker socket target: ${old_socket}"
+    fi
+    warm_required=1
+  elif (( LEGACY_SERVICE_ACTIVE == 1 )); then
+    # A first migration has no old private worker socket. A deliberately dangling
+    # marker still lets the auto-role candidate prove full read-only warm standby;
+    # the public legacy process remains untouched until the later socket handoff.
+    atomic_symlink "$legacy_warm_marker" "${DATA_DIR%/}/run/active-worker.sock"
+    warm_required=1
   fi
 
   # With an existing A/B worker, auto mode starts this generation as a tiny
@@ -2140,7 +2879,7 @@ activate_staged_release() {
     [[ -z "$WORKER_FAILURE_REPORT" ]] || failure_hint="; failure report: ${WORKER_FAILURE_REPORT}"
     die "could not start staged worker ${RELEASE_ID}; active release was not changed${failure_hint}"
   fi
-  if ! wait_worker_ready "$new_socket" "$RELEASE_ID" "$HEALTH_TIMEOUT"; then
+  if ! wait_worker_ready "$new_socket" "$RELEASE_ID" "$HEALTH_TIMEOUT" "$warm_required"; then
     # Capture the whole unit (including every restarted PID and kernel OOM lines)
     # before cleanup. Querying only the first MainPID after this point cannot explain
     # the failure because the failed candidate is intentionally stopped below.
@@ -2155,6 +2894,9 @@ activate_staged_release() {
   ACTIVATION_OLD_SOCKET="$old_socket"
   ACTIVATION_OLD_WORKER_RELEASE="$old_worker_release"
   ACTIVATION_NEW_RELEASE="$RELEASE_ID"
+  if [[ -n "$old_release" || -n "$old_socket" || LEGACY_SERVICE_ACTIVE == 1 ]]; then
+    snapshot_old_console_generation "$old_socket" "$old_release_id"
+  fi
   # Close only the new-request admission barrier, then promote by atomically moving
   # the worker link. Existing HTTP/SSE/WebSocket requests stay pinned to the old
   # process. Link observation demotes its background writers and execs the candidate
@@ -2383,6 +3125,7 @@ WorkingDirectory=${DATA_DIR}
 Environment="CODEX_POOL_DATABASE=${DATABASE_PATH}"
 Environment="CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS}"
 Environment="CODEX_POOL_DATA_DIR=${DATA_DIR%/}/data"
+Environment="CODEX_POOL_INSTALL_DATA_DIR=${DATA_DIR}"
 Environment="CODEX_POOL_SUPER_INSTRUCT_DIR=${APP_DIR%/}/releases/%i/super-instruct/codex-skills"
 Environment="CODEX_POOL_SUPER_INSTRUCT_BRIDGE_FILE=${APP_DIR%/}/releases/%i/super-instruct/bridge.md"
 LoadCredential=master.key:${DATA_DIR%/}/data/keys/master.key
@@ -3061,7 +3804,7 @@ WARP:          ${warp_summary}
 Admin token:   ${admin_token_summary}
 
 Manual run:
-  CODEX_POOL_DATABASE=${DATABASE_PATH} CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS} CODEX_POOL_LISTEN_ADDR=${LISTEN_ADDR} CODEX_POOL_SUPER_INSTRUCT_DIR=${APP_DIR%/}/current/super-instruct/codex-skills CODEX_POOL_SUPER_INSTRUCT_BRIDGE_FILE=${APP_DIR%/}/current/super-instruct/bridge.md${manual_admin_env} ${BIN_DIR}/${APP_NAME} --config ${CONFIG_FILE}${reauth_manual}
+  CODEX_POOL_DATABASE=${DATABASE_PATH} CODEX_POOL_DATA_DIR=${DATA_DIR%/}/data CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS} CODEX_POOL_LISTEN_ADDR=${LISTEN_ADDR} CODEX_POOL_SUPER_INSTRUCT_DIR=${APP_DIR%/}/current/super-instruct/codex-skills CODEX_POOL_SUPER_INSTRUCT_BRIDGE_FILE=${APP_DIR%/}/current/super-instruct/bridge.md${manual_admin_env} ${BIN_DIR}/${APP_NAME} --config ${CONFIG_FILE}${reauth_manual}
 
 Useful service commands:
   systemctl status ${HANDOFF_SERVICE_NAME}.service
@@ -3077,8 +3820,14 @@ EOF
 main() {
   apply_port_overrides
   normalize_migrate_user_groups
-  ensure_project_files
   ensure_absolute_paths
+  validate_deployment_limits
+  if (( STATUS_ONLY == 1 )); then
+    collect_deployment_storage status
+    print_deployment_storage_status
+    return 0
+  fi
+  ensure_project_files
   validate_codex_reauth_settings
   acquire_deploy_lock
   remove_legacy_auxiliary_units
@@ -3087,22 +3836,36 @@ main() {
   trap 'exit 143' TERM
   trap 'exit 129' HUP
   log "Codex skills compatibility: full official skills/plugins/Browser Use support requires the official Codex account path; custom providers are best-effort."
+  cleanup_abandoned_deployment_artifacts
+  prune_console_generations || die "console generation pruning could not satisfy its byte budget"
+  if [[ -d "$BUILD_DIR" ]]; then
+    log "Removing previous release build artifacts ${BUILD_DIR}"
+    run_root rm -rf -- "$BUILD_DIR"
+  fi
+  reclaim_build_caches_under_pressure prebuild
+  enforce_deployment_budget prebuild
   ensure_system_deps
   adopt_interrupted_install_pause
   ensure_go
   build_project
+  enforce_deployment_budget prebuild
   resolve_requested_egress_ports
   prepare_runtime_layout
   install_binary_and_config
+  run_expand_only_migration
   install_sidecar
   install_nodejs
   install_chrome
   install_node_registrar
   install_python_registrar
   install_warp
+  enforce_deployment_budget poststage
   printf '%s\n' "$RELEASE_ID" | run_root tee "${RELEASE_DIR%/}/.staged-ok" >/dev/null
   install_systemd_unit
   open_firewall_port
+  run_root rm -rf -- "$BUILD_DIR"
+  collect_deployment_storage status
+  write_deployment_storage_state
   print_summary
 }
 

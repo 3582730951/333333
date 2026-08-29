@@ -198,6 +198,7 @@ export interface NavProps {
   selectedKeys?: ReadonlyArray<string>;
   isCollapsed?: boolean;
   onClick?: (event: { itemKey: string; group?: boolean }) => void;
+  onIntent?: (event: { itemKey: string }) => void;
   className?: string;
   style?: CSSProperties;
 }

@@ -144,7 +144,7 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 			OSHint:         osHint,
 		}
 	}
-	resp, err := s.upstream.Do(r.Context(), requestForToken(token))
+	resp, err := s.doAccountUpstreamAttempt(r.Context(), requestForToken(token))
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -157,7 +157,7 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 			if refreshed, rerr := s.forceRefreshClaudeToken(r.Context(), lease.Account, "auth_error"); rerr == nil {
 				token = refreshed
 				resp.Body.Close()
-				resp, err = s.upstream.Do(r.Context(), requestForToken(token))
+				resp, err = s.doAccountUpstreamAttempt(r.Context(), requestForToken(token))
 				if err != nil {
 					writeError(w, http.StatusBadGateway, err)
 					return

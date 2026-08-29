@@ -176,6 +176,7 @@ func (s *Server) effectiveSettings(ctx context.Context) map[string]interface{} {
 		"max_concurrent_upstream_effective":     false,
 		"max_concurrent_upstream_note":          "deprecated compatibility field; no process concurrency limit is enforced",
 		"allow_registration":                    s.flagEnabled(ctx, "allow_registration", true),
+		"ui_experience_v2":                      s.flagEnabled(ctx, "ui_experience_v2", true),
 	}
 }
 

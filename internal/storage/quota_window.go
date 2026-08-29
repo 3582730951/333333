@@ -146,6 +146,55 @@ ORDER BY sample_at`, strings.TrimSpace(accountID), strings.TrimSpace(windowKind)
 	return out, rows.Err()
 }
 
+// QuotaWindowCurrentSamplesByAccountIDs returns every requested account's current
+// cycle samples with one grouped query. It is the account-list path; callers compute
+// estimates in Go and avoid two queries per row.
+func (s *Store) QuotaWindowCurrentSamplesByAccountIDs(ctx context.Context, accountIDs []string, windowKind string) (map[string][]QuotaWindowSample, error) {
+	result := make(map[string][]QuotaWindowSample, len(accountIDs))
+	if s == nil || len(accountIDs) == 0 || strings.TrimSpace(windowKind) == "" {
+		return result, nil
+	}
+	seen := make(map[string]struct{}, len(accountIDs))
+	ids := make([]string, 0, len(accountIDs))
+	placeholders := make([]string, 0, len(accountIDs))
+	args := make([]interface{}, 0, len(accountIDs)+1)
+	for _, raw := range accountIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+		placeholders = append(placeholders, "?")
+		args = append(args, id)
+	}
+	if len(ids) == 0 {
+		return result, nil
+	}
+	args = append(args, strings.TrimSpace(windowKind))
+	rows, err := s.rdb.QueryContext(ctx, `
+SELECT s.account_id,s.window_kind,s.cycle_start,s.sample_at,s.used_percent,s.cost_usd,s.unsettled_share
+FROM quota_window_cycles c
+JOIN quota_window_samples s ON s.account_id=c.account_id AND s.window_kind=c.window_kind AND s.cycle_start=c.cycle_start
+WHERE c.account_id IN (`+strings.Join(placeholders, ",")+`) AND c.window_kind=?
+ORDER BY s.account_id,s.sample_at`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sample QuotaWindowSample
+		if err := rows.Scan(&sample.AccountID, &sample.WindowKind, &sample.CycleStart, &sample.SampleAt, &sample.UsedPercent, &sample.CostUSD, &sample.UnsettledShare); err != nil {
+			return nil, err
+		}
+		result[sample.AccountID] = append(result[sample.AccountID], sample)
+	}
+	return result, rows.Err()
+}
+
 // QuotaWindowCurrentCycle returns the cycle pointer most recently recorded by a
 // poll for the account's window kind.
 func (s *Store) QuotaWindowCurrentCycle(ctx context.Context, accountID, windowKind string) (QuotaWindowCycle, bool, error) {

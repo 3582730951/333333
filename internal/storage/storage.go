@@ -104,6 +104,8 @@ type Store struct {
 	apiKeyUsed       sync.Map // key hash -> last persisted minute
 	rateLimitGen     atomic.Uint64
 	affinityGen      atomic.Uint64
+	standbyReadOnly  atomic.Bool
+	warmStandbyMode  atomic.Bool
 }
 
 // ReadQuerier is the common read surface implemented by sql.DB, sql.Conn, and
@@ -1444,17 +1446,24 @@ func Now() int64 {
 }
 
 func (s *Store) Init(ctx context.Context) error {
-	return s.init(ctx, nil)
+	return s.init(ctx, nil, false)
 }
 
 // InitWithProgress is Init with phase notifications for startup supervisors.
 // Notifications are emitted immediately before each bounded schema phase so a
 // stalled upgrade leaves an actionable last-known phase in the service journal.
 func (s *Store) InitWithProgress(ctx context.Context, progress func(string)) error {
-	return s.init(ctx, progress)
+	return s.init(ctx, progress, false)
 }
 
-func (s *Store) init(ctx context.Context, progress func(string)) error {
+// InitExpandOnlyWithProgress applies only schema/table/column/index expansion
+// needed by the candidate release. Runtime defaults, compatibility rewrites,
+// cleanup and repairs remain active-generation work.
+func (s *Store) InitExpandOnlyWithProgress(ctx context.Context, progress func(string)) error {
+	return s.init(ctx, progress, true)
+}
+
+func (s *Store) init(ctx context.Context, progress func(string), expandOnly bool) error {
 	report := func(phase string) {
 		if progress != nil {
 			progress(phase)
@@ -1462,7 +1471,7 @@ func (s *Store) init(ctx context.Context, progress func(string)) error {
 	}
 	if s.driver == "postgres" {
 		report("postgres_schema")
-		return s.initPostgres(ctx)
+		return s.initPostgres(ctx, expandOnly)
 	}
 	report("sqlite_pragmas")
 	if _, err := s.db.ExecContext(ctx, `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA cache_size=-16384; PRAGMA mmap_size=67108864; PRAGMA temp_store=MEMORY; PRAGMA journal_size_limit=67108864; PRAGMA wal_autocheckpoint=2000;`); err != nil {
@@ -1493,6 +1502,10 @@ func (s *Store) init(ctx context.Context, progress func(string)) error {
 	if _, err := s.db.ExecContext(ctx, quotaWindowSchemaSQL); err != nil {
 		return err
 	}
+	report("account_request_rate_schema")
+	if _, err := s.db.ExecContext(ctx, accountRequestRateSchemaSQL); err != nil {
+		return err
+	}
 	// Create lifecycle management tables
 	report("runtime_schemas")
 	if _, err := s.db.ExecContext(ctx, lifecycleSchemaSQL); err != nil {
@@ -1520,6 +1533,10 @@ func (s *Store) init(ctx context.Context, progress func(string)) error {
 	report("goal_storage_accounting")
 	if err := s.migrateGoalContinuityV2(ctx); err != nil {
 		return err
+	}
+	if expandOnly {
+		report("expand_complete")
+		return nil
 	}
 	// Historical usage rollups and legacy billing-event repair are intentionally
 	// deferred until an active listener exists. Their schemas and current-write

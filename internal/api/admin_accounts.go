@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -93,6 +94,7 @@ type accountView struct {
 	CodexReauthAutoEnabled bool                          `json:"codex_reauth_auto_enabled,omitempty"`
 	CodexReauthLastStatus  string                        `json:"codex_reauth_last_status,omitempty"`
 	KiroAuth               *storage.KiroAuthSummary      `json:"kiro_auth,omitempty"`
+	RequestRate            storage.AccountRequestRate    `json:"request_rate"`
 }
 
 type accountImportResponse struct {
@@ -132,6 +134,7 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 		quotaSnapshots map[string][]storage.AccountRateLimit
 		reauthConfigs  map[string]storage.AccountCodexReauthConfig
 		kiroSummaries  map[string]storage.KiroAuthSummary
+		requestRates   map[string]storage.AccountRequestRate
 	)
 	loadCtx, cancelLoads := context.WithCancel(ctx)
 	defer cancelLoads()
@@ -159,6 +162,14 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 		func() (err error) {
 			kiroSummaries, err = s.store.KiroAuthSummariesByAccountIDs(loadCtx, accountIDs)
 			return err
+		},
+		func() error {
+			var rateErr error
+			requestRates, _, rateErr = s.AccountRequestRates(loadCtx, accountIDs)
+			if rateErr != nil {
+				log.Printf("account list request rates degraded: %v", rateErr)
+			}
+			return nil
 		},
 	}
 	var loadWG sync.WaitGroup
@@ -189,6 +200,18 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 	if loadErr != nil {
 		return nil, loadErr
 	}
+	now := storage.Now()
+	quotaSummaries := make([]QuotaSummary, len(accounts))
+	for index, account := range accounts {
+		var token *storage.AccountToken
+		if value, ok := tokens[account.ID]; ok {
+			token = &value
+		}
+		quotaSummaries[index] = BuildQuotaSummary(account, token, quotaSnapshots[account.ID], now)
+	}
+	if err := s.attachQuotaWindowEstimates(ctx, accounts, quotaSummaries, now); err != nil {
+		log.Printf("account list quota window estimates degraded: %v", err)
+	}
 	groupEgresses := make(map[string]string, len(groups))
 	for _, group := range groups {
 		id := strings.TrimSpace(group.DefaultEgressID)
@@ -203,20 +226,19 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 		}
 		groupEgresses[group.Name] = id
 	}
-	now := storage.Now()
 	out := make([]accountView, 0, len(accounts))
-	for _, account := range accounts {
+	for index, account := range accounts {
 		var token *storage.AccountToken
 		if t, ok := tokens[account.ID]; ok {
 			token = &t
 		}
-		summary := BuildQuotaSummary(account, token, quotaSnapshots[account.ID], now)
-		s.attachQuotaWindowEstimate(ctx, account, &summary, now)
+		summary := quotaSummaries[index]
 		view := accountView{
 			Account:      account,
 			Provider:     providers[account.ID],
 			Capabilities: capabilities[account.ID],
 			QuotaSummary: summary,
+			RequestRate:  requestRates[account.ID],
 		}
 		if token != nil {
 			view.AuthMethod = accountprovider.EffectiveAuthMethod(view.Provider, *token)

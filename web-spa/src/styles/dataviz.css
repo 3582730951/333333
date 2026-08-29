@@ -1187,6 +1187,87 @@
   padding-top: var(--pool-space-3);
 }
 
+.pool-frontend-performance__controls {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: var(--pool-space-3);
+  margin-top: var(--pool-space-4);
+}
+
+.pool-frontend-performance {
+  grid-column: 1 / -1;
+}
+
+.pool-sys-deployment-storage {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+.pool-frontend-performance__controls label {
+  display: grid;
+  gap: var(--pool-space-1);
+  color: var(--pool-text-2);
+  font-size: var(--pool-type-caption);
+}
+
+.pool-frontend-performance__controls select {
+  min-width: 148px;
+  min-height: 36px;
+  padding: 0 var(--pool-space-3);
+  color: var(--pool-text-1);
+  background: var(--pool-bg-material-strong);
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-control);
+}
+
+.pool-sys-deployment-storage__draining {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.pool-sys-deployment-storage__draining > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--pool-border) 82%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--pool-surface-raised) 72%, transparent);
+  font-size: 12px;
+}
+
+.pool-sys-deployment-storage__draining code {
+  max-width: 42%;
+  overflow: hidden;
+  color: var(--pool-text-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-sys-deployment-storage__draining span {
+  color: var(--pool-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.pool-frontend-performance__controls select:focus-visible {
+  outline: 2px solid var(--pool-focus-ring);
+  outline-offset: 2px;
+}
+
+@media (max-width: 560px) {
+  .pool-frontend-performance__controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .pool-frontend-performance__controls select {
+    width: 100%;
+  }
+}
+
 .pool-sys-guard__note {
   margin-top: var(--pool-space-2);
   color: var(--pool-text-3);
