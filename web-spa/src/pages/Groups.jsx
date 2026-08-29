@@ -199,6 +199,7 @@ function blankUserGroup() {
     block_gpt_target_groups: [],
     traffic_fallback_groups: blankTrafficFallbackGroups(),
     traffic_fallback_model_mappings: [],
+    pinned_egress_no_fallback: false,
     target_keys: [],
     model_routing: [],
   };
@@ -244,6 +245,7 @@ function userGroupDraft(row) {
       target_user_group_id: String(mapping.target_user_group_id || ''),
       target_model: String(mapping.target_model || ''),
     })),
+    pinned_egress_no_fallback: Boolean(row.pinned_egress_no_fallback),
     model_routing: (row.model_routing || []).map((rule) => ({
       model: rule.model || '',
       tiers: (rule.tiers || []).map((tier) => (tier || []).map(targetKey)),
@@ -310,6 +312,7 @@ function normalizedUserGroupPayload(draft, providers = []) {
       .filter((groupName) => selectedAccountGroups.has(groupName)),
     traffic_fallback_groups: trafficFallbackGroups,
     traffic_fallback_model_mappings: trafficFallbackModelMappings,
+    pinned_egress_no_fallback: Boolean(draft.pinned_egress_no_fallback),
     targets,
     model_routing: (draft.model_routing || []).filter((rule) => String(rule.model || '').trim()).map((rule) => {
       const mentioned = new Set();
@@ -897,6 +900,10 @@ function UserGroupEditor({
           </label>
           <Form.Input label="强制模型（可选）" value={draft.force_model} onChange={(force_model) => setDraft((current) => ({ ...current, force_model }))} placeholder="尊重客户端模型" />
           <Form.Select label="强制 effort（可选）" value={draft.force_effort} onChange={(force_effort) => setDraft((current) => ({ ...current, force_effort }))} optionList={EFFORTS.map((value) => ({ label: value || '不强制', value }))} />
+          <label className="pool-inline-switch">
+            <Switch checked={draft.pinned_egress_no_fallback} onChange={(value) => setDraft((current) => ({ ...current, pinned_egress_no_fallback: value }))} />
+            <span>出口固定·不回退（出错不切换流量/出口/账号）</span>
+          </label>
         </div>
         <div className="pool-instruction-profiles">
           {INSTRUCTION_FAMILIES.map((family) => {

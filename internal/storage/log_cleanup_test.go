@@ -83,6 +83,49 @@ func TestLogRetentionAndManualClearPreserveActiveBillingHolds(t *testing.T) {
 	}
 }
 
+func TestReclaimLogStorageUsesIncrementalVacuumWhenPrepared(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, err := store.DB().ExecContext(ctx, `PRAGMA auto_vacuum=INCREMENTAL`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `VACUUM`); err != nil {
+		t.Fatal(err)
+	}
+	var mode int
+	if err := store.DB().QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&mode); err != nil || mode != 2 {
+		t.Fatalf("auto_vacuum mode=%d err=%v, want INCREMENTAL (2)", mode, err)
+	}
+	if err := store.SetSetting(ctx, sqliteIncrementalVacuumSetting, "true"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `CREATE TABLE incremental_vacuum_probe(id INTEGER PRIMARY KEY, payload BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<512) INSERT INTO incremental_vacuum_probe(payload) SELECT zeroblob(4096) FROM n`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `DELETE FROM incremental_vacuum_probe`); err != nil {
+		t.Fatal(err)
+	}
+	var before, after int64
+	if err := store.DB().QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if before == 0 {
+		t.Fatal("fixture did not create reclaimable SQLite pages")
+	}
+	if err := store.ReclaimLogStorage(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after >= before {
+		t.Fatalf("incremental vacuum freelist=%d, want less than %d", after, before)
+	}
+}
+
 func assertTableCount(t *testing.T, store *Store, table string, want int64) {
 	t.Helper()
 	var got int64

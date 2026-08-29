@@ -42,6 +42,7 @@ func (s *Server) handleCustomProviderPassthroughWithModel(
 	routeModel string,
 	raw []byte,
 ) {
+	r = r.WithContext(withPinnedEgressPolicy(r.Context(), policy.PinnedEgressNoFallback))
 	switch r.Method {
 	case http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodPut, http.MethodPatch, http.MethodHead:
 	default:
@@ -100,13 +101,15 @@ func (s *Server) handleCustomProviderPassthroughWithModel(
 		}
 	}
 
+	pinnedNoFallback := policy.PinnedEgressNoFallback || pinnedEgressNoFallbackFromContext(r.Context())
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
 		Group:             policy.Group,
 		Provider:          provider.ID,
 		Model:             routeModel,
 		EstimatedTokens:   virtual.EstimateTokensJSON(raw),
 		Affinity:          affinity,
-		ImmutableAffinity: immutableResource,
+		ImmutableAffinity: immutableResource || pinnedNoFallback,
+		NoEgressFallback:  pinnedNoFallback,
 		SkipWait:          userGroupFallbackProbe(r.Context()),
 	})
 	if err != nil {

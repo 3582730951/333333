@@ -327,6 +327,16 @@ func configFields() []configField {
 			Help: "同账号已有在途请求时允许叠加的估算输入 token 上限；0=关闭。", boot: func(c config.Config) interface{} { return int(c.AccountTokenBudget) }},
 		{Key: "resource_headroom_percent", Label: "资源安全余量", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "CPU、内存或 FD 达到安全线时暂停新准入；最小 10%。", boot: func(c config.Config) interface{} { return c.ResourceHeadroomPercent }},
+		{Key: "admission_cpu_enabled", Label: "准入 CPU 阀门", Category: catLimits, Type: fieldBool, Effect: effectScheduler,
+			Help: "灰度开关：关闭后准入仍严格受内存和 FD 安全线保护，但 CPU 满载不会暂停健康请求。默认开启。", boot: func(c config.Config) interface{} { return c.AdmissionCPUEnabled }},
+		{Key: "sse_flush_batch_bytes", Label: "SSE 微批字节数", Category: catLimits, Type: fieldInt, Effect: effectHot,
+			Help: "流式响应达到该完整帧字节数时立即 flush，默认 4096。", boot: func(c config.Config) interface{} { return c.SSEFlushBatchBytes }},
+		{Key: "sse_flush_max_delay_millis", Label: "SSE 最大延迟毫秒", Category: catLimits, Type: fieldInt, Effect: effectHot,
+			Help: "首帧后的 SSE 微批最长等待时间，默认 3 毫秒；可调为 0–1 毫秒降低延迟。", boot: func(c config.Config) interface{} { return c.SSEFlushMaxDelayMillis }},
+		{Key: "sse_tail_flush_bytes", Label: "SSE 尾部 flush 字节数", Category: catLimits, Type: fieldInt, Effect: effectHot,
+			Help: "未完成 SSE 帧达到该大小时强制写出，默认 8192。", boot: func(c config.Config) interface{} { return c.SSETailFlushBytes }},
+		{Key: "sqlite_incremental_vacuum_enabled", Label: "SQLite 增量回收", Category: catLimits, Type: fieldBool, Effect: effectRestart,
+			Help: "谨慎开关：仅当 SQLite 已在维护窗口切换为 auto_vacuum=INCREMENTAL 后执行增量回收；默认关闭，不改变现有 VACUUM。", boot: func(c config.Config) interface{} { return c.SQLiteIncrementalVacuumEnabled }},
 		{Key: "connect_timeout_seconds", Label: "连接阶段超时（秒）", Category: catLimits, Type: fieldInt, Effect: effectUpstream,
 			Help: "仅限制 DNS/TCP/HTTP CONNECT/SOCKS/TLS 建连，默认 12 秒；不缩短长推理和 SSE 读取超时。允许 1–60。", boot: func(c config.Config) interface{} { return c.ConnectTimeoutSeconds }},
 		{Key: "scheduler_index_enabled", Label: "调度索引 v2", Category: catLimits, Type: fieldBool, Effect: effectScheduler,
@@ -357,6 +367,8 @@ func configFields() []configField {
 			Help: "压缩、账号等待及恢复期间的目标运行心跳，默认 15 秒。", boot: func(c config.Config) interface{} { return c.GoalHeartbeatSeconds }},
 		{Key: "goal_compression_concurrency", Label: "目标压缩并发", Category: catLimits, Type: fieldInt, Effect: effectHot,
 			Help: "全局可同时执行的目标压缩作业数，默认 1。", boot: func(c config.Config) interface{} { return c.GoalCompressionConcurrency }},
+		{Key: "goal_chunk_format_v2", Label: "目标整段压缩格式", Category: catLimits, Type: fieldBool, Effect: effectHot,
+			Help: "灰度启用整段 gzip 后再按 64KiB 分块加密；默认关闭，旧分块格式仍可读取。", boot: func(c config.Config) interface{} { return c.GoalChunkFormatV2 }},
 		{Key: "codex_session_mapping_enabled", Label: "Codex 会话映射", Category: catLimits, Type: fieldBool, Effect: effectHot,
 			Help: "用于固定连接 WebSocket 和显式兼容模式的加密 UUIDv7 映射。HTTP 无状态直通开启时优先，不会建立或使用上游 continuation 映射。", boot: func(c config.Config) interface{} { return c.CodexSessionMappingEnabled }},
 		{Key: "codex_session_mapping_retention_days", Label: "Codex 映射保留天数", Category: catLimits, Type: fieldInt, Effect: effectHot,
@@ -621,6 +633,11 @@ func (s *Server) effectiveSchedulerConfig(ctx context.Context) config.Config {
 	c.StatefulStickyWaitSeconds = s.settingInt(ctx, "stateful_sticky_wait_seconds", c.StatefulStickyWaitSeconds)
 	c.AccountTokenBudget = s.settingInt64(ctx, "account_token_budget", c.AccountTokenBudget)
 	c.ResourceHeadroomPercent = s.settingInt(ctx, "resource_headroom_percent", c.ResourceHeadroomPercent)
+	c.AdmissionCPUEnabled = s.flagEnabled(ctx, "admission_cpu_enabled", c.AdmissionCPUEnabled)
+	c.SSEFlushBatchBytes = s.settingInt(ctx, "sse_flush_batch_bytes", c.SSEFlushBatchBytes)
+	c.SSEFlushMaxDelayMillis = s.settingInt(ctx, "sse_flush_max_delay_millis", c.SSEFlushMaxDelayMillis)
+	c.SSETailFlushBytes = s.settingInt(ctx, "sse_tail_flush_bytes", c.SSETailFlushBytes)
+	setSSEFlushSettings(c.SSEFlushBatchBytes, c.SSEFlushMaxDelayMillis, c.SSETailFlushBytes)
 	c.SchedulerIndexEnabled = s.flagEnabled(ctx, "scheduler_index_enabled", c.SchedulerIndexEnabled)
 	c.StrictStickyMaxCooldownSeconds = s.settingInt(ctx, "strict_sticky_max_cooldown_seconds", c.StrictStickyMaxCooldownSeconds)
 	c.CooldownWaitMaxSeconds = s.settingInt(ctx, "cooldown_wait_max_seconds", c.CooldownWaitMaxSeconds)
@@ -637,6 +654,15 @@ func (s *Server) effectiveSchedulerConfig(ctx context.Context) config.Config {
 	if c.ResourceHeadroomPercent < 10 {
 		c.ResourceHeadroomPercent = 10
 	}
+	if c.SSEFlushBatchBytes <= 0 {
+		c.SSEFlushBatchBytes = 4 * 1024
+	}
+	if c.SSEFlushMaxDelayMillis < 0 {
+		c.SSEFlushMaxDelayMillis = 3
+	}
+	if c.SSETailFlushBytes <= 0 {
+		c.SSETailFlushBytes = 8 * 1024
+	}
 	if c.StrictStickyMaxCooldownSeconds < 0 {
 		c.StrictStickyMaxCooldownSeconds = 0
 	}
@@ -647,6 +673,29 @@ func (s *Server) effectiveSchedulerConfig(ctx context.Context) config.Config {
 		c.SchedulerHeartbeatSeconds = 15
 	}
 	return c
+}
+
+func isSSEFlushSetting(key string) bool {
+	switch key {
+	case "sse_flush_batch_bytes", "sse_flush_max_delay_millis", "sse_tail_flush_bytes":
+		return true
+	default:
+		return false
+	}
+}
+
+// refreshSSEFlushSettings applies the three API-stream knobs immediately after a
+// settings write. They are classified as effectHot (rather than scheduler-owned),
+// so this explicit hook is needed when a PATCH changes only SSE values.
+func (s *Server) refreshSSEFlushSettings(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	setSSEFlushSettings(
+		s.settingInt(ctx, "sse_flush_batch_bytes", s.cfg.SSEFlushBatchBytes),
+		s.settingInt(ctx, "sse_flush_max_delay_millis", s.cfg.SSEFlushMaxDelayMillis),
+		s.settingInt(ctx, "sse_tail_flush_bytes", s.cfg.SSETailFlushBytes),
+	)
 }
 
 // settingsViewJSON renders the registry with each field's current effective value and
@@ -695,6 +744,7 @@ func (s *Server) applySettingsPatch(ctx context.Context, body map[string]interfa
 	updates := make(map[string]string, len(body))
 	changedUpstream := false
 	changedScheduler := false
+	changedSSE := false
 	for k, v := range body {
 		f, ok := configFieldByKey(k)
 		if !ok {
@@ -714,6 +764,9 @@ func (s *Server) applySettingsPatch(ctx context.Context, body map[string]interfa
 		if f.Effect == effectScheduler {
 			changedScheduler = true
 		}
+		if isSSEFlushSetting(k) {
+			changedSSE = true
+		}
 	}
 	if changedUpstream {
 		if err := s.persistAndPublishEffectiveUpstreamConfig(ctx, func(ctx context.Context) error {
@@ -726,6 +779,8 @@ func (s *Server) applySettingsPatch(ctx context.Context, body map[string]interfa
 	}
 	if changedScheduler && s.scheduler != nil {
 		s.scheduler.UpdateConfig(s.effectiveSchedulerConfig(ctx))
+	} else if changedSSE {
+		s.refreshSSEFlushSettings(ctx)
 	}
 	s.handleCompatibilityManifestSettings(ctx, body)
 	return changedUpstream, nil
@@ -930,13 +985,17 @@ func validateSettingValue(f configField, v interface{}) (string, error) {
 			return "", fmt.Errorf("must be greater than 0 and less than 1")
 		}
 		return raw, nil
-	case "sticky_wait_millis", "scheduler_heartbeat_seconds":
+	case "sticky_wait_millis", "scheduler_heartbeat_seconds", "sse_flush_batch_bytes", "sse_flush_max_delay_millis", "sse_tail_flush_bytes":
 		raw, err := validateIntegerSetting(v)
 		if err != nil {
 			return "", err
 		}
 		n, _ := strconv.ParseInt(raw, 10, 64)
-		if n <= 0 {
+		if f.Key == "sse_flush_max_delay_millis" {
+			if n < 0 || n > 1000 {
+				return "", fmt.Errorf("must be between 0 and 1000")
+			}
+		} else if n <= 0 {
 			return "", fmt.Errorf("must be greater than 0")
 		}
 		return raw, nil

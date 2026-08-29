@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 )
+
+const sqliteIncrementalVacuumSetting = "sqlite_incremental_vacuum_enabled"
 
 // LogRecordCounts describes the disposable observability/history rows managed by
 // the unified log-retention policy. Active billing holds are deliberately excluded:
@@ -180,8 +183,38 @@ func (s *Store) ReclaimLogStorage(ctx context.Context) error {
 	if err := s.CheckpointLogStorage(ctx); err != nil {
 		return err
 	}
+	if s.incrementalVacuumEnabled(ctx) {
+		var mode int
+		if err := s.db.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+			return err
+		}
+		// SQLite only performs incremental_vacuum when the file was explicitly
+		// prepared with auto_vacuum=INCREMENTAL (mode 2). Do not silently issue a
+		// costly migration VACUUM here; operators must schedule that one-time step.
+		if mode == 2 {
+			if _, err := s.db.ExecContext(ctx, `PRAGMA incremental_vacuum`); err != nil {
+				return err
+			}
+			return s.CheckpointLogStorage(ctx)
+		}
+	}
 	if _, err := s.db.ExecContext(ctx, `VACUUM`); err != nil {
 		return err
 	}
 	return s.CheckpointLogStorage(ctx)
+}
+
+func (s *Store) incrementalVacuumEnabled(ctx context.Context) bool {
+	if s == nil || s.db == nil {
+		return false
+	}
+	value, ok, err := s.GetSetting(ctx, sqliteIncrementalVacuumSetting)
+	if err != nil {
+		return false
+	}
+	if !ok {
+		return s.sqliteIncrementalVacuumDefault
+	}
+	enabled, err := strconv.ParseBool(value)
+	return err == nil && enabled
 }

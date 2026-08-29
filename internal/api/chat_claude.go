@@ -75,7 +75,11 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	affinityEstablished := affinity.Hash != "" && affinityBindingErr == nil && existingAffinity.Provider != "" && existingAffinity.Model != "" && existingAffinity.EgressID != ""
 	exclude := map[string]bool{}
 	explicitKiro := routeMode == "kiro"
-	immutableAffinity := affinityEstablished && explicitKiro
+	// A pinned user group treats the first successful account/egress choice as
+	// durable identity too.  Even when this is an automatic Claude route (rather
+	// than an explicit Kiro session), an upstream error must not rebind the
+	// conversation to another account.
+	immutableAffinity := pol.PinnedEgressNoFallback || (affinityEstablished && explicitKiro)
 	kiroCfg := s.effectiveKiroConfig(r.Context())
 	// Kiro is never allowed to run with thinking disabled. The flag is harmless
 	// for official Claude candidates and filters Kiro to thinking-capable models.
@@ -84,6 +88,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	for {
 		lease, err = s.scheduler.Select(r.Context(), scheduler.Route{
 			Group:                 routeGroup,
+			NoEgressFallback:      pol.PinnedEgressNoFallback,
 			AllowedProviders:      allowedProviders,
 			Affinity:              affinity,
 			AffinityWait:          kiroAffinityWait(r.Context(), s, allowedProviders),
@@ -258,6 +263,9 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 			maxAttempts := s.settingInt(r.Context(), "failover_max_attempts", s.cfg.FailoverMaxAttempts)
 			if maxAttempts < 2 {
 				maxAttempts = 2
+			}
+			if pol.PinnedEgressNoFallback {
+				maxAttempts = 1
 			}
 			retryCount := chatClaudeModelRetryCount(r.Context())
 			if retryCount+1 < maxAttempts && !refreshHeartbeat.Committed() {

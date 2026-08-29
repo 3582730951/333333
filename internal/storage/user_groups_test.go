@@ -30,6 +30,7 @@ func TestUserGroupCRUD(t *testing.T) {
 		SuperInstructMemoryEnabled:          true,
 		SuperInstructMonitorEnabled:         true,
 		ForceModel:                          "", ForceEffort: "",
+		PinnedEgressNoFallback:  true,
 		BlockClaudeTargetGroups: []string{"claude-pool"},
 		BlockGPTTargetGroups:    []string{"gpt-pool"},
 	}
@@ -64,6 +65,9 @@ func TestUserGroupCRUD(t *testing.T) {
 		!reflect.DeepEqual(got.BlockGPTTargetGroups, []string{"gpt-pool"}) {
 		t.Errorf("target-family blocks not persisted: claude=%v gpt=%v", got.BlockClaudeTargetGroups, got.BlockGPTTargetGroups)
 	}
+	if !got.PinnedEgressNoFallback {
+		t.Error("pinned egress no-fallback flag was not persisted")
+	}
 
 	// Get by name
 	got2, ok2, err2 := s.GetUserGroupByName(ctx, "mygroup")
@@ -85,6 +89,9 @@ func TestUserGroupCRUD(t *testing.T) {
 	got3, _, _ := s.GetUserGroup(ctx, "ug_test001")
 	if got3.SystemPrompt != "Updated." {
 		t.Errorf("update not persisted: %q", got3.SystemPrompt)
+	}
+	if !got3.PinnedEgressNoFallback {
+		t.Error("pinned egress no-fallback flag was lost during update")
 	}
 
 	// Delete

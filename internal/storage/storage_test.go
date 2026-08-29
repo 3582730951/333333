@@ -45,6 +45,24 @@ func TestInitCreatesCyberGroupAndDirectEgress(t *testing.T) {
 	}
 }
 
+func TestSQLiteSpacePragmasAreApplied(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	var journalLimit, autoCheckpoint int64
+	if err := store.DB().QueryRowContext(ctx, `PRAGMA journal_size_limit`).Scan(&journalLimit); err != nil {
+		t.Fatalf("read journal_size_limit: %v", err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `PRAGMA wal_autocheckpoint`).Scan(&autoCheckpoint); err != nil {
+		t.Fatalf("read wal_autocheckpoint: %v", err)
+	}
+	if journalLimit != 64<<20 {
+		t.Fatalf("journal_size_limit=%d, want %d", journalLimit, int64(64<<20))
+	}
+	if autoCheckpoint != 2000 {
+		t.Fatalf("wal_autocheckpoint=%d, want 2000", autoCheckpoint)
+	}
+}
+
 func TestCodexHTTPStatelessMigrationUpdatesOnlyLegacyStableProfileOnce(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

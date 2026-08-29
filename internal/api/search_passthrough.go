@@ -36,6 +36,7 @@ func (s *Server) handleSearchPassthrough(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	r = r.WithContext(withPinnedEgressPolicy(r.Context(), policy.PinnedEgressNoFallback))
 	r = s.withIntelligentRoutingFallbacks(r, policy)
 	resolvedRaw := originalRaw
 	if policy.ForceModel != "" {
@@ -173,6 +174,7 @@ func (s *Server) customProviderForSearchModel(
 	model, group string,
 	body []byte,
 ) (storage.CustomProvider, bool) {
+	pinnedNoFallback := pinnedEgressNoFallbackFromContext(ctx)
 	candidates := s.customProvidersForModel(ctx, model)
 	// An explicit path route is positive operator evidence that the provider
 	// implements this proprietary extension. Keep wildcard passthrough ahead of
@@ -190,11 +192,13 @@ func (s *Server) customProviderForSearchModel(
 			targetModel = model
 		}
 		lease, err := s.scheduler.Select(ctx, scheduler.Route{
-			Group:           group,
-			Provider:        provider.ID,
-			Model:           targetModel,
-			EstimatedTokens: virtual.EstimateTokensJSON(body),
-			SkipWait:        true,
+			Group:             group,
+			Provider:          provider.ID,
+			Model:             targetModel,
+			EstimatedTokens:   virtual.EstimateTokensJSON(body),
+			ImmutableAffinity: pinnedNoFallback,
+			NoEgressFallback:  pinnedNoFallback,
+			SkipWait:          true,
 		})
 		if err != nil {
 			continue

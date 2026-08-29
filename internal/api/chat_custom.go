@@ -116,17 +116,20 @@ func customProviderSupportsProtocol(provider storage.CustomProvider, protocol st
 // custom candidate is unavailable, ok=false deliberately lets automatic routing
 // continue to the built-in Codex/Claude providers.
 func (s *Server) customProviderForModel(ctx context.Context, model, group string, body []byte) (storage.CustomProvider, bool) {
+	pinnedNoFallback := pinnedEgressNoFallbackFromContext(ctx)
 	for _, provider := range s.customProvidersForModel(ctx, model) {
 		targetModel, mapped := customProviderMappedModel(provider, model)
 		if !mapped {
 			targetModel = model
 		}
 		lease, err := s.scheduler.Select(ctx, scheduler.Route{
-			Group:           group,
-			Provider:        provider.ID,
-			Model:           targetModel,
-			EstimatedTokens: virtual.EstimateTokensJSON(body),
-			SkipWait:        true,
+			Group:             group,
+			Provider:          provider.ID,
+			Model:             targetModel,
+			EstimatedTokens:   virtual.EstimateTokensJSON(body),
+			ImmutableAffinity: pinnedNoFallback,
+			NoEgressFallback:  pinnedNoFallback,
+			SkipWait:          true,
 		})
 		if err != nil {
 			continue
@@ -541,6 +544,9 @@ func (s *Server) callCustom(w http.ResponseWriter, r *http.Request, provider sto
 	if attempts < 1 {
 		attempts = 1
 	}
+	if pinnedEgressNoFallbackFromContext(r.Context()) {
+		attempts = 1
+	}
 	return s.callCustomAttempt(w, r, provider, body, model, routeGroup, proto, upstreamPath, map[string]bool{}, attempts)
 }
 
@@ -569,14 +575,17 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 	// request context. This keeps Codex prompt_cache_key/thread hierarchies and
 	// Claude Code session identifiers stable across protocol conversion.
 	affinity := customProviderScopedAffinity(r, provider, customProviderProtocolAffinity(r, body, proto))
+	pinnedNoFallback := pinnedEgressNoFallbackFromContext(r.Context())
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
-		Group:           routeGroup,
-		Provider:        provider.ID,
-		Affinity:        affinity,
-		Model:           model,
-		EstimatedTokens: virtual.EstimateTokensJSON(body),
-		Exclude:         exclude,
-		SkipWait:        userGroupFallbackProbe(r.Context()),
+		Group:             routeGroup,
+		Provider:          provider.ID,
+		Affinity:          affinity,
+		Model:             model,
+		EstimatedTokens:   virtual.EstimateTokensJSON(body),
+		Exclude:           exclude,
+		ImmutableAffinity: pinnedNoFallback,
+		NoEgressFallback:  pinnedNoFallback,
+		SkipWait:          userGroupFallbackProbe(r.Context()),
 	})
 	if err != nil {
 		status, _ := noAccountHTTPStatus(err)
@@ -680,7 +689,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 	// Failover may choose another account, but it may not rotate this account onto a
 	// group/provider/standby outlet and thereby change its network identity.
 	attemptBodyHash := diagnosticBodyHash(body)
-	replaySafe := !routing.HasServerSideState(upstreamPath, r, body) && !routing.IsStrictSticky(upstreamPath, r, body)
+	replaySafe := !pinnedNoFallback && !routing.HasServerSideState(upstreamPath, r, body) && !routing.IsStrictSticky(upstreamPath, r, body)
 	resp, requestErr, _ := s.doAccountCredentialRetry(r.Context(), lease.Account, replaySafe, func() (*upstream.Response, error) {
 		return s.upstream.Do(r.Context(), upstream.Request{
 			Method:           http.MethodPost,
@@ -756,7 +765,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 		if ruleMatched {
 			switch decision.Match.DownstreamAction {
 			case upstreamrules.DownstreamActionFailover:
-				if attemptsRemaining > 1 {
+				if !pinnedNoFallback && attemptsRemaining > 1 {
 					if exclude != nil {
 						exclude[lease.Account.ID] = true
 					}
@@ -782,7 +791,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 				}
 			}
 		}
-		if accountRetryable && attemptsRemaining > 1 {
+		if !pinnedNoFallback && accountRetryable && attemptsRemaining > 1 {
 			if exclude != nil {
 				exclude[lease.Account.ID] = true
 			}

@@ -176,6 +176,9 @@ func (s *Scheduler) SelectAcross(ctx context.Context, choices []RouteChoice) (Ro
 }
 
 func (s *Scheduler) normalizeAcrossRoute(ctx context.Context, route *Route) error {
+	if route.NoEgressFallback {
+		route.ImmutableAffinity = true
+	}
 	if route.Group == "" {
 		route.Group = s.Config().DefaultGroup
 	}

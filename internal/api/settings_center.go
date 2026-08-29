@@ -53,6 +53,7 @@ type settingsCenterWritePlan struct {
 	diffs            []settingsCenterDiff
 	changedUpstream  bool
 	changedScheduler bool
+	changedSSE       bool
 }
 
 func newSettingsCenterWritePlan() *settingsCenterWritePlan {
@@ -191,6 +192,8 @@ func (s *Server) settingsCenterPost(w http.ResponseWriter, r *http.Request) {
 	}
 	if plan.changedScheduler && s.scheduler != nil {
 		s.scheduler.UpdateConfig(s.effectiveSchedulerConfig(ctx))
+	} else if plan.changedSSE {
+		s.refreshSSEFlushSettings(ctx)
 	}
 
 	writeJSON(w, http.StatusOK, settingsCenterSaveResp{Saved: plan.diffs})
@@ -329,6 +332,9 @@ func (s *Server) planConfigPatch(ctx context.Context, plan *settingsCenterWriteP
 		}
 		if f.Effect == effectScheduler {
 			plan.changedScheduler = true
+		}
+		if isSSEFlushSetting(k) {
+			plan.changedSSE = true
 		}
 		plan.appendDiffs(settingsCenterDiff{
 			Section:  "config",
@@ -1281,6 +1287,8 @@ func (s *Server) handleSettingsCenterTemplate(w http.ResponseWriter, r *http.Req
 			}
 			if plan.changedScheduler && s.scheduler != nil {
 				s.scheduler.UpdateConfig(s.effectiveSchedulerConfig(r.Context()))
+			} else if plan.changedSSE {
+				s.refreshSSEFlushSettings(r.Context())
 			}
 			out := cloneSettingsMap(t)
 			out["saved"] = plan.diffs

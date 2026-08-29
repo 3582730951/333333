@@ -51,6 +51,13 @@ var (
 type Store struct {
 	path   string
 	driver string
+	// sqliteIncrementalVacuumDefault is the boot-config value used when the
+	// settings table has no operator override. Runtime settings still take
+	// precedence, so an explicit false can turn the feature back off.
+	sqliteIncrementalVacuumDefault bool
+	// goalChunkFormatV2Default is the boot-config fallback used until an
+	// operator stores an explicit runtime setting.
+	goalChunkFormatV2Default bool
 	// db is the single-connection WRITE pool. SQLite permits only one writer at a
 	// time, so funneling every write through one connection means our own
 	// concurrency never collides into SQLITE_BUSY. Init() sets WAL/synchronous on it.
@@ -267,6 +274,10 @@ type UserGroup struct {
 	ModelRouting                 []ModelRoutingRule            `json:"model_routing"`
 	CreatedAt                    int64                         `json:"created_at"`
 	UpdatedAt                    int64                         `json:"updated_at"`
+	// PinnedEgressNoFallback keeps requests in this user group on the selected
+	// account/primary egress when an upstream error occurs. It is opt-in and
+	// defaults to false so existing groups retain seamless failover behavior.
+	PinnedEgressNoFallback bool `json:"pinned_egress_no_fallback"`
 }
 
 const (
@@ -1454,7 +1465,7 @@ func (s *Store) init(ctx context.Context, progress func(string)) error {
 		return s.initPostgres(ctx)
 	}
 	report("sqlite_pragmas")
-	if _, err := s.db.ExecContext(ctx, `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA cache_size=-16384; PRAGMA mmap_size=67108864; PRAGMA temp_store=MEMORY;`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA cache_size=-16384; PRAGMA mmap_size=67108864; PRAGMA temp_store=MEMORY; PRAGMA journal_size_limit=67108864; PRAGMA wal_autocheckpoint=2000;`); err != nil {
 		return err
 	}
 	report("base_schema")
@@ -3216,6 +3227,7 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
 		`ALTER TABLE user_groups ADD COLUMN block_gpt_target_groups TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE user_groups ADD COLUMN traffic_fallback_groups_json TEXT NOT NULL DEFAULT '{}'`,
 		`ALTER TABLE user_groups ADD COLUMN traffic_fallback_model_mappings_json TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE user_groups ADD COLUMN pinned_egress_no_fallback INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE api_keys ADD COLUMN user_group_id TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_api_keys_user_group ON api_keys(user_group_id) WHERE user_group_id <> ''`,
 		// Antigravity explicit cache entries: tracks Gemini CachedContent resources
@@ -3648,13 +3660,14 @@ func (s *Store) DeleteGroup(ctx context.Context, name string) error {
 
 // ── UserGroup CRUD ──────────────────────────────────────────────────────────
 
-const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at`
+const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback`
 
 func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
 	var g UserGroup
 	var apply, miEnabled, superEnabled, superResponseRewriteEnabled, superMemoryEnabled, superMonitorEnabled int
 	var filesJSON, profilesJSON, superSkillIDsJSON, superProfilesJSON, blockClaudeJSON, blockGPTJSON, fallbackGroupsJSON, fallbackMappingsJSON, routingJSON string
-	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &superEnabled, &superSkillIDsJSON, &superProfilesJSON, &superResponseRewriteEnabled, &superMemoryEnabled, &superMonitorEnabled, &g.ForceModel, &g.ForceEffort, &blockClaudeJSON, &blockGPTJSON, &fallbackGroupsJSON, &fallbackMappingsJSON, &routingJSON, &g.CreatedAt, &g.UpdatedAt)
+	var pinnedNoFallback int
+	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &superEnabled, &superSkillIDsJSON, &superProfilesJSON, &superResponseRewriteEnabled, &superMemoryEnabled, &superMonitorEnabled, &g.ForceModel, &g.ForceEffort, &blockClaudeJSON, &blockGPTJSON, &fallbackGroupsJSON, &fallbackMappingsJSON, &routingJSON, &g.CreatedAt, &g.UpdatedAt, &pinnedNoFallback)
 	g.SystemPromptApplyToCompaction = apply != 0
 	g.ModelInstructionsEnabled = miEnabled != 0
 	g.ModelInstructionsFiles = decodeStringList(filesJSON)
@@ -3665,6 +3678,7 @@ func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
 	g.SuperInstructResponseRewriteEnabled = superResponseRewriteEnabled != 0
 	g.SuperInstructMemoryEnabled = superMemoryEnabled != 0
 	g.SuperInstructMonitorEnabled = superMonitorEnabled != 0
+	g.PinnedEgressNoFallback = pinnedNoFallback != 0
 	g.BlockClaudeTargetGroups = decodeStringList(blockClaudeJSON)
 	g.BlockGPTTargetGroups = decodeStringList(blockGPTJSON)
 	if err == nil {
@@ -3827,9 +3841,9 @@ func (s *Store) CreateUserGroup(ctx context.Context, g UserGroup) error {
 	}
 	g.UpdatedAt = now
 	routingJSON := encodeModelRouting(g.ModelRouting)
-	_, err = s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO NOTHING`,
-		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), routingJSON, g.CreatedAt, g.UpdatedAt)
+		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), routingJSON, g.CreatedAt, g.UpdatedAt, boolInt(g.PinnedEgressNoFallback))
 	return err
 }
 
@@ -4341,8 +4355,8 @@ func (s *Store) CreateUserGroupDefinition(ctx context.Context, g UserGroup) erro
 		g.CreatedAt = now
 	}
 	g.UpdatedAt = now
-	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt, boolInt(g.PinnedEgressNoFallback)); err != nil {
 		return err
 	}
 	if err := insertUserGroupTargets(ctx, tx, g, now); err != nil {
@@ -4364,8 +4378,8 @@ func (s *Store) ReplaceUserGroupDefinition(ctx context.Context, g UserGroup) err
 		return err
 	}
 	now := Now()
-	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, super_instruct_enabled=?, super_instruct_skill_ids=?, super_instruct_profiles=?, super_instruct_response_rewrite_enabled=?, super_instruct_memory_enabled=?, super_instruct_monitor_enabled=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, updated_at=? WHERE id=?`,
-		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), now, g.ID)
+	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, super_instruct_enabled=?, super_instruct_skill_ids=?, super_instruct_profiles=?, super_instruct_response_rewrite_enabled=?, super_instruct_memory_enabled=?, super_instruct_monitor_enabled=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, pinned_egress_no_fallback=?, updated_at=? WHERE id=?`,
+		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), boolInt(g.PinnedEgressNoFallback), now, g.ID)
 	if err != nil {
 		return err
 	}
@@ -4395,8 +4409,8 @@ func (s *Store) UpdateUserGroup(ctx context.Context, g UserGroup) error {
 		return err
 	}
 	g.SuperInstructProfiles = superProfiles
-	_, err = s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, super_instruct_enabled=?, super_instruct_skill_ids=?, super_instruct_profiles=?, super_instruct_response_rewrite_enabled=?, super_instruct_memory_enabled=?, super_instruct_monitor_enabled=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, updated_at=? WHERE id=?`,
-		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), Now(), g.ID)
+	_, err = s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, super_instruct_enabled=?, super_instruct_skill_ids=?, super_instruct_profiles=?, super_instruct_response_rewrite_enabled=?, super_instruct_memory_enabled=?, super_instruct_monitor_enabled=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, pinned_egress_no_fallback=?, updated_at=? WHERE id=?`,
+		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), boolInt(g.PinnedEgressNoFallback), Now(), g.ID)
 	return err
 }
 

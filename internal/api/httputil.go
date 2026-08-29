@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"codex-account-pool/internal/bodysource"
@@ -171,6 +172,36 @@ const (
 	sseTailFlushLimit = 8 * 1024
 )
 
+var (
+	sseBatchBytes atomic.Int64
+	sseDelayNanos atomic.Int64
+	sseTailBytes  atomic.Int64
+)
+
+func init() {
+	setSSEFlushSettings(sseFlushBatchSize, 3, sseTailFlushLimit)
+}
+
+// setSSEFlushSettings updates streaming flush policy without changing wire bytes.
+// Values are clamped so an invalid administrative override cannot disable progress.
+func setSSEFlushSettings(batch, delayMillis, tail int) {
+	if batch <= 0 {
+		batch = sseFlushBatchSize
+	}
+	if delayMillis < 0 {
+		delayMillis = 3
+	}
+	if delayMillis > 1000 {
+		delayMillis = 1000
+	}
+	if tail <= 0 {
+		tail = sseTailFlushLimit
+	}
+	sseBatchBytes.Store(int64(batch))
+	sseDelayNanos.Store(int64(time.Duration(delayMillis) * time.Millisecond))
+	sseTailBytes.Store(int64(tail))
+}
+
 type adaptiveSSEBatch struct {
 	mu       sync.Mutex
 	w        http.ResponseWriter
@@ -199,11 +230,11 @@ func (b *adaptiveSSEBatch) append(p []byte) error {
 	case complete > 0 && !b.first:
 		b.first = true
 		return b.flushPrefixLocked(complete)
-	case complete >= sseFlushBatchSize:
+	case complete >= int(sseBatchBytes.Load()):
 		return b.flushPrefixLocked(complete)
 	case complete > 0:
 		b.armLocked()
-	case len(b.batch) >= sseTailFlushLimit:
+	case len(b.batch) >= int(sseTailBytes.Load()):
 		return b.flushPrefixLocked(len(b.batch))
 	}
 	return nil
@@ -213,7 +244,14 @@ func (b *adaptiveSSEBatch) armLocked() {
 	if b.timer != nil {
 		return
 	}
-	b.timer = time.AfterFunc(sseFlushMaxDelay, func() {
+	delay := time.Duration(sseDelayNanos.Load())
+	if delay <= 0 {
+		if complete := completeSSEPrefixLen(b.batch); complete > 0 {
+			_ = b.flushPrefixLocked(complete)
+		}
+		return
+	}
+	b.timer = time.AfterFunc(delay, func() {
 		defer supervisor.Recover("adaptive-sse-flush")
 		b.mu.Lock()
 		defer b.mu.Unlock()
@@ -575,12 +613,45 @@ func ensureResponsesPromptCacheKey(raw []byte, key string) []byte {
 // shards and lose nearly every hit. prompt_cache_key is a routing hint, not context;
 // the input/instructions/tools/history bytes remain untouched, and explicit custom
 // keys from other clients are preserved verbatim.
+type officialCodexPromptCacheAnalysis struct {
+	root     map[string]interface{}
+	existing string
+	stable   string
+	ok       bool
+}
+
+func analyzeOfficialCodexPromptCacheKey(r *http.Request, raw []byte, model string) officialCodexPromptCacheAnalysis {
+	analysis := officialCodexPromptCacheAnalysis{existing: routing.PromptCacheKey(raw)}
+	if !looksLikeUUID(analysis.existing) || !isOfficialCodexCLIRequest(r) {
+		return analysis
+	}
+	root, err := decodeJSONMapUseNumber(raw)
+	if err != nil {
+		return analysis
+	}
+	analysis.root = root
+	analysis.stable = officialCodexStablePromptCacheBaseFromRoot(r, root, model)
+	if analysis.stable == "" {
+		// The fallback remains intentionally byte-equivalent to the old path. It is
+		// only reached when the official large-prefix fingerprint is in its dead
+		// zone, so retaining the established helper avoids changing eligibility.
+		if prefixHash := automaticPromptCachePrefixHash(raw); prefixHash != "" {
+			analysis.stable = automaticPromptCacheKey(model, prefixHash)
+		}
+	}
+	analysis.ok = analysis.stable != ""
+	return analysis
+}
+
 func normalizeOfficialCodexPromptCacheKey(r *http.Request, raw []byte, model string, shardCounts ...int) ([]byte, bool) {
-	existing := routing.PromptCacheKey(raw)
-	stable := officialCodexStablePromptCacheBase(r, raw, model)
-	if stable == "" {
+	return normalizeOfficialCodexPromptCacheKeyFromAnalysis(r, raw, model, analyzeOfficialCodexPromptCacheKey(r, raw, model), shardCounts...)
+}
+
+func normalizeOfficialCodexPromptCacheKeyFromAnalysis(r *http.Request, raw []byte, model string, analysis officialCodexPromptCacheAnalysis, shardCounts ...int) ([]byte, bool) {
+	if !analysis.ok {
 		return raw, false
 	}
+	stable := analysis.stable
 	shards := 4
 	if len(shardCounts) > 0 {
 		shards = shardCounts[0]
@@ -589,10 +660,10 @@ func normalizeOfficialCodexPromptCacheKey(r *http.Request, raw []byte, model str
 		shards = 4
 	}
 	if shards > 1 {
-		seed := officialCodexPromptCacheShardSeedWithRequest(r, raw, existing)
+		seed := officialCodexPromptCacheShardSeedFromRoot(r, analysis.root, analysis.existing)
 		stable = fmt.Sprintf("%s_s%02d", stable, codexPromptCacheShard(seed, shards))
 	}
-	if stable == existing {
+	if stable == analysis.existing {
 		return raw, false
 	}
 	out, err := sjson.SetBytes(raw, "prompt_cache_key", stable)
@@ -610,15 +681,23 @@ func normalizeOfficialCodexPromptCacheKey(r *http.Request, raw []byte, model str
 // shared upstream prefix, so its aggregate request rate — not any one shard's fraction
 // of it — is what decides how many shards that prefix actually needs.
 func officialCodexStablePromptCacheBase(r *http.Request, raw []byte, model string) string {
-	if !looksLikeUUID(routing.PromptCacheKey(raw)) || !isOfficialCodexCLIRequest(r) {
+	return analyzeOfficialCodexPromptCacheKey(r, raw, model).stable
+}
+
+func officialCodexStablePromptCacheBaseFromRoot(r *http.Request, root map[string]interface{}, model string) string {
+	if !looksLikeUUIDFromRoot(root) || !isOfficialCodexCLIRequest(r) {
 		return ""
 	}
-	prefixHash := officialCodexBasePromptCacheHash(raw)
+	prefixHash := officialCodexBasePromptCacheHashFromRoot(root)
 	if prefixHash == "" {
-		prefixHash = automaticPromptCachePrefixHash(raw)
+		return ""
 	}
 	return automaticPromptCacheKey(model, prefixHash)
 }
+
+// looksLikeUUIDFromRoot is intentionally conservative; callers normally validate
+// the raw key before parsing. It exists only for the single-parse normalization path.
+func looksLikeUUIDFromRoot(root map[string]interface{}) bool { return root != nil }
 
 // officialCodexPromptCacheShardSeed keeps one conversation on one shard while
 // distributing sibling agents that share the large immutable base prefix. A body
@@ -629,6 +708,11 @@ func officialCodexPromptCacheShardSeed(raw []byte, originalUUID string) string {
 }
 
 func officialCodexPromptCacheShardSeedWithRequest(r *http.Request, raw []byte, originalUUID string) string {
+	root, _ := decodeJSONMapUseNumber(raw)
+	return officialCodexPromptCacheShardSeedFromRoot(r, root, originalUUID)
+}
+
+func officialCodexPromptCacheShardSeedFromRoot(r *http.Request, root map[string]interface{}, originalUUID string) string {
 	if r != nil {
 		// The official CLI carries child-thread identity in headers on some
 		// Responses paths, while other paths put the same value in the body.
@@ -644,14 +728,10 @@ func officialCodexPromptCacheShardSeedWithRequest(r *http.Request, raw []byte, o
 			}
 		}
 	}
-	var root map[string]json.RawMessage
-	if json.Unmarshal(raw, &root) == nil {
-		var threadID string
-		if json.Unmarshal(root["thread_id"], &threadID) == nil && strings.TrimSpace(threadID) != "" {
-			return "thread:" + threadID
-		}
+	if threadID, ok := root["thread_id"].(string); ok && strings.TrimSpace(threadID) != "" {
+		return "thread:" + threadID
 	}
-	if anchor := officialCodexFirstUserAnchor(raw); anchor != "" {
+	if anchor := officialCodexFirstUserAnchorFromRoot(root); anchor != "" {
 		return "anchor:" + anchor
 	}
 	return "uuid:" + strings.TrimSpace(originalUUID)
@@ -666,6 +746,10 @@ func officialCodexFirstUserAnchor(raw []byte) string {
 	if err != nil {
 		return ""
 	}
+	return officialCodexFirstUserAnchorFromRoot(root)
+}
+
+func officialCodexFirstUserAnchorFromRoot(root map[string]interface{}) string {
 	sequence := root["input"]
 	if sequence == nil {
 		sequence = root["messages"]
@@ -717,6 +801,10 @@ func officialCodexBasePromptCacheHash(raw []byte) string {
 	if err != nil {
 		return ""
 	}
+	return officialCodexBasePromptCacheHashFromRoot(root)
+}
+
+func officialCodexBasePromptCacheHashFromRoot(root map[string]interface{}) string {
 	stable := map[string]interface{}{}
 	for _, key := range []string{"instructions", "tools", "tool_choice", "parallel_tool_calls", "reasoning", "text"} {
 		if value, ok := root[key]; ok {

@@ -1,0 +1,14 @@
+artifact_type=unified_diff_excerpt
+source=/workspace/config.example.json
+--- config.example.json (baseline)
++++ config.example.json (implemented)
+@@
++  "admission_cpu_enabled": true,
++  "sse_flush_batch_bytes": 4096,
++  "sse_flush_max_delay_millis": 3,
++  "sse_tail_flush_bytes": 8192,
++  "sqlite_incremental_vacuum_enabled": false,
+   "context_journal_ttl_seconds": 3600,
+@@
++  "goal_chunk_format_v2": false,
+   "codex_session_mapping_enabled": true,

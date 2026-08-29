@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // config_hotreload_test.go is the end-to-end guard for Phase ① (requirement #1):
@@ -140,6 +141,53 @@ func TestCodexCacheOptimizationSettingsHotReloadAndValidate(t *testing.T) {
 	for _, body := range []string{`{"codex_prompt_cache_key_shards":0}`, `{"codex_prompt_cache_key_shards":17}`, `{"codex_gpt56_explicit_cache_mode":"invalid"}`} {
 		if status, _ := patchConfigStatus(t, h, body); status != http.StatusBadRequest {
 			t.Fatalf("invalid config %s status=%d", body, status)
+		}
+	}
+}
+
+func TestSSEFlushSettingsHotReloadAndValidate(t *testing.T) {
+	oldBatch := sseBatchBytes.Load()
+	oldDelay := sseDelayNanos.Load()
+	oldTail := sseTailBytes.Load()
+	t.Cleanup(func() {
+		sseBatchBytes.Store(oldBatch)
+		sseDelayNanos.Store(oldDelay)
+		sseTailBytes.Store(oldTail)
+	})
+
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"id":"resp"}`)) })
+	patchConfig(t, h, `{"sse_flush_batch_bytes":2048,"sse_flush_max_delay_millis":1,"sse_tail_flush_bytes":4096}`)
+	if got := sseBatchBytes.Load(); got != 2048 {
+		t.Fatalf("hot SSE batch bytes = %d, want 2048", got)
+	}
+	if got := time.Duration(sseDelayNanos.Load()); got != time.Millisecond {
+		t.Fatalf("hot SSE delay = %s, want 1ms", got)
+	}
+	if got := sseTailBytes.Load(); got != 4096 {
+		t.Fatalf("hot SSE tail bytes = %d, want 4096", got)
+	}
+
+	status, body := postSettingsCenter(t, h, `[{"section":"config","values":{"sse_flush_batch_bytes":1024,"sse_flush_max_delay_millis":0,"sse_tail_flush_bytes":2048}}]`)
+	if status != http.StatusOK {
+		t.Fatalf("settings center SSE patch = %d: %s", status, body)
+	}
+	if got := sseBatchBytes.Load(); got != 1024 {
+		t.Fatalf("settings center SSE batch bytes = %d, want 1024", got)
+	}
+	if got := time.Duration(sseDelayNanos.Load()); got != 0 {
+		t.Fatalf("settings center SSE delay = %s, want 0", got)
+	}
+	if got := sseTailBytes.Load(); got != 2048 {
+		t.Fatalf("settings center SSE tail bytes = %d, want 2048", got)
+	}
+
+	for _, payload := range []string{
+		`{"sse_flush_batch_bytes":0}`,
+		`{"sse_flush_max_delay_millis":1001}`,
+		`{"sse_tail_flush_bytes":-1}`,
+	} {
+		if status, _ := patchConfigStatus(t, h, payload); status != http.StatusBadRequest {
+			t.Fatalf("invalid SSE config %s status=%d", payload, status)
 		}
 	}
 }

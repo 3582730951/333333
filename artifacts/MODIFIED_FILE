@@ -1,0 +1,7 @@
+artifact_type=modified_file_record
+plan=docs/2025-08-29-plan.md
+source=/workspace/config.example.json
+original_sha256=f1e8a7d88f894b34986fa67ad33ed2254a3da70bd10178742476fb70718ae9ae
+current_sha256=18f6442c78ed55a885392d04543f4d2a75a367bbbfb00a2e721f4e0349ce4262
+implementation_marker=plan-2025-08-29-complete
+status=source-remains-modified

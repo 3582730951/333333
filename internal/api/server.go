@@ -1566,7 +1566,10 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// fresh account instead). codexAttempt adds the leased account here before it
 	// returns outcomeRetry.
 	exclude := map[string]bool{}
-	attempts := s.codexFailoverAttempts(r.Context(), movable, pol.Group, model, exclude)
+	attempts := 1
+	if !pol.PinnedEgressNoFallback {
+		attempts = s.codexFailoverAttempts(r.Context(), movable, pol.Group, model, exclude)
+	}
 	current := codexRetryRequest{Raw: raw, Header: currentHeader}
 	modelCapabilityRejected := false
 	attemptsRemaining := attempts
@@ -1596,7 +1599,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 			currentAffinity = affinity
 		}
 		allowAnotherOuterAttempt := attemptsRemaining > 0 && outerAttempts < maxCodexOuterAttempts
-		result := s.codexAttempt(w, r, current.Raw, attemptSource, attemptMeta, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, instructionPlan, allowAnotherOuterAttempt, exclude)
+		result := s.codexAttempt(w, r, current.Raw, attemptSource, attemptMeta, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, pol.PinnedEgressNoFallback, instructionPlan, allowAnotherOuterAttempt, exclude)
 		if result.Outcome == outcomeModelRetry {
 			modelCapabilityRejected = true
 		}
@@ -1609,6 +1612,17 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 			attemptsRemaining = 1
 		}
 		if result.Outcome == outcomeContextRecovery {
+			if pol.PinnedEgressNoFallback {
+				// A pinned group explicitly opts out of durable account/egress
+				// migration as well as ordinary seamless failover. Return the
+				// upstream/context error produced by this exact binding unchanged.
+				if result.RecoveryBoundUnavailable {
+					writePoolCodeError(w, http.StatusConflict, "bound_account_unavailable", "the account bound to this session is unavailable")
+				} else {
+					writeRaw(w, result.RecoveryStatus, result.RecoveryHeader, result.RecoveryBody)
+				}
+				return
+			}
 			// A strict CPA turn normally stays on its original account.  When that
 			// account is gone, or its upstream context has been confirmed missing,
 			// rebuild the encrypted durable history into one fresh root instead of
@@ -1669,7 +1683,10 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 					// replacement account may be exhausted too while a later one is
 					// healthy. The exclusion set still prevents revisiting any account
 					// already failed by this downstream turn.
-					attemptsRemaining = s.codexFailoverAttempts(r.Context(), true, pol.Group, routing.Model(current.Raw), exclude)
+					attemptsRemaining = 1
+					if !pol.PinnedEgressNoFallback {
+						attemptsRemaining = s.codexFailoverAttempts(r.Context(), true, pol.Group, routing.Model(current.Raw), exclude)
+					}
 					remainingOuterBudget := maxCodexOuterAttempts - outerAttempts
 					if attemptsRemaining > remainingOuterBudget {
 						attemptsRemaining = remainingOuterBudget
@@ -1795,7 +1812,7 @@ func sameBodyBytes(left, right []byte) bool {
 	return len(left) == 0 || &left[0] == &right[0] || bytes.Equal(left, right)
 }
 
-func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, replaySource bodysource.BodySource, replayMeta *bodysource.BodyMeta, baseHeader http.Header, prepared bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort string, instructionPlan *CodexInstructionPlan, allowRetry bool, exclude map[string]bool) codexAttemptResult {
+func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, replaySource bodysource.BodySource, replayMeta *bodysource.BodyMeta, baseHeader http.Header, prepared bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort string, pinnedNoFallback bool, instructionPlan *CodexInstructionPlan, allowRetry bool, exclude map[string]bool) codexAttemptResult {
 	path := r.URL.Path
 	sourceRaw := raw
 	includeChatStreamUsage := isChat && chatStreamUsageRequested(raw)
@@ -1822,11 +1839,12 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	}
 	route := scheduler.Route{
 		Group:                    routeGroup,
+		NoEgressFallback:         pinnedNoFallback,
 		Provider:                 "codex",
 		Affinity:                 affinity,
 		Strict:                   strict,
 		ServerSideState:          !movable,
-		ImmutableAffinity:        !movable,
+		ImmutableAffinity:        pinnedNoFallback || !movable,
 		Movable:                  movable,
 		Model:                    model,
 		EstimatedTokens:          codexEstimatedTokensWithMeta(model, raw, replayMeta),
@@ -2011,10 +2029,11 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// reuse is driven by the supported prompt_cache_key + stable account affinity.
 	if !prepared && !strictNativeCPA {
 		codexShards := s.codexPromptCacheKeyShards(r.Context())
-		if base := officialCodexStablePromptCacheBase(r, body, model); base != "" {
-			codexShards = s.codexPromptCachePrefixShards(lease.Account.ID, model, base, codexShards, time.Now())
+		analysis := analyzeOfficialCodexPromptCacheKey(r, body, model)
+		if analysis.ok {
+			codexShards = s.codexPromptCachePrefixShards(lease.Account.ID, model, analysis.stable, codexShards, time.Now())
 		}
-		if updated, normalized := normalizeOfficialCodexPromptCacheKey(r, body, model, codexShards); normalized {
+		if updated, normalized := normalizeOfficialCodexPromptCacheKeyFromAnalysis(r, body, model, analysis, codexShards); normalized {
 			body = updated
 			promptCacheKeySource = "official_codex_stable_prefix"
 		}
@@ -2758,6 +2777,13 @@ codexResponse:
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 		if movable && retryableForFailover(v, resp.StatusCode) {
+			if pinnedNoFallback {
+				// Keep the selected account and its primary egress authoritative for
+				// pinned groups. In particular, do not turn a final 429 into a
+				// capacity wait that would replay the same request later.
+				s.writeFilteredError(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber)
+				return codexAttemptResult{Outcome: outcomeDone}
+			}
 			if v.State == ban.RateLimited || resp.StatusCode == http.StatusTooManyRequests {
 				if allowRetry {
 					return retry()

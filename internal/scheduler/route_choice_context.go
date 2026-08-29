@@ -115,6 +115,16 @@ func (s *Scheduler) selectFromRouteChoiceContext(ctx context.Context, route Rout
 	choices := make([]RouteChoice, 0, len(state.templates))
 	for _, template := range state.templates {
 		merged := route
+		// Route-level safety flags are part of the target template as well as the
+		// caller's base route. Preserve them when the choice context swaps groups;
+		// otherwise a pinned user-group route could accidentally lose its immutable
+		// account/primary-egress boundary at the SelectAcross hand-off.
+		if template.Route.NoEgressFallback {
+			merged.NoEgressFallback = true
+		}
+		if template.Route.ImmutableAffinity {
+			merged.ImmutableAffinity = true
+		}
 		if group := strings.TrimSpace(template.Route.Group); group != "" {
 			merged.Group = group
 			// Outlet order belongs to the target group. Do not copy an order resolved

@@ -430,6 +430,9 @@ type Route struct {
 	// session. RequiredEgressID completes that same identity boundary.
 	RequiredAccountID string
 	RequiredEgressID  string
+	// NoEgressFallback requires the selected account's primary egress; an
+	// unhealthy primary is terminal and must not resolve standby metadata.
+	NoEgressFallback bool
 	// FailFastBoundRecovery is set only when the caller owns a durable replay for
 	// an exact RequiredAccountID binding. Health/quota cooldowns then return
 	// ErrBoundAccountUnavailable immediately so the caller can rotate the durable
@@ -623,6 +626,9 @@ func NewWithLeaseCoordinator(store *storage.Store, cfg config.Config, coordinato
 		s.egressEWMA[i].rows = map[string]egressEWMA{}
 	}
 	s.cfg.Store(cfg)
+	// Apply the initial CPU admission valve state immediately. UpdateConfig
+	// handles subsequent hot reloads, but admission.New defaults to enabled.
+	s.admission.SetCPUEnabled(cfg.AdmissionCPUEnabled)
 	s.routeStructureVersion.Store(1)
 	if notifications := coordinator.Notifications(); notifications != nil {
 		s.coordinatorWG.Add(1)
@@ -657,6 +663,7 @@ func (s *Scheduler) Config() config.Config {
 func (s *Scheduler) UpdateConfig(cfg config.Config) {
 	s.cfg.Store(cfg)
 	s.admission.SetHeadroom(cfg.ResourceHeadroomPercent)
+	s.admission.SetCPUEnabled(cfg.AdmissionCPUEnabled)
 	s.clearCandidateIndexes()
 	s.routeStructureVersion.Add(1)
 	s.NotifyStateChanged()
@@ -783,6 +790,12 @@ func (s *Scheduler) egressEWMAQuality(egressID string) (successBucket int, laten
 func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 	if lease, handled, err := s.selectFromRouteChoiceContext(ctx, route); handled {
 		return lease, err
+	}
+	// A no-egress-fallback route is also an immutable affinity route: once an
+	// account/primary outlet has been selected, ordinary affinity recovery must
+	// not rebind it to another account or resolve a standby outlet.
+	if route.NoEgressFallback {
+		route.ImmutableAffinity = true
 	}
 	started := time.Now()
 	defer s.observeRouteSelection(started)

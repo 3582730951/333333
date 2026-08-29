@@ -1,5 +1,12 @@
 import { get } from '../../../api.js';
 
+export type UserGroup = {
+  id?: string;
+  name: string;
+  pinned_egress_no_fallback?: boolean;
+  [key: string]: unknown;
+};
+
 function rowsOf(value: unknown, keys: string[]): any[] {
   if (Array.isArray(value)) return value;
   if (!value || typeof value !== 'object') return [];

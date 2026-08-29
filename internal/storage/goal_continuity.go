@@ -7,7 +7,6 @@ package storage
 // token encryption in exactly the same way as context_journal.
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -249,26 +248,7 @@ type preparedGoalChunk struct {
 // Preparing once, outside the transaction, both halves the CPU work and removes all of
 // it from the lock window.
 func (s *Store) prepareGoalChunks(payload string) ([]preparedGoalChunk, int64) {
-	if payload == "" {
-		return nil, 0
-	}
-	chunks := make([]preparedGoalChunk, 0, (len(payload)+goalPayloadChunkSize-1)/goalPayloadChunkSize)
-	var stored int64
-	for offset, index := 0, 0; offset < len(payload); index++ {
-		end := offset + goalPayloadChunkSize
-		if end > len(payload) {
-			end = len(payload)
-		}
-		part := payload[offset:end]
-		encrypted := s.sealToken(compressContextPayload(part))
-		chunks = append(chunks, preparedGoalChunk{
-			index: index, payloadHash: hashGoalPayload(part),
-			plainBytes: len(part), encrypted: encrypted,
-		})
-		stored += int64(len(encrypted))
-		offset = end
-	}
-	return chunks, stored
+	return s.prepareGoalChunksLegacy(payload)
 }
 
 // estimateGoalChunkStorage reports the ciphertext-aware stored size of a payload
@@ -308,48 +288,20 @@ func (s *Store) insertPreparedGoalChunks(ctx context.Context, tx *sql.Tx, goalID
 }
 
 func (s *Store) insertGoalChunks(ctx context.Context, tx *sql.Tx, goalID, kind string, segmentSequence, createdAt int64, payload string) (int64, error) {
-	chunks, _ := s.prepareGoalChunks(payload)
+	return s.insertGoalChunksWithFormat(ctx, tx, goalID, kind, segmentSequence, createdAt, payload, s.goalChunkFormatV2Enabled(ctx))
+}
+
+func (s *Store) insertGoalChunksWithFormat(ctx context.Context, tx *sql.Tx, goalID, kind string, segmentSequence, createdAt int64, payload string, formatV2 bool) (int64, error) {
+	chunks, _ := s.prepareGoalChunksWithFormat(payload, formatV2)
 	return s.insertPreparedGoalChunks(ctx, tx, goalID, kind, segmentSequence, createdAt, chunks)
 }
 
 func (s *Store) readGoalChunks(ctx context.Context, goalID, kind string, segmentSequence int64) (string, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT p.payload_hash,p.payload_bytes,p.encrypted_payload
-FROM goal_payload_chunk p JOIN goal_session s ON s.id=p.goal_id
-WHERE p.goal_id=? AND p.payload_kind=? AND p.segment_sequence=? AND s.state<>'reclaiming'
-ORDER BY p.chunk_index`, goalID, kind, segmentSequence)
-	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
-	var payload bytes.Buffer
-	for rows.Next() {
-		var hash, encrypted string
-		var plainBytes int64
-		if err = rows.Scan(&hash, &plainBytes, &encrypted); err != nil {
-			return "", err
-		}
-		if plainBytes < 0 || plainBytes > goalPayloadChunkSize {
-			return "", fmt.Errorf("goal payload chunk declares invalid plaintext length %d", plainBytes)
-		}
-		decoded, decodeErr := s.openContextPayload(encrypted, goalPayloadChunkSize)
-		if decodeErr != nil {
-			return "", fmt.Errorf("decode goal payload chunk: %w", decodeErr)
-		}
-		if int64(len(decoded)) != plainBytes || hashGoalPayload(decoded) != hash {
-			return "", errors.New("goal payload chunk failed plaintext length/hash verification")
-		}
-		if int64(payload.Len())+plainBytes > maxStoredContextPayloadBytes {
-			return "", fmt.Errorf("goal payload exceeds %d-byte reconstruction limit", maxStoredContextPayloadBytes)
-		}
-		payload.WriteString(decoded)
-	}
-	if err = rows.Err(); err != nil {
-		return "", err
-	}
-	if payload.Len() == 0 {
-		return "", ErrGoalNotFound
-	}
-	return payload.String(), nil
+	return s.readGoalChunksCompat(ctx, goalID, kind, segmentSequence)
+}
+
+func (s *Store) readGoalChunksLegacy(ctx context.Context, goalID, kind string, segmentSequence int64) (string, error) {
+	return s.readGoalChunksCompat(ctx, goalID, kind, segmentSequence)
 }
 
 type GoalRun struct {
@@ -504,7 +456,15 @@ ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_
 			return result, err
 		}
 	}
-	return result, tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return result, err
+	}
+	// CommitGoalTurn may have populated the process settings snapshot while doing
+	// its codec rollout check immediately before this migration.  The migration
+	// writes the inherited defaults in the same transaction, so invalidate that
+	// snapshot before the next request observes the new policy.
+	s.InvalidateSettingsCache()
+	return result, nil
 }
 
 func (s *Store) migrateGoalContinuityV2(ctx context.Context) error {
@@ -873,7 +833,8 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 	// doing them here keeps thousands of chunk operations out of SQLite's single writer
 	// lock, where they would serialize every other foreground commit and the disk_guard
 	// write probe behind this one request.
-	segmentChunks, segmentEstimatedBytes := s.prepareGoalChunks(turn.SegmentPayload)
+	formatV2 := s.goalChunkFormatV2Enabled(ctx)
+	segmentChunks, segmentEstimatedBytes := s.prepareGoalChunksWithFormat(turn.SegmentPayload, formatV2)
 
 	// A Codex child branch always resolves by its own concrete thread first.  The
 	// parent/root alias remains owned by the root session and is relationship data,
@@ -920,7 +881,7 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 	checkpointPrepared := false
 	if len(turn.CheckpointPayload) >= goalCheckpointPrepareAheadMinBytes &&
 		(turn.ReplaceHistory || s.goalProbablyAbsent(ctx, resolutionSets, family)) {
-		checkpointChunks, checkpointEstimatedBytes = s.prepareGoalChunks(turn.CheckpointPayload)
+		checkpointChunks, checkpointEstimatedBytes = s.prepareGoalChunksWithFormat(turn.CheckpointPayload, formatV2)
 		checkpointPrepared = true
 	}
 
@@ -951,7 +912,7 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 	// tested here. A narrower fill than the insert guard would silently write zero
 	// chunks, which is data loss rather than a slowdown.
 	if (created || turn.ReplaceHistory) && !checkpointPrepared {
-		checkpointChunks, checkpointEstimatedBytes = s.prepareGoalChunks(turn.CheckpointPayload)
+		checkpointChunks, checkpointEstimatedBytes = s.prepareGoalChunksWithFormat(turn.CheckpointPayload, formatV2)
 		checkpointPrepared = true
 	}
 	if !created {
@@ -1820,9 +1781,12 @@ WHERE c.id=? AND s.state<>'reclaiming'`, id).Scan(
 	if item.FormatVersion >= goalPayloadFormatV2 {
 		item.Payload, err = s.readGoalChunks(ctx, item.GoalID, goalChunkCheckpoint, 0)
 	} else {
-		item.Payload = s.openToken(encrypted)
+		item.Payload, err = s.openContextPayload(encrypted, maxStoredContextPayloadBytes)
 	}
-	return item, nil
+	if err == nil {
+		err = verifyGoalPayloadMetadata(item.Payload, item.PayloadHash, item.PayloadBytes)
+	}
+	return item, err
 }
 
 func (s *Store) listGoalSegmentsAfter(ctx context.Context, goalID string, after int64) ([]GoalSegment, error) {
@@ -1854,11 +1818,14 @@ ORDER BY g.sequence ASC`, goalID, after)
 	for i := range out {
 		if out[i].FormatVersion >= goalPayloadFormatV2 {
 			out[i].Payload, err = s.readGoalChunks(ctx, out[i].GoalID, goalChunkSegment, out[i].Sequence)
-			if err != nil {
-				return nil, err
-			}
 		} else {
-			out[i].Payload = s.openToken(encryptedPayloads[i])
+			out[i].Payload, err = s.openContextPayload(encryptedPayloads[i], maxStoredContextPayloadBytes)
+		}
+		if err == nil {
+			err = verifyGoalPayloadMetadata(out[i].Payload, out[i].PayloadHash, out[i].PayloadBytes)
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 	return out, nil
@@ -1868,53 +1835,40 @@ func (s *Store) listGoalCompactedSegments(ctx context.Context, goalID string, th
 	if through <= 0 {
 		return nil, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT p.segment_sequence,p.payload_hash,p.payload_bytes,p.encrypted_payload
+	rows, err := s.rdb.QueryContext(ctx, `SELECT DISTINCT p.segment_sequence
 FROM goal_payload_chunk p JOIN goal_session s ON s.id=p.goal_id
 WHERE p.goal_id=? AND p.payload_kind=? AND p.segment_sequence>0 AND p.segment_sequence<=? AND s.state<>'reclaiming'
-ORDER BY p.segment_sequence,p.chunk_index`, goalID, goalChunkSegment, through)
+ORDER BY p.segment_sequence`, goalID, goalChunkSegment, through)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := make([]GoalSegment, 0)
-	var sequence int64
-	var payload bytes.Buffer
-	flush := func() {
-		if sequence > 0 {
-			out = append(out, GoalSegment{GoalID: goalID, Sequence: sequence, Payload: payload.String(), FormatVersion: goalPayloadFormatV2, State: "compacted"})
-		}
-		payload.Reset()
-	}
+	sequences := make([]int64, 0)
 	for rows.Next() {
-		var current int64
-		var hash, encrypted string
-		var plainBytes int64
-		if err = rows.Scan(&current, &hash, &plainBytes, &encrypted); err != nil {
+		var sequence int64
+		if err = rows.Scan(&sequence); err != nil {
 			return nil, err
 		}
-		if sequence != 0 && current != sequence {
-			flush()
-		}
-		sequence = current
-		if plainBytes < 0 || plainBytes > goalPayloadChunkSize {
-			return nil, fmt.Errorf("goal payload chunk declares invalid plaintext length %d", plainBytes)
-		}
-		decoded, decodeErr := s.openContextPayload(encrypted, goalPayloadChunkSize)
+		sequences = append(sequences, sequence)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	out := make([]GoalSegment, 0, len(sequences))
+	for _, sequence := range sequences {
+		decoded, decodeErr := s.readGoalChunksCompat(ctx, goalID, goalChunkSegment, sequence)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
-		if int64(len(decoded)) != plainBytes || hashGoalPayload(decoded) != hash {
-			return nil, errors.New("goal payload chunk failed plaintext length/hash verification")
-		}
-		if int64(payload.Len())+plainBytes > maxStoredContextPayloadBytes {
-			return nil, fmt.Errorf("goal segment exceeds %d-byte reconstruction limit", maxStoredContextPayloadBytes)
-		}
-		payload.WriteString(decoded)
+		out = append(out, GoalSegment{
+			GoalID: goalID, Sequence: sequence, Payload: decoded,
+			PayloadHash: hashGoalPayload(decoded), PayloadBytes: int64(len(decoded)),
+			FormatVersion: goalPayloadFormatV2, State: "compacted",
+		})
 	}
-	if err = rows.Err(); err != nil {
-		return nil, err
-	}
-	flush()
 	return out, nil
 }
 
@@ -1958,6 +1912,10 @@ func (s *Store) CompactGoalSegmentsWithRatio(ctx context.Context, goalID string,
 	if chunkRatio <= 0 || chunkRatio > 1 {
 		chunkRatio = 1
 	}
+	// Read the rollout switch before opening the SQLite transaction. In-memory
+	// stores intentionally use one connection; querying settings through that
+	// connection while the compaction transaction is open would deadlock.
+	formatV2 := s.goalChunkFormatV2Enabled(ctx)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -2027,8 +1985,14 @@ WHERE s.id=? AND s.expires_at>? AND s.state<>'reclaiming'`, goalID, Now()).Scan(
 	now := Now()
 	var addedStorage, removedStorage int64
 	if checkpoint.FormatVersion < goalPayloadFormatV2 {
-		checkpoint.Payload = s.openToken(encryptedCheckpoint)
-		stored, insertErr := s.insertGoalChunks(ctx, tx, goalID, goalChunkCheckpoint, 0, now, checkpoint.Payload)
+		checkpoint.Payload, err = s.openContextPayload(encryptedCheckpoint, maxStoredContextPayloadBytes)
+		if err != nil {
+			return err
+		}
+		if err = verifyGoalPayloadMetadata(checkpoint.Payload, checkpoint.PayloadHash, checkpoint.PayloadBytes); err != nil {
+			return err
+		}
+		stored, insertErr := s.insertGoalChunksWithFormat(ctx, tx, goalID, goalChunkCheckpoint, 0, now, checkpoint.Payload, formatV2)
 		if insertErr != nil {
 			return insertErr
 		}
@@ -2038,7 +2002,19 @@ WHERE s.id=? AND s.expires_at>? AND s.state<>'reclaiming'`, goalID, Now()).Scan(
 		if segment.format >= goalPayloadFormatV2 {
 			continue
 		}
-		stored, insertErr := s.insertGoalChunks(ctx, tx, goalID, goalChunkSegment, segment.sequence, segment.createdAt, s.openToken(segment.encrypted))
+		payload, openErr := s.openContextPayload(segment.encrypted, maxStoredContextPayloadBytes)
+		if openErr != nil {
+			return openErr
+		}
+		var payloadHash string
+		var payloadBytes int64
+		if err = tx.QueryRowContext(ctx, `SELECT payload_hash,payload_bytes FROM goal_segment WHERE id=?`, segment.id).Scan(&payloadHash, &payloadBytes); err != nil {
+			return err
+		}
+		if err = verifyGoalPayloadMetadata(payload, payloadHash, payloadBytes); err != nil {
+			return err
+		}
+		stored, insertErr := s.insertGoalChunksWithFormat(ctx, tx, goalID, goalChunkSegment, segment.sequence, segment.createdAt, payload, formatV2)
 		if insertErr != nil {
 			return insertErr
 		}

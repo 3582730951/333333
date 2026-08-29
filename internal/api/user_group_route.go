@@ -567,6 +567,9 @@ func (s *Server) dispatchUserGroupTrafficFallback(
 	pol downstreamPolicy,
 	dispatch func(http.ResponseWriter, *http.Request),
 ) bool {
+	if pol.PinnedEgressNoFallback {
+		return false
+	}
 	if routing.HasServerSideState(r.URL.Path, r, resolvedRaw) {
 		return false
 	}
@@ -687,9 +690,25 @@ retryUserGroupRoute:
 	replaySafe := !routing.HasServerSideState(r.URL.Path, r, resolvedRaw)
 	streamRequest := isStreamRequest(resolvedRaw)
 	units := buildUserGroupDispatchUnits(plan)
+	if pol.PinnedEgressNoFallback {
+		// Pinning is an explicit opt-in to one configured route. Do not let the
+		// availability pre-filter, rendezvous fan-out, or a later tier silently
+		// choose another user-group target. The first unit is already ordered with
+		// any durable conversation binding at its head; retain only that target.
+		if len(units) > 1 {
+			units = units[:1]
+		}
+		if len(units) == 1 && len(units[0].Targets) > 1 {
+			units[0].Targets = units[0].Targets[:1]
+		}
+		if len(units) == 0 {
+			writePoolCodeError(w, http.StatusServiceUnavailable, "user_group_route_unavailable", "the pinned user-group target is unavailable")
+			return true
+		}
+	}
 	// Availability markers describe scheduler-backed account pools. Provider
 	// targets fail open inside the filter and retain their adapter-specific path.
-	if replaySafe && s.routeAvailability != nil {
+	if !pol.PinnedEgressNoFallback && replaySafe && s.routeAvailability != nil {
 		model := routing.Model(resolvedRaw)
 		units = s.filterUnavailableUserGroupDispatchUnits(r, pol, model, plan, units)
 	}
@@ -701,7 +720,7 @@ retryUserGroupRoute:
 		// A grouped unit retains a speculative probe until we know the downstream
 		// handler consumed its scheduler context. Test/extension dispatchers that do
 		// not select an account fall back to the remaining targets one by one.
-		speculative := replaySafe && (moreUnits || len(unit.Targets) > 1)
+		speculative := !pol.PinnedEgressNoFallback && replaySafe && (moreUnits || len(unit.Targets) > 1)
 		attempt := newUserGroupAttemptWriter(r.Context(), w, streamRequest, strings.HasPrefix(strings.TrimSpace(r.URL.Path), "/v1/responses"), bodysource.CaptureOptions{
 			MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
 			Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver, TempFileNamePrefix: "codex-pool-route-response-*",
@@ -722,7 +741,11 @@ retryUserGroupRoute:
 			for _, choiceTarget := range unit.Targets {
 				choices = append(choices, scheduler.RouteChoice{
 					ChoiceKey: userGroupTargetChoiceKey(choiceTarget),
-					Route:     scheduler.Route{Group: choiceTarget.ID},
+					Route: scheduler.Route{
+						Group:             choiceTarget.ID,
+						NoEgressFallback:  pol.PinnedEgressNoFallback,
+						ImmutableAffinity: pol.PinnedEgressNoFallback,
+					},
 				})
 			}
 			var claim scheduler.RouteChoiceClaim
@@ -762,7 +785,7 @@ retryUserGroupRoute:
 			}
 			candidateContext, choiceState = scheduler.WithRouteChoices(candidateContext, choices, claim)
 		}
-		if replaySafe && (moreUnits || len(unit.Targets) > 1) {
+		if !pol.PinnedEgressNoFallback && replaySafe && (moreUnits || len(unit.Targets) > 1) {
 			candidateContext = withUserGroupFallbackProbe(candidateContext)
 		}
 		candidate := r.Clone(candidateContext)
@@ -862,6 +885,13 @@ retryUserGroupRoute:
 			return true
 		}
 		retryable := attempt.RetryableFailure()
+		if pol.PinnedEgressNoFallback {
+			// The buffered error is the contract for a pinned group: commit it to
+			// the client and never probe another target, account, egress, or traffic
+			// fallback group.
+			attempt.Commit()
+			return true
+		}
 		// Preserve the legacy extension surface: when dispatch did not invoke the
 		// scheduler, expand a grouped unit into its remaining individual targets.
 		if retryable && replaySafe && choiceState != nil && !choiceState.Used() && len(unit.Targets) > 1 {

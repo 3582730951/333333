@@ -33,6 +33,7 @@ type Snapshot struct {
 }
 type Controller struct {
 	headroom            atomic.Int64
+	cpuEnabled          atomic.Bool
 	snap                atomic.Value
 	mu                  sync.Mutex
 	changed             chan struct{}
@@ -48,6 +49,7 @@ type Controller struct {
 func New(headroom int) *Controller {
 	c := &Controller{changed: make(chan struct{}), stop: make(chan struct{})}
 	c.SetHeadroom(headroom)
+	c.cpuEnabled.Store(true)
 	c.snap.Store(Snapshot{Timestamp: time.Now().Unix(), HeadroomPercent: int(c.headroom.Load())})
 	// Unit/integration test binaries construct hundreds of short-lived servers and
 	// have no HTTP shutdown hook to close their handlers. Avoid leaking one sampler
@@ -57,6 +59,7 @@ func New(headroom int) *Controller {
 	}
 	return c
 }
+func (c *Controller) SetCPUEnabled(enabled bool) { c.cpuEnabled.Store(enabled) }
 func (c *Controller) SetHeadroom(v int) {
 	if v < 10 {
 		v = 10
@@ -171,10 +174,14 @@ func (c *Controller) sample() {
 		s.MemUsedPercent += 100 * float64(s.ReservedBytes) / float64(limit)
 	}
 	s.FDUsedPercent = fdPercent()
-	for _, r := range []struct {
+	resources := []struct {
 		name string
 		used float64
-	}{{"cpu", s.CPUUsedPercent}, {"memory", s.MemUsedPercent}, {"fd", s.FDUsedPercent}} {
+	}{{"cpu", s.CPUUsedPercent}, {"memory", s.MemUsedPercent}, {"fd", s.FDUsedPercent}}
+	for _, r := range resources {
+		if r.name == "cpu" && !c.cpuEnabled.Load() {
+			continue
+		}
 		if r.used >= stop {
 			s.Paused = true
 			s.Reason = r.name
@@ -182,8 +189,12 @@ func (c *Controller) sample() {
 			break
 		}
 	}
+	if s.Paused && s.Reason == "cpu" && !c.cpuEnabled.Load() {
+		s.Reason = ""
+	}
 	if s.Paused && s.Reason == "" {
-		if s.CPUUsedPercent < resume && s.MemUsedPercent < resume && s.FDUsedPercent < resume {
+		cpuOK := !c.cpuEnabled.Load() || s.CPUUsedPercent < resume
+		if cpuOK && s.MemUsedPercent < resume && s.FDUsedPercent < resume {
 			c.recoveries++
 		} else {
 			c.recoveries = 0

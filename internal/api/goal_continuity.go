@@ -290,6 +290,13 @@ func (s *Server) compactOneGoalChunk(parent context.Context, goalID string) (boo
 		finishState, finishCode = "retryable", "goal_compaction_failed"
 		return true, time.Second
 	}
+	if s.flagEnabled(jobCtx, storage.GoalChunkFormatV2Setting, s.cfg.GoalChunkFormatV2) {
+		if _, migrateErr := s.store.MigrateGoalChunkFormatV2(jobCtx, goalID); migrateErr != nil {
+			finishState, finishCode = "retryable", "goal_chunk_migration_failed"
+			_ = s.store.SetGoalCompactionState(context.Background(), goalID, "retryable")
+			return true, time.Second
+		}
+	}
 	stages := s.goalCompressionStages(jobCtx)
 	if err = s.store.CompactGoalSegmentsWithRatio(jobCtx, goalID, stages, s.goalCompressionChunkRatio(jobCtx)); err != nil {
 		finishState, finishCode = "retryable", "goal_compaction_failed"

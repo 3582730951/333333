@@ -324,19 +324,19 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// of leaking it downstream.
 	movable := !routing.HasServerSideState(path, r, raw)
 	attempts := 1
-	if s.flagEnabled(r.Context(), "seamless_failover", s.cfg.SeamlessFailover) && movable {
+	if s.flagEnabled(r.Context(), "seamless_failover", s.cfg.SeamlessFailover) && movable && !pol.PinnedEgressNoFallback {
 		if attempts = s.settingInt(r.Context(), "failover_max_attempts", s.cfg.FailoverMaxAttempts); attempts < 1 {
 			attempts = 1
 		}
 	}
-	if movable && attempts < 2 {
+	if movable && !pol.PinnedEgressNoFallback && attempts < 2 {
 		attempts = 2
 	}
 	exclude := map[string]bool{}
 	modelCapabilityRejected := false
 	r = r.WithContext(withSchedulerWait(r.Context(), w, isStreamRequest(raw), "anthropic"))
 	for attempt := 1; attempt <= attempts; attempt++ {
-		outcome := s.claudeMessagesAttempt(w, r, raw, path, affinity, strict, movable, model, pol.Group, pol.KeyHash, allowedProviders, routeMode == "kiro" || boundKiro, affinityEstablished, true, exclude)
+		outcome := s.claudeMessagesAttempt(w, r, raw, path, affinity, strict, movable, model, pol.Group, pol.KeyHash, pol.PinnedEgressNoFallback, allowedProviders, routeMode == "kiro" || boundKiro, affinityEstablished, true, exclude)
 		if outcome == outcomeModelRetry {
 			modelCapabilityRejected = true
 		}
@@ -357,7 +357,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 // account is added to exclude before any retry so it is not re-selected. Mirrors the
 // Codex path's codexAttempt; a benched account is held out of the pool until the
 // recheck loop re-validates it.
-func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, raw []byte, path string, affinity routing.AffinityKey, strict, movable bool, model, group, apiKeyHash string, allowedProviders []string, explicitKiro, affinityEstablished, allowRetry bool, exclude map[string]bool) attemptOutcome {
+func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, raw []byte, path string, affinity routing.AffinityKey, strict, movable bool, model, group, apiKeyHash string, pinnedNoFallback bool, allowedProviders []string, explicitKiro, affinityEstablished, allowRetry bool, exclude map[string]bool) attemptOutcome {
 	streamReq := isStreamRequest(raw)
 	countTokens := strings.HasSuffix(path, "/count_tokens")
 	compaction := kirowire.IsClaudeCodeCompactionRequest(raw)
@@ -368,7 +368,10 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	if explicitKiro && compaction && virtual.EstimateTokensJSON(raw) >= kiroCompactionExtendedRouteThreshold {
 		routeContextMode = "1m"
 	}
-	immutableAffinity := affinityEstablished && explicitKiro
+	// User-group pinning extends the normal Kiro-only immutable affinity boundary
+	// to every Claude provider.  The selected account/primary egress remains the
+	// sole retry target; an unavailable binding is surfaced directly.
+	immutableAffinity := pinnedNoFallback || (affinityEstablished && explicitKiro)
 	if !movable && !affinityEstablished {
 		writePoolCodeError(w, http.StatusConflict, "state_binding_missing", "request depends on server-side state but no persisted session binding exists")
 		return outcomeDone
@@ -385,6 +388,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	}
 	route := scheduler.Route{
 		Group:                 group,
+		NoEgressFallback:      pinnedNoFallback,
 		AllowedProviders:      allowedProviders,
 		Affinity:              affinity,
 		AffinityWait:          kiroAffinityWait(r.Context(), s, allowedProviders),

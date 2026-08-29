@@ -34,9 +34,20 @@ func OpenWithConfig(cfg config.Config) (*Store, error) {
 		return nil, err
 	}
 	if strings.EqualFold(strings.TrimSpace(cfg.StorageDriver), "postgres") {
-		return openPostgres(cfg.PostgresDSN)
+		store, err := openPostgres(cfg.PostgresDSN)
+		if err != nil {
+			return nil, err
+		}
+		store.goalChunkFormatV2Default = cfg.GoalChunkFormatV2
+		return store, nil
 	}
-	return Open(cfg.DatabasePath)
+	store, err := Open(cfg.DatabasePath)
+	if err != nil {
+		return nil, err
+	}
+	store.sqliteIncrementalVacuumDefault = cfg.SQLiteIncrementalVacuumEnabled
+	store.goalChunkFormatV2Default = cfg.GoalChunkFormatV2
+	return store, nil
 }
 
 func openPostgres(dsn string) (*Store, error) {

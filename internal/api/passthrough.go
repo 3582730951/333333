@@ -68,6 +68,7 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
+	r = r.WithContext(withPinnedEgressPolicy(r.Context(), pol.PinnedEgressNoFallback))
 	r = s.withIntelligentRoutingFallbacks(r, pol)
 	hint := normalizeProviderHintLoose(r.Header.Get("X-Pool-Provider"))
 	if strings.TrimSpace(r.Header.Get("X-Pool-Provider")) == "" {
@@ -94,7 +95,8 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 		Group:             pol.Group,
 		Provider:          "claude",
 		Affinity:          affinity,
-		ImmutableAffinity: immutableResource,
+		ImmutableAffinity: immutableResource || pol.PinnedEgressNoFallback,
+		NoEgressFallback:  pol.PinnedEgressNoFallback,
 		SkipWait:          userGroupFallbackProbe(r.Context()),
 	})
 	if err != nil {
@@ -151,7 +153,7 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 
 	if resp.StatusCode >= 400 {
 		errorBody := readUpstreamErrorBody(resp.Body)
-		if claudeAuthError(resp.StatusCode, resp.Header, errorBody) && claudeTokenCanRefresh(token) {
+		if !pol.PinnedEgressNoFallback && claudeAuthError(resp.StatusCode, resp.Header, errorBody) && claudeTokenCanRefresh(token) {
 			if refreshed, rerr := s.forceRefreshClaudeToken(r.Context(), lease.Account, "auth_error"); rerr == nil {
 				token = refreshed
 				resp.Body.Close()

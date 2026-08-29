@@ -130,10 +130,17 @@ FROM goal_payload_chunk WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT ?`, afte
 		}
 		deltas := make(map[string]int64)
 		for _, row := range batch {
-			plain := s.openToken(row.payload)
-			if err := s.CryptoError(); err != nil {
+			plain, openErr := s.openGoalChunkToken(row.payload)
+			if openErr != nil {
 				_ = tx.Rollback()
-				return err
+				return openErr
+			}
+			// Whole-payload gc2 rows are already compressed as one logical stream
+			// and authenticated piece-by-piece.  The older ctx2 migration must leave
+			// them untouched; attempting to decode each piece as an independent
+			// context envelope would either fail startup or destroy the stream.
+			if strings.HasPrefix(plain, goalChunkFormatV2Prefix) {
+				continue
 			}
 			if row.plainBytes < 0 || row.plainBytes > goalPayloadChunkSize {
 				_ = tx.Rollback()

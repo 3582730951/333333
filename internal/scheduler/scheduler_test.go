@@ -941,6 +941,29 @@ func TestStrictStickyDoesNotSwitchUnavailableAccount(t *testing.T) {
 	}
 }
 
+func TestNoEgressFallbackDoesNotSwitchUnavailableBoundAccount(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"pinned-acc-1", "pinned-acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := routing.AffinityKey{Hash: "pinned-hash", Key: "pinned-key", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "pinned-acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetAccountQuarantine(ctx, "pinned-acc-1", storage.Now()+3600, "test"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.StickyWaitMillis = 1
+	s := New(store, cfg)
+	if _, err := s.Select(ctx, Route{Group: "cyber", Affinity: key, NoEgressFallback: true}); !errors.Is(err, ErrBoundAccountUnavailable) {
+		t.Fatalf("no-egress-fallback err=%v, want ErrBoundAccountUnavailable instead of account switch", err)
+	}
+}
+
 func TestCapabilityAwareRoutingPrefersAccountWithModel(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()

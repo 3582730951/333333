@@ -8,6 +8,18 @@ worker_socket="${run_dir}/worker-${release_id}.sock"
 active_link="${run_dir}/active-worker.sock"
 worker=/usr/local/lib/codex-pool/releases/docker/codex-pool-server
 
+# Go 1.25 derives GOMAXPROCS from the container CPU quota. Set a soft heap
+# target from the cgroup limit when the operator did not provide one; this is
+# deliberately best-effort and never imposes a hard memory cap.
+if [ -z "${GOMEMLIMIT:-}" ] && [ -r /sys/fs/cgroup/memory.max ]; then
+  memory_max=$(awk '($1 ~ /^[0-9]+$/) { print $1; exit }' /sys/fs/cgroup/memory.max)
+  if [ -n "${memory_max:-}" ] && [ "$memory_max" -gt 0 ] 2>/dev/null; then
+    # Divide before multiplying so very large numeric cgroup limits cannot
+    # overflow POSIX shell's signed arithmetic.
+    export GOMEMLIMIT=$((memory_max / 100 * 85 + memory_max % 100 * 85 / 100))
+  fi
+fi
+
 if [ -f "${secret_dir}/codex_pool_master_key" ] && [ -z "${CODEX_POOL_MASTER_KEY_FILE:-}" ]; then
   export CODEX_POOL_MASTER_KEY_FILE="${secret_dir}/codex_pool_master_key"
 fi

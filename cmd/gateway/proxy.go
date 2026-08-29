@@ -49,8 +49,11 @@ func newGatewayPoolClient() *http.Client {
 		Transport: &http.Transport{
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, // pool_server 可能用自签名证书
 			Proxy:               http.ProxyFromEnvironment,
-			MaxIdleConns:        32,
-			MaxIdleConnsPerHost: 8,
+			ForceAttemptHTTP2:   true,
+			MaxIdleConns:        256,
+			MaxIdleConnsPerHost: 64,
+			WriteBufferSize:     64 << 10,
+			ReadBufferSize:      64 << 10,
 			IdleConnTimeout:     90 * time.Second,
 			TLSHandshakeTimeout: 10 * time.Second,
 		},

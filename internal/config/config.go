@@ -386,8 +386,17 @@ type Config struct {
 	AccountTokenBudget       int64  `json:"account_token_budget"`
 	// SchedulerIndexEnabled selects the immutable candidate index/power-of-two path.
 	// Disabling it retains the full-scan compatibility path for one release.
-	SchedulerIndexEnabled    bool `json:"scheduler_index_enabled"`
-	ResourceHeadroomPercent  int  `json:"resource_headroom_percent"`
+	SchedulerIndexEnabled   bool `json:"scheduler_index_enabled"`
+	ResourceHeadroomPercent int  `json:"resource_headroom_percent"`
+	AdmissionCPUEnabled     bool `json:"admission_cpu_enabled"`
+	SSEFlushBatchBytes      int  `json:"sse_flush_batch_bytes"`
+	SSEFlushMaxDelayMillis  int  `json:"sse_flush_max_delay_millis"`
+	SSETailFlushBytes       int  `json:"sse_tail_flush_bytes"`
+	// SQLiteIncrementalVacuumEnabled opts maintenance into incremental page
+	// reclamation only after the database has been explicitly migrated to
+	// auto_vacuum=INCREMENTAL. It is off by default because enabling that SQLite
+	// mode requires a one-time maintenance VACUUM.
+	SQLiteIncrementalVacuumEnabled bool `json:"sqlite_incremental_vacuum_enabled"`
 	// IntelligentRoutingEnabled is the master switch for the intelligent routing
 	// mechanism: per-group fallback chains (GroupFallbacks) evaluated through
 	// SelectAcross so an empty group is skipped instantly, instant selection when
@@ -410,7 +419,7 @@ type Config struct {
 	// session, and the single following turn detaches from the old response chain.
 	// Keyed by user-group id; a group is opted in only when its value is true.
 	SafetySessionRotationGroups map[string]bool `json:"safety_session_rotation_groups"`
-	ContextJournalTTLSeconds int  `json:"context_journal_ttl_seconds"`
+	ContextJournalTTLSeconds    int             `json:"context_journal_ttl_seconds"`
 	// ContextJournalMaxRows / ContextJournalMaxMB bound the encrypted replay journal on
 	// low-config VPS hosts. When either is exceeded the disk guard evicts the rows with
 	// the lowest expires_at first — which, thanks to sliding TTL, are the least-recently
@@ -431,6 +440,7 @@ type Config struct {
 	GoalLeaseSeconds           int     `json:"goal_lease_seconds"`
 	GoalHeartbeatSeconds       int     `json:"goal_heartbeat_seconds"`
 	GoalCompressionConcurrency int     `json:"goal_compression_concurrency"`
+	GoalChunkFormatV2          bool    `json:"goal_chunk_format_v2"`
 	// CodexSessionMappingEnabled enables the strict native Responses context
 	// engine. Normal turns use encrypted identity metadata plus HMAC aliases; when
 	// the bound account or previous_response_id is lost, the encrypted goal chain
@@ -1116,6 +1126,11 @@ func Default() Config {
 		SchedulerIndexEnabled:             true,
 		IntelligentRoutingEnabled:         true,
 		ResourceHeadroomPercent:           10,
+		AdmissionCPUEnabled:               true,
+		SSEFlushBatchBytes:                4 * 1024,
+		SSEFlushMaxDelayMillis:            3,
+		SSETailFlushBytes:                 8 * 1024,
+		SQLiteIncrementalVacuumEnabled:    false,
 		ContextJournalTTLSeconds:          3600,
 		ContextJournalMaxRows:             50000,
 		ContextJournalMaxMB:               200,
@@ -1128,6 +1143,7 @@ func Default() Config {
 		GoalLeaseSeconds:                  90,
 		GoalHeartbeatSeconds:              15,
 		GoalCompressionConcurrency:        1,
+		GoalChunkFormatV2:                 false,
 		CodexSessionMappingEnabled:        true,
 		CodexSessionMappingRetentionDays:  7,
 		CodexCPAStrict:                    true,
@@ -1935,6 +1951,21 @@ func (c *Config) normalize() {
 	}
 	if c.ResourceHeadroomPercent < 10 {
 		c.ResourceHeadroomPercent = 10
+	}
+	// Streaming flush knobs are runtime-tunable, but normalize boot-loaded
+	// configs as well so callers that bypass the admin settings registry retain
+	// the documented defaults and cannot accidentally disable progress.
+	if c.SSEFlushBatchBytes <= 0 {
+		c.SSEFlushBatchBytes = 4 * 1024
+	}
+	if c.SSEFlushMaxDelayMillis < 0 {
+		c.SSEFlushMaxDelayMillis = 3
+	}
+	if c.SSEFlushMaxDelayMillis > 1000 {
+		c.SSEFlushMaxDelayMillis = 1000
+	}
+	if c.SSETailFlushBytes <= 0 {
+		c.SSETailFlushBytes = 8 * 1024
 	}
 	if c.ContextJournalTTLSeconds <= 0 {
 		c.ContextJournalTTLSeconds = 3600

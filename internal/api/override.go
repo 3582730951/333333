@@ -33,8 +33,9 @@ type downstreamPolicy struct {
 	UserID  string
 	Authed  bool
 	// UserGroupID, when set, means the key uses the two-layer group model.
-	UserGroupID         string
-	ModelOverrideSource string
+	UserGroupID            string
+	PinnedEgressNoFallback bool
+	ModelOverrideSource    string
 }
 
 // downstreamIdent carries the resolved key/user identity through the request context
@@ -54,6 +55,11 @@ const (
 	ctxKeyUsageDiagnostics
 	ctxKeyModelDiagnostics
 	ctxKeyPublicChatPolicy
+	// ctxKeyPinnedEgress marks a request resolved to a user group whose primary
+	// account/egress is authoritative.  It is kept separate from the downstream
+	// identity because custom and opaque passthrough adapters do not otherwise
+	// receive the full policy value.
+	ctxKeyPinnedEgress
 )
 
 type modelDiagnostics struct{ Requested, Resolved, Source string }
@@ -74,10 +80,25 @@ func publicChatPolicyFromContext(ctx context.Context) (downstreamPolicy, bool) {
 }
 
 func withDownstreamKey(ctx context.Context, pol downstreamPolicy) context.Context {
+	if pol.PinnedEgressNoFallback {
+		ctx = context.WithValue(ctx, ctxKeyPinnedEgress, true)
+	}
 	if pol.KeyHash == "" && pol.UserID == "" {
 		return ctx
 	}
 	return context.WithValue(ctx, ctxKeyDownstream, downstreamIdent{pol.KeyHash, pol.UserID})
+}
+
+func withPinnedEgressPolicy(ctx context.Context, pinned bool) context.Context {
+	if !pinned {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyPinnedEgress, true)
+}
+
+func pinnedEgressNoFallbackFromContext(ctx context.Context) bool {
+	pinned, _ := ctx.Value(ctxKeyPinnedEgress).(bool)
+	return pinned
 }
 
 func downstreamFromCtx(ctx context.Context) (string, string) {
@@ -186,8 +207,9 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 		if strings.TrimSpace(pol.ProviderHint) == "" {
 			pol.ProviderHint = "auto"
 		}
-		if strings.TrimSpace(pol.UserGroupID) != "" && (strings.TrimSpace(pol.ForceModel) == "" || strings.TrimSpace(pol.ForceEffort) == "") {
+		if strings.TrimSpace(pol.UserGroupID) != "" {
 			if ug, ok, ugErr := s.store.GetUserGroup(ctx, pol.UserGroupID); ugErr == nil && ok {
+				pol.PinnedEgressNoFallback = ug.PinnedEgressNoFallback
 				if strings.TrimSpace(pol.ForceModel) == "" {
 					pol.ForceModel = strings.TrimSpace(ug.ForceModel)
 					if pol.ForceModel != "" {
@@ -256,18 +278,17 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 	}
 	// User-facing policy lives exclusively on user groups. Account-pool groups are
 	// routing inventory and must never override model or effort.
-	if pol.ForceModel == "" || pol.ForceEffort == "" {
-		if pol.UserGroupID != "" {
-			if ug, ok, ugErr := s.store.GetUserGroup(ctx, pol.UserGroupID); ugErr == nil && ok {
-				if pol.ForceModel == "" {
-					pol.ForceModel = strings.TrimSpace(ug.ForceModel)
-					if pol.ForceModel != "" {
-						pol.ModelOverrideSource = "user_group"
-					}
+	if pol.UserGroupID != "" {
+		if ug, ok, ugErr := s.store.GetUserGroup(ctx, pol.UserGroupID); ugErr == nil && ok {
+			pol.PinnedEgressNoFallback = ug.PinnedEgressNoFallback
+			if pol.ForceModel == "" {
+				pol.ForceModel = strings.TrimSpace(ug.ForceModel)
+				if pol.ForceModel != "" {
+					pol.ModelOverrideSource = "user_group"
 				}
-				if pol.ForceEffort == "" {
-					pol.ForceEffort = strings.TrimSpace(ug.ForceEffort)
-				}
+			}
+			if pol.ForceEffort == "" {
+				pol.ForceEffort = strings.TrimSpace(ug.ForceEffort)
 			}
 		}
 	}
@@ -280,6 +301,9 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 		pol.ForceModel = strings.TrimSpace(fallback.TargetModel)
 		pol.ProviderHint = "auto"
 		pol.ModelOverrideSource = "traffic_fallback"
+		if ug, found, ugErr := s.store.GetUserGroup(ctx, pol.UserGroupID); ugErr == nil && found {
+			pol.PinnedEgressNoFallback = ug.PinnedEgressNoFallback
+		}
 	}
 	return pol, true
 }
@@ -333,6 +357,7 @@ func (s *Server) attachUserGroupPolicy(w http.ResponseWriter, r *http.Request, p
 		writePoolCodeError(w, http.StatusUnprocessableEntity, "user_group_not_found", "configured user group was not found")
 		return r, false
 	}
+	pol.PinnedEgressNoFallback = group.PinnedEgressNoFallback
 	requestGroup := superInstructPolicyForClient(userGroupPolicyAsAccountGroup(group), r)
 	return r.WithContext(withRequestAccountGroupPolicy(r.Context(), requestGroup)), true
 }

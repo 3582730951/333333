@@ -49,6 +49,7 @@ func (s *Server) handleCodexPassthroughWithPolicy(
 	routeModel string,
 	raw []byte,
 ) {
+	r = r.WithContext(withPinnedEgressPolicy(r.Context(), policy.PinnedEgressNoFallback))
 	switch r.Method {
 	case http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodPut, http.MethodPatch:
 	default:
@@ -102,10 +103,11 @@ func (s *Server) handleCodexPassthroughWithPolicy(
 	}
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
 		Group:             policy.Group,
+		NoEgressFallback:  policy.PinnedEgressNoFallback,
 		Provider:          "codex",
 		Model:             routeModel,
 		Affinity:          affinity,
-		ImmutableAffinity: immutableResource,
+		ImmutableAffinity: immutableResource || policy.PinnedEgressNoFallback,
 		SkipWait:          userGroupFallbackProbe(r.Context()),
 	})
 	if err != nil {

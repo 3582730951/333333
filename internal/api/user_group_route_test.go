@@ -774,6 +774,80 @@ func TestDispatchUserGroupRouteCandidatesFallsBackBeforeCommitAcrossEntrypoints(
 	}
 }
 
+func TestPinnedUserGroupCommitsFirstUpstreamErrorWithoutTargetFallback(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: "pinned-route-secondary"}); err != nil {
+		t.Fatal(err)
+	}
+	targets := []storage.TargetRef{
+		{Kind: storage.TargetKindAccountPoolGroup, ID: "cyber"},
+		{Kind: storage.TargetKindAccountPoolGroup, ID: "pinned-route-secondary"},
+	}
+
+	for _, test := range []struct {
+		name       string
+		path       string
+		body       string
+		headerName string
+		status     int
+	}{
+		{name: "chat_503", path: "/v1/chat/completions", body: `{"model":"gpt","messages":[]}`, headerName: "Thread-Id", status: http.StatusServiceUnavailable},
+		{name: "responses_429", path: "/v1/responses", body: `{"model":"gpt","input":"hello"}`, headerName: "Thread-Id", status: http.StatusTooManyRequests},
+		{name: "messages_500", path: "/v1/messages", body: `{"model":"gpt","messages":[{"role":"user","content":"hello"}]}`, headerName: "X-Claude-Code-Session-Id", status: http.StatusInternalServerError},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			groupID := "ug_pinned_" + test.name
+			if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
+				ID: groupID, Name: groupID, Targets: targets, PinnedEgressNoFallback: true,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			raw := []byte(test.body)
+			req := httptest.NewRequest(http.MethodPost, test.path, nil)
+			req.Header.Set(test.headerName, "pinned-session-"+test.name)
+			pol := downstreamPolicy{UserGroupID: groupID, PinnedEgressNoFallback: true}
+
+			recorder := httptest.NewRecorder()
+			attempts := make([]storage.TargetRef, 0, len(targets))
+			handled := h.app.dispatchUserGroupRouteCandidates(recorder, req, raw, raw, pol, func(w http.ResponseWriter, candidate *http.Request) {
+				target, ok := userGroupRouteOverride(candidate.Context())
+				if !ok {
+					t.Fatal("candidate request missing route override")
+				}
+				attempts = append(attempts, target)
+				w.Header().Set("X-Upstream-Target", target.ID)
+				w.WriteHeader(test.status)
+				_, _ = io.WriteString(w, `{"error":{"message":"pinned upstream failure"}}`)
+			})
+			if !handled || len(attempts) != 1 {
+				t.Fatalf("handled=%v attempts=%+v", handled, attempts)
+			}
+			if recorder.Code != test.status || recorder.Header().Get("X-Upstream-Target") != attempts[0].ID || recorder.Body.String() != `{"error":{"message":"pinned upstream failure"}}` {
+				t.Fatalf("response status=%d headers=%v body=%s", recorder.Code, recorder.Header(), recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestPinnedUserGroupSkipsCrossGroupTrafficFallback(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	recorder := httptest.NewRecorder()
+	raw := []byte(`{"model":"gpt-5.6-sol","input":"pinned"}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(raw))
+	dispatched := false
+	handled := h.app.dispatchUserGroupTrafficFallback(
+		recorder,
+		request,
+		raw,
+		raw,
+		downstreamPolicy{UserGroupID: "ug_pinned_traffic", PinnedEgressNoFallback: true},
+		func(http.ResponseWriter, *http.Request) { dispatched = true },
+	)
+	if handled || dispatched {
+		t.Fatalf("pinned traffic fallback handled=%v dispatched=%v, want both false", handled, dispatched)
+	}
+}
+
 func TestDispatchUserGroupRoutePersistsTerminalBindingAfterClientCancellation(t *testing.T) {
 	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
 	const groupID = "ug_cancelled_terminal_binding"

@@ -509,8 +509,8 @@ internal/console/dist/assets/Egress-Ck-YxhLo.js.br
 internal/console/dist/assets/EmailPool-Bbd1I9N4.js
 internal/console/dist/assets/EmailPool-Bbd1I9N4.js.br
 internal/console/dist/assets/ErrorToast-DIcAWovk.js
-internal/console/dist/assets/Groups-DeZEgHht.js
-internal/console/dist/assets/Groups-DeZEgHht.js.br
+internal/console/dist/assets/Groups-C0FIvIRe.js
+internal/console/dist/assets/Groups-C0FIvIRe.js.br
 internal/console/dist/assets/Keys-B_z4j76f.js
 internal/console/dist/assets/Keys-B_z4j76f.js.br
 internal/console/dist/assets/LazyCharts-DOPkr_Pw.js
@@ -604,10 +604,10 @@ internal/console/dist/assets/hooks-BRtsxPDY.js
 internal/console/dist/assets/hooks-BRtsxPDY.js.br
 internal/console/dist/assets/i18n-DYjhMICW.js
 internal/console/dist/assets/i18n-DYjhMICW.js.br
-internal/console/dist/assets/index-CRfLVdWx.js
-internal/console/dist/assets/index-CRfLVdWx.js.br
 internal/console/dist/assets/index-Dx6oKrpV.css
 internal/console/dist/assets/index-Dx6oKrpV.css.br
+internal/console/dist/assets/index-W0ljeRWk.js
+internal/console/dist/assets/index-W0ljeRWk.js.br
 internal/console/dist/assets/jsx-runtime-B2iFcflP.js
 internal/console/dist/assets/jsx-runtime-B2iFcflP.js.br
 internal/console/dist/assets/keys-DPPtpvKM.js
@@ -860,6 +860,8 @@ internal/storage/email_pool.go
 internal/storage/email_pool_test.go
 internal/storage/encryption_test.go
 internal/storage/goal_checkpoint_prepare_ahead_test.go
+internal/storage/goal_chunk_format_v2.go
+internal/storage/goal_chunk_format_v2_test.go
 internal/storage/goal_chunk_prepare_bench_test.go
 internal/storage/goal_continuity.go
 internal/storage/goal_continuity_test.go
@@ -1050,6 +1052,7 @@ scripts/maintenance/reclaim-disk-space.sh
 scripts/maintenance/reclaim-space-now.sh
 scripts/managed-source-manifest.txt
 scripts/prune-managed-source.sh
+scripts/publish-github.sh
 scripts/reap-old-release.sh
 scripts/rollback-release.sh
 scripts/selftest.sh
