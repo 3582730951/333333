@@ -25,6 +25,17 @@ list_candidates() {
 
 list_candidates | awk '
   /(^|\/)passwd\.txt$/ { next }
+  /(^|\/)(test|tests|testdata)\// { next }
+  /^(cmd\/extreme-load|tools\/(acceptance|e2e|visual))\// { next }
+  /(^|\/)[^\/]*_test\.[^\/]+$/ { next }
+  /(^|\/)test[_-][^\/]*\.[^\/]+$/ { next }
+  /(^|\/)[^\/]*[-.]test\.[^\/]+$/ { next }
+  /(^|\/)[^\/]*_spec\.[^\/]+$/ { next }
+  /(^|\/)spec[_-][^\/]*\.[^\/]+$/ { next }
+  /(^|\/)[^\/]*[-.]spec\.[^\/]+$/ { next }
+  /(^|\/)[^\/]*selftest[^\/]*$/ { next }
+  /(^|\/)(playwright|vitest|jest)\.config\.[^\/]+$/ { next }
+  /^scripts\/ci\.sh$/ { next }
   /^super-instruct\/LICENSE$/ { print; next }
   /^internal\/console\/dist\// { print; next }
   /^(cmd|internal|services|sidecar|modules|scripts|deploy|web-spa\/src|web-spa\/scripts|workers\/node-registrar\/src|super-instruct)\// &&

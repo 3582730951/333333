@@ -30,6 +30,12 @@ while IFS= read -r -d '' tracked; do
     continue
   fi
 
+  # This checksum-stable tokenizer table is compiled into the Go binary. It is
+  # a production source asset, not a generated release binary.
+  if [[ "$tracked" == "internal/tokenizer/o200k_base.tiktoken.gz" ]]; then
+    continue
+  fi
+
   size="$(wc -c < "$tracked")"
   if (( size > max_bytes )); then
     echo "tracked file exceeds ${max_bytes} bytes: $tracked ($size bytes)" >&2
@@ -37,6 +43,24 @@ while IFS= read -r -d '' tracked; do
   fi
 
   lower="${tracked,,}"
+  if [[ "$tracked" != "README.md" ]]; then
+    case "$lower" in
+      *.md|docs/*|*/docs/*)
+        echo "GitHub publication forbids documentation outside root README.md: $tracked" >&2
+        failed=1
+        ;;
+    esac
+  fi
+  case "$lower" in
+    .run/*|archive/*|artifacts/*|tests/*|*/tests/*|testdata/*|*/testdata/*|cmd/extreme-load/*|tools/acceptance/*|tools/e2e/*|tools/visual/*)
+      echo "GitHub publication forbids internal/test path: $tracked" >&2
+      failed=1
+      ;;
+    *_test.*|*/test_*.*|test_*.*|*/test-*.*|test-*.*|*-test.*|*.test.*|*_spec.*|*/spec_*.*|spec_*.*|*/spec-*.*|spec-*.*|*-spec.*|*.spec.*|*selftest*|*/playwright.config.*|*/vitest.config.*|*/jest.config.*|scripts/ci.sh)
+      echo "GitHub publication forbids test source: $tracked" >&2
+      failed=1
+      ;;
+  esac
   case "$lower" in
     *.exe|*.dll|*.dylib|*.so|*.a|*.o|*.bin|*.zip|*.tar|*.tar.gz|*.tgz|*.gz|*.bz2|*.xz|*.7z|*.rar|*.sqlite|*.sqlite3|*.db|*.wasm)
       echo "tracked binary/archive/database extension is forbidden: $tracked" >&2
@@ -49,6 +73,7 @@ done < <(git ls-files -z)
 # harmless; every non-empty binary blob must be kept out of source control.
 while IFS= read -r -d '' binary; do
   [[ -s "$binary" ]] || continue
+  [[ "$binary" == "internal/tokenizer/o200k_base.tiktoken.gz" ]] && continue
   echo "tracked binary content is forbidden: $binary" >&2
   failed=1
 done < <(git grep -z -IL -e '' -- . || true)

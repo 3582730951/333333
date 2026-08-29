@@ -1,1 +1,0 @@
-docker run --rm --entrypoint /usr/local/lib/codex-pool/releases/docker/registrar-python-venv/bin/python -v /workspace:/workspace -w /workspace codex-pool:verification -m unittest sidecar/test_async_sidecar.py

@@ -1,7 +1,0 @@
-330068fa9eee713a5713952f4bafeda00c6c89e72281db38f77e9daab705d0a5  captures/claude-2.1.226-api-key.raw
-b53a4c9a696bda0baff083f82df636ce17138ca152b003d6f1021155973b931b  captures/claude-2.1.226-clienthello.bin
-c0c3b1b4f126f51be7eb9ad9531627978a3aec06a88f5c2d7273c4a8d1878907  captures/claude-2.1.226-oauth.raw
-54be1c270d43549232d3f6bade18709b06fdc608aa8379f63dcfa4b63526975a  captures/claude-2.1.226-tools.raw
-09247e6b8e975263c1b8e2ae7f90388f91f396d79e7ab5d5be12d50f3e4aea51  captures/modified-inprocess-clienthello.bin
-21fa854c7e94eee37e6ca83522a6c1069fa1f5467791121d5d5704fc8ddecaf6  captures/modified-sidecar-clienthello.bin
-0f9d4a37086724179b2339ca3247206e41ae2754d0cdf202fdba9bcee9831dc3  captures/modified-sidecar-request.raw

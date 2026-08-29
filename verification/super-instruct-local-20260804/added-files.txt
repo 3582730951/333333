@@ -1,3 +1,0 @@
-internal/superinstruct/inject.go
-internal/superinstruct/inject_test.go
-super-instruct/bridge.md

@@ -61,6 +61,7 @@ candidate_configs = [Path(p) for p in configs]
 candidate_configs += [
     Path("/etc/codex-pool/config.json"),
     Path("/var/lib/codex-pool/config.json"),
+    script_cwd / "var" / "config" / "config.local.json",
     script_cwd / "config.json",
     script_cwd / "config.server.json",
     script_cwd / "config.local.json",

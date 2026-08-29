@@ -3,8 +3,12 @@
 .gstack/
 .agents/
 .codex/
+.claude/
 .build/
 *.log
+
+# Repository-local runtime state: configs, databases, credentials, and scratch.
+/var/
 
 # Local databases and WAL/SHM sidecars
 *.sqlite3
@@ -28,6 +32,7 @@ config.*.json
 node_modules/
 web-spa/node_modules/
 web-spa/dist/
+/bin/
 /pool-server
 /pool-server-new
 /other_cpa
@@ -37,12 +42,43 @@ web-spa/dist/
 /cmd/pool-server/pool-server
 /wsl-list.txt
 /other_new_gpt_register
-/docs/*
-!/docs/operations/
-/docs/operations/*
-!/docs/operations/codex-cache-hit-rollout.md
 /other
 /example_zip
+
+# Local-only reference repositories and diagnostic fixtures. These may contain
+# nested Git histories, credentials, or production-derived captures.
+/third_party/reference/
+/data/
+/diagnostics/
+
+# GitHub source-publication policy. The only published documentation file is
+# the root README.md; tests remain available in the local/internal worktree but
+# are deliberately absent from the GitHub branch.
+/archive/
+/artifacts/
+/docs/
+/tests/
+**/tests/
+**/testdata/
+*_test.*
+test_*.*
+test-*.*
+*-test.*
+*.test.*
+*_spec.*
+spec_*.*
+spec-*.*
+*-spec.*
+*.spec.*
+*selftest*
+playwright.config.*
+vitest.config.*
+jest.config.*
+/scripts/ci.sh
+/cmd/extreme-load/
+/tools/acceptance/
+/tools/e2e/
+/tools/visual/
 
 # Python caches and captured traffic artifacts
 __pycache__/
@@ -57,12 +93,11 @@ pngs/
 pngs_s/
 screenshot*.png
 
-# Local verification source bundles and downloaded toolchains
-/artifacts/**/baseline/original.tar.gz
-/artifacts/**/modified/workspace-source.tar.gz
-/artifacts/**/go*.linux-amd64.tar.gz
-/artifacts/**/old-src/
-
 # Keep the embedded console bundle tracked for the Go binary.
 !internal/console/dist/
 !internal/console/dist/**
+
+# Documentation policy is last so a broader build-artifact exception cannot
+# accidentally re-include nested Markdown. Only the root README is published.
+*.md
+!/README.md

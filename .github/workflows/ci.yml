@@ -91,12 +91,9 @@ jobs:
       - name: Install deterministic frontend dependencies
         working-directory: web-spa
         run: npm ci
-      - name: Install Chromium and browser system dependencies
+      - name: Typecheck and build the published frontend source
         working-directory: web-spa
-        run: npx playwright install --with-deps chromium
-      - name: Typecheck, test, visual smoke, and build
-        working-directory: web-spa
-        run: npm run verify
+        run: npm run build
       - name: Verify the embedded SPA artifact is current
         run: |
           git diff --exit-code -- internal/console/dist scripts/managed-source-manifest.txt

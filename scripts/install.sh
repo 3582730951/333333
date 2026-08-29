@@ -84,6 +84,8 @@ ACTIVATION_NEW_RELEASE=""
 # unchanged — lets the restart block skip a needless sidecar restart that would sever
 # in-flight upstream streams.
 SIDECAR_CHANGED=1
+SUPER_INSTRUCT_SOURCE=""
+SUPER_INSTRUCT_SOURCE_KIND="none"
 
 if [[ -n "${BIN_DIR:-}" ]]; then
   BIN_DIR_EXPLICIT=1
@@ -1147,10 +1149,20 @@ ensure_project_files() {
     CONSOLE_RELEASE_ALLOW_STALE=1 \
     bash "${PROJECT_ROOT}/scripts/verify-console-release.sh" >/dev/null ||
     die "embedded console release is incomplete; refusing to build or switch releases"
-  # These resources are always shipped. User-group policy plus the API-key
-  # Codex installer choice controls use; the cloud installer has no global gate.
-  [[ -f super-instruct/bridge.md ]] || die "Super-Instruct M1 bridge not found: super-instruct/bridge.md"
-  [[ -d super-instruct/codex-skills ]] || die "Super-Instruct skills not found: super-instruct/codex-skills"
+  # Internal Markdown resources are intentionally absent from the GitHub
+  # publication. A local/internal source tree still stages the complete bundle;
+  # an in-place public update preserves the bundle from the active release. A
+  # fresh public install remains valid with the optional capability unavailable.
+  if [[ -f "${PROJECT_ROOT}/super-instruct/bridge.md" && -d "${PROJECT_ROOT}/super-instruct/codex-skills" ]]; then
+    SUPER_INSTRUCT_SOURCE="${PROJECT_ROOT}/super-instruct"
+    SUPER_INSTRUCT_SOURCE_KIND="bundled"
+  elif [[ -f "${APP_DIR%/}/current/super-instruct/bridge.md" && -d "${APP_DIR%/}/current/super-instruct/codex-skills" ]]; then
+    SUPER_INSTRUCT_SOURCE="${APP_DIR%/}/current/super-instruct"
+    SUPER_INSTRUCT_SOURCE_KIND="preserved"
+    warn "Super-Instruct resources are absent from this source; preserving the active release bundle"
+  else
+    warn "Super-Instruct resources are not included in this source; installing the gateway with that optional capability unavailable"
+  fi
   if bool_enabled "$WITH_SIDECAR"; then
     [[ -f sidecar/curl_cffi_sidecar.py ]] || die "sidecar/curl_cffi_sidecar.py not found"
     [[ -f sidecar/requirements.txt ]] || die "sidecar/requirements.txt not found"
@@ -1324,8 +1336,8 @@ install_binary_and_config() {
     run_root install -m 0755 sidecar/curl_cffi_sidecar.py "$staging/sidecar/"
     run_root install -m 0644 sidecar/requirements.txt "$staging/sidecar/"
   fi
-  if [[ -d super-instruct ]]; then
-    run_root cp -a super-instruct/. "$staging/super-instruct/"
+  if [[ -n "$SUPER_INSTRUCT_SOURCE" ]]; then
+    run_root cp -a "${SUPER_INSTRUCT_SOURCE%/}/." "$staging/super-instruct/"
     # cp -a preserves source ownership, which may be root:root or a build user.
     # The worker runs as ${SERVICE_USER}:${SERVICE_GROUP} and the tree is later
     # tightened to o=, so the service group must own read/execute access.
@@ -3013,7 +3025,11 @@ print_summary() {
   else
     migration_summary="disabled (account-pool groups stay separate)"
   fi
-  super_instruct_summary="bundled; enabled per API-key install choice within user-group policy"
+  case "$SUPER_INSTRUCT_SOURCE_KIND" in
+    bundled) super_instruct_summary="bundled; enabled per API-key install choice within user-group policy" ;;
+    preserved) super_instruct_summary="preserved from the previously active release" ;;
+    *) super_instruct_summary="unavailable (internal Markdown resources are not part of this source)" ;;
+  esac
   frontend_url="$(frontend_url_hint)"
   manual_admin_env=""
   admin_token_summary="<empty>"

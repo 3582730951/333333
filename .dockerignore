@@ -3,6 +3,7 @@
 .gstack
 .agents
 .codex
+.claude
 .build
 
 # Local regression/reference trees and captured diagnostics are not build inputs.
@@ -12,6 +13,19 @@
 /other_cpa
 /other_new_gpt_register
 /example_zip
+/archive
+/artifacts
+/legacy-cache-hit-optimization
+/third_party
+/tests
+/var
+/verification
+/docs
+/cmd/extreme-load
+/tools/acceptance
+/tools/e2e
+/tools/visual
+/scripts/ci.sh
 /capture
 /newtest
 /pngs
@@ -29,6 +43,20 @@ web-spa/dist
 *.pcapng
 __pycache__
 *.pyc
+*_test.*
+test_*.*
+test-*.*
+*-test.*
+*.test.*
+*_spec.*
+spec_*.*
+spec-*.*
+*-spec.*
+*.spec.*
+*selftest*
+playwright.config.*
+vitest.config.*
+jest.config.*
 
 bin
 pool-server

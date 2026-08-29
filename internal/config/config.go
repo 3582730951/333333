@@ -23,7 +23,7 @@ const (
 	// model catalog and some live models by this value, so old preserved config
 	// values are floored to this default during normalization.
 	// Refreshed 2026-08-27 to Codex CLI 0.150.1, whose wire traits were verified
-	// against the codex-rs tree in other/codex. The application-level protocol traits
+	// against the codex-rs tree in third_party/reference/codex. The application-level protocol traits
 	// for every accepted downstream version live in codexCLIFingerprints below.
 	DefaultClientVersion                  = "0.150.1"
 	DefaultStickyWaitMillis               = 100
@@ -143,7 +143,7 @@ type CodexCLIFingerprint struct {
 // codexCLIFingerprints is the fingerprint library verified against the corresponding
 // official Codex releases. Keep newest first.
 //
-// 0.150.1 was verified against the codex-rs tree in other/codex: the default
+// 0.150.1 was verified against the codex-rs tree in third_party/reference/codex: the default
 // x-codex-beta-features value is still exactly "remote_compaction_v2" (the FEATURES
 // table has only two Stage::Experimental entries — network_proxy and prevent_idle_sleep —
 // both default_enabled:false, while RemoteCompactionV2 is Stage::Stable/default_enabled:true

@@ -17,7 +17,7 @@ function exists(relativePath) {
 
 const vendorLogoPath = 'web-spa/src/components/VendorLogo.jsx';
 const oauthModalPath = 'web-spa/src/components/OAuthLoginModal.jsx';
-const policyPath = 'docs/CONSOLE_ASSET_POLICY.md';
+const policyPath = 'docs/architecture/console-asset-policy.md';
 const requiredAssets = [
   'web-spa/src/assets/vendors/openai-blossom.svg',
   'web-spa/src/assets/vendors/anthropic.svg',
@@ -44,7 +44,7 @@ for (const asset of requiredAssets) {
 }
 
 if (!exists(policyPath)) {
-  problems.push('docs/CONSOLE_ASSET_POLICY.md must document vendor logo provenance.');
+  problems.push('docs/architecture/console-asset-policy.md must document vendor logo provenance.');
 } else {
   const policy = read(policyPath);
   for (const required of [

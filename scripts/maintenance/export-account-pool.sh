@@ -50,6 +50,7 @@ if [[ -z "$config_path" ]]; then
   for candidate in \
     /etc/codex-pool/config.json \
     /var/lib/codex-pool/config.json \
+    "$repo_root/var/config/config.local.json" \
     "$repo_root/config.local.json" \
     "$repo_root/config.json" \
     "$repo_root/config.example.json"; do

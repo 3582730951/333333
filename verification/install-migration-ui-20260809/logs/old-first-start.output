@@ -1,8 +1,0 @@
-2026/08/09 07:58:13 startup: initializing storage
-2026/08/09 07:58:13 startup: storage initialized in 58ms
-2026/08/09 07:58:13 codex pool server listening on 127.0.0.1:18787
-2026/08/09 07:58:13 worker role active release=development fencing_token=1
-2026/08/09 07:58:13 model probe sweep: probed=0 failed=0
-2026/08/09 07:58:13 startup: deferred storage migrations completed in 3ms
-2026/08/09 07:58:13 [REGISTRATION] auto-registration NOT auto-filling: 注册功能默认关闭；需显式启用 registration_enabled; auto-refill 策略未启用（在「自动注册」页开启 refill 策略并设置 target/threshold）; 未配置 hotmail_otp provider（protocol_v2/browser_v3 需要）; required registrar artifact is unavailable; required registrar artifact is unavailable; authenticated email OTP provider is not configured; registration egress is not ready | providers mailbox=0 sms=0 captcha=0 | pool active=0 target=20 deficit=20
-2026/08/09 07:58:43 [QUOTA-POLL] started (interval=300s, max_concurrent=5)

@@ -16,7 +16,7 @@ import (
 // what lets an operator deliberately hold an OpenAI OAuth account in the 429
 // state without rotating through the healthy pool. The wire shape matches the
 // codex-rs protocol types CustomToolCall{CustomToolCallOutput}
-// (other/codex/codex-rs/protocol/src/models.rs).
+// (third_party/reference/codex/codex-rs/protocol/src/models.rs).
 const (
 	codexSyntheticAgentContextToolName   = "exec"
 	codexSyntheticAgentContextCallPrefix = "call_codexpool_overdraft_"

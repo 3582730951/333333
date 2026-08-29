@@ -1,5 +1,0 @@
-ROOT=/workspace/artifacts/crossborder-vps-95.111.197.204-20260801T1241Z
-STATE=/root/crossborder-deploy-20260801T1241Z
-TARGET=95.111.197.204
-KEY=/root/.ssh/upcloud-20260801
-STAMP=20260801T1241Z

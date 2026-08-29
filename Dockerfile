@@ -40,8 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends unzip && \
 COPY web-spa/package.json web-spa/package-lock.json ./
 RUN npm ci
 COPY web-spa/ ./
-COPY docs/CONSOLE_ASSET_POLICY.md /src/docs/CONSOLE_ASSET_POLICY.md
-RUN mkdir -p /src/internal/console && npm run verify
+RUN mkdir -p /src/internal/console && npm run build:assets
 
 FROM node:22.23.1-trixie-slim AS registrar-node
 

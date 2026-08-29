@@ -71,6 +71,7 @@ if [[ -n $config_path ]]; then
 else
   candidates=()
   for candidate in \
+    "$PWD/var/data/pool.sqlite3" \
     "$PWD/pool.sqlite3" \
     "$PWD/data/pool.sqlite3" \
     /var/lib/codex-pool/pool.sqlite3

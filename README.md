@@ -1,8 +1,27 @@
 # Codex Account Pool Server
 
-独立账号池网关实现，不修改 `other_codex`、`other_cpa`、`other_Codex_Manager` 参考源码。
+独立账号池网关实现。第三方研究仓库统一隔离在 `third_party/reference/`，不参与生产构建。
 
-项目目录约定见 `docs/PROJECT_STRUCTURE.md`。
+GitHub 发布树只包含本 `README.md`；内部文档、测试源码和运行状态均由发布门禁过滤。
+
+## 仓库结构
+
+| 路径 | 职责 |
+| --- | --- |
+| `cmd/` | Go 可执行程序入口 |
+| `internal/` | 服务端私有领域代码 |
+| `web-spa/` | 管理控制台前端源码 |
+| `services/`、`sidecar/`、`workers/` | Python/Node 辅助服务与传输侧车 |
+| `modules/`、`super-instruct/` | 独立模块与随产品发布的资源 |
+| `deploy/` | 容器、systemd 与反向代理部署定义 |
+| `scripts/`、`tools/` | 运维自动化、构建检查与工程工具 |
+| `tests/` | 内部端到端、性能测试及本地私密夹具（不发布） |
+| `docs/` | 内部架构、运维、计划与报告（不发布） |
+| `artifacts/` | 内部实施证据和历史验证快照（不发布） |
+| `archive/` | 本地旧仓库与源码备份，不参与构建或发布 |
+| `third_party/reference/` | 本地第三方参考仓库，不纳入版本控制 |
+| `var/` | 本机配置、数据库、凭据与临时文件，不纳入版本控制 |
+| `bin/` | 本机构建产物，不纳入版本控制 |
 
 ## 功能覆盖
 
@@ -42,7 +61,7 @@
 - 通用「自定义供应商」框架：任何 **OpenAI Chat-Completions 兼容**、**OpenAI Responses 原生**或 **Anthropic Messages** 上游都能接入。新数据库不预置第三方供应商；升级只清理从未编辑且没有账号引用的旧版精确示例，用户配置保持不变。
 - 每个供应商显式声明 `upstream_protocol`：默认 `chat_completions`（Tier 3，Responses→Chat 桥接，支持稳定版 function/namespace/custom/client tool-search，兼容性损失显式报告）；可选 `responses`（Tier 2，`/v1/responses` 原生透明转发，保留 typed tools、`include`、`previous_response_id` 与未来字段/事件）。
 - 一个供应商可为 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 和其他资源路径分别配置 Base URL、协议与传输画像；精确路径优先于 `*` 回退。每条路径的粘性会话和 Cookie jar 均按下游身份隔离。
-- DeepSeek V4 官方 API 会为 Claude Code 的 `/v1/messages` 自动选择原生 Anthropic 路径；Codex 的 Responses↔Chat 桥保留工具轮 `reasoning_content`、非 null content 与并行工具归属。缓存和双 CLI 配置见 [`docs/operations/DEEPSEEK_CACHE_AND_CLI.md`](docs/operations/DEEPSEEK_CACHE_AND_CLI.md)。
+- DeepSeek V4 官方 API 会为 Claude Code 的 `/v1/messages` 自动选择原生 Anthropic 路径；Codex 的 Responses↔Chat 桥保留工具轮 `reasoning_content`、非 null content 与并行工具归属。
 - 模型可**自动发现**（探测 `{base_url}/models` 并回写）或手动维护；管理端「供应商」页用普通表单新增，不依赖厂商预设。
 - REST:`GET/POST /admin/providers`、`DELETE /admin/providers/{id}`、`POST /admin/accounts/import-key`(裸 API Key 入池)。
 
@@ -151,7 +170,7 @@ curl -X POST http://127.0.0.1:8787/admin/groups/cyber/assign-egress \
 ## 本地运行
 
 ```bash
-cd pool_server
+cd /path/to/codex-account-pool
 go mod tidy
 go test ./...
 go run ./cmd/pool-server --config config.example.json
@@ -280,27 +299,21 @@ Claude Code 固定发送的 Anthropic `max_tokens` 不会写入内置 Codex Resp
 `max` 是单会话档位，用 `/effort max` 或 `claude --effort max`；持久化 `effortLevel` 使用
 `low`、`medium`、`high`、`xhigh`。
 
-## 自测
+## 构建检查
 
 ```bash
-chmod +x scripts/selftest.sh
-scripts/selftest.sh
-CODEX_POOL_RUN_SIDECAR_SELFTEST=1 scripts/selftest.sh
+go vet ./...
+go build ./...
+npm --prefix web-spa ci
+npm --prefix web-spa run build
 ```
 
-自测执行：
-
-1. `gofmt` 检查；
-2. `go test ./...`；
-3. `go test ./... -count=2`；
-4. `go vet ./...`；
-5. 编译单二进制；
-6. 可选 sidecar 自测（`CODEX_POOL_RUN_SIDECAR_SELFTEST=1`）。
+测试源码只保留在内部工作树，不进入 GitHub 发布分支。
 
 ## curl_cffi sidecar
 
 ```bash
-cd pool_server/sidecar
+cd sidecar
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt

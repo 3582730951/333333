@@ -47,6 +47,14 @@ trap 'rm -f "$candidate_file"' EXIT
   for relative_root in "${managed_roots[@]}"; do
     [[ -d "${ROOT}/${relative_root}" ]] || continue
     find "${ROOT}/${relative_root}" -type f \
+      ! -path '*/test/*' ! -path '*/tests/*' ! -path '*/testdata/*' \
+      ! -path '*/cmd/extreme-load/*' \
+      ! -name '*_test.*' ! -name 'test_*.*' ! -name 'test-*.*' \
+      ! -name '*-test.*' ! -name '*.test.*' ! -name '*_spec.*' \
+      ! -name 'spec_*.*' ! -name 'spec-*.*' ! -name '*-spec.*' \
+      ! -name '*.spec.*' ! -name '*selftest*' \
+      ! -name 'playwright.config.*' ! -name 'vitest.config.*' \
+      ! -name 'jest.config.*' ! -path '*/scripts/ci.sh' \
       \( -name '*.go' -o -name '*.py' -o -name '*.js' -o -name '*.jsx' \
          -o -name '*.ts' -o -name '*.tsx' -o -name '*.css' -o -name '*.json' \
          -o -name '*.jsonc' -o -name '*.mjs' -o -name '*.sql' -o -name '*.sh' \) -print

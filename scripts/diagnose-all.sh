@@ -218,5 +218,5 @@ if [ "$COOLING_COUNT" = "0" ] && [ "$BINDING_COUNT" -gt 0 ] && [ "$USAGE_COUNT" 
     echo ""
 fi
 
-echo "完整文档: /workspace/pool_server/COOLDOWN_DIAGNOSIS_GUIDE.md"
+echo "完整文档: docs/operations/cooldown-diagnosis-guide.md"
 echo ""

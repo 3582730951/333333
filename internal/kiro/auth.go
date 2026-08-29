@@ -343,7 +343,7 @@ func MachineID(c storage.KiroCredentials, t storage.AccountToken) string {
 }
 
 // canonicalMachineID derives the machine-id the real Kiro client presents (ground
-// truth: other/kiro.rs machine_id.rs): API-key => sha256("KiroAPIKey/"+key), OAuth
+// truth: third_party/reference/kiro.rs machine_id.rs): API-key => sha256("KiroAPIKey/"+key), OAuth
 // => sha256("KotlinNativeAPI/"+refreshToken). Presenting this value makes the pool
 // show the SAME device id AWS already associates with the account, instead of a
 // divergent one that reads as a new/unknown device. Returns "" when the needed

@@ -1,1 +1,0 @@
-docker run --rm -v /workspace:/workspace -w /workspace -e GOTOOLCHAIN=local golang:1.25.12 go test ./internal/anthropicwire ./internal/cloak ./internal/prompt ./internal/upstream ./internal/upstream/tlsclient -count=1

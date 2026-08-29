@@ -40,6 +40,7 @@ if command -v rsync >/dev/null 2>&1; then
     --exclude '.run/' \
     --exclude '.codex/' \
     --exclude '.agents/' \
+    --exclude '.claude/' \
     --exclude '.build/' \
     --exclude '*.sqlite3' --exclude '*.sqlite3-*' --exclude '*.sqlite3-shm' --exclude '*.sqlite3-wal' \
     --exclude '*.log' --exclude '*.env' --exclude '.env' --exclude '.env.*' \
@@ -49,10 +50,16 @@ if command -v rsync >/dev/null 2>&1; then
     --include 'config.example.json' --include 'config.lifecycle.json' --exclude 'config.*.json' \
     --exclude 'web-spa/node_modules/' --exclude 'web-spa/dist/' \
     --exclude 'example_zip/' --exclude 'other/' \
+    --exclude 'archive/' --exclude 'bin/' --exclude 'third_party/' --exclude 'var/' \
     --exclude 'test/' --exclude 'tests/' --exclude 'testdata/' \
+    --exclude 'cmd/extreme-load/' \
+    --exclude 'tools/acceptance/' --exclude 'tools/e2e/' --exclude 'tools/visual/' \
     --exclude '*_test.go' --exclude '**/testdata/**' \
     --exclude '*_test.py' --exclude 'test_*.py' \
     --exclude '*_test.*' --exclude 'test_*.*' \
+    --exclude 'test-*.*' --exclude '*-test.*' --exclude '*selftest*' \
+    --exclude 'playwright.config.*' --exclude 'vitest.config.*' --exclude 'jest.config.*' \
+    --exclude 'scripts/ci.sh' \
     --exclude '*.test.js' --exclude '*.test.jsx' \
     --exclude '*.test.ts' --exclude '*.test.tsx' \
     --exclude '*.test.mjs' --exclude '*.spec.js' --exclude '*.spec.jsx' \
@@ -77,14 +84,15 @@ import sys
 
 root, work = (os.path.realpath(p) for p in sys.argv[1:3])
 excluded_dirs = {
-    ".git", ".run", ".codex", ".agents", ".build", "node_modules",
-    "example_zip", "other", "docs", "data", "diagnostics", "verification", "artifacts",
-    "test", "tests", "testdata",
+    ".git", ".run", ".codex", ".agents", ".claude", ".build", "node_modules",
+    "archive", "bin", "example_zip", "other", "third_party", "var",
+    "docs", "data", "diagnostics", "verification", "artifacts",
+    "test", "tests", "testdata", "acceptance", "e2e", "visual", "extreme-load",
     "legacy-cache-hit-optimization", "testdata",
 }
 excluded_names = {"auth.json", "passwd.txt", ".upcloud-deploy-context", "1.txt", "config.toml"}
 excluded_suffixes = (".sqlite3", ".sqlite3-shm", ".sqlite3-wal", ".sqlite3-journal", ".log", ".env", ".secret", ".secrets")
-excluded_globs = ("*_test.*", "test_*.*", "*_spec.*", "*.test.js", "*.test.jsx", "*.test.ts", "*.test.tsx",
+excluded_globs = ("*_test.*", "test_*.*", "test-*.*", "*-test.*", "*selftest*", "playwright.config.*", "vitest.config.*", "jest.config.*", "*_spec.*", "*.test.js", "*.test.jsx", "*.test.ts", "*.test.tsx",
                   "*.test.mjs", "*.spec.js", "*.spec.jsx", "*.spec.ts", "*.spec.tsx", "*.spec.mjs",
                   ".env.*", "config.*.json", "gpt-*.md", "write_*.md")
 
@@ -98,6 +106,8 @@ def excluded(rel, name, is_dir):
         return True
     if name in {"config.example.json", "config.lifecycle.json"}:
         return False
+    if rel == "scripts/ci.sh":
+        return True
     return any(fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(rel, pat) for pat in excluded_globs)
 
 for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
@@ -142,7 +152,7 @@ git -C "$WORK" commit -q -m "publish snapshot $(date -u +%Y%m%dT%H%M%SZ)"
 # auditable and allows CI/operators to verify the tree without network access.
 printf 'publication snapshot: %s\n' "$WORK"
 printf 'tracked files: %s\n' "$(git -C "$WORK" ls-files | wc -l | tr -d ' ')"
-if git -C "$WORK" ls-files | grep -E '(^|/)([^/]*_test\.(go|py|js|jsx|ts|tsx|mjs)|test_[^/]*\.(py|js|jsx|ts|tsx|mjs)|[^/]*_spec\.(go|py|js|jsx|ts|tsx|mjs)|[^/]*\.(test|spec)\.(js|jsx|ts|tsx|mjs)|testdata/)|(^|/)docs/|(^|/)verification/|(^|/)legacy-cache-hit-optimization/' >/dev/null; then
+if git -C "$WORK" ls-files | grep -E '(^|/)([^/]*_test\.[^/]+|test[_-][^/]*\.[^/]+|[^/]*-test\.[^/]+|[^/]*_spec\.[^/]+|spec[_-][^/]*\.[^/]+|[^/]*-spec\.[^/]+|[^/]*\.(test|spec)\.[^/]+|[^/]*selftest[^/]*|(playwright|vitest|jest)\.config\.[^/]+|testdata/)|^scripts/ci\.sh$|(^|/)(archive|artifacts|docs|tests|third_party|var|verification)/|(^|/)legacy-cache-hit-optimization/' >/dev/null; then
   printf 'ERROR: filtered snapshot contains excluded paths\n' >&2
   exit 1
 fi

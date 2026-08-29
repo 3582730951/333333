@@ -49,6 +49,8 @@ cd "$PROJECT_ROOT"
 
 SERVICE_NAME="${SERVICE_NAME:-codex-pool}"
 HANDOFF_SERVICE_NAME="${HANDOFF_SERVICE_NAME:-${SERVICE_NAME}-handoff}"
+CONFIG_FILE_EXPLICIT=0
+[[ -n "${CONFIG_FILE:-}" ]] && CONFIG_FILE_EXPLICIT=1
 DATA_DIR="${DATA_DIR:-/var/lib/codex-pool}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/codex-pool/config.json}"
 BACKUP=""
@@ -105,7 +107,55 @@ db_from_config() {
 }
 
 resolve_db_path() {
-  if [[ -n "${DATABASE_PATH:-}" ]]; then
+  local cli_data_dir="" cli_database_path="" cli_config_dir=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --data-dir)
+        [[ $# -ge 2 && -n "${2:-}" ]] || die "--data-dir requires a non-empty value"
+        cli_data_dir="$2"
+        shift 2
+        ;;
+      --data-dir=*)
+        cli_data_dir="${1#*=}"
+        [[ -n "$cli_data_dir" ]] || die "--data-dir requires a non-empty value"
+        shift
+        ;;
+      --database-path)
+        [[ $# -ge 2 && -n "${2:-}" ]] || die "--database-path requires a non-empty value"
+        cli_database_path="$2"
+        shift 2
+        ;;
+      --database-path=*)
+        cli_database_path="${1#*=}"
+        [[ -n "$cli_database_path" ]] || die "--database-path requires a non-empty value"
+        shift
+        ;;
+      --config-dir)
+        [[ $# -ge 2 && -n "${2:-}" ]] || die "--config-dir requires a non-empty value"
+        cli_config_dir="$2"
+        shift 2
+        ;;
+      --config-dir=*)
+        cli_config_dir="${1#*=}"
+        [[ -n "$cli_config_dir" ]] || die "--config-dir requires a non-empty value"
+        shift
+        ;;
+      *) shift ;;
+    esac
+  done
+
+  [[ -n "$cli_data_dir" ]] && DATA_DIR="$cli_data_dir"
+  if [[ -n "$cli_config_dir" && "$CONFIG_FILE_EXPLICIT" == "0" ]]; then
+    CONFIG_FILE="${cli_config_dir%/}/config.json"
+  fi
+
+  # Installer CLI flags have the same precedence here as they do in
+  # scripts/install.sh. Resolving them before the backup is essential: otherwise a
+  # custom-path deployment could be detected correctly by install.sh but update.sh
+  # would snapshot the unrelated default /var/lib database.
+  if [[ -n "$cli_database_path" ]]; then
+    DB="$cli_database_path"
+  elif [[ -n "${DATABASE_PATH:-}" ]]; then
     DB="$DATABASE_PATH"
   elif DB="$(discover_db_from_systemd)" && [[ -n "$DB" ]]; then
     :
@@ -466,7 +516,7 @@ main() {
   [[ -f scripts/install.sh ]] || die "scripts/install.sh not found — run update.sh from inside the uploaded project folder"
 
   resolve_listen_addr "$@"
-  resolve_db_path
+  resolve_db_path "$@"
   BEFORE="$(count_accounts "$DB")"
   [[ -n "$BEFORE" ]] && log "Accounts before update: ${BEFORE} (db: ${DB})"
 
