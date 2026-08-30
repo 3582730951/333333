@@ -52,6 +52,7 @@ GitHub 发布树只包含本 `README.md`；内部文档、测试源码和运行�
 - L3 浏览器 repair/bootstrap：可向 `/admin/accounts/<id>/browser-repair` 注入隔离 cookie jar。
 - Egress 类型：`direct`、`http_proxy`、`https_proxy`、`socks5h_proxy`、`socks5_proxy`、`warp_proxy`、`curl_cffi_sidecar`（+`chain_proxy`）。
 - 管理面：账号导入、probe、refresh、egress、CF 事件、group prompt。
+- **Codex 强制卡 429（账号级、默认关闭）**：同一 OAuth 账号在现有“两次明确 429/30 秒”条件确认后，原账号原出口保持最多 15 分钟，立即启动 100 个并发、无 `Retry-After`/冷却等待的重复请求；首个非 429 上游响应到达即取消其余探针。超时才把当前下游请求切换到其他账号；该风暴按请求隔离，不阻塞其他下游连接，API Key 账号不启用。
 - 网页 OAuth 登录导入：管理端一键生成 OpenAI/Codex 与 Claude（Pro/Max）的登录链接，浏览器登录后把回调网址/授权码粘贴回来即可入池（PKCE，凭据只在服务端落库）。
 - 租户、用户、项目、账号生命周期管理：`/admin/tenants`、`/admin/users`、`/admin/projects`、`/admin/accounts/:id/disable|enable|delete`。
 - 下游响应过滤内部 header，避免泄露账号 ID、egress ID、pool/sidecar 私有 header。

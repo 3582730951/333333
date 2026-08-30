@@ -8,6 +8,7 @@ import { post, batchOp } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import AccountDrawer from '../components/AccountDrawer.jsx';
+import Sub2APIHubPanel from '../components/Sub2APIHubPanel.jsx';
 import OAuthLoginModal from '../components/OAuthLoginModal.jsx';
 import MobileResourceCell from '../components/MobileResourceCell.jsx';
 import { TextClamp, TinyMeter } from '../components/DisplayPrimitives.jsx';
@@ -19,7 +20,10 @@ import useResponsiveLayout from '../hooks/useResponsiveLayout.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
 import { fmtInt, fmtRelative, fmtTokens, fmtUSD, middleEllipsis } from '../lib/format.js';
 import { accountQueryKeys, useAccountsPage } from '../features/accounts/queries/accounts.ts';
-import { fetchAccountArchive, fetchAccountsPage, importAccountArchive } from '../features/accounts/api/accounts.ts';
+import {
+  downloadConfirmedAccountExport, fetchAccountArchive, fetchAccountsPage,
+  importAccountArchive, preflightAccountExport,
+} from '../features/accounts/api/accounts.ts';
 import {
   seedAccountRates, subscribeAccountRateBatches, subscribeAccountRateFeed, useAccountRequestRate,
 } from '../features/accounts/live/accountRates.ts';
@@ -85,26 +89,30 @@ function AccountRateMetric({ account, compact = false }) {
   const rate = useAccountRequestRate(account.id, account.request_rate);
   const state = REQUEST_RATE_STATE[rate.state] || REQUEST_RATE_STATE.unavailable;
   const known = rate.state === 'live' || rate.state === 'stale';
-  const active = known && rate.rpm > 0;
+  const active = known && (rate.logical_rpm > 0 || rate.tpm > 0);
+  const title = known
+    ? `逻辑请求 ${fmtInt(rate.logical_rpm)} RPM · Token ${fmtTokens(rate.tpm)} TPM · 上游尝试 ${fmtInt(rate.attempt_rpm)} RPM · 根任务 ${fmtInt(rate.root_rpm)} · 子 agent ${fmtInt(rate.subagent_rpm)} · 未识别 ${fmtInt(rate.unknown_rpm)}`
+    : `${state.label} · ${state.hint}`;
   if (compact) {
     return (
       <Tag
         size="small"
         color={active ? 'blue' : rate.state === 'stale' ? 'amber' : 'grey'}
         className={active ? 'pool-account-rpm-chip pool-account-rpm-chip--active' : 'pool-account-rpm-chip'}
-        title={`${state.label} · ${state.hint}`}
+        title={title}
       >
-        {known ? `${fmtInt(rate.rpm)} RPM` : 'RPM —'}
+        {known ? `${fmtInt(rate.logical_rpm)} RPM · ${fmtTokens(rate.tpm)} TPM` : 'RPM / TPM —'}
       </Tag>
     );
   }
   return (
     <div
       className={`pool-account-rpm${active ? ' pool-account-rpm--active' : ''}`}
-      aria-label={known ? `${fmtInt(rate.rpm)} RPM，${state.hint}，${state.label}` : `RPM ${state.label}`}
+      aria-label={known ? `${title}，${state.hint}，${state.label}` : `RPM 和 TPM ${state.label}`}
+      title={title}
     >
-      <strong>{known ? fmtInt(rate.rpm) : '—'} <span>RPM</span></strong>
-      <small>{rate.state === 'live' ? '滚动 60 秒' : state.label}</small>
+      <strong>{known ? fmtInt(rate.logical_rpm) : '—'} <span>RPM</span></strong>
+      <small>{known ? `${fmtTokens(rate.tpm)} TPM` : state.label}</small>
     </div>
   );
 }
@@ -112,7 +120,37 @@ function AccountRateMetric({ account, compact = false }) {
 function AccountRateDetail({ account }) {
   const rate = useAccountRequestRate(account.id, account.request_rate);
   if (rate.state === 'unavailable') return '暂不可用 · 等待采样器恢复';
-  return `${fmtInt(rate.rpm)} RPM · ${rate.state === 'stale' ? '数据延迟' : '滚动 60 秒'} · ${rate.sampled_at ? `${fmtRelative(rate.sampled_at)}采样` : '刚刚采样'}`;
+  return `${fmtInt(rate.logical_rpm)} RPM · ${fmtTokens(rate.tpm)} TPM · 根 ${fmtInt(rate.root_rpm)} / 子 ${fmtInt(rate.subagent_rpm)} / 未识别 ${fmtInt(rate.unknown_rpm)} · 上游尝试 ${fmtInt(rate.attempt_rpm)} · ${rate.state === 'stale' ? '数据延迟' : '滚动 60 秒'} · ${rate.sampled_at ? `${fmtRelative(rate.sampled_at)}采样` : '刚刚采样'}`;
+}
+
+function ExportPreflightSummary({ preview, policy }) {
+  if (!preview) return null;
+  const blocked = policy === 'fail_all' && preview.incompatible > 0;
+  return (
+    <div className="pool-export-preflight" role="status" aria-live="polite">
+      <div className="pool-export-preflight__summary">
+        <Tag color={preview.compatible ? 'green' : 'grey'}>{preview.compatible} 个兼容</Tag>
+        <Tag color={preview.incompatible ? 'red' : 'green'}>{preview.incompatible} 个不兼容</Tag>
+        <span>确认令牌 5 分钟内有效且只能使用一次。</span>
+      </div>
+      {blocked ? <div className="pool-callout pool-callout--warning">当前策略为“发现不兼容即全部停止”。请取消后改为“跳过并生成报告”，或重新选择账号。</div> : null}
+      <div className="pool-export-preflight__items">
+        {preview.items.map((item) => (
+          <div className="pool-export-preflight__item" key={item.account_code} data-compatible={item.compatible ? 'true' : 'false'}>
+            <div>
+              <strong>{item.account_code}</strong>
+              <Tag size="small" color={item.compatible ? 'green' : 'red'}>{item.compatible ? '可导出' : '不可导出'}</Tag>
+              {item.planned_filename ? <span>{item.planned_filename}</span> : null}
+            </div>
+            {item.secret_types.length ? <small>将包含：{item.secret_types.join('、')}</small> : null}
+            {item.errors.map((message) => <p className="pool-export-preflight__error" key={`e:${message}`}>{message}</p>)}
+            {item.warnings.map((message) => <p className="pool-export-preflight__warning" key={`w:${message}`}>{message}</p>)}
+          </div>
+        ))}
+      </div>
+      <p className="pool-field__help">预检只展示账号代号、文件名和凭据类型，不会把 Token、邮箱、代理地址或密码写入页面。</p>
+    </div>
+  );
 }
 
 export function accountCredentialPresentation(account) {
@@ -305,6 +343,9 @@ export default function Accounts() {
   const [authType, setAuthType] = useState('all');
   const [groupFilter, setGroupFilter] = useState('all');
   const [exportFormat, setExportFormat] = useState('backup');
+  const [exportIncludeProxies, setExportIncludeProxies] = useState(false);
+  const [exportIncompatiblePolicy, setExportIncompatiblePolicy] = useState('fail_all');
+  const [strictExportConfirmation, setStrictExportConfirmation] = useState(null);
   const [selected, setSelected] = useState([]);
   const [selectedAccountMeta, setSelectedAccountMeta] = useState({});
   const [selectMode, setSelectMode] = useState(false);
@@ -314,6 +355,7 @@ export default function Accounts() {
   const [moveIDs, setMoveIDs] = useState([]);
   const [archiveImportOpen, setArchiveImportOpen] = useState(false);
   const [archiveFile, setArchiveFile] = useState(null);
+  const [hubOpen, setHubOpen] = useState(false);
   const accountArchiveAbortRef = useRef(null);
   const importRefreshTimersRef = useRef([]);
 
@@ -548,11 +590,27 @@ export default function Accounts() {
     });
   };
 
-  const { run: exportAccountBackup, running: accountExportRunning } = useAsyncAction(async (ids = []) => {
+  const { run: prepareAccountExport, running: accountExportPreparing } = useAsyncAction(async (ids = []) => {
     abortController(accountArchiveAbortRef.current);
     const controller = createAbortController();
     accountArchiveAbortRef.current = controller;
     try {
+      if (exportFormat !== 'backup') {
+        if (!ids.length) {
+          Toast.warning('严格格式导出必须明确选择账号，不能隐式导出整个账号池');
+          return false;
+        }
+        const request = {
+          account_ids: ids,
+          format: exportFormat,
+          include_proxies: exportFormat === 'sub2api-v1' && exportIncludeProxies,
+          incompatible_policy: exportIncompatiblePolicy,
+        };
+        const preview = await preflightAccountExport(request, abortSignal(controller));
+        if (controller?.signal.aborted) return false;
+        setStrictExportConfirmation({ request, preview });
+        return true;
+      }
       const archive = await fetchAccountArchive(ids, exportFormat, abortSignal(controller));
       if (controller?.signal.aborted) return false;
       if (!downloadBlob(archive.filename, archive.blob)) {
@@ -573,6 +631,50 @@ export default function Accounts() {
       if (accountArchiveAbortRef.current === controller) accountArchiveAbortRef.current = null;
     }
   });
+
+  const { run: confirmStrictAccountExport, running: accountExportConfirming } = useAsyncAction(async () => {
+    const pending = strictExportConfirmation;
+    if (!pending) return false;
+    if (pending.preview.compatible === 0) {
+      Toast.warning('没有可导出的兼容账号');
+      return false;
+    }
+    if (pending.request.incompatible_policy === 'fail_all' && pending.preview.incompatible > 0) {
+      Toast.warning('当前策略会因不兼容账号停止，请调整策略或选择');
+      return false;
+    }
+    abortController(accountArchiveAbortRef.current);
+    const controller = createAbortController();
+    accountArchiveAbortRef.current = controller;
+    try {
+      const archive = await downloadConfirmedAccountExport(
+        pending.request,
+        pending.preview.confirmation_nonce,
+        abortSignal(controller),
+      );
+      if (controller?.signal.aborted) return false;
+      if (!downloadBlob(archive.filename, archive.blob)) {
+        Toast.error('浏览器未能开始下载，请检查下载权限');
+        return false;
+      }
+      setStrictExportConfirmation(null);
+      if (archive.skipped) {
+        Toast.warning(`已安全导出 ${archive.exported || pending.preview.compatible} 个账号，并跳过 ${archive.skipped} 个不兼容账号`);
+      } else {
+        Toast.success(`已安全导出 ${archive.exported || pending.preview.compatible} 个账号`);
+      }
+      return true;
+    } catch (error) {
+      if (controller?.signal.aborted) return false;
+      showErrorToast(error);
+      return false;
+    } finally {
+      if (accountArchiveAbortRef.current === controller) accountArchiveAbortRef.current = null;
+    }
+  });
+
+  const accountExportRunning = accountExportPreparing || accountExportConfirming;
+  const exportAccountBackup = prepareAccountExport;
 
   const { run: restoreAccountBackup, running: accountImportRunning } = useAsyncAction(async () => {
     if (!archiveFile) {
@@ -693,7 +795,15 @@ export default function Accounts() {
       { title: 'provider', get: (r) => r.provider }, { title: 'group', get: (r) => r.group_name },
       { title: 'plan', get: (r) => r.plan_type }, { title: 'auth_method', get: (r) => `${r.auth_method || ''} ${r.credential_mode || ''}` },
       { title: 'billing_mode', get: (r) => r.billing_mode }, { title: 'status', get: (r) => r.status },
-		{ title: 'rpm_60s', get: (r) => r.request_rate?.state === 'unavailable' ? '' : r.request_rate?.rpm },
+		{ title: 'logical_rpm_60s', get: (r) => r.request_rate?.state === 'unavailable' ? '' : r.request_rate?.logical_rpm },
+		{ title: 'attempt_rpm_60s', get: (r) => r.request_rate?.state === 'unavailable' ? '' : r.request_rate?.attempt_rpm },
+		{ title: 'root_rpm_60s', get: (r) => r.request_rate?.state === 'unavailable' ? '' : r.request_rate?.root_rpm },
+		{ title: 'subagent_rpm_60s', get: (r) => r.request_rate?.state === 'unavailable' ? '' : r.request_rate?.subagent_rpm },
+		{ title: 'unknown_rpm_60s', get: (r) => r.request_rate?.state === 'unavailable' ? '' : r.request_rate?.unknown_rpm },
+		{ title: 'tpm_60s', get: (r) => r.request_rate?.state === 'unavailable' ? '' : r.request_rate?.tpm },
+		{ title: 'input_tpm_60s', get: (r) => r.request_rate?.state === 'unavailable' ? '' : r.request_rate?.input_tpm },
+		{ title: 'cached_input_tpm_60s', get: (r) => r.request_rate?.state === 'unavailable' ? '' : r.request_rate?.cached_input_tpm },
+		{ title: 'output_tpm_60s', get: (r) => r.request_rate?.state === 'unavailable' ? '' : r.request_rate?.output_tpm },
     ];
     const ok = downloadCSV('accounts.csv', toCSV(filtered, cols));
     if (!ok) Toast.error('导出失败，请检查浏览器下载权限');
@@ -784,7 +894,7 @@ export default function Accounts() {
       },
     },
     {
-		title: <span title="账号最近滚动 60 秒内真正发往上游的请求尝试数">实时负载</span>,
+		title: <span title="账号滚动 60 秒逻辑请求 RPM、Token TPM，并单列重试/故障转移产生的上游尝试">实时负载</span>,
 		key: 'request_rate',
 		width: 136,
 		align: 'right',
@@ -894,11 +1004,35 @@ export default function Accounts() {
             style={{ width: 168 }}
             optionList={[
               { label: '完整账号备份', value: 'backup' },
+              { label: 'Sub2API data v1', value: 'sub2api-v1' },
               { label: 'CLIProxyAPI', value: 'cliproxyapi' },
               { label: 'Codex auth.json', value: 'codex-auth' },
             ]}
           />
-          <Button icon={<IconDownload />} loading={accountExportRunning} disabled={accountImportRunning} onClick={() => exportAccountBackup([])}>一键导出全部</Button>
+          {exportFormat !== 'backup' ? (
+            <Select
+              value={exportIncompatiblePolicy}
+              onChange={setExportIncompatiblePolicy}
+              style={{ width: 176 }}
+              optionList={[
+                { label: '不兼容则全部停止', value: 'fail_all' },
+                { label: '跳过并生成报告', value: 'skip_with_report' },
+              ]}
+            />
+          ) : null}
+          {exportFormat === 'sub2api-v1' ? (
+            <label className="pool-inline-check" title="只导出可由 Sub2API data v1 表达的账号出口；预检会明确提示遗漏">
+              <input type="checkbox" checked={exportIncludeProxies} onChange={(event) => setExportIncludeProxies(event.target.checked)} />
+              包含可兼容代理
+            </label>
+          ) : null}
+          <Button
+            icon={<IconDownload />}
+            loading={accountExportRunning}
+            disabled={accountImportRunning || exportFormat !== 'backup'}
+            title={exportFormat === 'backup' ? '导出完整账号池备份' : '严格格式需要明确选择账号'}
+            onClick={() => exportAccountBackup([])}
+          >一键导出全部</Button>
           <Button icon={<IconDownload />} loading={accountExportRunning} disabled={!selected.length || accountImportRunning} onClick={() => exportAccountBackup([...selected])}>一键导出所选{selected.length ? `(${selected.length})` : ''}</Button>
           <Button icon={<IconFile />} disabled={accountExportRunning || accountImportRunning} onClick={() => setArchiveImportOpen(true)}>一键导入账号池</Button>
           <Button icon={<IconRefresh />} loading={refreshing} onClick={() => load()}>刷新</Button>
@@ -908,6 +1042,7 @@ export default function Accounts() {
             </Button>
           ) : null}
           {!responsive.isMobile ? <Button icon={<IconPlus />} theme="solid" onClick={() => setImportOpen(true)}>添加账号</Button> : null}
+          <Button className="pool-hub-entry-button" onClick={() => setHubOpen(true)}>号池链接</Button>
         </>} />
 
       {selected.length > 0 && (
@@ -978,6 +1113,16 @@ export default function Accounts() {
         statusTag={statusTag} onAction={action} actionRunning={drawerAcct ? isAccountRowRunning(drawerAcct.id) : false}
         actionDisabled={bulkActionRunning || bulkMoveRunning} isActionLoading={isAccountActionLoading}
         onUpdated={handleAccountUpdated} onClose={() => setDrawerAcct(null)} />
+      <Modal
+        title="Sub2API 号池链接"
+        visible={hubOpen}
+        onCancel={() => setHubOpen(false)}
+        footer={null}
+        width="min(1120px, calc(100vw - 32px))"
+        className="pool-hub-modal"
+      >
+        <Sub2APIHubPanel />
+      </Modal>
       <Modal title={moveIDs.length === 1 ? '移动账号到分组' : '批量移动到分组'} visible={moveOpen} onCancel={() => { if (!bulkMoveRunning) { setMoveOpen(false); setMoveIDs([]); } }} onOk={bulkMove} confirmLoading={bulkMoveRunning} okText="移动">
         <Select value={moveGroup} onChange={setMoveGroup} style={{ width: '100%' }} placeholder="选择目标分组"
           optionList={groups.map((g) => ({ label: g.name, value: g.name }))} />
@@ -1014,6 +1159,20 @@ export default function Accounts() {
           </span>
         </div>
       </Modal>
+      <ConfirmDialog
+        open={Boolean(strictExportConfirmation)}
+        title="确认导出敏感账号凭据？"
+        description={<ExportPreflightSummary
+          preview={strictExportConfirmation?.preview}
+          policy={strictExportConfirmation?.request?.incompatible_policy}
+        />}
+        confirmText="确认并下载"
+        busy={accountExportConfirming}
+        onCancel={() => {
+          if (!accountExportConfirming) setStrictExportConfirmation(null);
+        }}
+        onConfirm={confirmStrictAccountExport}
+      />
       <OAuthLoginModal open={importOpen} onClose={() => setImportOpen(false)} onSuccess={handleAccountImported} />
     </div>
   );

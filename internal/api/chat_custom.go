@@ -395,6 +395,13 @@ func withCustomProviderDownstreamAffinity(r *http.Request, body []byte, proto st
 	affinity := customProviderProtocolAffinity(r, body, proto)
 	diagnostics := usageDiagnosticsFromCtx(r.Context())
 	diagnostics.AffinitySource = affinity.Source
+	// Preserve the downstream tier declaration across protocol bridges. The
+	// upstream response may omit it; storage then records a provisional tier
+	// rather than silently billing a Fast request as Standard.
+	if tier := serviceTierFromRequestBody(body); tier != "" {
+		diagnostics.RequestedServiceTier = tier
+		diagnostics.ForwardedServiceTier = tier
+	}
 	var prefix routing.PromptPrefixFingerprint
 	if strings.EqualFold(strings.TrimSpace(proto), "claude") {
 		prefix = routing.AnthropicStablePromptPrefixFingerprint(body)

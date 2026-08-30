@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"codex-account-pool/internal/authz"
 	"codex-account-pool/internal/storage"
 )
 
@@ -246,13 +247,14 @@ func lastForwardedValue(raw string) string {
 	return ""
 }
 
-// userView is the JSON shape returned to the SPA for the authenticated identity.
-// via is "session" (logged-in user), "admin_token" (legacy Bearer), or "open"
-// (no admin_token configured — historical open-admin deployment).
+// userView is the JSON shape returned to the SPA for an authenticated identity.
+// Capabilities are an experience hint only; the server independently authorizes
+// every protected route.
 func userView(u storage.User, via string) map[string]interface{} {
 	return map[string]interface{}{
 		"id": u.ID, "email": u.Email, "name": u.Name,
 		"role": u.Role, "status": u.Status, "via": via, "authed": true,
+		"capabilities": authz.ForRole(u.Role),
 	}
 }
 
@@ -362,7 +364,7 @@ func (s *Server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	u, err := s.store.CreateUserWithBootstrap(r.Context(), storage.User{
+	u, err := s.store.CreatePublicUser(r.Context(), storage.User{
 		ID: generatedID("usr"), Email: email, Name: strings.TrimSpace(req.Name), Status: "active", PasswordHash: ph,
 	}, s.flagEnabled(r.Context(), "allow_registration", true))
 	if errors.Is(err, storage.ErrUserEmailExists) {
@@ -381,6 +383,10 @@ func (s *Server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.enqueueAudit(storage.AuditLogRow{
+		Action: "user_registered", State: "success", Reason: "public_registration",
+		Detail: "user_id=" + u.ID + " role=user", CreatedAt: storage.Now(),
+	})
 	writeJSON(w, http.StatusOK, userView(u, "session"))
 }
 
@@ -429,10 +435,18 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.enqueueAudit(storage.AuditLogRow{
+		Action: "user_login", State: "success", Reason: "password",
+		Detail: "user_id=" + u.ID + " role=" + u.Role, CreatedAt: storage.Now(),
+	})
 	writeJSON(w, http.StatusOK, userView(u, "session"))
 }
 
 func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.currentUser(r); ok && !s.csrfOK(r) {
+		writeCapabilityError(w, http.StatusForbidden, "csrf_invalid", "invalid or missing CSRF token")
+		return
+	}
 	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
 		_ = s.store.DeleteUserSession(r.Context(), hashAPIKey(c.Value))
 	}
@@ -442,29 +456,31 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 }
 
-// handleAuthMe reports the current identity for the SPA. A session user is returned
-// directly; otherwise a configured+matching admin_token reports an admin identity,
-// and a deployment with no admin_token reports the historical "open" admin so the
-// panel works out of the box. Anything else is 401 (the SPA shows login/register).
+// handleAuthMe reports only cryptographically authenticated identities. An empty
+// administrator configuration is setup-required, never an anonymous admin mode.
 func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	if u, ok := s.currentUser(r); ok {
 		writeJSON(w, http.StatusOK, userView(u, "session"))
 		return
 	}
 	allowReg := s.flagEnabled(r.Context(), "allow_registration", true)
-	if s.cfg.AdminToken != "" {
-		if subtle.ConstantTimeCompare([]byte(adminBearerToken(r)), []byte(s.cfg.AdminToken)) == 1 {
-			writeJSON(w, http.StatusOK, map[string]interface{}{"id": "", "email": "admin", "name": "Admin", "role": "admin", "via": "admin_token", "authed": true})
-			return
-		}
-		writeJSON(w, http.StatusUnauthorized, map[string]interface{}{"authed": false, "allow_registration": allowReg})
+	hasAdmin, err := s.store.HasAdminUser(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("authorization storage unavailable"))
 		return
 	}
-	// No admin_token configured. Until an admin is registered the panel is usable open
-	// (zero-config bootstrap); once an admin exists, anonymous access requires login.
-	if s.hasAdminUser(r.Context()) {
-		writeJSON(w, http.StatusUnauthorized, map[string]interface{}{"authed": false, "allow_registration": allowReg})
+	if !hasAdmin {
+		writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+			"authed": false, "allow_registration": allowReg, "setup_required": true,
+		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"id": "", "email": "", "name": "", "role": "admin", "via": "open", "authed": false, "allow_registration": allowReg})
+	if s.cfg.AdminToken != "" && constantTimeTokenEqual(adminBearerToken(r), s.cfg.AdminToken) {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"id": "", "email": "admin", "name": "Admin", "role": "admin",
+			"via": "admin_token", "authed": true, "capabilities": authz.ForRole("admin"),
+		})
+		return
+	}
+	writeJSON(w, http.StatusUnauthorized, map[string]interface{}{"authed": false, "allow_registration": allowReg, "setup_required": false})
 }

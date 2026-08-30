@@ -40,10 +40,10 @@ const (
 	// symlinks it onto PATH and a global npm install puts it there too, so it is the
 	// fallback that lets a deployment whose release layout differs still resolve.
 	moduleBinaryName = "cursor-api-proxy"
-	defaultUsageURL    = "https://api2.cursor.sh/auth/usage"
-	failedStartTTL     = 30 * time.Second
-	startTimeout       = 20 * time.Second
-	maxInstances       = 64
+	defaultUsageURL  = "https://api2.cursor.sh/auth/usage"
+	failedStartTTL   = 30 * time.Second
+	startTimeout     = 20 * time.Second
+	maxInstances     = 64
 )
 
 type Credential struct {

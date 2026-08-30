@@ -186,6 +186,8 @@ type Server struct {
 	publicChatLimiterMu    sync.Mutex
 	publicChatLimiter      map[string]publicChatRateWindow
 	publicChatLastMinute   int64
+	sub2APIHubLimiterMu    sync.Mutex
+	sub2APIHubLimiters     map[string]*sub2APIHubRateState
 
 	claudeCacheFlightsMu sync.Mutex
 	claudeCacheFlights   map[string]chan struct{}
@@ -313,6 +315,7 @@ func NewServer(dep Dependencies) *Server {
 		superMemory:           superinstruct.NewMemoryKernel(superInstructMemoryPath(dep.Config)),
 		superMonitor:          superinstruct.NewMonitorPanel(),
 		publicChatLimiter:     map[string]publicChatRateWindow{},
+		sub2APIHubLimiters:    map[string]*sub2APIHubRateState{},
 		compatibilityManifest: compatmanifest.New(dep.Config.DataDir, nil),
 		compatibilityWake:     make(chan struct{}, 1),
 
@@ -561,6 +564,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/auth/login", s.handleAuthLogin)
 	s.mux.HandleFunc("/auth/logout", s.handleAuthLogout)
 	s.mux.HandleFunc("/auth/me", s.handleAuthMe)
+	s.mux.HandleFunc("/setup/status", s.handleSetupStatus)
+	s.mux.HandleFunc("/setup/claim-admin", s.handleSetupClaimAdmin)
 	s.mux.HandleFunc("/client/errors", s.handleClientError)
 	s.mux.HandleFunc("/client/performance", s.handleClientPerformance)
 
@@ -574,6 +579,13 @@ func (s *Server) routes() {
 	// exposes listing/export/inference/admin surfaces.
 	s.mux.HandleFunc("/api/account-pool/import", s.accountPoolImport)
 
+	// Sub2API-compatible inbound Hub. These routes deliberately bypass the ordinary
+	// admin bearer gate and enforce a connection-scoped Hub key in their own handler.
+	s.mux.HandleFunc("/api/v1/admin/groups/all", s.sub2APIHubGroupsAll)
+	s.mux.HandleFunc("/api/v1/admin/proxies/all", s.sub2APIHubProxiesAll)
+	s.mux.HandleFunc("/api/v1/admin/accounts", s.sub2APIHubAccounts)
+	s.mux.HandleFunc("/api/v1/admin/accounts/", s.sub2APIHubAccountAction)
+
 	// Registration automation APIs
 	s.mux.HandleFunc("/admin/register/providers/test", s.handleProviderTest)
 	s.mux.HandleFunc("/admin/automation/policies", s.handleAutomationPolicies)
@@ -582,16 +594,22 @@ func (s *Server) routes() {
 	// End-user self-service (session-authenticated, owner-scoped). See userportal.go.
 	s.mux.HandleFunc("/user/api-keys", s.handleUserKeys)
 	s.mux.HandleFunc("/user/api-keys/", s.handleUserKeyAction)
+	s.mux.HandleFunc("/user/overview", s.handleUserOverview)
 	s.mux.HandleFunc("/user/usage", s.handleUserUsage)
+	s.mux.HandleFunc("/user/usage/events", s.handleUserUsageEvents)
 	s.mux.HandleFunc("/user/usage/timeseries", s.handleUserUsageTimeseries)
+	s.mux.HandleFunc("/user/quota", s.handleUserQuota)
 	s.mux.HandleFunc("/user/models", s.handleUserModels)
 	s.mux.HandleFunc("/user/profile", s.handleUserProfile)
+	s.mux.HandleFunc("/user/sessions", s.handleUserSessions)
+	s.mux.HandleFunc("/user/sessions/", s.handleUserSessions)
 	s.mux.HandleFunc("/admin/accounts", s.adminAccounts)
 	s.mux.HandleFunc("/admin/accounts/rates", s.adminAccountRates)
 	s.mux.HandleFunc("/admin/stream/account-rates", s.adminAccountRatesStream)
 	s.mux.HandleFunc("/admin/models", s.handleAdminModels)
 	s.mux.HandleFunc("/admin/accounts/summary", s.adminAccountsSummary)
 	s.mux.HandleFunc("/admin/accounts/export", s.adminAccountsExport)
+	s.mux.HandleFunc("/admin/accounts/export/preflight", s.handleStrictAccountExportPreflight)
 	s.mux.HandleFunc("/admin/accounts/import-archive", s.adminAccountsArchiveImport)
 	s.mux.HandleFunc("/admin/accounts/import-auth-json", s.adminImportAuthJSON)
 	s.mux.HandleFunc("/admin/accounts/import-token", s.adminImportToken)
@@ -600,6 +618,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/accounts/import-kiro-json", s.adminImportKiroJSON)
 	s.mux.HandleFunc("/admin/accounts/import-kiro-api-key", s.adminImportKiroAPIKey)
 	s.mux.HandleFunc("/admin/accounts/import-cursor", s.adminImportCursor)
+	s.mux.HandleFunc("/admin/sub2api-hub/connections", s.adminSub2APIHubConnections)
+	s.mux.HandleFunc("/admin/sub2api-hub/connections/", s.adminSub2APIHubConnectionAction)
 	s.mux.HandleFunc("/admin/cursor", s.adminCursorModule)
 	// Bulk-reassign accounts to a group (exact path; takes precedence over the
 	// /admin/accounts/ subtree handler). Single reassign is /admin/accounts/<id>/group.
@@ -631,6 +651,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/model-quality/reset", s.adminModelQualityReset)
 	s.mux.HandleFunc("/admin/usage/cache", s.adminUsageCache)
 	s.mux.HandleFunc("/admin/usage/cache/reset", s.adminUsageCacheReset)
+	s.mux.HandleFunc("/admin/usage/events/", s.adminUsageEventValuation)
+	s.mux.HandleFunc("/admin/usage/reconcile", s.adminUsageReconcile)
+	s.mux.HandleFunc("/admin/pricing/catalogs", s.adminPricingCatalogs)
+	s.mux.HandleFunc("/admin/pricing/catalogs/", s.adminPricingCatalogAction)
 	s.mux.HandleFunc("/admin/usage/timeseries", s.adminUsageTimeseries)
 	s.mux.HandleFunc("/admin/usage/by-model", s.adminUsageByModel)
 	s.mux.HandleFunc("/admin/usage/model-audit", s.adminUsageModelAudit)
@@ -2171,6 +2195,8 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		codexScrubber = scrub.Scrubber
 	}
 	logicalUsageDiag := codexRequestUsageDiagnostics(body, usageMeta, affinity, promptCacheKeySource, retentionEffective, retentionSource)
+	logicalUsageDiag.RequestedServiceTier = serviceTierFromRequestBody(raw)
+	logicalUsageDiag.ForwardedServiceTier = serviceTierFromRequestBody(body)
 	logicalUsageDiag.CacheControlInjected = autoCacheBreakpointInjected
 	cacheKeyObservation := s.observeCodexPromptCacheKey(lease.Account.ID, resolvedModel, promptCacheKeyWithMeta(body, usageMeta), codexCacheShardCount, time.Now())
 	defer cacheKeyObservation.Done()
@@ -2443,6 +2469,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 	}()
 	codexResetRetried := false
+	forceCodex429StormAttempted := false
 	statefulRuleRecoveryAttempted := false
 	handleResponsesContextAttemptError := func(status int, header http.Header, body []byte, reason string) (codexAttemptResult, bool) {
 		contextError := responsesContextError(status, body)
@@ -2522,29 +2549,59 @@ codexResponse:
 		if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error"); ok {
 			return handled
 		}
-		// 强制卡429 (opt-in, per OpenAI OAuth account): after two explicit 429s
-		// within the confirmation window, retain this same account/egress and
-		// retry instead of failing over. The first 429 still falls through to the
-		// ordinary failover/cooldown path below. Unlike the IgnoreRateLimitControls
-		// branch, this recognizes only an explicit 429, not a 200-body usage signal.
-		if lease.Account.ForceCodex429 && resp.StatusCode == http.StatusTooManyRequests && !upstream.AccountUsesAPIKey(token) {
+		// 强制卡429 (opt-in, per OpenAI OAuth account): the trigger remains exactly
+		// two explicit 429s in the existing confirmation window.  Once confirmed,
+		// retain this account/egress and run a 100-worker, no-cooldown storm for up
+		// to fifteen minutes.  The first non-429 response wins; only expiry permits
+		// this request to fail over to another account.
+		if !forceCodex429StormAttempted && lease.Account.ForceCodex429 && resp.StatusCode == http.StatusTooManyRequests && !upstream.AccountUsesAPIKey(token) {
 			if s.confirmForceCodex429(r.Context(), lease.Account.ID) {
-				_ = resp.Body.Close()
-				resp, finalEgress, err = s.retryCodexSameAccountAfterRateLimit(r.Context(), lease, func() upstream.Request {
+				forceCodex429StormAttempted = true
+				initial429Status, initial429Header, initial429Body := resp.StatusCode, resp.Header.Clone(), append([]byte(nil), errorBody...)
+				if resp.Body != nil {
+					_ = resp.Body.Close()
+				}
+				resp, finalEgress, err = s.retryCodexForce429Storm(r.Context(), lease, func() upstream.Request {
 					return requestForToken(token)
-				}, resp.StatusCode, resp.Header, errorBody)
+				})
 				if err != nil {
 					_ = s.settleBillingHold(r.Context(), holdID, "force_codex_429_retry_interrupted")
 					if r.Context().Err() != nil {
 						return codexAttemptResult{Outcome: outcomeDone}
 					}
+					if errors.Is(err, errForceCodex429StormExpired) {
+						// The complete force window elapsed without a usable response.
+						// Exclude the original account before the next scheduler pass;
+						// unlike normal rate-limit handling, this transition does not
+						// sleep for Retry-After or a persisted cooldown.
+						if exclude != nil {
+							exclude[lease.Account.ID] = true
+						}
+						s.scheduler.RefreshAccountCache()
+						if movable {
+							if allowRetry {
+								return retry()
+							}
+							// Preserve one outer selection pass even when this account
+							// consumed the initial failover budget.
+							return codexAttemptResult{Outcome: outcomeRetry, WaitForCapacity: true}
+						}
+						// Stateful/native sessions cannot safely cross accounts with a
+						// live previous_response_id. Keep the original 429 private.
+						s.writeFilteredError(r.Context(), w, "codex", initial429Status, initial429Header, initial429Body, codexScrubber)
+						return codexAttemptResult{Outcome: outcomeDone}
+					}
 					writeError(w, http.StatusBadGateway, err)
 					return codexAttemptResult{Outcome: outcomeDone}
 				}
-				if resp.StatusCode < http.StatusBadRequest {
+				if resp != nil && resp.StatusCode < http.StatusBadRequest {
 					goto codexSuccess
 				}
-				goto codexResponse
+				if resp != nil {
+					goto codexResponse
+				}
+				writeError(w, http.StatusBadGateway, errors.New("force codex 429 storm returned no response"))
+				return codexAttemptResult{Outcome: outcomeDone}
 			}
 		}
 		// Goal's fixed machine terminal is the one signal that must leave the
@@ -3929,7 +3986,7 @@ func (s *Server) doCodexUpstream(ctx context.Context, req upstream.Request) (*up
 	if s == nil || s.upstreamDo == nil {
 		return nil, fmt.Errorf("%w: client is unavailable", errInvalidUpstreamResponse)
 	}
-	s.ObserveAccountRequestAttempt(req.Account.ID, req.Provider, req.DownstreamPath)
+	s.ObserveAccountRequestAttempt(req.Account.ID, req.Provider, req.DownstreamPath, ctx)
 	resp, err := s.upstreamDo(ctx, req)
 	if err != nil {
 		return resp, err
@@ -4283,6 +4340,7 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 		return // relay-internal (moderation) calls must not be metered against pool accounts
 	}
 	parsed := usage.ParseResponse(body)
+	unsettled := false
 	actualModel := strings.TrimSpace(parsed.Model)
 	if actualModel == "" {
 		actualModel = "unknown"
@@ -4320,15 +4378,24 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 			} else {
 				log.Printf("[USAGE-WARN] account=%s: no usage in response body (len=%d) and no billing_hold fallback",
 					accountID, len(body))
-				return
+				// Preserve a durable event shell even when the upstream omitted usage.
+				// Zero is not a measured token count: the normalized component remains
+				// unsettled and can be reconciled if a later diagnostic arrives.
+				parsed = unsettledUsageParsed(parsed, "upstream_usage_missing")
+				unsettled = true
 			}
 		} else {
 			log.Printf("[USAGE-WARN] account=%s: no usage in response body (len=%d)", accountID, len(body))
-			return
+			parsed = unsettledUsageParsed(parsed, "upstream_usage_missing")
+			unsettled = true
 		}
+	}
+	if model := strings.TrimSpace(parsed.Model); model != "" {
+		actualModel = model
 	}
 	keyHash, userID := downstreamFromCtx(ctx)
 	diag := usageDiagnosticsFromCtx(ctx)
+	diag.AgentClass = accountAgentClassFromContext(ctx)
 	diag.ActualModel = actualModel
 	modelDiag := modelDiagnosticsFromCtx(ctx)
 	diag.BillingHoldID = holdIDFromCtx(ctx)
@@ -4343,6 +4410,15 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 	diag.CacheTotalInputTokens = parsed.CacheTotalInputTokens
 	diag.CacheCreation5mTokens = parsed.CacheCreation5mTokens
 	diag.CacheCreation1hTokens = parsed.CacheCreation1hTokens
+	diag.ObservedServiceTier = parsed.ServiceTier
+	diag.OutputReasoningTokens = parsed.OutputReasoningTokens
+	diag.UsageIntegrityError = parsed.IntegrityError
+	if unsettled {
+		diag.UsageSource = "unsettled"
+	}
+	if presence, err := json.Marshal(parsed.Presence); err == nil {
+		diag.UsageFieldPresenceJSON = string(presence)
+	}
 	if diag.CachePrewarmAttempted && parsed.CacheReadTokens > 0 {
 		diag.CacheHitAfterPrewarm = true
 	}
@@ -4379,15 +4455,17 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 	if isInternalCall(ctx) {
 		return // relay-internal (moderation) calls must not be metered against pool accounts
 	}
-	actualModel := strings.TrimSpace(parsed.Model)
-	if actualModel == "" {
-		actualModel = "unknown"
-	}
 	modelDiag := modelDiagnosticsFromCtx(ctx)
 	if strings.TrimSpace(parsed.Model) == "" {
 		parsed.Model = firstNonEmpty(modelDiag.Resolved, modelDiag.Requested)
 	}
-	if parsed.TotalTokens == 0 && parsed.PromptTokens == 0 && parsed.CompletionTokens == 0 {
+	actualModel := strings.TrimSpace(parsed.Model)
+	if actualModel == "" {
+		actualModel = "unknown"
+	}
+	usageFieldsReported := parsed.Presence.InputTotal || parsed.Presence.OutputTotal || parsed.Presence.TotalReported
+	unsettled := false
+	if parsed.TotalTokens == 0 && parsed.PromptTokens == 0 && parsed.CompletionTokens == 0 && !usageFieldsReported {
 		// Session 33: When the stream scanner cannot extract countable tokens
 		// (e.g. the upstream terminated with an error instead of a normal
 		// completion), fall back to the billing hold's estimated_tokens.
@@ -4411,16 +4489,19 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 			} else {
 				log.Printf("[USAGE-WARN] account=%s: all tokens are zero, model=%s, raw=%s",
 					accountID, parsed.Model, string(parsed.RawUsage))
-				return
+				parsed = unsettledUsageParsed(parsed, "upstream_usage_missing")
+				unsettled = true
 			}
 		} else {
 			log.Printf("[USAGE-WARN] account=%s: all tokens are zero, model=%s, raw=%s",
 				accountID, parsed.Model, string(parsed.RawUsage))
-			return
+			parsed = unsettledUsageParsed(parsed, "upstream_usage_missing")
+			unsettled = true
 		}
 	}
 	keyHash, userID := downstreamFromCtx(ctx)
 	diag := usageDiagnosticsFromCtx(ctx)
+	diag.AgentClass = accountAgentClassFromContext(ctx)
 	diag.ActualModel = actualModel
 	diag.BillingHoldID = holdIDFromCtx(ctx)
 	diag.RequestedModel, diag.ResolvedModel, diag.ModelOverrideSource = modelDiag.Requested, modelDiag.Resolved, modelDiag.Source
@@ -4434,10 +4515,36 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 	diag.CacheTotalInputTokens = parsed.CacheTotalInputTokens
 	diag.CacheCreation5mTokens = parsed.CacheCreation5mTokens
 	diag.CacheCreation1hTokens = parsed.CacheCreation1hTokens
+	diag.ObservedServiceTier = parsed.ServiceTier
+	diag.OutputReasoningTokens = parsed.OutputReasoningTokens
+	diag.UsageIntegrityError = parsed.IntegrityError
+	if unsettled {
+		diag.UsageSource = "unsettled"
+	}
+	if presence, err := json.Marshal(parsed.Presence); err == nil {
+		diag.UsageFieldPresenceJSON = string(presence)
+	}
 	if diag.CachePrewarmAttempted && parsed.CacheReadTokens > 0 {
 		diag.CacheHitAfterPrewarm = true
 	}
 	s.enqueueUsage(storage.UsageRecordWrite{AccountID: accountID, RouteKeyHash: routeHash, APIKeyHash: keyHash, UserID: userID, Model: parsed.Model,
 		Prompt: parsed.PromptTokens, Completion: parsed.CompletionTokens, Total: parsed.TotalTokens, Cached: parsed.CachedTokens,
 		CacheRead: parsed.CacheReadTokens, CacheCreation: parsed.CacheCreationTokens, Raw: parsed.RawUsage, Diagnostics: diag})
+}
+
+// unsettledUsageParsed creates an evidence-bearing usage shell without inventing
+// token counts.  It is used when an upstream response completed (or failed) but
+// supplied no usable usage object; a later hold/diagnostic replay can then settle
+// the same usage_event_id instead of silently losing the request.
+func unsettledUsageParsed(parsed usage.Parsed, reason string) usage.Parsed {
+	model := strings.TrimSpace(parsed.Model)
+	if model == "" {
+		model = "unknown"
+	}
+	marker := map[string]interface{}{"unsettled": true, "reason": reason}
+	raw, err := json.Marshal(marker)
+	if err != nil {
+		raw = json.RawMessage(`{"unsettled":true}`)
+	}
+	return usage.Parsed{Model: model, RawUsage: raw}
 }

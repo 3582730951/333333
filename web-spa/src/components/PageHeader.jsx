@@ -17,7 +17,7 @@ export default function PageHeader({ title, subtitle, actions }) {
   );
 }
 
-export function Panel({ title, extra, children, style }) {
+export function Panel({ title, extra = null, children, style = undefined }) {
   return (
     <div className="pool-panel" style={style} data-reveal="">
       {(title || extra) && (

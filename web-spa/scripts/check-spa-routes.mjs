@@ -18,7 +18,7 @@ for (const redirect of redirects) {
   const target = redirect.to.split(/[?#]/, 1)[0];
   if (!routePaths.includes(target)) failures.push(`redirect target has no route: ${redirect.path} -> ${redirect.to}`);
 }
-if (routePaths.filter((pathValue) => pathValue.startsWith('/portal')).length !== 4) failures.push('portal route matrix must contain four routes.');
+if (routePaths.filter((pathValue) => pathValue.startsWith('/portal')).length !== 7) failures.push('portal route matrix must contain seven routes.');
 if (routePaths.filter((pathValue) => !pathValue.startsWith('/portal')).length !== 27) failures.push('admin route metadata must contain twenty-seven canonical routes.');
 const aiRoutes = routePaths.filter((pathValue) => pathValue.startsWith('/settings/ai/'));
 if (aiRoutes.length !== 6) failures.push('AI settings must expose six canonical secondary routes.');

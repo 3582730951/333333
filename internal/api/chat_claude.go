@@ -208,6 +208,8 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 		}
 	}
 	usageDiag := claudeRequestUsageDiagnostics(result.Body, affinity, claudeTTL, cacheInject)
+	usageDiag.RequestedServiceTier = serviceTierFromRequestBody(raw)
+	usageDiag.ForwardedServiceTier = serviceTierFromRequestBody(result.Body)
 	usageDiag.CachePrewarmAttempted = s.maybePrewarmClaudeCache(r.Context(), s.claudeCachePrewarmMode(r.Context()), requestForToken(token))
 	releaseFlight, waitedForFlight := s.enterClaudeCacheSingleflight(r.Context(), s.claudeCacheSingleflightEnabled(r.Context()), lease.Account.ID, resolvedModel, result.Body, affinity)
 	if waitedForFlight {

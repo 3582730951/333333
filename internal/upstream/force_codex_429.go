@@ -121,8 +121,8 @@ func AppendForceCodex429SyntheticPair(body []byte) ([]byte, bool) {
 		return body, false
 	}
 	outputItem, err := json.Marshal(struct {
-		Type   string `json:"type"`
-		CallID string `json:"call_id"`
+		Type   string              `json:"type"`
+		CallID string              `json:"call_id"`
 		Output []map[string]string `json:"output"`
 	}{
 		Type:   "custom_tool_call_output",

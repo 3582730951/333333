@@ -26,6 +26,7 @@ import {
   Save,
   Search,
   Settings,
+  Shield,
   Square,
   Sun,
   Trash2,
@@ -69,6 +70,9 @@ export const IconRefresh = icon(RefreshCw);
 export const IconSave = icon(Save);
 export const IconSearch = icon(Search);
 export const IconSetting = icon(Settings);
+export const IconShield = icon(Shield);
+// Compatibility alias used by newer panels; keep the canonical name IconDelete.
+export const IconTrash = IconDelete;
 export const IconStop = icon(Square);
 export const IconSun = icon(Sun);
 export const IconTick = icon(Check);
@@ -99,6 +103,7 @@ export {
   Save,
   Search,
   Settings,
+  Shield,
   Sun,
   Moon,
   Trash2,

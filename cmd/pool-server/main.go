@@ -57,6 +57,7 @@ func run() int {
 	var selfTest bool
 	var migrateOnly bool
 	var expandOnly bool
+	var provisionAdminSetup bool
 	flag.StringVar(&configPath, "config", "", "path to JSON configuration file")
 	flag.StringVar(&unixSocket, "unix-socket", "", "serve on a private Unix socket instead of the configured TCP address")
 	flag.StringVar(&releaseID, "release-id", strings.TrimSpace(os.Getenv("CODEX_POOL_RELEASE_ID")), "deployed release identifier exposed by /readyz")
@@ -64,6 +65,7 @@ func run() int {
 	flag.BoolVar(&selfTest, "self-test", false, "verify that the worker binary can start")
 	flag.BoolVar(&migrateOnly, "migrate-only", false, "apply storage migrations and exit without opening listeners")
 	flag.BoolVar(&expandOnly, "expand-only", false, "with --migrate-only, permit additive/compatible schema expansion only")
+	flag.BoolVar(&provisionAdminSetup, "provision-admin-setup", false, "read a one-time admin setup token from stdin, store only its HMAC, and exit")
 	flag.Parse()
 	if selfTest {
 		fmt.Println("codex-pool-server self-test ok")
@@ -75,6 +77,13 @@ func run() int {
 	if expandOnly && !migrateOnly {
 		log.Printf("--expand-only requires --migrate-only")
 		return 2
+	}
+	if provisionAdminSetup {
+		if migrateOnly || expandOnly {
+			log.Printf("--provision-admin-setup cannot be combined with migration flags")
+			return 2
+		}
+		return runProvisionAdminSetup(configPath)
 	}
 	if migrateOnly {
 		if !expandOnly {
@@ -1131,17 +1140,11 @@ func enforceBindSecurity(cfg config.Config) {
 	if isLoopbackBindHost(host) {
 		return // localhost-only: not reachable off-box, nothing to enforce
 	}
-	allowInsecure, _ := strconv.ParseBool(os.Getenv("CODEX_POOL_ALLOW_INSECURE_BIND"))
 	if strings.TrimSpace(cfg.AdminToken) == "" {
-		msg := "refusing to start: listen_addr %q is not loopback and admin_token is empty — " +
-			"the admin API would expose every account token to the internet with no auth. " +
-			"Set a strong admin_token, bind 127.0.0.1 behind a reverse proxy, or set " +
-			"CODEX_POOL_ALLOW_INSECURE_BIND=1 to override."
-		if allowInsecure {
-			log.Printf("[SECURITY-WARN] "+msg+" (overridden)", cfg.ListenAddr)
-		} else {
-			log.Fatalf("[SECURITY] "+msg, cfg.ListenAddr)
-		}
+		// Empty no longer means anonymous administration. Every /admin route fails
+		// closed with setup_required until a one-time loopback claim creates an
+		// active administrator; admin_token remains an explicit emergency option.
+		log.Printf("[SECURITY] listen_addr %q has no emergency admin_token; browser administration remains setup_required until one-time claim", cfg.ListenAddr)
 	} else if looksLikeWeakToken(cfg.AdminToken) {
 		log.Printf("[SECURITY-WARN] admin_token looks weak/placeholder while bound to a public "+
 			"interface (%s); use a long random secret in production.", cfg.ListenAddr)

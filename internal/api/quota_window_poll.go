@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"codex-account-pool/internal/storage"
@@ -84,7 +85,79 @@ func (s *Server) recordQuotaWindowSample(ctx context.Context, accountID, windowK
 	}); err != nil {
 		return
 	}
+	s.persistCurrentAccountCapacityEstimate(ctx, accountID, windowKind, cycleStart, windowSeconds, now)
 	s.finalizeExpiredQuotaWindows(ctx, accountID, windowKind, cycleStart, now)
+}
+
+func quotaUSDToMicro(value float64) *int64 {
+	// Keep the conversion fail-closed: float64 rounds MaxInt64 to 2^63, so a
+	// strict `>` comparison can admit a value that wraps negative on int64 cast.
+	const maxMicroUSDExclusive = 9223372036854775808.0
+	scaled := value * 1_000_000
+	if !quotaWindowIsFinite(value) || value < 0 || !quotaWindowIsFinite(scaled) || scaled >= maxMicroUSDExclusive {
+		return nil
+	}
+	rounded := math.Round(scaled)
+	if rounded < 0 || rounded >= maxMicroUSDExclusive {
+		return nil
+	}
+	result := int64(rounded)
+	return &result
+}
+
+func (s *Server) persistCurrentAccountCapacityEstimate(ctx context.Context, accountID, windowKind string, cycleStart, windowSeconds, now int64) {
+	samples, err := s.store.QuotaWindowSamples(ctx, accountID, windowKind, cycleStart)
+	if err != nil || len(samples) == 0 {
+		return
+	}
+	estimate := quotaWindowSelectBest(quotaWindowSamplesFromStorage(samples), now, quotaWindowStaleAfter(windowKind))
+	if estimate.State != "estimated" {
+		return
+	}
+	dimensions, err := s.store.AccountUsageWindowDimensionSummary(ctx, accountID, cycleStart, now)
+	if err != nil {
+		return
+	}
+	valuationWindow, err := s.store.AccountUsageValuationWindowSummary(ctx, accountID, cycleStart, now)
+	if err != nil {
+		return
+	}
+	method := "empirical_quota_window_versioned_valuation"
+	confidence := estimate.Confidence
+	if valuationWindow.TotalEvents == 0 {
+		method = "empirical_quota_window_legacy_cutover"
+		confidence = "low"
+	}
+	if !dimensions.Homogeneous || valuationWindow.UnavailableEvents > 0 {
+		confidence = "low"
+	}
+	usedRatio := int64(math.Round(estimate.UsedPercent * 10_000))
+	remaining := quotaUSDToMicro(estimate.RemainingCost.Center)
+	lower := quotaUSDToMicro(estimate.RemainingCost.Lower)
+	upper := quotaUSDToMicro(estimate.RemainingCost.Upper)
+	var creditsRemaining *int64
+	if snapshotsByAccount, snapshotErr := s.store.ListAccountRateLimitsByAccountIDs(ctx, []string{accountID}); snapshotErr == nil {
+		for _, snapshot := range snapshotsByAccount[accountID] {
+			if snapshot.LimiterType != codexCreditsLimiterType || strings.TrimSpace(snapshot.Raw) == "" {
+				continue
+			}
+			var detail map[string]interface{}
+			if json.Unmarshal([]byte(snapshot.Raw), &detail) != nil {
+				continue
+			}
+			if value, ok := detail["credits_remaining_milli"].(float64); ok && value >= 0 && value <= float64(math.MaxInt64) && value == math.Trunc(value) {
+				v := int64(value)
+				creditsRemaining = &v
+			}
+		}
+	}
+	_ = s.store.UpsertAccountCapacityEstimate(ctx, storage.AccountCapacityEstimate{
+		AccountID: accountID, LimiterKind: windowKind, ModelFamily: dimensions.ModelFamily,
+		ServiceTier: dimensions.ServiceTier, CycleStart: cycleStart, CycleEnd: cycleStart + windowSeconds,
+		UsedRatioPPM: &usedRatio, RemainingUnits: remaining, UnitKind: "api_list_price_equivalent_micro_usd",
+		USDEquivalentMicro: remaining, CreditsRemainingMilli: creditsRemaining, Method: method, SampleCount: int64(estimate.Evidence.SampleCount),
+		Confidence: confidence, LowerBoundUnits: lower, UpperBoundUnits: upper, UpdatedAt: now,
+	})
 }
 
 // finalizeExpiredQuotaWindows runs the best-prefix estimator over every fully

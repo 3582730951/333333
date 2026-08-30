@@ -21,12 +21,40 @@ const optionalNumber = z.preprocess(
   z.coerce.number().finite().optional(),
 );
 
+const rateCounter = z.coerce.number().int().nonnegative().catch(0);
+
 export const accountRequestRateSchema = z.object({
   rpm: z.coerce.number().int().nonnegative().catch(0),
+  logical_rpm: rateCounter.optional(),
+  attempt_rpm: rateCounter.optional(),
+  root_rpm: rateCounter.optional(),
+  subagent_rpm: rateCounter.optional(),
+  unknown_rpm: rateCounter.optional(),
+  attempt_root_rpm: rateCounter.optional(),
+  attempt_subagent_rpm: rateCounter.optional(),
+  attempt_unknown_rpm: rateCounter.optional(),
+  tpm: rateCounter.optional(),
+  input_tpm: rateCounter.optional(),
+  cached_input_tpm: rateCounter.optional(),
+  output_tpm: rateCounter.optional(),
   window_seconds: z.coerce.number().int().positive().catch(60),
   sampled_at: z.coerce.number().int().nonnegative().catch(0),
   state: z.enum(['live', 'stale', 'unavailable']).catch('unavailable'),
-});
+}).transform((rate) => ({
+  ...rate,
+  logical_rpm: rate.logical_rpm ?? rate.rpm,
+  attempt_rpm: rate.attempt_rpm ?? rate.rpm,
+  root_rpm: rate.root_rpm ?? 0,
+  subagent_rpm: rate.subagent_rpm ?? 0,
+  unknown_rpm: rate.unknown_rpm ?? (rate.logical_rpm == null ? rate.rpm : 0),
+  attempt_root_rpm: rate.attempt_root_rpm ?? 0,
+  attempt_subagent_rpm: rate.attempt_subagent_rpm ?? 0,
+  attempt_unknown_rpm: rate.attempt_unknown_rpm ?? (rate.attempt_rpm == null ? rate.rpm : 0),
+  tpm: rate.tpm ?? 0,
+  input_tpm: rate.input_tpm ?? 0,
+  cached_input_tpm: rate.cached_input_tpm ?? 0,
+  output_tpm: rate.output_tpm ?? 0,
+}));
 
 const accountSchema = z.object({
   id: z.preprocess((value) => typeof value === 'number' ? String(value) : value, z.string().min(1)),
@@ -239,21 +267,94 @@ function archiveBlob(data: unknown, contentType: string): Blob {
   return data instanceof Blob ? data : new Blob([data as BlobPart], { type: contentType });
 }
 
-export type AccountExportFormat = 'backup' | 'cliproxyapi' | 'codex-auth';
+export type AccountExportFormat = 'backup' | 'sub2api-v1' | 'cliproxyapi' | 'codex-auth';
+export type StrictAccountExportFormat = Exclude<AccountExportFormat, 'backup'>;
+export type AccountExportIncompatiblePolicy = 'fail_all' | 'skip_with_report';
 
-export async function fetchAccountArchive(ids: string[] = [], formatOrSignal: AccountExportFormat | AbortSignal = 'backup', signal?: AbortSignal): Promise<AccountArchiveDownload> {
-  const format: AccountExportFormat = typeof formatOrSignal === 'string' ? formatOrSignal : 'backup';
-  const requestSignal = typeof formatOrSignal === 'string' ? signal : formatOrSignal;
-  const normalizedIDs = [...new Set(ids.map((id) => String(id || '').trim()).filter(Boolean))];
-  const response = await api.get('/admin/accounts/export', {
-    params: {
-      format,
-      ...(normalizedIDs.length ? { ids: normalizedIDs.join(',') } : {}),
-    },
+export interface AccountExportPreflightRequest {
+  account_ids: string[];
+  format: StrictAccountExportFormat;
+  include_proxies: boolean;
+  incompatible_policy: AccountExportIncompatiblePolicy;
+}
+
+export interface AccountExportPreflightItem {
+  account_id: string;
+  account_code: string;
+  compatible: boolean;
+  errors: string[];
+  warnings: string[];
+  planned_filename: string;
+  secret_types: string[];
+}
+
+export interface AccountExportPreflight {
+  format: StrictAccountExportFormat;
+  compatible: number;
+  incompatible: number;
+  items: AccountExportPreflightItem[];
+  confirmation_nonce: string;
+  confirmation_expires_at: number;
+  fixture_status: Record<string, string>;
+}
+
+const accountExportPreflightSchema = z.object({
+  format: z.enum(['sub2api-v1', 'cliproxyapi', 'codex-auth']),
+  compatible: z.coerce.number().int().nonnegative(),
+  incompatible: z.coerce.number().int().nonnegative(),
+  items: z.array(z.object({
+    account_id: z.string(),
+    account_code: z.string(),
+    compatible: z.boolean(),
+    errors: z.array(z.string()).catch([]),
+    warnings: z.array(z.string()).catch([]),
+    planned_filename: z.string().catch(''),
+    secret_types: z.array(z.string()).catch([]),
+  })),
+  confirmation_nonce: z.string().min(16),
+  confirmation_expires_at: z.coerce.number().int().positive(),
+  fixture_status: z.record(z.string(), z.string()).catch({}),
+});
+
+function normalizedExportIDs(ids: string[]): string[] {
+  return [...new Set(ids.map((id) => String(id || '').trim()).filter(Boolean))];
+}
+
+export async function preflightAccountExport(
+  request: AccountExportPreflightRequest,
+  signal?: AbortSignal,
+): Promise<AccountExportPreflight> {
+  const payload = { ...request, account_ids: normalizedExportIDs(request.account_ids) };
+  if (!payload.account_ids.length) throw new Error('严格格式导出必须先选择至少一个账号。');
+  const response = await api.post('/admin/accounts/export/preflight', payload, {
+    timeout: accountArchiveTimeoutMs,
+    ...(signal ? { signal } : {}),
+  });
+  return parseApiResponse(
+    accountExportPreflightSchema,
+    response.data,
+    responseHeader(response.headers, 'x-request-id'),
+  ) as AccountExportPreflight;
+}
+
+export async function downloadConfirmedAccountExport(
+  request: AccountExportPreflightRequest,
+  confirmationNonce: string,
+  signal?: AbortSignal,
+): Promise<AccountArchiveDownload> {
+  const response = await api.post('/admin/accounts/export', {
+    ...request,
+    account_ids: normalizedExportIDs(request.account_ids),
+    confirmation_nonce: confirmationNonce,
+  }, {
     responseType: 'blob',
     timeout: accountArchiveTimeoutMs,
-    ...(requestSignal ? { signal: requestSignal } : {}),
+    ...(signal ? { signal } : {}),
   });
+  return parseAccountArchiveResponse(response);
+}
+
+async function parseAccountArchiveResponse(response: { data: unknown; headers?: unknown }): Promise<AccountArchiveDownload> {
   const contentType = responseHeader(response.headers, 'content-type').toLowerCase();
   const isZIP = contentType.includes('application/zip');
   const isJSON = contentType.includes('application/json');
@@ -280,6 +381,22 @@ export async function fetchAccountArchive(ids: string[] = [], formatOrSignal: Ac
     ...(Number.isFinite(exported) && exported > 0 ? { exported } : {}),
     ...(Number.isFinite(skipped) && skipped > 0 ? { skipped } : {}),
   };
+}
+
+export async function fetchAccountArchive(ids: string[] = [], formatOrSignal: AccountExportFormat | AbortSignal = 'backup', signal?: AbortSignal): Promise<AccountArchiveDownload> {
+  const format: AccountExportFormat = typeof formatOrSignal === 'string' ? formatOrSignal : 'backup';
+  const requestSignal = typeof formatOrSignal === 'string' ? signal : formatOrSignal;
+  const normalizedIDs = normalizedExportIDs(ids);
+  const response = await api.get('/admin/accounts/export', {
+    params: {
+      format,
+      ...(normalizedIDs.length ? { ids: normalizedIDs.join(',') } : {}),
+    },
+    responseType: 'blob',
+    timeout: accountArchiveTimeoutMs,
+    ...(requestSignal ? { signal: requestSignal } : {}),
+  });
+  return parseAccountArchiveResponse(response);
 }
 
 export async function importAccountArchive(file: File, signal?: AbortSignal): Promise<AccountArchiveImportResult> {

@@ -58,6 +58,7 @@ warp_exits_choice_set=0
 [[ -v WARP_EXITS ]] && warp_exits_choice_set=1
 
 forward_args=()
+migration_flag=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fresh-install)
@@ -98,12 +99,48 @@ while [[ $# -gt 0 ]]; do
       egress_udp_port_choice_set=1
       shift
       ;;
+    --migrate-user-groups)
+      [[ "$migration_flag" != "no" ]] || {
+        printf 'ERROR: conflicting group migration flags; use only one of --migrate-user-groups/--no-migrate-user-groups\n' >&2
+        exit 2
+      }
+      migration_flag="yes"
+      forward_args+=("$1")
+      shift
+      ;;
+    --no-migrate-user-groups)
+      [[ "$migration_flag" != "yes" ]] || {
+        printf 'ERROR: conflicting group migration flags; use only one of --migrate-user-groups/--no-migrate-user-groups\n' >&2
+        exit 2
+      }
+      migration_flag="no"
+      forward_args+=("$1")
+      shift
+      ;;
     *)
       forward_args+=("$1")
       shift
       ;;
   esac
 done
+
+# A CLI choice is stronger than an inherited environment value.  This matters
+# during upgrades: the previous systemd unit may have enabled the legacy
+# compatibility migration, but `--no-migrate-user-groups` must prevent the new
+# release from running it again.  The default is now materialized as an explicit
+# no-migration argument below; there is no implicit interactive consent path.
+case "$migration_flag" in
+  yes) MIGRATE_USER_GROUPS=1; export MIGRATE_USER_GROUPS ;;
+  no)  MIGRATE_USER_GROUPS=0; export MIGRATE_USER_GROUPS ;;
+  *)
+    # Never inherit a legacy service/shell value on the friendly entry point.
+    # Group migration is a potentially expansive data mutation and therefore
+    # requires the explicit --migrate-user-groups opt-in on every invocation.
+    MIGRATE_USER_GROUPS=0
+    export MIGRATE_USER_GROUPS
+    forward_args+=(--no-migrate-user-groups)
+    ;;
+esac
 set -- "${forward_args[@]}"
 
 case "$install_mode" in
@@ -218,19 +255,15 @@ echo "==> Codex skills 兼容提示：完整官方 skills/plugins/Browser Use �
 echo
 
 # The legacy compatibility migration copies every account-pool group into a
-# same-named user-facing routing group. That is useful for some upgrades, but
-# recreates deliberately removed user groups on the next service start. Ask on
-# the friendly entry point and default to keeping the two group layers separate.
-# Automation can bypass the question with either documented flag or by setting
-# MIGRATE_USER_GROUPS=0/1.
-migration_choice_set=0
+# same-named user-facing routing group. It is a potentially expansive data
+# mutation, so the friendly entry point requires the explicit
+# --migrate-user-groups opt-in and otherwise forwards --no-migrate-user-groups.
 help_requested=0
 status_requested=0
 sidecar_prompt_enabled=1
 warp_prompt_enabled=1
 for arg in "$@"; do
   case "$arg" in
-    --migrate-user-groups|--no-migrate-user-groups) migration_choice_set=1 ;;
     --listen-addr|--listen-addr=*) admin_port_choice_set=1 ;;
     --sidecar-addr|--sidecar-addr=*) egress_tcp_port_choice_set=1 ;;
     --warp-exits|--warp-exits=*) warp_exits_choice_set=1 ;;
@@ -294,20 +327,6 @@ if [[ "$help_requested" == 0 ]]; then
       export WITH_WARP WARP_EXITS WARP_BASE_PORT
     fi
   fi
-fi
-
-if [[ "$help_requested" == "0" && "$migration_choice_set" == "0" && ! -v MIGRATE_USER_GROUPS ]]; then
-  migration_answer=""
-  if [[ -t 0 ]]; then
-    printf '是否将现有账号池分组迁移为同名用户分组？这可能会创建多个用户分组。 [y/N]: '
-    IFS= read -r migration_answer || true
-  else
-    echo "==> 非交互执行：默认跳过账号池分组→用户分组迁移"
-  fi
-  case "$migration_answer" in
-    y|Y|yes|YES|Yes|是) set -- "$@" --migrate-user-groups ;;
-    *) set -- "$@" --no-migrate-user-groups ;;
-  esac
 fi
 
 if [[ "$help_requested" == "0" ]] && { [[ "$install_mode" == "update" ]] || { [[ "$install_mode" == "auto" ]] && detect_existing_install "$@"; }; }; then

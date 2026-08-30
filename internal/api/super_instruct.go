@@ -109,7 +109,13 @@ func (s *Server) adminSuperInstructSkills(w http.ResponseWriter, r *http.Request
 		"client_choice_header":   superInstructClientChoiceHeader,
 		"client_choice_required": true,
 		"pipeline":               []string{"M1", "M4", "M3", "M5", "M6"},
-		"skills":                 skills,
+		"compiler": map[string]interface{}{
+			"version":          "compiled-v2-lossless-cache",
+			"mode":             "original_full",
+			"stats":            superinstruct.CompileStatsSnapshot(),
+			"semantic_rewrite": false,
+		},
+		"skills": skills,
 	})
 }
 

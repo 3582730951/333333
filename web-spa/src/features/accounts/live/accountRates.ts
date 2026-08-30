@@ -30,6 +30,18 @@ let removeVisibilityListener: (() => void) | null = null;
 
 const unavailableRate = (sampledAt = 0): AccountRequestRate => ({
   rpm: 0,
+  logical_rpm: 0,
+  attempt_rpm: 0,
+  root_rpm: 0,
+  subagent_rpm: 0,
+  unknown_rpm: 0,
+  attempt_root_rpm: 0,
+  attempt_subagent_rpm: 0,
+  attempt_unknown_rpm: 0,
+  tpm: 0,
+  input_tpm: 0,
+  cached_input_tpm: 0,
+  output_tpm: 0,
   window_seconds: 60,
   sampled_at: sampledAt,
   state: 'unavailable',
@@ -42,10 +54,41 @@ function normalizeRate(value: unknown, sampledAt = 0, windowSeconds = 60): Accou
     : 'unavailable';
   return {
     rpm: Math.max(0, Math.trunc(Number(row.rpm) || 0)),
+    logical_rpm: Math.max(0, Math.trunc(Number(row.logical_rpm ?? row.rpm) || 0)),
+    attempt_rpm: Math.max(0, Math.trunc(Number(row.attempt_rpm ?? row.rpm) || 0)),
+    root_rpm: Math.max(0, Math.trunc(Number(row.root_rpm) || 0)),
+    subagent_rpm: Math.max(0, Math.trunc(Number(row.subagent_rpm) || 0)),
+    unknown_rpm: Math.max(0, Math.trunc(Number(row.unknown_rpm) || 0)),
+    attempt_root_rpm: Math.max(0, Math.trunc(Number(row.attempt_root_rpm) || 0)),
+    attempt_subagent_rpm: Math.max(0, Math.trunc(Number(row.attempt_subagent_rpm) || 0)),
+    attempt_unknown_rpm: Math.max(0, Math.trunc(Number(row.attempt_unknown_rpm) || 0)),
+    tpm: Math.max(0, Math.trunc(Number(row.tpm) || 0)),
+    input_tpm: Math.max(0, Math.trunc(Number(row.input_tpm) || 0)),
+    cached_input_tpm: Math.max(0, Math.trunc(Number(row.cached_input_tpm) || 0)),
+    output_tpm: Math.max(0, Math.trunc(Number(row.output_tpm) || 0)),
     window_seconds: Math.max(1, Math.trunc(Number(row.window_seconds) || windowSeconds || 60)),
     sampled_at: Math.max(0, Math.trunc(Number(row.sampled_at) || sampledAt || 0)),
     state,
   };
+}
+
+function sameRate(left: AccountRequestRate, right: AccountRequestRate): boolean {
+  return left.rpm === right.rpm
+    && left.logical_rpm === right.logical_rpm
+    && left.attempt_rpm === right.attempt_rpm
+    && left.root_rpm === right.root_rpm
+    && left.subagent_rpm === right.subagent_rpm
+    && left.unknown_rpm === right.unknown_rpm
+    && left.attempt_root_rpm === right.attempt_root_rpm
+    && left.attempt_subagent_rpm === right.attempt_subagent_rpm
+    && left.attempt_unknown_rpm === right.attempt_unknown_rpm
+    && left.tpm === right.tpm
+    && left.input_tpm === right.input_tpm
+    && left.cached_input_tpm === right.cached_input_tpm
+    && left.output_tpm === right.output_tpm
+    && left.window_seconds === right.window_seconds
+    && left.sampled_at === right.sampled_at
+    && left.state === right.state;
 }
 
 function flushPending() {
@@ -55,8 +98,7 @@ function flushPending() {
   for (const [id, next] of pending) {
     pending.delete(id);
     const previous = rates.get(id);
-    if (previous && previous.rpm === next.rpm && previous.state === next.state
-      && previous.sampled_at === next.sampled_at && previous.window_seconds === next.window_seconds) continue;
+    if (previous && sameRate(previous, next)) continue;
     rates.set(id, next);
     batch[id] = next;
     listeners.get(id)?.forEach((listener) => listener());
@@ -65,7 +107,7 @@ function flushPending() {
   batchListeners.forEach((listener) => listener(batch));
   let totalRPM = 0;
   for (const rate of rates.values()) {
-    if (rate.state === 'live') totalRPM += rate.rpm;
+    if (rate.state === 'live') totalRPM += rate.logical_rpm;
   }
   dispatchBrowserEvent('pool-rpm-activity', Math.min(1, totalRPM / 120));
 }
@@ -224,7 +266,11 @@ function subscribeAccountRate(id: string, listener: RateListener): () => void {
 
 export function useAccountRequestRate(id: string, initial?: AccountRequestRate): AccountRequestRate {
   const fallback = useMemo(() => normalizeRate(initial), [
-    initial?.rpm, initial?.window_seconds, initial?.sampled_at, initial?.state,
+    initial?.rpm, initial?.logical_rpm, initial?.attempt_rpm,
+    initial?.root_rpm, initial?.subagent_rpm, initial?.unknown_rpm,
+    initial?.attempt_root_rpm, initial?.attempt_subagent_rpm, initial?.attempt_unknown_rpm,
+    initial?.tpm, initial?.input_tpm, initial?.cached_input_tpm, initial?.output_tpm,
+    initial?.window_seconds, initial?.sampled_at, initial?.state,
   ]);
   useEffect(() => {
     if (!id || !initial) return;
@@ -234,7 +280,11 @@ export function useAccountRequestRate(id: string, initial?: AccountRequestRate):
       pending.set(id, next);
       if (frame == null) frame = requestBrowserAnimationFrame(flushPending);
     }
-  }, [id, initial?.rpm, initial?.window_seconds, initial?.sampled_at, initial?.state]);
+  }, [id, initial?.rpm, initial?.logical_rpm, initial?.attempt_rpm,
+    initial?.root_rpm, initial?.subagent_rpm, initial?.unknown_rpm,
+    initial?.attempt_root_rpm, initial?.attempt_subagent_rpm, initial?.attempt_unknown_rpm,
+    initial?.tpm, initial?.input_tpm, initial?.cached_input_tpm, initial?.output_tpm,
+    initial?.window_seconds, initial?.sampled_at, initial?.state]);
   return useSyncExternalStore(
     (listener) => subscribeAccountRate(id, listener),
     () => rates.get(id) || fallback,

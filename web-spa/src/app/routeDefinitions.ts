@@ -31,10 +31,13 @@ export const adminRoutes = [
 ] as const satisfies ReadonlyArray<RouteDefinition>;
 
 export const portalRoutes = [
-  { path: '/portal', role: 'user', navGroup: 'portal', titleKey: 'nav.my_usage', descriptionKey: 'page.portal_usage.desc', lazyLoader: () => import('../pages/portal/PortalDashboard.tsx'), prefetch: 'eager' },
+  { path: '/portal', role: 'user', navGroup: 'portal', titleKey: 'portal_details.nav_overview', descriptionKey: 'page.portal_usage.desc', lazyLoader: () => import('../pages/portal/PortalDashboard.tsx'), prefetch: 'eager' },
   { path: '/portal/keys', role: 'user', navGroup: 'portal', titleKey: 'nav.my_keys', descriptionKey: 'page.portal_keys.desc', lazyLoader: () => import('../pages/portal/PortalKeys.tsx'), prefetch: 'never' },
+  { path: '/portal/usage', role: 'user', navGroup: 'portal', titleKey: 'portal_details.nav_usage', descriptionKey: 'portal_details.usage_subtitle', lazyLoader: () => import('../pages/portal/PortalUsage.tsx'), prefetch: 'never' },
+  { path: '/portal/quota', role: 'user', navGroup: 'portal', titleKey: 'portal_details.nav_quota', descriptionKey: 'portal_details.quota_subtitle', lazyLoader: () => import('../pages/portal/PortalQuota.tsx'), prefetch: 'never' },
   { path: '/portal/models', role: 'user', navGroup: 'portal', titleKey: 'nav.models', descriptionKey: 'page.models.desc', lazyLoader: () => import('../pages/portal/PortalModels.tsx'), prefetch: 'never' },
   { path: '/portal/profile', role: 'user', navGroup: 'portal', titleKey: 'nav.my_profile', descriptionKey: 'page.portal_profile.desc', lazyLoader: () => import('../pages/portal/PortalProfile.jsx'), prefetch: 'never' },
+  { path: '/portal/sessions', role: 'user', navGroup: 'portal', titleKey: 'portal_details.nav_sessions', descriptionKey: 'portal_details.sessions_subtitle', lazyLoader: () => import('../pages/portal/PortalSessions.tsx'), prefetch: 'never' },
 ] as const satisfies ReadonlyArray<RouteDefinition>;
 
 export const legacyRedirects = [

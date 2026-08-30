@@ -187,8 +187,11 @@ function portalNavigation(): NavigationItem[] {
   const icons: Record<string, ComponentType<any>> = {
     '/portal': IconHistogram,
     '/portal/keys': IconKey,
+    '/portal/usage': IconList,
+    '/portal/quota': IconPulse,
     '/portal/models': IconSetting,
     '/portal/profile': IconUser,
+    '/portal/sessions': IconUserGroup,
   };
   return portalRoutes.map((route) => {
     const Icon = icons[route.path] || IconList;

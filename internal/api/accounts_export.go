@@ -60,6 +60,10 @@ func (s *Server) adminAccountsExport(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
 		return
 	}
+	if r.Method == http.MethodPost {
+		s.handleStrictAccountExport(w, r)
+		return
+	}
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
 		return
@@ -299,6 +303,9 @@ func officialCodexAuthDocument(record accountExportRecord) (codexAuthDocument, e
 	if strings.TrimSpace(token.IDTokenRaw) == "" || strings.TrimSpace(token.AccessToken) == "" {
 		return codexAuthDocument{}, errors.New("official ChatGPT auth.json requires both id_token and access_token")
 	}
+	if syntheticCodexIDToken(token.IDTokenRaw) {
+		return codexAuthDocument{}, errors.New("official ChatGPT auth.json cannot export a local metadata-only synthetic id_token")
+	}
 	lastRefresh := ""
 	if token.LastRefresh > 0 {
 		lastRefresh = time.Unix(token.LastRefresh, 0).UTC().Format(time.RFC3339)
@@ -316,6 +323,9 @@ func cliProxyDocument(record accountExportRecord) (cliProxyCodexDocument, error)
 	}
 	if strings.TrimSpace(record.Token.AccessToken) == "" {
 		return cliProxyCodexDocument{}, errors.New("access_token is empty")
+	}
+	if strings.TrimSpace(record.Token.IDTokenRaw) == "" || syntheticCodexIDToken(record.Token.IDTokenRaw) {
+		return cliProxyCodexDocument{}, errors.New("CLIProxyAPI export requires a real id_token")
 	}
 	lastRefresh, expired := "", ""
 	if record.Token.LastRefresh > 0 {

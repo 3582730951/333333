@@ -25,6 +25,7 @@ type quotaModelPrice struct {
 
 type quotaModelPriceEntry struct {
 	prefix string
+	exact  bool
 	price  quotaModelPrice
 }
 
@@ -32,8 +33,9 @@ type quotaModelPriceEntry struct {
 // their family before the generic prefix is tried.
 var quotaModelPriceTable = []quotaModelPriceEntry{
 	// OpenAI / ChatGPT family (public API list prices, USD per 1M tokens).
-	// The gpt-5 entry covers the Codex plan variants (gpt-5-codex, gpt-5.6-sol,
-	// gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.2) at the gpt-5 tier.
+	// Legacy rows do not retain a service-tier/catalog id, so only exact audited
+	// model families are eligible here.  In particular, never let a broad
+	// "gpt-5" prefix silently price gpt-5.6-sol/terra/luna at an unrelated rate.
 	{prefix: "gpt-4o-mini", price: quotaModelPrice{inputUSD: 0.15, outputUSD: 0.60, cacheReadFactor: 0.1, cacheCreationFactor: 1.0}},
 	{prefix: "gpt-4.1-nano", price: quotaModelPrice{inputUSD: 0.10, outputUSD: 0.40, cacheReadFactor: 0.1, cacheCreationFactor: 1.0}},
 	{prefix: "gpt-4.1-mini", price: quotaModelPrice{inputUSD: 0.40, outputUSD: 1.60, cacheReadFactor: 0.1, cacheCreationFactor: 1.0}},
@@ -42,7 +44,14 @@ var quotaModelPriceTable = []quotaModelPriceEntry{
 	{prefix: "gpt-4-turbo", price: quotaModelPrice{inputUSD: 10.00, outputUSD: 30.00, cacheReadFactor: 0.1, cacheCreationFactor: 1.0}},
 	{prefix: "gpt-4", price: quotaModelPrice{inputUSD: 30.00, outputUSD: 60.00, cacheReadFactor: 0.1, cacheCreationFactor: 1.0}},
 	{prefix: "gpt-3.5-turbo", price: quotaModelPrice{inputUSD: 0.50, outputUSD: 1.50, cacheReadFactor: 0.1, cacheCreationFactor: 1.0}},
-	{prefix: "gpt-5", price: quotaModelPrice{inputUSD: 1.25, outputUSD: 10.00, cacheReadFactor: 0.1, cacheCreationFactor: 1.0}},
+	{prefix: "gpt-5.6-sol", price: quotaModelPrice{inputUSD: 4.00, outputUSD: 20.00, cacheReadFactor: 0.1, cacheCreationFactor: 1.25}},
+	{prefix: "gpt-5.6-terra", price: quotaModelPrice{inputUSD: 2.00, outputUSD: 12.00, cacheReadFactor: 0.1, cacheCreationFactor: 1.25}},
+	{prefix: "gpt-5.6-luna", price: quotaModelPrice{inputUSD: 0.20, outputUSD: 1.20, cacheReadFactor: 0.1, cacheCreationFactor: 1.25}},
+	{prefix: "gpt-5.5", price: quotaModelPrice{inputUSD: 5.00, outputUSD: 30.00, cacheReadFactor: 0.1, cacheCreationFactor: -1}},
+	{prefix: "gpt-5.4", price: quotaModelPrice{inputUSD: 2.50, outputUSD: 15.00, cacheReadFactor: 0.1, cacheCreationFactor: -1}},
+	// Keep the historical exact gpt-5 row for pre-catalog records.  `exact`
+	// prevents it from becoming a catch-all for newer gpt-5.x variants.
+	{prefix: "gpt-5", exact: true, price: quotaModelPrice{inputUSD: 1.25, outputUSD: 10.00, cacheReadFactor: 0.1, cacheCreationFactor: -1}},
 	{prefix: "o3-mini", price: quotaModelPrice{inputUSD: 1.10, outputUSD: 4.40, cacheReadFactor: 0.1, cacheCreationFactor: 1.0}},
 	{prefix: "o3", price: quotaModelPrice{inputUSD: 2.00, outputUSD: 8.00, cacheReadFactor: 0.1, cacheCreationFactor: 1.0}},
 	{prefix: "o4-mini", price: quotaModelPrice{inputUSD: 1.10, outputUSD: 4.40, cacheReadFactor: 0.1, cacheCreationFactor: 1.0}},
@@ -51,10 +60,6 @@ var quotaModelPriceTable = []quotaModelPriceEntry{
 	{prefix: "o1", price: quotaModelPrice{inputUSD: 15.00, outputUSD: 60.00, cacheReadFactor: 0.1, cacheCreationFactor: 1.0}},
 	// Claude family (public API list prices). Cache creation costs 1.25x input.
 	{prefix: "claude-haiku", price: quotaModelPrice{inputUSD: 1.00, outputUSD: 5.00, cacheReadFactor: 0.1, cacheCreationFactor: 1.25}},
-	// claude-fable-5 has no published list price; sonnet-tier placeholder keeps a
-	// served flagship from reading as zero-cost. Confidence grading tolerates the
-	// approximation (constant per-model bias widens spread, never fabricates).
-	{prefix: "claude-fable-5", price: quotaModelPrice{inputUSD: 3.00, outputUSD: 15.00, cacheReadFactor: 0.1, cacheCreationFactor: 1.25}},
 	{prefix: "claude-sonnet", price: quotaModelPrice{inputUSD: 3.00, outputUSD: 15.00, cacheReadFactor: 0.1, cacheCreationFactor: 1.25}},
 	{prefix: "claude-opus", price: quotaModelPrice{inputUSD: 5.00, outputUSD: 25.00, cacheReadFactor: 0.1, cacheCreationFactor: 1.25}},
 }
@@ -71,6 +76,9 @@ func init() {
 func quotaModelPriceFor(model string) (quotaModelPrice, bool) {
 	model = strings.TrimSpace(strings.ToLower(model))
 	for _, entry := range quotaModelPriceTable {
+		if entry.exact && model != entry.prefix {
+			continue
+		}
 		if strings.HasPrefix(model, entry.prefix) {
 			return entry.price, true
 		}
@@ -85,6 +93,11 @@ func quotaModelPriceFor(model string) (quotaModelPrice, bool) {
 func quotaUsageCostUSD(model string, promptTokens, completionTokens, cacheReadTokens, cacheCreationTokens int64) float64 {
 	price, ok := quotaModelPriceFor(model)
 	if !ok {
+		return 0
+	}
+	if cacheCreationTokens > 0 && price.cacheCreationFactor < 0 {
+		// The historical catalog did not publish a cache-write rate for this
+		// exact model.  Do not substitute the ordinary input rate.
 		return 0
 	}
 	input := math.Max(0, float64(promptTokens)-float64(cacheReadTokens)-float64(cacheCreationTokens))
@@ -132,12 +145,35 @@ func (s *Server) sumQuotaWindowCost(ctx context.Context, accountID string, windo
 	if s == nil || s.store == nil || windowEnd <= windowStart {
 		return 0, 0
 	}
+	fixed, fixedErr := s.store.AccountUsageValuationWindowSummary(ctx, accountID, windowStart, windowEnd)
+	if fixedErr == nil && fixed.TotalEvents > 0 {
+		total := float64(fixed.TotalMicroUSD) / 1_000_000
+		unsettledShare := 0.0
+		if fixed.TotalMicroUSD > 0 {
+			unsettledShare = float64(fixed.ProvisionalMicroUSD) / float64(fixed.TotalMicroUSD)
+		}
+		// Missing rates/components have no amount that can be included in the
+		// numerator. Their event share is therefore a lower-bound quality penalty,
+		// never a fabricated zero-dollar contribution.
+		unavailableShare := float64(fixed.UnavailableEvents) / float64(fixed.TotalEvents)
+		if unavailableShare > unsettledShare {
+			unsettledShare = unavailableShare
+		}
+		return total, unsettledShare
+	}
+	// Historical rows written before the fixed-point cutover have no component
+	// record. Preserve the old estimator solely as a visibly lower-confidence
+	// compatibility input; every new event takes the audited path above.
 	rows, err := s.store.AccountUsageCostRows(ctx, accountID, windowStart, windowEnd)
 	if err != nil {
 		return 0, 0
 	}
 	total, unsettled := 0.0, 0.0
+	unknownRows := 0
 	for _, row := range rows {
+		if price, known := quotaModelPriceFor(row.Model); !known || (row.CacheCreationTokens > 0 && price.cacheCreationFactor < 0) {
+			unknownRows++
+		}
 		cost := quotaUsageCostUSD(row.Model, row.PromptTokens, row.CompletionTokens, row.CacheReadTokens, row.CacheCreationTokens)
 		total += cost
 		if row.Estimated != 0 {
@@ -145,7 +181,19 @@ func (s *Server) sumQuotaWindowCost(ctx context.Context, accountID string, windo
 		}
 	}
 	if total <= 0 {
+		// A zero amount for an unknown model is not evidence of free usage.
+		// Returning a non-zero uncertainty share keeps the capacity estimator from
+		// presenting the lower bound as a settled dollar balance.
+		if unknownRows > 0 && len(rows) > 0 {
+			return total, 1
+		}
 		return total, 0
+	}
+	if unknownRows > 0 {
+		unknownShare := float64(unknownRows) / float64(len(rows))
+		if unknownShare > unsettled/total {
+			unsettled = total * unknownShare
+		}
 	}
 	return total, unsettled / total
 }

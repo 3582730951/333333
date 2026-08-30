@@ -3,13 +3,17 @@ package superinstruct
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"unicode/utf16"
 	"unicode/utf8"
 )
@@ -33,6 +37,37 @@ type Skill struct {
 // Library resolves and compiles the migrated Super-Instruct resource bundle.
 type Library struct {
 	Dir string
+}
+
+const compileCacheLimit = 128
+
+type compileCacheEntry struct {
+	compiled string
+	skills   []Skill
+	lastUsed uint64
+}
+
+var bundleCompileCache = struct {
+	sync.Mutex
+	entries map[string]compileCacheEntry
+}{entries: make(map[string]compileCacheEntry)}
+
+var bundleCompileClock atomic.Uint64
+var bundleCompileHits atomic.Uint64
+var bundleCompileMisses atomic.Uint64
+
+type CompilerStats struct {
+	Hits       uint64 `json:"hits"`
+	Misses     uint64 `json:"misses"`
+	Entries    int    `json:"entries"`
+	MaxEntries int    `json:"max_entries"`
+}
+
+func CompileStatsSnapshot() CompilerStats {
+	bundleCompileCache.Lock()
+	entries := len(bundleCompileCache.entries)
+	bundleCompileCache.Unlock()
+	return CompilerStats{Hits: bundleCompileHits.Load(), Misses: bundleCompileMisses.Load(), Entries: entries, MaxEntries: compileCacheLimit}
 }
 
 // New returns a Library rooted at dir. An empty dir uses default discovery.
@@ -222,6 +257,109 @@ func (l Library) Compile(ctx context.Context, selected []string) (string, []Skil
 	if err != nil {
 		return "", nil, err
 	}
+	cacheKey, keyErr := l.compileCacheKey(ids)
+	if keyErr == nil {
+		bundleCompileCache.Lock()
+		if cached, ok := bundleCompileCache.entries[cacheKey]; ok {
+			cached.lastUsed = bundleCompileClock.Add(1)
+			bundleCompileCache.entries[cacheKey] = cached
+			bundleCompileCache.Unlock()
+			bundleCompileHits.Add(1)
+			return cached.compiled, append([]Skill(nil), cached.skills...), nil
+		}
+		bundleCompileCache.Unlock()
+	}
+	bundleCompileMisses.Add(1)
+	compiled, skills, err := l.compileUncached(ctx, ids)
+	if err != nil {
+		return "", nil, err
+	}
+	if keyErr == nil {
+		bundleCompileCache.Lock()
+		if len(bundleCompileCache.entries) >= compileCacheLimit {
+			oldestKey := ""
+			oldestUse := ^uint64(0)
+			for key, entry := range bundleCompileCache.entries {
+				if entry.lastUsed < oldestUse {
+					oldestKey, oldestUse = key, entry.lastUsed
+				}
+			}
+			delete(bundleCompileCache.entries, oldestKey)
+		}
+		bundleCompileCache.entries[cacheKey] = compileCacheEntry{compiled: compiled, skills: append([]Skill(nil), skills...), lastUsed: bundleCompileClock.Add(1)}
+		bundleCompileCache.Unlock()
+	}
+	return compiled, skills, nil
+}
+
+func (l Library) compileCacheKey(ids []string) (string, error) {
+	root, err := filepath.Abs(l.root())
+	if err != nil {
+		return "", err
+	}
+	includeResources := len(ids) > 0
+	targetIDs := append([]string(nil), ids...)
+	if len(targetIDs) == 0 {
+		entries, readErr := os.ReadDir(root)
+		if readErr != nil {
+			return "", readErr
+		}
+		for _, entry := range entries {
+			if entry.IsDir() && ValidSkillID(entry.Name()) {
+				targetIDs = append(targetIDs, entry.Name())
+			}
+		}
+		sort.Strings(targetIDs)
+	}
+	var fingerprint strings.Builder
+	fingerprint.WriteString("super-instruct-compiled-v2\x00")
+	fingerprint.WriteString(root)
+	for _, id := range targetIDs {
+		fingerprint.WriteByte(0)
+		fingerprint.WriteString(id)
+		dir := filepath.Join(root, id)
+		files := []string{"SKILL.md"}
+		if includeResources {
+			files, err = skillAllRegularFiles(dir)
+			if err != nil {
+				return "", err
+			}
+		}
+		for _, rel := range files {
+			info, statErr := os.Stat(filepath.Join(dir, filepath.FromSlash(rel)))
+			if statErr != nil {
+				return "", statErr
+			}
+			fingerprint.WriteByte(0)
+			fingerprint.WriteString(rel)
+			fingerprint.WriteString(fmt.Sprintf(":%d:%d", info.Size(), info.ModTime().UnixNano()))
+		}
+	}
+	digest := sha256.Sum256([]byte(fingerprint.String()))
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func skillAllRegularFiles(dir string) ([]string, error) {
+	files := []string{}
+	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || !entry.Type().IsRegular() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return relErr
+		}
+		files = append(files, filepath.ToSlash(rel))
+		return nil
+	})
+	sort.Strings(files)
+	return files, err
+}
+
+func (l Library) compileUncached(ctx context.Context, ids []string) (string, []Skill, error) {
 	includeResources := len(ids) > 0
 	all, err := l.List(ctx)
 	if err != nil {

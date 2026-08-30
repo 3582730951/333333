@@ -567,6 +567,9 @@ VALUES(?,'direct','direct','','',1,'healthy',0,0,'',0,0,?,?) ON CONFLICT(id) DO 
 	if err = s.applyCheckedPostgresMigrations(ctx); err != nil {
 		return err
 	}
+	if err = s.ensureBuiltinPricingCatalog(ctx); err != nil {
+		return err
+	}
 	if expandOnly {
 		return nil
 	}
@@ -584,8 +587,40 @@ type checkedPostgresMigration struct {
 
 var checkedPostgresMigrations = []checkedPostgresMigration{
 	{
+		version:    "20260829_sub2api_hub_v1",
+		statements: splitSQLStatements(postgresSchema(sub2APIHubSchemaSQL)),
+	},
+	{
+		version:    "20260829_account_export_confirmation_v1",
+		statements: splitSQLStatements(postgresSchema(accountExportConfirmationSchemaSQL)),
+	},
+	{
+		version:    "20260829_pricing_v1",
+		statements: splitSQLStatements(postgresSchema(pricingSchemaSQL)),
+	},
+	{
+		version: "20260830_pricing_expiry_v2",
+		statements: []string{
+			`ALTER TABLE pricing_catalog_versions ADD COLUMN IF NOT EXISTS expires_at BIGINT NOT NULL DEFAULT 0`,
+		},
+	},
+	{
+		version:    "20260829_admin_setup_v1",
+		statements: splitSQLStatements(postgresSchema(adminSetupSchemaSQL)),
+	},
+	{
+		version:    "20260829_account_request_rate_v2",
+		statements: splitSQLStatements(postgresSchema(accountRequestRateV2SchemaSQL)),
+	},
+	{
 		version:    "20260829_account_request_rate_v1",
 		statements: splitSQLStatements(postgresSchema(accountRequestRateSchemaSQL)),
+	},
+	{
+		version: "20260830_account_request_rate_settlement_v3",
+		statements: []string{
+			`ALTER TABLE account_usage_rate_events ADD COLUMN IF NOT EXISTS settlement_state TEXT NOT NULL DEFAULT 'unsettled'`,
+		},
 	},
 	{
 		version: "20260815_actual_model_audit_v1",

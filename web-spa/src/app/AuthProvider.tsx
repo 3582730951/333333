@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, type ReactNode } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { clearToken, getToken, isUnauthorizedError, logout as apiLogout, me } from '../api.js';
+import { clearToken, isUnauthorizedError, logout as apiLogout, me } from '../api.js';
 import { addWindowListener } from '../lib/browserLifecycle.js';
 import { Toast } from '../components/pool/index.jsx';
 import { consoleBootstrap } from './bootstrap';
@@ -29,7 +29,7 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 async function loadCurrentUser(): Promise<AuthUser | null> {
   try {
     const response = await me({ suppressUnauthorizedEvent: true });
-    if (!response || (!response.authed && response.via !== 'open')) return null;
+    if (!response || response.authed !== true) return null;
     return { ...response, role: response.role === 'admin' ? 'admin' : 'user' } as AuthUser;
   } catch (error) {
     if (isUnauthorizedError(error)) return null;
@@ -43,13 +43,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 	const serverBootstrapAuth = bootstrap && Object.prototype.hasOwnProperty.call(bootstrap, 'auth')
 		? (bootstrap.auth ?? null)
 		: undefined;
-	// A top-level document request cannot carry the admin bearer token stored by the
-	// SPA. Use only its presence (never its value) to paint the authenticated shell
-	// immediately; the stale timestamp below still validates /me in the background.
-	// An invalid token therefore falls back to Login as soon as the server rejects it.
-	const initialAuth: AuthUser | null | undefined = serverBootstrapAuth === null && getToken()
-		? { id: '', email: 'admin', name: 'Admin', role: 'admin', via: 'admin_token', authed: true, optimistic: true }
-		: serverBootstrapAuth;
+	// Only a server-confirmed identity may choose the admin or portal route graph.
+	// A bearer token's presence is not proof: optimistically mounting the admin shell
+	// can download privileged chunks and issue control-plane prefetches before /me
+	// rejects a stale or forged credential.
+	const verifiedBootstrapAuth = serverBootstrapAuth && serverBootstrapAuth.authed === true
+		? serverBootstrapAuth
+		: serverBootstrapAuth === undefined ? undefined : null;
+	const initialAuth: AuthUser | null | undefined = verifiedBootstrapAuth === null ? undefined : verifiedBootstrapAuth;
 	const query = useQuery({
 		queryKey: AUTH_QUERY_KEY,
 		queryFn: loadCurrentUser,

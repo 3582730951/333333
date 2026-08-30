@@ -733,6 +733,8 @@ func (s *Server) adminAccountAction(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	switch action {
+	case "capacity":
+		s.adminAccountCapacity(w, r, accountID)
 	case "kiro":
 		if len(parts) == 3 && parts[2] == "cache-probe" {
 			s.adminKiroCacheProbe(w, r, accountID)

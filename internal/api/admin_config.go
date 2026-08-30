@@ -15,7 +15,6 @@ import (
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream"
 	"context"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -24,6 +23,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"codex-account-pool/internal/authz"
 )
 
 func (s *Server) adminIdentity(w http.ResponseWriter, r *http.Request, accountID string) {
@@ -1316,47 +1317,14 @@ func (s *Server) adminVirtualSweep(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) adminAllowed(w http.ResponseWriter, r *http.Request) bool {
-	// A logged-in user session takes precedence: admins pass, a non-admin is rejected
-	// (so a normal portal user can never reach /admin/*). Session-authenticated unsafe
-	// methods must also carry the double-submit CSRF token; the admin_token (Bearer,
-	// non-ambient) path below is exempt.
-	if u, ok := s.currentUser(r); ok {
-		if u.Role != "admin" {
-			writeError(w, http.StatusForbidden, errors.New("admin role required"))
-			return false
+	required, ok := authz.RequiredForRoute(r.Method, r.URL.Path)
+	if !ok {
+		required = authz.AdminAccountsWrite
+		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+			required = authz.AdminAccountsRead
 		}
-		if !s.csrfOK(r) {
-			writeError(w, http.StatusForbidden, errors.New("invalid or missing CSRF token"))
-			return false
-		}
-		return true
 	}
-	if s.cfg.AdminToken == "" {
-		if downstreamAPIKeyAttempt(r) {
-			writeError(w, http.StatusForbidden, errors.New("admin role required"))
-			return false
-		}
-		// No admin token configured and no session: open bootstrap until the portal has
-		// an admin, after which anonymous /admin is locked down (must log in as admin).
-		if s.hasAdminUser(r.Context()) {
-			writeError(w, http.StatusUnauthorized, errors.New("admin login required"))
-			return false
-		}
-		return true
-	}
-	token := adminBearerToken(r)
-	// Constant-time compare so a remote attacker can't time-probe the admin token
-	// byte-by-byte. (An empty AdminToken is handled by the bootstrap branch above, so
-	// both operands are non-empty secrets here.)
-	if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.AdminToken)) == 1 {
-		return true
-	}
-	if downstreamAPIKeyAttempt(r) {
-		writeError(w, http.StatusForbidden, errors.New("admin role required"))
-		return false
-	}
-	writeError(w, http.StatusUnauthorized, errors.New("admin token required"))
-	return false
+	return s.requireCapability(w, r, required)
 }
 
 func adminBearerToken(r *http.Request) string {

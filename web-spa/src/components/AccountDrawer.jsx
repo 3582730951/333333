@@ -32,13 +32,17 @@ function AccountRatePanel({ account }) {
   const known = rate.state === 'live' || rate.state === 'stale';
   const state = rate.state === 'live' ? '实时' : rate.state === 'stale' ? '延迟' : '不可用';
   const reason = rate.state === 'live'
-    ? '最近 60 秒真实上游请求尝试'
+    ? '逻辑请求按服务端事件去重；TPM 使用终态上游 Usage；缓存 Token 是输入子集，不会再次叠加到总量'
     : rate.state === 'stale'
       ? '持久桶或查询暂时延迟，展示最近可用值'
       : '采样器尚未就绪或存储暂不可用';
   return (
     <Panel title="实时负载" style={{ marginBottom: 14 }}>
-      <Row k="滚动 60 秒" v={known ? <b className={rate.rpm > 0 ? 'pool-account-rpm-value--active' : ''}>{fmtInt(rate.rpm)} RPM</b> : '—'} />
+      <Row k="逻辑请求" v={known ? <b className={rate.logical_rpm > 0 ? 'pool-account-rpm-value--active' : ''}>{fmtInt(rate.logical_rpm)} RPM</b> : '—'} />
+      <Row k="Token 吞吐" v={known ? <b className={rate.tpm > 0 ? 'pool-account-rpm-value--active' : ''}>{fmtTokens(rate.tpm)} TPM</b> : '—'} />
+      <Row k="Token 明细" v={known ? `输入 ${fmtTokens(rate.input_tpm)} · 缓存输入 ${fmtTokens(rate.cached_input_tpm)} · 输出 ${fmtTokens(rate.output_tpm)}` : '—'} />
+      <Row k="Agent 明细" v={known ? `根任务 ${fmtInt(rate.root_rpm)} · 子 agent ${fmtInt(rate.subagent_rpm)} · 未识别 ${fmtInt(rate.unknown_rpm)}` : '—'} />
+      <Row k="上游尝试" v={known ? `${fmtInt(rate.attempt_rpm)} RPM（根 ${fmtInt(rate.attempt_root_rpm)} · 子 ${fmtInt(rate.attempt_subagent_rpm)} · 未识别 ${fmtInt(rate.attempt_unknown_rpm)}）` : '—'} />
       <Row k="状态" v={<Tag size="small" color={rate.state === 'live' ? 'blue' : rate.state === 'stale' ? 'amber' : 'grey'}>{state}</Tag>} />
       <Row k="最近采样" v={rate.sampled_at ? fmtDateTime(rate.sampled_at) : '—'} />
       <Typography.Text size="small" type="tertiary">{reason}</Typography.Text>
@@ -73,13 +77,14 @@ export default function AccountDrawer({
     if (!account) return EMPTY_ACCOUNT_DETAIL;
     const encodedID = encodeURIComponent(account.id);
     const supportsCodexReauth = (account.provider || 'codex') === 'codex' && account.auth_method !== 'api_key' && account.credential_mode !== 'agent_identity';
-    const [data, profiles, groups, codexReauth] = await Promise.all([
+    const [data, profiles, groups, codexReauth, capacity] = await Promise.all([
       get('/admin/audit', { account_id: account.id, limit: 10 }, { signal }),
       get('/admin/egress-profiles', undefined, { signal }),
       get('/admin/groups', undefined, { signal }),
       supportsCodexReauth
         ? get(`/admin/accounts/${encodedID}/codex-reauth-status`, undefined, { signal }).catch((err) => ({ error: err?.message || String(err) }))
         : Promise.resolve(null),
+      get(`/admin/accounts/${encodedID}/capacity`, undefined, { signal }).catch((err) => ({ error: err?.message || String(err) })),
     ]);
     const rows = Array.isArray(data) ? data : data?.rows || [];
     return {
@@ -87,6 +92,7 @@ export default function AccountDrawer({
       profiles: Array.isArray(profiles) ? profiles : profiles?.profiles || profiles?.egress_profiles || [],
       groups: Array.isArray(groups) ? groups : groups?.groups || [],
       codexReauth,
+      capacity,
     };
   }, [account]);
 
@@ -317,6 +323,18 @@ export default function AccountDrawer({
   const paidHealthTest = requiresPaidHealthTest(account);
   const protectedProbeQuarantine = isProtectedProbeQuarantine(account);
   const capabilities = Array.isArray(account.capabilities) ? account.capabilities : [];
+  const capacity = details.capacity || null;
+  const capacityEstimates = Array.isArray(capacity?.capacity_estimates) ? capacity.capacity_estimates : [];
+  const capacityEntitlement = capacity?.entitlement || {};
+
+  const formatCapacityUSD = (micro) => {
+    const value = Number(micro);
+    return Number.isFinite(value) && value >= 0 ? fmtUSD(value / 1_000_000) : '不可用';
+  };
+  const formatCapacityCredits = (milli) => {
+    const value = Number(milli);
+    return Number.isFinite(value) && value >= 0 ? `${(value / 1000).toFixed(3)} Credits` : '不可用';
+  };
 
   return (
     <Drawer title={account.label || account.id} visible={!!account} onCancel={onClose} width={520} className="pool-account-drawer">
@@ -413,6 +431,26 @@ export default function AccountDrawer({
         );
       })() : null}
 
+      <Panel title="容量与计价证据" style={{ marginBottom: 14 }}>
+        {capacity?.error ? <Typography.Text type="tertiary">容量诊断暂不可用：{capacity.error}</Typography.Text> : (
+          <>
+            <Row k="API 公价等价（近 30 天）" v={capacity?.last_30d_valuation?.api_micro_usd_settled != null ? formatCapacityUSD(capacity.last_30d_valuation.api_micro_usd_settled) : '不可用'} />
+            <Row k="ChatGPT Credits" v={capacity?.last_30d_valuation?.chatgpt_milli_credits_settled != null ? formatCapacityCredits(capacity.last_30d_valuation.chatgpt_milli_credits_settled) : '无订阅证据'} />
+            <Row k="套餐先验" v={capacityEntitlement.plan_only?.plan_family || 'unknown'} />
+            <Row k="席位证据" v={capacityEntitlement.current_evidence ? <Tag size="small" color={capacityEntitlement.current_evidence.confidence === 'high' ? 'green' : 'amber'}>{capacityEntitlement.current_evidence.seat_type || 'unknown'} · {capacityEntitlement.current_evidence.confidence || 'unknown'}</Tag> : <Tag size="small">未确认</Tag>} />
+            {capacityEntitlement.conflict ? <Typography.Text type="warning" as="p">检测到多来源权益冲突，当前显示按保守规则降级。</Typography.Text> : null}
+            {capacityEntitlement.premium_fixture_status ? <Typography.Text type="tertiary" size="small" as="p">Premium/5x Team：{capacityEntitlement.premium_fixture_status}</Typography.Text> : null}
+            {capacityEstimates.length ? <div className="pool-capacity-estimates">{capacityEstimates.slice(0, 4).map((estimate) => (
+              <div className="pool-capacity-estimate" key={`${estimate.limiter_kind}:${estimate.model_family}:${estimate.service_tier}:${estimate.cycle_start}`}>
+                <div><b>{estimate.model_family || 'unknown'}</b><Tag size="small" color={estimate.service_tier === 'fast' ? 'violet' : 'blue'}>{estimate.service_tier || 'unknown'}</Tag><Tag size="small">置信度 {estimate.confidence || 'unavailable'}</Tag></div>
+                <div className="pool-muted">剩余 API 等价：{formatCapacityUSD(estimate.usd_equivalent_micro)} · Credits：{formatCapacityCredits(estimate.credits_remaining_milli)}</div>
+                <div className="pool-muted">样本 {estimate.sample_count ?? 0} · {estimate.method || '—'}</div>
+              </div>
+            ))}</div> : <Typography.Text type="tertiary" size="small">尚无满足置信度门槛的容量估算；需要额度窗口快照与已结算 Usage。</Typography.Text>}
+          </>
+        )}
+      </Panel>
+
       <Panel title="调度例外" style={{ marginBottom: 14 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
           <div>
@@ -434,7 +472,7 @@ export default function AccountDrawer({
           <div>
             <div style={{ fontWeight: 600, fontSize: 13 }}>强制卡429</div>
             <Typography.Text size="small" type="tertiary">
-              仅限 Codex OAuth 账号。注入合成工具上下文，两次明确 429 后保持同账号重试、不切换账号。
+              仅限 Codex OAuth 账号。注入合成工具上下文，两次明确 429 后在原账号开启 100 并发直打（无冷却）最多 15 分钟；首个非 429 上游响应立即收敛，其间其他下游连接仍独立转发，超时才切换账号。
             </Typography.Text>
           </div>
           <Switch

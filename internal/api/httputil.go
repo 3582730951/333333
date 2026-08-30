@@ -1000,6 +1000,16 @@ func codexRequestUsageDiagnostics(body []byte, meta *bodysource.BodyMeta, affini
 	}
 }
 
+func serviceTierFromRequestBody(body []byte) string {
+	var root struct {
+		ServiceTier string `json:"service_tier"`
+	}
+	if json.Unmarshal(body, &root) != nil {
+		return ""
+	}
+	return strings.TrimSpace(root.ServiceTier)
+}
+
 func codexCacheBreakpointDiagnostics(body []byte) (int, string) {
 	var root map[string]json.RawMessage
 	if json.Unmarshal(body, &root) != nil {

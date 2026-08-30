@@ -20,6 +20,7 @@ import (
 	"codex-account-pool/internal/secretbox"
 	"codex-account-pool/internal/superinstruct"
 	"codex-account-pool/internal/supervisor"
+	"codex-account-pool/internal/usage"
 
 	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
@@ -1506,6 +1507,28 @@ func (s *Store) init(ctx context.Context, progress func(string), expandOnly bool
 	if _, err := s.db.ExecContext(ctx, accountRequestRateSchemaSQL); err != nil {
 		return err
 	}
+	report("admin_setup_schema")
+	if _, err := s.db.ExecContext(ctx, adminSetupSchemaSQL); err != nil {
+		return err
+	}
+	report("account_export_confirmation_schema")
+	if _, err := s.db.ExecContext(ctx, accountExportConfirmationSchemaSQL); err != nil {
+		return err
+	}
+	report("sub2api_hub_schema")
+	if _, err := s.db.ExecContext(ctx, sub2APIHubSchemaSQL); err != nil {
+		return err
+	}
+	report("pricing_schema")
+	if _, err := s.db.ExecContext(ctx, pricingSchemaSQL); err != nil {
+		return err
+	}
+	if err := s.ensurePricingCatalogExpiryColumn(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureBuiltinPricingCatalog(ctx); err != nil {
+		return err
+	}
 	// Create lifecycle management tables
 	report("runtime_schemas")
 	if _, err := s.db.ExecContext(ctx, lifecycleSchemaSQL); err != nil {
@@ -2929,6 +2952,10 @@ ON CONFLICT(account_id) DO NOTHING`,
 		`ALTER TABLE usage_records ADD COLUMN actual_model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN model_mismatch INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN model_mismatch_reason TEXT NOT NULL DEFAULT ''`,
+		// Rate-event settlement is additive so an unsettled no-usage shell can be
+		// replaced by the later terminal sample without counting a second logical
+		// request. Existing rows default to unsettled and remain visible in RPM.
+		`ALTER TABLE account_usage_rate_events ADD COLUMN settlement_state TEXT NOT NULL DEFAULT 'unsettled'`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_records_model_mismatch_created ON usage_records(model_mismatch, created_at)`,
 		`ALTER TABLE billing_holds ADD COLUMN usage_expected INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE billing_holds ADD COLUMN usage_recorded_at INTEGER NOT NULL DEFAULT 0`,
@@ -3303,20 +3330,17 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
 	return nil
 }
 
-// legacyUserGroupMigrationEnabled controls the compatibility backfill that
-// copies account-pool groups into the user-facing routing layer. Keep the
-// historical behavior when the variable is absent, while allowing installers
-// to disable the backfill so deleted user groups stay deleted across restarts.
+// legacyUserGroupMigrationEnabled controls the destructive compatibility
+// backfill that copies account-pool groups into the user-facing routing layer.
+// It is opt-in: an absent, blank, false, or unrecognized value must never
+// recreate user groups that an operator deliberately removed.
 func legacyUserGroupMigrationEnabled() bool {
-	raw, ok := os.LookupEnv("CODEX_POOL_MIGRATE_USER_GROUPS")
-	if !ok || strings.TrimSpace(raw) == "" {
-		return true
-	}
+	raw, _ := os.LookupEnv("CODEX_POOL_MIGRATE_USER_GROUPS")
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "0", "false", "no", "off":
-		return false
-	default:
+	case "1", "true", "yes", "on":
 		return true
+	default:
+		return false
 	}
 }
 
@@ -5222,32 +5246,32 @@ func (s *Store) GetUser(ctx context.Context, id string) (User, bool, error) {
 	return u, err == nil, err
 }
 
-// CountUsers returns the number of registered users (used to bootstrap the first
-// user as an admin).
+// CountUsers returns the number of registered users. It is retained for
+// operational diagnostics; public registration must never use this count to
+// derive a role.
 func (s *Store) CountUsers(ctx context.Context) (int, error) {
 	var n int
 	err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n)
 	return n, err
 }
 
-// CreateUserWithBootstrap atomically assigns the first registered user the admin
-// role. The role decision, registration gate, duplicate-email check, and insert are
-// one SQLite write statement, so concurrent first registrations cannot both observe
-// an empty users table and become administrators.
-func (s *Store) CreateUserWithBootstrap(ctx context.Context, item User, allowRegistration bool) (User, error) {
+// CreatePublicUser atomically creates a public-registration account with the
+// least-privileged role. The caller-supplied Role is deliberately ignored: the
+// public registration surface is not an administrator bootstrap mechanism, even
+// on an empty database.
+func (s *Store) CreatePublicUser(ctx context.Context, item User, allowRegistration bool) (User, error) {
 	now := Now()
 	if item.CreatedAt == 0 {
 		item.CreatedAt = now
 	}
 	item.UpdatedAt = now
+	item.Role = "user"
 	if item.Status == "" {
 		item.Status = "active"
 	}
 	result, err := s.db.ExecContext(ctx, `INSERT INTO users(id, tenant_id, email, name, role, status, password_hash, created_at, updated_at)
-SELECT ?, ?, ?, ?,
-       CASE WHEN NOT EXISTS(SELECT 1 FROM users) THEN 'admin' ELSE 'user' END,
-       ?, ?, ?, ?
-WHERE (? OR NOT EXISTS(SELECT 1 FROM users))
+SELECT ?, ?, ?, ?, 'user', ?, ?, ?, ?
+WHERE ? <> 0
   AND NOT EXISTS(SELECT 1 FROM users WHERE email = ? COLLATE NOCASE)`,
 		item.ID, item.TenantID, strings.TrimSpace(item.Email), item.Name, item.Status, item.PasswordHash, item.CreatedAt, item.UpdatedAt,
 		boolInt(allowRegistration), strings.TrimSpace(item.Email))
@@ -5274,6 +5298,17 @@ WHERE (? OR NOT EXISTS(SELECT 1 FROM users))
 		return User{}, errors.New("created user could not be read back")
 	}
 	return created, nil
+}
+
+// CreateUserWithBootstrap is retained as a source-compatible alias for older
+// callers. Public registration is never an administrator bootstrap mechanism;
+// first-admin creation must go through the one-time setup claim flow.
+//
+// Deprecated: use CreatePublicUser for registration and ClaimAdminSetup for the
+// explicit administrator initialization workflow.
+func (s *Store) CreateUserWithBootstrap(ctx context.Context, item User, allowRegistration bool) (User, error) {
+	item.Role = "user"
+	return s.CreatePublicUser(ctx, item, allowRegistration)
 }
 
 // HasAdminUser reports whether at least one active admin user exists. Once true, an
@@ -9610,7 +9645,11 @@ func (s *Store) InsertUsageRecordWithCacheDetails(ctx context.Context, accountID
 }
 
 type UsageDiagnostics struct {
-	UsageEventID                      string
+	UsageEventID string
+	// AgentClass is a server-derived request lineage classification. Supported
+	// values are root, subagent and unknown; it is never trusted as an event ID or
+	// authorization input.
+	AgentClass                        string
 	UsageProvider                     string
 	UsageSource                       string
 	CacheReadPresent                  bool
@@ -9661,6 +9700,13 @@ type UsageDiagnostics struct {
 	ActualModel                       string
 	ModelMismatch                     bool
 	ModelMismatchReason               string
+	ProductSurface                    string
+	RequestedServiceTier              string
+	ForwardedServiceTier              string
+	ObservedServiceTier               string
+	OutputReasoningTokens             int64
+	UsageFieldPresenceJSON            string
+	UsageIntegrityError               string
 }
 
 type UsageRecordWrite struct {
@@ -9950,6 +9996,89 @@ WHERE usage_records.estimated > 0 AND excluded.estimated = 0`,
  updated_at=MAX(updated_at,?) WHERE event_id=?`, state, now, diag.RouteEpoch, diag.RouteEpoch, now, diag.UsageEventID); err != nil {
 			return err
 		}
+		cachedInput := cached
+		if cacheRead > cachedInput {
+			cachedInput = cacheRead
+		}
+		// Cached input is a subset of prompt input.  Keep the rate event
+		// invariant true even when a permissive/legacy upstream reports a
+		// negative value or a cache-read count larger than the prompt.  The
+		// normalized usage row still records the integrity diagnostic; rate
+		// aggregation must never amplify that malformed sample.
+		if cachedInput < 0 {
+			cachedInput = 0
+		}
+		if prompt >= 0 && cachedInput > prompt {
+			cachedInput = prompt
+		}
+		totalForRate := total
+		// An explicitly reported zero is authoritative (for example a
+		// cancelled/empty completion).  The legacy fallback used <=0 and
+		// silently converted that zero into prompt+completion, making TPM and
+		// cost views disagree with the upstream evidence.  Only derive a total
+		// when the field was genuinely absent; malformed/overflowing values stay
+		// zero and are marked integrity_error by the normalized record.
+		presence := usage.PresenceFromRaw(raw)
+		if totalForRate <= 0 && !presence.TotalReported {
+			if derived, ok := safeNonNegativeSum(prompt, completion); ok {
+				totalForRate = derived
+			} else {
+				totalForRate = 0
+			}
+		}
+		if totalForRate < 0 {
+			totalForRate = 0
+		}
+		// Keep the rate-event lifecycle aligned with the normalized usage row.
+		// In particular, a no-usage shell is explicitly "unsettled" and a later
+		// terminal sample is allowed to replace it in place. This avoids both a
+		// lost request and a double-counted logical RPM.
+		ratePresence := usage.PresenceFromRaw(raw)
+		if strings.TrimSpace(diag.UsageFieldPresenceJSON) != "" {
+			_ = json.Unmarshal([]byte(diag.UsageFieldPresenceJSON), &ratePresence)
+		}
+		rateNormalized := usage.Normalize(usage.Parsed{
+			Model: write.Model, PromptTokens: prompt, CompletionTokens: completion,
+			OutputReasoningTokens: diag.OutputReasoningTokens, TotalTokens: total,
+			CachedTokens: cached, CacheReadTokens: cacheRead, CacheCreationTokens: cacheCreation,
+			Presence: ratePresence, IntegrityError: diag.UsageIntegrityError, RawUsage: raw,
+		}, diag.UsageProvider, diag.UsageSource, diag.Estimated)
+		rateSettlement := rateNormalized.SettlementState
+		if rateSettlement == "" {
+			rateSettlement = "unsettled"
+		}
+		occurredAt := now
+		// RPM is a request-arrival metric, not a completion-time metric. Long
+		// streams may finish outside their arrival minute, so anchor the logical
+		// event to the durable usage shell created at ingress/hold time.
+		if queryErr := exec.QueryRowContext(ctx, `SELECT created_at FROM usage_events WHERE event_id=?`, diag.UsageEventID).Scan(&occurredAt); queryErr != nil {
+			return queryErr
+		}
+		// The rolling usage event is updated in the same transaction as the
+		// canonical usage row. A replay is a no-op, while a terminal real sample
+		// atomically replaces its earlier estimate without incrementing RPM.
+		if _, err = exec.ExecContext(ctx, `INSERT INTO account_usage_rate_events(event_id,account_id,occurred_at,input_tokens,cached_input_tokens,output_tokens,total_tokens,agent_class,settlement_state,estimated,updated_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(event_id) DO UPDATE SET
+ account_id=excluded.account_id,
+ input_tokens=excluded.input_tokens,
+ cached_input_tokens=excluded.cached_input_tokens,
+ output_tokens=excluded.output_tokens,
+ total_tokens=excluded.total_tokens,
+ agent_class=excluded.agent_class,
+ settlement_state=excluded.settlement_state,
+ estimated=excluded.estimated,
+ updated_at=excluded.updated_at
+
+WHERE (account_usage_rate_events.estimated>0 AND excluded.estimated=0) OR
+      (account_usage_rate_events.settlement_state IN ('unsettled','partial','provisional') AND excluded.settlement_state<>'unsettled')`,
+			diag.UsageEventID, accountID, occurredAt, prompt, cachedInput, completion, totalForRate,
+			NormalizeAgentClass(diag.AgentClass), rateSettlement, boolInt(diag.Estimated), now); err != nil {
+			return err
+		}
+		if err = s.writeNormalizedUsage(ctx, exec, write, diag, now); err != nil {
+			return err
+		}
 	}
 	if diag.BillingHoldID != "" {
 		_, err = exec.ExecContext(ctx, `UPDATE billing_holds SET usage_recorded_at=CASE WHEN usage_recorded_at>0 THEN usage_recorded_at ELSE ? END, usage_expected=1 WHERE id=?`, now, diag.BillingHoldID)
@@ -10076,13 +10205,28 @@ func finalizeUsageDiagnostics(model string, prompt, cached, cacheRead, cacheCrea
 	} else if diag.CacheTotalInputTokens <= 0 || diag.CacheMissTokens < 0 {
 		if isAnthropicUsageMap(usageMap, cacheCreation) {
 			diag.CacheMissTokens = prompt
-			diag.CacheTotalInputTokens = prompt + cacheRead + cacheCreation
+			if totalInput, ok := safeNonNegativeSum(prompt, cacheRead, cacheCreation); ok {
+				diag.CacheTotalInputTokens = totalInput
+			} else {
+				diag.CacheMissTokens = 0
+				diag.CacheTotalInputTokens = 0
+				if diag.DiagnosticsMissReason == "" {
+					diag.DiagnosticsMissReason = "cache_input_overflow"
+				}
+			}
 		} else {
-			diag.CacheMissTokens = prompt - cacheRead
-			if diag.CacheMissTokens < 0 {
+			if prompt < 0 || cacheRead < 0 {
+				diag.CacheMissTokens = 0
+			} else if prompt >= cacheRead {
+				diag.CacheMissTokens = prompt - cacheRead
+			} else {
 				diag.CacheMissTokens = 0
 			}
-			diag.CacheTotalInputTokens = prompt
+			if prompt >= 0 {
+				diag.CacheTotalInputTokens = prompt
+			} else {
+				diag.CacheTotalInputTokens = 0
+			}
 		}
 	}
 	if diag.CacheTotalInputTokens < 0 {
@@ -10118,8 +10262,8 @@ func canonicalAuditModel(model string) string {
 }
 
 func rawUsageMap(raw json.RawMessage) map[string]interface{} {
-	var root map[string]interface{}
-	if len(raw) == 0 || json.Unmarshal(raw, &root) != nil {
+	root, err := usage.DecodeObject(raw)
+	if len(raw) == 0 || err != nil {
 		return nil
 	}
 	if usage, ok := root["usage"].(map[string]interface{}); ok {
@@ -10133,12 +10277,23 @@ func rawUsageMap(raw json.RawMessage) map[string]interface{} {
 	return root
 }
 
+func safeNonNegativeSum(values ...int64) (int64, bool) {
+	const maxInt64 = int64(^uint64(0) >> 1)
+	var total int64
+	for _, value := range values {
+		if value < 0 || value > maxInt64-total {
+			return 0, false
+		}
+		total += value
+	}
+	return total, true
+}
+
 func rawEstimated(raw json.RawMessage, usageMap map[string]interface{}) bool {
 	if b, ok := usageMap["estimated"].(bool); ok && b {
 		return true
 	}
-	var root map[string]interface{}
-	if len(raw) > 0 && json.Unmarshal(raw, &root) == nil {
+	if root, err := usage.DecodeObject(raw); len(raw) > 0 && err == nil {
 		if b, ok := root["estimated"].(bool); ok && b {
 			return true
 		}

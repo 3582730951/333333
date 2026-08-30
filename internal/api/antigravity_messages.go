@@ -299,7 +299,7 @@ func (s *Server) doAntigravityWithEgressRetry(ctx context.Context, req upstream.
 		if strings.TrimSpace(cookieJarKey) == "" {
 			cookieJarKey = lease.Account.ID + ":" + egress.ID
 		}
-		s.ObserveAccountRequestAttempt(lease.Account.ID, "antigravity", "messages")
+		s.ObserveAccountRequestAttempt(lease.Account.ID, "antigravity", "messages", ctx)
 		return s.upstream.DoAntigravity(ctx, egress, cookieJarKey, wireReq)
 	}
 
@@ -506,6 +506,7 @@ func (s *Server) recordAntigravityUsage(r *http.Request, accountID, model string
 		Prompt: inputTok, Completion: outputTok, Total: inputTok + outputTok, Cached: cachedTok,
 		CacheRead: cachedTok, Raw: json.RawMessage(raw), Diagnostics: storage.UsageDiagnostics{
 			UsageEventID:     firstNonEmpty(usageEventIDFromContext(r.Context()), requestIDFromContext(r.Context())),
+			AgentClass:       accountAgentClassFromContext(r.Context()),
 			UsageProvider:    "antigravity",
 			UsageSource:      "upstream",
 			CacheReadPresent: cachedTok > 0,

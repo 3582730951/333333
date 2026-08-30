@@ -224,6 +224,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 	w.Header().Set(requestIDHeader, requestID)
 	setSecurityHeaders(w, r)
+	if !s.authorizeRegisteredRoute(rec, r) {
+		return
+	}
 	if s.rejectForStoragePressure(r) {
 		writePublicServiceUnavailable(rec)
 		return
@@ -247,18 +250,27 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	var requestBody bodysource.BodySource
 	var bodyMeta bodysource.BodyMeta
+	bodyCaptureConfig := s.cfg
+	if r.URL.Path == "/api/v1/admin/accounts" || strings.HasPrefix(r.URL.Path, "/api/v1/admin/accounts/") {
+		// Hub compatibility accepts credential batches, but its public, scoped key
+		// surface must never inherit the gateway's 1 GiB inference-body ceiling.
+		bodyCaptureConfig.MaxBodyBytes = sub2APIHubBodyLimit
+		if bodyCaptureConfig.BodyMemoryThresholdBytes > sub2APIHubBodyLimit {
+			bodyCaptureConfig.BodyMemoryThresholdBytes = sub2APIHubBodyLimit
+		}
+	}
 	if r.Body != nil && r.Body != http.NoBody {
 		var err error
 		if !s.cfg.BodyV2Enabled {
 			var raw []byte
-			raw, err = readLimited(r.Body, s.cfg.MaxBodyBytes)
+			raw, err = readLimited(r.Body, bodyCaptureConfig.MaxBodyBytes)
 			if err == nil {
 				requestBody = bodysource.Bytes(raw)
 			}
 		} else if requestNeedsBodyMeta(r) {
-			requestBody, bodyMeta, err = captureJSONRequestBody(r.Context(), r.Body, s.cfg, s.requestBodyBudget, s.identitySecretCached, r.ContentLength)
+			requestBody, bodyMeta, err = captureJSONRequestBody(r.Context(), r.Body, bodyCaptureConfig, s.requestBodyBudget, s.identitySecretCached, r.ContentLength)
 		} else {
-			requestBody, err = captureRequestBody(r.Context(), r.Body, s.cfg, s.requestBodyBudget, r.ContentLength)
+			requestBody, err = captureRequestBody(r.Context(), r.Body, bodyCaptureConfig, s.requestBodyBudget, r.ContentLength)
 		}
 		_ = r.Body.Close()
 		if err != nil {
@@ -291,6 +303,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx = contextWithBodyMeta(ctx, bodyMeta)
 	}
 	ctx = contextWithUsageEventID(ctx, newRequestID())
+	ctx = contextWithAccountAgentClass(ctx, requestAccountAgentClass(r))
 	ctx = contextWithRuntimeSettingsCache(ctx)
 	r = r.WithContext(ctx)
 	s.mux.ServeHTTP(rec, r)

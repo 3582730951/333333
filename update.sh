@@ -48,6 +48,17 @@ set -Eeuo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
 
+# `--help` must be side-effect free. In particular, do not let it reach the
+# backup/build/update path (an older wrapper treated unknown flags as update
+# arguments and could start a deployment when an operator only wanted usage).
+for _update_help_arg in "$@"; do
+  case "$_update_help_arg" in
+    -h|--help)
+      exec bash scripts/install.sh --help
+      ;;
+  esac
+done
+
 SERVICE_NAME="${SERVICE_NAME:-codex-pool}"
 HANDOFF_SERVICE_NAME="${HANDOFF_SERVICE_NAME:-${SERVICE_NAME}-handoff}"
 CONFIG_FILE_EXPLICIT=0
@@ -62,6 +73,35 @@ AFTER=""
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# Keep group migration an explicit, opt-in update capability.  In particular, do
+# not let an old service's environment or a stale shell export silently turn it
+# back on when an operator runs `./update.sh` without a flag.  A CLI flag remains
+# the authoritative choice and is forwarded to the canonical installer below.
+MIGRATION_FLAG=""
+for _update_arg in "$@"; do
+  case "$_update_arg" in
+    --migrate-user-groups)
+      [[ "$MIGRATION_FLAG" != "no" ]] || die "conflicting group migration flags; use only one of --migrate-user-groups/--no-migrate-user-groups"
+      MIGRATION_FLAG="yes"
+      ;;
+    --no-migrate-user-groups)
+      [[ "$MIGRATION_FLAG" != "yes" ]] || die "conflicting group migration flags; use only one of --migrate-user-groups/--no-migrate-user-groups"
+      MIGRATION_FLAG="no"
+      ;;
+  esac
+done
+if [[ "$MIGRATION_FLAG" == "yes" ]]; then
+  MIGRATE_USER_GROUPS=1
+elif [[ "$MIGRATION_FLAG" == "no" ]]; then
+  MIGRATE_USER_GROUPS=0
+else
+  # The no-migration flag is deliberately materialized on the command line so
+  # scripts/install.sh cannot inherit a legacy MIGRATE_USER_GROUPS=1 export.
+  MIGRATE_USER_GROUPS=0
+  set -- "$@" --no-migrate-user-groups
+fi
+export MIGRATE_USER_GROUPS
 
 bool_enabled() {
   case "${1:-}" in

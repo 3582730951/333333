@@ -1,14 +1,17 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,9 +73,10 @@ type whamUsageResponse struct {
 // upstream (it may be hidden even when credits exist), so it is carried verbatim
 // rather than coerced to a number.
 type whamCredits struct {
-	HasCredits bool    `json:"has_credits"`
-	Unlimited  bool    `json:"unlimited"`
-	Balance    *string `json:"balance"`
+	HasCredits            bool    `json:"has_credits"`
+	Unlimited             bool    `json:"unlimited"`
+	Balance               *string `json:"balance"`
+	RemainingMilliCredits *int64  `json:"remaining_milli_credits,omitempty"`
 }
 
 // whamSpendControl mirrors SpendControlStatusDetails.
@@ -91,6 +95,120 @@ type whamSpendControlLimit struct {
 	RemainingPercent  float64 `json:"remaining_percent"`
 	ResetAfterSeconds int64   `json:"reset_after_seconds"`
 	ResetAt           int64   `json:"reset_at"`
+}
+
+// UnmarshalJSON accepts the two wire variants observed in the wild: monetary
+// fields are strings in the browser response but some deployments serialize
+// them as JSON numbers.  A strict string unmarshal would discard the entire
+// quota response (and therefore its usable windows) when that happens.
+func (w *whamUsageResponse) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		PlanType  string `json:"plan_type"`
+		RateLimit struct {
+			Allowed         bool       `json:"allowed"`
+			LimitReached    bool       `json:"limit_reached"`
+			PrimaryWindow   whamWindow `json:"primary_window"`
+			SecondaryWindow whamWindow `json:"secondary_window"`
+		} `json:"rate_limit"`
+		Credits                    json.RawMessage        `json:"credits"`
+		SpendControl               json.RawMessage        `json:"spend_control"`
+		RateLimitResetCredits      map[string]interface{} `json:"rate_limit_reset_credits"`
+		RateLimitResetCreditsCamel map[string]interface{} `json:"rateLimitResetCredits"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*w = whamUsageResponse{PlanType: wire.PlanType}
+	w.RateLimit.Allowed, w.RateLimit.LimitReached = wire.RateLimit.Allowed, wire.RateLimit.LimitReached
+	w.RateLimit.PrimaryWindow, w.RateLimit.SecondaryWindow = wire.RateLimit.PrimaryWindow, wire.RateLimit.SecondaryWindow
+	w.RateLimitResetCredits, w.RateLimitResetCreditsCamel = wire.RateLimitResetCredits, wire.RateLimitResetCreditsCamel
+	if len(wire.Credits) > 0 && string(wire.Credits) != "null" {
+		var credits struct {
+			HasCredits            bool            `json:"has_credits"`
+			Unlimited             bool            `json:"unlimited"`
+			Balance               json.RawMessage `json:"balance"`
+			RemainingMilliCredits json.RawMessage `json:"remaining_milli_credits"`
+			CreditsRemainingMilli json.RawMessage `json:"credits_remaining_milli"`
+			RemainingCredits      json.RawMessage `json:"remaining_credits"`
+		}
+		if err := json.Unmarshal(wire.Credits, &credits); err != nil {
+			return err
+		}
+		w.Credits = &whamCredits{HasCredits: credits.HasCredits, Unlimited: credits.Unlimited}
+		if value := flexibleJSONText(credits.Balance); value != "" {
+			w.Credits.Balance = &value
+		}
+		for index, raw := range []json.RawMessage{credits.RemainingMilliCredits, credits.CreditsRemainingMilli, credits.RemainingCredits} {
+			if value, ok := flexibleNonNegativeInt(raw); ok {
+				// A field explicitly named *credits is interpreted as whole credits;
+				// milli_credits is already in storage units.
+				if index == 2 && len(credits.RemainingMilliCredits) == 0 && len(credits.CreditsRemainingMilli) == 0 {
+					if value <= math.MaxInt64/1000 {
+						value *= 1000
+					}
+				}
+				w.Credits.RemainingMilliCredits = &value
+				break
+			}
+		}
+	}
+	if len(wire.SpendControl) > 0 && string(wire.SpendControl) != "null" {
+		var spend struct {
+			Reached         bool            `json:"reached"`
+			IndividualLimit json.RawMessage `json:"individual_limit"`
+		}
+		if err := json.Unmarshal(wire.SpendControl, &spend); err != nil {
+			return err
+		}
+		w.SpendControl = &whamSpendControl{Reached: spend.Reached}
+		if len(spend.IndividualLimit) > 0 && string(spend.IndividualLimit) != "null" {
+			var limit struct {
+				Source            json.RawMessage `json:"source"`
+				Limit             json.RawMessage `json:"limit"`
+				Used              json.RawMessage `json:"used"`
+				Remaining         json.RawMessage `json:"remaining"`
+				UsedPercent       float64         `json:"used_percent"`
+				RemainingPercent  float64         `json:"remaining_percent"`
+				ResetAfterSeconds int64           `json:"reset_after_seconds"`
+				ResetAt           int64           `json:"reset_at"`
+			}
+			if err := json.Unmarshal(spend.IndividualLimit, &limit); err != nil {
+				return err
+			}
+			w.SpendControl.IndividualLimit = &whamSpendControlLimit{
+				Source: flexibleJSONText(limit.Source), Limit: flexibleJSONText(limit.Limit),
+				Used: flexibleJSONText(limit.Used), Remaining: flexibleJSONText(limit.Remaining),
+				UsedPercent: limit.UsedPercent, RemainingPercent: limit.RemainingPercent,
+				ResetAfterSeconds: limit.ResetAfterSeconds, ResetAt: limit.ResetAt,
+			}
+		}
+	}
+	return nil
+}
+
+func flexibleJSONText(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return strings.TrimSpace(text)
+	}
+	var number json.Number
+	if json.Unmarshal(raw, &number) == nil {
+		return strings.TrimSpace(number.String())
+	}
+	return ""
+}
+
+func flexibleNonNegativeInt(raw json.RawMessage) (int64, bool) {
+	text := flexibleJSONText(raw)
+	if text == "" {
+		return 0, false
+	}
+	value, err := strconv.ParseInt(text, 10, 64)
+	return value, err == nil && value >= 0
 }
 
 type whamWindow struct {
@@ -875,6 +993,10 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 	if err := json.Unmarshal(body, &wham); err != nil {
 		return newQuotaPollError("decode_error", 0, nil, fmt.Errorf("decode: %w", err))
 	}
+	var whamEvidence map[string]interface{}
+	if json.Unmarshal(body, &whamEvidence) == nil {
+		s.captureEntitlementEvidence(ctx, acc.ID, "quota_metadata", whamEvidence)
+	}
 
 	now := storage.Now()
 
@@ -970,6 +1092,9 @@ func (s *Server) upsertCodexCreditsSnapshot(ctx context.Context, accountID strin
 		detail["unlimited"] = wham.Credits.Unlimited
 		if wham.Credits.Balance != nil {
 			detail["balance"] = strings.TrimSpace(*wham.Credits.Balance)
+		}
+		if wham.Credits.RemainingMilliCredits != nil {
+			detail["credits_remaining_milli"] = *wham.Credits.RemainingMilliCredits
 		}
 		if wham.Credits.Unlimited {
 			status = "unlimited"

@@ -744,7 +744,7 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 	send := func(accessToken string, requestBody []byte) (*upstream.Response, error) {
 		headers := requestHeaders.Clone()
 		headers.Set("authorization", "Bearer "+accessToken)
-		s.ObserveAccountRequestAttempt(lease.Account.ID, "kiro", "generate")
+		s.ObserveAccountRequestAttempt(lease.Account.ID, "kiro", "generate", r.Context())
 		return s.upstream.DoRawSourceObserved(r.Context(), lease.Egress, http.MethodPost, target, headers, bodysource.Bytes(requestBody), lease.Binding.CookieJarKey, "kiro", converted.Model)
 	}
 	response, err := send(bearer, body)
@@ -1399,6 +1399,7 @@ func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity rou
 	keyHash, userID := downstreamFromCtx(r.Context())
 	diagnostics := storage.UsageDiagnostics{
 		UsageEventID:            firstNonEmpty(usageEventIDFromContext(r.Context()), requestIDFromContext(r.Context())),
+		AgentClass:              accountAgentClassFromContext(r.Context()),
 		UsageProvider:           "kiro",
 		UsageSource:             data.UsageSource,
 		CacheReadPresent:        data.Metering.CacheReadTokens.Present,

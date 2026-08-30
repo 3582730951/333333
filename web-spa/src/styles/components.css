@@ -4567,6 +4567,24 @@ so the mark owns the size
   font-size: 13px;
 }
 
+.pool-setup-notice {
+  display: grid;
+  gap: 4px;
+  margin: -4px 0 18px;
+  padding: 12px 14px;
+  background: color-mix(in srgb, var(--pool-action) 8%, var(--pool-bg-surface-2));
+  border: 1px solid color-mix(in srgb, var(--pool-action) 28%, var(--pool-border));
+  border-radius: var(--pool-radius-control);
+  color: var(--pool-text-2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.pool-setup-notice b {
+  color: var(--pool-text);
+  font-size: 13px;
+}
+
 .pool-login-secondary {
   display: flex;
   flex-wrap: wrap;
@@ -8660,3 +8678,134 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   justify-content: flex-start;
   white-space: nowrap;
 }
+.pool-inline-check {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding-inline: 10px;
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-control);
+  color: var(--pool-text-2);
+  background: var(--pool-surface-subtle);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.pool-inline-check:focus-within {
+  border-color: var(--pool-accent);
+  box-shadow: 0 0 0 3px var(--pool-accent-soft);
+}
+
+.pool-export-preflight {
+  display: grid;
+  gap: 12px;
+}
+
+.pool-export-preflight__summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--pool-text-2);
+}
+
+.pool-export-preflight__items {
+  max-height: min(46vh, 440px);
+  overflow: auto;
+  display: grid;
+  gap: 8px;
+  padding-right: 4px;
+}
+
+.pool-export-preflight__item {
+  display: grid;
+  gap: 5px;
+  padding: 10px 12px;
+  border: 1px solid var(--pool-border);
+  border-left: 3px solid var(--pool-success);
+  border-radius: var(--pool-radius-control);
+  background: var(--pool-surface-subtle);
+}
+
+.pool-export-preflight__item[data-compatible='false'] {
+  border-left-color: var(--pool-danger);
+}
+
+.pool-export-preflight__item > div {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.pool-export-preflight__item span,
+.pool-export-preflight__item small {
+  color: var(--pool-text-3);
+}
+
+.pool-export-preflight__item p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.pool-export-preflight__error {
+  color: var(--pool-danger);
+}
+
+.pool-export-preflight__warning {
+  color: var(--pool-warning);
+}
+
+.pool-callout--warning {
+  padding: 10px 12px;
+  border: 1px solid var(--pool-warning);
+  border-radius: var(--pool-radius-control);
+  color: var(--pool-warning);
+  background: var(--pool-warning-soft);
+}
+/* Sub2API Hub connection surface: dense enough for operators, calm enough for
+   a first-run setup. The panel intentionally uses existing pool tokens so the
+   same light/glow treatment follows the active theme and reduced-motion rules. */
+.pool-hub-modal .pool-modal-body { padding: 0; }
+.pool-hub-panel { display: grid; gap: 16px; }
+.pool-hub-panel__intro { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.pool-hub-panel__intro h3 { margin: 0 0 5px; }
+.pool-hub-panel__toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.pool-hub-connection-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+.pool-hub-connection-card { min-width: 0; overflow: hidden; }
+.pool-hub-connection-card__head, .pool-hub-connection-card__metrics, .pool-hub-connection-card__meta, .pool-hub-connection-card__actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pool-hub-connection-card__head { justify-content: space-between; }
+.pool-hub-connection-card__title { font-size: 15px; font-weight: 700; }
+.pool-hub-connection-card__id { font: 11px/1.4 var(--pool-mono, ui-monospace, monospace); overflow-wrap: anywhere; }
+.pool-hub-connection-card__metrics { margin-top: 14px; font-size: 12px; }
+.pool-hub-connection-card__metrics span { padding: 5px 8px; border-radius: 8px; background: color-mix(in srgb, var(--pool-accent) 8%, transparent); }
+.pool-hub-connection-card__meta { margin-top: 10px; font-size: 11px; }
+.pool-hub-connection-card__actions { margin-top: 14px; }
+.pool-hub-connection-card__config { display: grid; gap: 8px; margin-top: 12px; padding: 10px; border: 1px solid var(--pool-border); border-radius: 9px; background: color-mix(in srgb, var(--pool-bg-elevated, #fff) 92%, var(--pool-accent)); }
+.pool-hub-connection-card__config-row, .pool-hub-secret__row { display: grid; grid-template-columns: 92px minmax(0, 1fr) auto; align-items: center; gap: 8px; font-size: 12px; }
+.pool-hub-connection-card__config code, .pool-hub-secret code { overflow-wrap: anywhere; font: 11px/1.4 var(--pool-mono, ui-monospace, monospace); }
+.pool-hub-empty { min-height: 230px; display: grid; place-items: center; align-content: center; gap: 10px; padding: 24px; text-align: center; color: var(--pool-text-secondary); border: 1px dashed var(--pool-border); border-radius: 12px; }
+.pool-hub-empty .pool-icon { width: 30px; height: 30px; color: var(--pool-accent); }
+.pool-hub-empty b { color: var(--pool-text); }
+.pool-hub-editor { display: grid; gap: 14px; }
+.pool-hub-editor__switch { display: flex; align-items: center; gap: 10px; }
+.pool-hub-editor__switch span { display: grid; gap: 2px; font-size: 13px; }
+.pool-hub-editor__switch small { color: var(--pool-text-secondary); }
+.pool-hub-secret { display: grid; gap: 14px; }
+.pool-hub-secret__row { padding: 9px 10px; border: 1px solid var(--pool-border); border-radius: 8px; }
+.pool-secret-value { color: var(--pool-accent); word-break: break-all; }
+.pool-hub-secret__footer { display: flex; justify-content: flex-end; }
+@media (max-width: 700px) {
+  .pool-hub-panel__intro { display: grid; }
+  .pool-hub-panel__toolbar { justify-content: flex-start; }
+  .pool-hub-connection-grid { grid-template-columns: 1fr; }
+  .pool-hub-connection-card__config-row, .pool-hub-secret__row { grid-template-columns: 1fr; align-items: flex-start; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pool-hub-connection-card, .pool-hub-empty { transition: none !important; }
+}
+.pool-capacity-estimates { display: grid; gap: 8px; margin-top: 10px; }
+.pool-capacity-estimate { display: grid; gap: 4px; padding: 8px 10px; border: 1px solid var(--pool-border); border-radius: 8px; font-size: 12px; }
+.pool-capacity-estimate > div:first-child { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }

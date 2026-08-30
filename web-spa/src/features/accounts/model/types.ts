@@ -21,7 +21,20 @@ export interface AccountModelCapability {
 export type AccountRequestRateState = 'live' | 'stale' | 'unavailable';
 
 export interface AccountRequestRate {
+  /** Legacy wire-attempt RPM retained for old clients. */
   rpm: number;
+  logical_rpm: number;
+  attempt_rpm: number;
+  root_rpm: number;
+  subagent_rpm: number;
+  unknown_rpm: number;
+  attempt_root_rpm: number;
+  attempt_subagent_rpm: number;
+  attempt_unknown_rpm: number;
+  tpm: number;
+  input_tpm: number;
+  cached_input_tpm: number;
+  output_tpm: number;
   window_seconds: number;
   sampled_at: number;
   state: AccountRequestRateState;

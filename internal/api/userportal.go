@@ -1,10 +1,15 @@
 package api
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"codex-account-pool/internal/storage"
 )
@@ -59,6 +64,237 @@ func (s *Server) handleUserKeys(w http.ResponseWriter, r *http.Request) {
 	default:
 		methodNotAllowed(w)
 	}
+}
+
+func publicUserSessionID(tokenHash string) string {
+	digest := sha256.Sum256([]byte("portal-session-v1\x00" + tokenHash))
+	return hex.EncodeToString(digest[:16])
+}
+
+func (s *Server) handleUserSessions(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	currentHash := ""
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		currentHash = hashAPIKey(cookie.Value)
+	}
+	sessions, err := s.store.ListUserSessions(r.Context(), u.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if r.Method == http.MethodGet && strings.Trim(r.URL.Path, "/") == "user/sessions" {
+		items := make([]map[string]interface{}, 0, len(sessions))
+		for _, session := range sessions {
+			userAgent := strings.TrimSpace(session.UserAgent)
+			if len(userAgent) > 240 {
+				userAgent = userAgent[:240]
+			}
+			items = append(items, map[string]interface{}{
+				"id": publicUserSessionID(session.TokenHash), "current": session.TokenHash == currentHash,
+				"user_agent": userAgent, "created_at": session.CreatedAt, "expires_at": session.ExpiresAt,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"sessions": items})
+		return
+	}
+	if r.Method != http.MethodDelete {
+		methodNotAllowed(w)
+		return
+	}
+	requestedID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/user/sessions/"), "/")
+	if requestedID == "" || strings.Contains(requestedID, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	ownedHash := ""
+	for _, session := range sessions {
+		if publicUserSessionID(session.TokenHash) == requestedID {
+			ownedHash = session.TokenHash
+			break
+		}
+	}
+	if ownedHash == "" {
+		http.NotFound(w, r)
+		return
+	}
+	deleted, err := s.store.DeleteUserSessionOwned(r.Context(), ownedHash, u.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !deleted {
+		http.NotFound(w, r)
+		return
+	}
+	if ownedHash == currentHash {
+		clearCookie(w, sessionCookieName, s.requestIsHTTPS(r))
+		clearCookie(w, csrfCookieName, s.requestIsHTTPS(r))
+	}
+	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "user_session_revoke", State: "success", Reason: "owner_requested", Detail: "user_id=" + u.ID + " session_id=" + requestedID})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": true, "current": ownedHash == currentHash})
+}
+
+type portalUsageCursor struct {
+	At int64  `json:"at"`
+	ID string `json:"id"`
+}
+
+func decodePortalUsageCursor(value string) (portalUsageCursor, error) {
+	if strings.TrimSpace(value) == "" {
+		return portalUsageCursor{}, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil || len(raw) > 512 {
+		return portalUsageCursor{}, errors.New("invalid usage cursor")
+	}
+	var cursor portalUsageCursor
+	if json.Unmarshal(raw, &cursor) != nil || cursor.At <= 0 || cursor.ID == "" {
+		return portalUsageCursor{}, errors.New("invalid usage cursor")
+	}
+	return cursor, nil
+}
+
+func encodePortalUsageCursor(row storage.UsageComponentRow) string {
+	raw, _ := json.Marshal(portalUsageCursor{At: row.CreatedAt, ID: row.UsageEventID})
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func (s *Server) handleUserUsageEvents(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	cursor, err := decodePortalUsageCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	from, _ := strconv.ParseInt(r.URL.Query().Get("from"), 10, 64)
+	to, _ := strconv.ParseInt(r.URL.Query().Get("to"), 10, 64)
+	if to <= 0 {
+		to = time.Now().Unix()
+	}
+	if from <= 0 {
+		from = to - 30*24*60*60
+	}
+	if from > to {
+		writeError(w, http.StatusBadRequest, errors.New("from must not be after to"))
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	tier := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("service_tier")))
+	if tier != "" && tier != "default" && tier != "fast" {
+		writeError(w, http.StatusBadRequest, errors.New("service_tier must be default or fast"))
+		return
+	}
+	components, hasMore, err := s.store.ListUserUsageComponents(r.Context(), storage.UserUsageComponentFilter{
+		UserID: u.ID, Model: r.URL.Query().Get("model"), ServiceTier: tier, From: from, To: to,
+		CursorAt: cursor.At, CursorEventID: cursor.ID, Limit: limit,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	eventIDs := make([]string, len(components))
+	for index := range components {
+		eventIDs[index] = components[index].UsageEventID
+	}
+	valuations, err := s.store.ListUsageValuationsByEventIDs(r.Context(), eventIDs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	items := make([]map[string]interface{}, 0, len(components))
+	for _, row := range components {
+		items = append(items, map[string]interface{}{
+			"usage_event_id":   row.UsageEventID,
+			"models":           map[string]string{"requested": row.RequestedModel, "resolved": row.ResolvedModel, "observed": row.UpstreamModel},
+			"service_tier":     map[string]string{"requested": row.RequestedServiceTier, "forwarded": row.ForwardedServiceTier, "observed": row.ObservedServiceTier, "billed": row.BilledServiceTier, "reason": row.BilledTierReason},
+			"tokens":           map[string]interface{}{"input_total": row.InputTotal, "input_uncached": row.InputUncached, "cached_read": row.CachedRead, "cache_write": row.CacheWrite, "output_total": row.OutputTotal, "output_reasoning": row.OutputReasoning, "presence": row.FieldPresence},
+			"settlement_state": row.SettlementState, "estimated": row.Estimated != 0, "integrity_error": row.IntegrityError,
+			"valuations": valuations[row.UsageEventID], "created_at": row.CreatedAt, "updated_at": row.UpdatedAt,
+		})
+	}
+	nextCursor := ""
+	if hasMore && len(components) > 0 {
+		nextCursor = encodePortalUsageCursor(components[len(components)-1])
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"items": items, "next_cursor": nextCursor, "has_more": hasMore, "from": from, "to": to})
+}
+
+func (s *Server) handleUserQuota(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	now := time.Now().Unix()
+	from := now - 30*24*60*60
+	summary, err := s.store.AccountValuationTotals(r.Context(), "", u.ID, from, now)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	accuracy := "settled"
+	if summary.UnavailableEvents > 0 {
+		accuracy = "partial"
+	} else if summary.ProvisionalEvents > 0 {
+		accuracy = "estimated"
+	}
+	catalogs, err := s.store.ListPricingCatalogVersions(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	var activeCatalog interface{}
+	for _, catalog := range catalogs {
+		if catalog.Status == "active" {
+			activeCatalog = catalog
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"period": map[string]int64{"from": from, "to": now}, "accuracy": accuracy,
+		"valuation": summary, "catalog": activeCatalog, "updated_at": summary.UpdatedAt,
+		"labels": map[string]string{"usd": "API list-price equivalent consumed", "credits": "ChatGPT Credits consumed when subscription evidence is available"},
+	})
+}
+
+func (s *Server) handleUserOverview(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	keys, err := s.store.ListAPIKeysByUser(r.Context(), u.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	now := time.Now().Unix()
+	valuation, err := s.store.AccountValuationTotals(r.Context(), "", u.ID, now-7*24*60*60, now)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"user": userView(u, "session"), "api_key_count": len(keys), "last_7d_valuation": valuation,
+		"onboarding": map[string]bool{"create_key": len(keys) == 0, "copy_config": len(keys) == 0, "first_request": valuation.SettledEvents+valuation.ProvisionalEvents == 0},
+		"updated_at": now,
+	})
 }
 
 // handleUserKeyAction: PATCH/DELETE /user/api-keys/{hash} — only on a key the caller owns.

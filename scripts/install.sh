@@ -45,6 +45,9 @@ WARP_ACCOUNTS_PER_EXIT="${WARP_ACCOUNTS_PER_EXIT:-3}"
 CF_SOLVER_URL="${CF_SOLVER_URL:-}"
 LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:8787}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-}"
+ADMIN_SETUP_TOKEN=""
+ADMIN_SETUP_PROVISIONED=0
+ADMIN_SETUP_EXPIRES_AT=0
 OPEN_FIREWALL="${OPEN_FIREWALL:-0}"
 PUBLIC_URL="${PUBLIC_URL:-}"
 INSTALL_GO="${INSTALL_GO:-auto}"
@@ -639,10 +642,14 @@ json_escape() {
 
 generate_admin_token() {
   if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 24
+    openssl rand -hex 32
   else
-    od -An -N24 -tx1 /dev/urandom | tr -d ' \n'
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
   fi
+}
+
+generate_admin_setup_token() {
+  generate_admin_token
 }
 
 listen_host() {
@@ -1419,6 +1426,32 @@ prepare_runtime_layout() {
   fi
 }
 
+prepare_existing_database_permissions() {
+  # A database created by an older root-run installer can remain root-owned
+  # even though the new release deliberately performs migrations as the
+  # unprivileged service user.  Normalize only the database inode and its
+  # SQLite sidecars; contents and backups remain untouched.  Reject symlinks so
+  # an upgrade cannot unexpectedly chown a path outside DATABASE_PATH.
+  if ! run_root test -e "$DATABASE_PATH"; then
+    return 0
+  fi
+  if run_root test -L "$DATABASE_PATH"; then
+    die "DATABASE_PATH must not be a symlink: ${DATABASE_PATH}"
+  fi
+  run_root chown "$SERVICE_USER:$SERVICE_GROUP" "$DATABASE_PATH" || die "could not assign database ownership to ${SERVICE_USER}: ${DATABASE_PATH}"
+  run_root chmod 0640 "$DATABASE_PATH" || die "could not secure database permissions: ${DATABASE_PATH}"
+  for suffix in -wal -shm -journal; do
+    local sidecar="${DATABASE_PATH}${suffix}"
+    if run_root test -e "$sidecar"; then
+      if run_root test -L "$sidecar"; then
+        die "SQLite sidecar must not be a symlink: ${sidecar}"
+      fi
+      run_root chown "$SERVICE_USER:$SERVICE_GROUP" "$sidecar" || die "could not assign SQLite sidecar ownership: ${sidecar}"
+      run_root chmod 0640 "$sidecar" || die "could not secure SQLite sidecar permissions: ${sidecar}"
+    fi
+  done
+}
+
 install_binary_and_config() {
   local tmp existing_admin staging current_target commit_id built_at
   RELEASE_DIR="${APP_DIR%/}/releases/${RELEASE_ID}"
@@ -1474,21 +1507,24 @@ EOF
 
   if [[ -f "$CONFIG_FILE" ]]; then
     warn "Keeping existing config: ${CONFIG_FILE}"
+    # Older releases commonly left an existing config as root:root 0640.  The
+    # new expand-only migration and standby worker run as SERVICE_USER, so that
+    # otherwise valid upgrade would fail before the active symlink can change.
+    # Preserve the file contents and owner; narrow the access mode to
+    # root/service-group and reject symlinks rather than following an unexpected
+    # path during an update.
+    if run_root test -L "$CONFIG_FILE"; then
+      die "CONFIG_FILE must not be a symlink: ${CONFIG_FILE}"
+    fi
+    run_root chgrp "$SERVICE_GROUP" "$CONFIG_FILE" || die "could not grant ${SERVICE_GROUP} read access to ${CONFIG_FILE}"
+    run_root chmod 0640 "$CONFIG_FILE" || die "could not secure permissions on ${CONFIG_FILE}"
     if [[ -z "$ADMIN_TOKEN" ]]; then
       existing_admin="$(config_string_value "$CONFIG_FILE" "admin_token" || true)"
       if [[ -n "$existing_admin" ]]; then
         ADMIN_TOKEN="$existing_admin"
-      elif external_listen_enabled; then
-        ADMIN_TOKEN="$(generate_admin_token)"
-        warn "Existing config has an empty admin_token while LISTEN_ADDR=${LISTEN_ADDR} is externally reachable."
-        warn "Generated CODEX_POOL_ADMIN_TOKEN for the service; add it to ${CONFIG_FILE} too if you run manually."
       fi
     fi
   else
-    if [[ -z "$ADMIN_TOKEN" ]] && external_listen_enabled; then
-      ADMIN_TOKEN="$(generate_admin_token)"
-      log "Generated admin token for externally reachable frontend"
-    fi
     log "Installing default config to ${CONFIG_FILE}"
     tmp="$(mktemp)"
     render_runtime_config >"$tmp"
@@ -1511,12 +1547,44 @@ run_expand_only_migration() {
   log "Applying additive expand-only storage migrations before standby startup"
   run_service env \
     CODEX_POOL_DATABASE="$DATABASE_PATH" \
+    CODEX_POOL_MIGRATE_USER_GROUPS="$MIGRATE_USER_GROUPS" \
     CODEX_POOL_DATA_DIR="${DATA_DIR%/}/data" \
     CODEX_POOL_MASTER_KEY_FILE="${DATA_DIR%/}/data/keys/master.key" \
     CODEX_POOL_IDENTITY_KEY_FILE="${DATA_DIR%/}/data/keys/identity.key" \
     CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE="${DATA_DIR%/}/data/keys/diagnostic-alias.key" \
     "$binary" --config "$CONFIG_FILE" --migrate-only --expand-only ||
     die "expand-only migration failed; the active release and traffic links were not changed"
+}
+
+provision_admin_setup() {
+  local binary="${RELEASE_DIR%/}/${APP_NAME}" output
+  [[ -x "$binary" ]] || die "admin setup provisioning binary is missing: ${binary}"
+  ADMIN_SETUP_TOKEN="$(generate_admin_setup_token)"
+  [[ ${#ADMIN_SETUP_TOKEN} -ge 64 ]] || die "CSPRNG returned a short admin setup token"
+  output="$({ printf '%s\n' "$ADMIN_SETUP_TOKEN" | run_service env \
+    CODEX_POOL_DATABASE="$DATABASE_PATH" \
+    CODEX_POOL_MIGRATE_USER_GROUPS="$MIGRATE_USER_GROUPS" \
+    CODEX_POOL_DATA_DIR="${DATA_DIR%/}/data" \
+    CODEX_POOL_MASTER_KEY_FILE="${DATA_DIR%/}/data/keys/master.key" \
+    CODEX_POOL_IDENTITY_KEY_FILE="${DATA_DIR%/}/data/keys/identity.key" \
+    CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE="${DATA_DIR%/}/data/keys/diagnostic-alias.key" \
+    "$binary" --config "$CONFIG_FILE" --provision-admin-setup; } 2>&1)" || {
+      ADMIN_SETUP_TOKEN=""
+      die "one-time admin setup provisioning failed"
+    }
+  case "$output" in
+    *'"admin_setup":"provisioned"'*)
+      ADMIN_SETUP_PROVISIONED=1
+      ADMIN_SETUP_EXPIRES_AT="$(printf '%s' "$output" | sed -n 's/.*"expires_at":\([0-9][0-9]*\).*/\1/p' | tail -n1)"
+      ;;
+    *'"admin_setup":"already_completed"'*)
+      ADMIN_SETUP_TOKEN=""
+      ;;
+    *)
+      ADMIN_SETUP_TOKEN=""
+      die "admin setup provisioner returned an unrecognized status"
+      ;;
+  esac
 }
 
 systemd_requested() {
@@ -3743,7 +3811,7 @@ frontend_url_hint() {
 }
 
 print_summary() {
-  local sidecar_summary migration_summary warp_summary super_instruct_summary frontend_url manual_admin_env admin_token_summary reauth_manual
+  local sidecar_summary migration_summary warp_summary super_instruct_summary frontend_url manual_admin_env admin_token_summary admin_setup_summary reauth_manual
   if bool_enabled "$WITH_SIDECAR"; then
     sidecar_summary="${SERVICE_NAME}-sidecar.service (${SIDECAR_ADDR})"
   else
@@ -3780,6 +3848,14 @@ print_summary() {
     manual_admin_env=" CODEX_POOL_ADMIN_TOKEN_FILE=${DATA_DIR%/}/data/keys/admin.token"
     admin_token_summary="<configured in ${DATA_DIR%/}/data/keys/admin.token>"
   fi
+  admin_setup_summary="already completed"
+  if (( ADMIN_SETUP_PROVISIONED == 1 )); then
+    if [[ -t 1 ]]; then
+      admin_setup_summary="${ADMIN_SETUP_TOKEN} (one-time, expires_at=${ADMIN_SETUP_EXPIRES_AT}, claim from loopback)"
+    else
+      admin_setup_summary="provisioned but hidden because stdout is not an interactive terminal; rerun provisioning interactively before expiry"
+    fi
+  fi
 
   cat <<EOF
 
@@ -3802,6 +3878,7 @@ Registration:  ${registration_summary}
 Group migration: ${migration_summary}
 WARP:          ${warp_summary}
 Admin token:   ${admin_token_summary}
+Admin setup:   ${admin_setup_summary}
 
 Manual run:
   CODEX_POOL_DATABASE=${DATABASE_PATH} CODEX_POOL_DATA_DIR=${DATA_DIR%/}/data CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS} CODEX_POOL_LISTEN_ADDR=${LISTEN_ADDR} CODEX_POOL_SUPER_INSTRUCT_DIR=${APP_DIR%/}/current/super-instruct/codex-skills CODEX_POOL_SUPER_INSTRUCT_BRIDGE_FILE=${APP_DIR%/}/current/super-instruct/bridge.md${manual_admin_env} ${BIN_DIR}/${APP_NAME} --config ${CONFIG_FILE}${reauth_manual}
@@ -3851,8 +3928,10 @@ main() {
   enforce_deployment_budget prebuild
   resolve_requested_egress_ports
   prepare_runtime_layout
+  prepare_existing_database_permissions
   install_binary_and_config
   run_expand_only_migration
+  provision_admin_setup
   install_sidecar
   install_nodejs
   install_chrome

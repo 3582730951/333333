@@ -100,10 +100,13 @@ func cacheAccountHealthRows(rows []storage.CacheUsageMetricRow, codebook diagnos
 		} else if band == "disabled" {
 			reason = "thresholds_disabled"
 		}
-		provider := ""
-		for p := range a.providers {
-			provider = p
-			break
+		provider := "unknown"
+		if len(a.providers) == 1 {
+			for p := range a.providers {
+				provider = p
+			}
+		} else if len(a.providers) > 1 {
+			provider = "mixed"
 		}
 		out = append(out, []string{code, provider, itoa64(a.requests), itoa64(a.hits), fmtRate(rate), score, band, reason})
 	}

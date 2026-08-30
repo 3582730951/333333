@@ -36,6 +36,11 @@ type accountRateSubscription struct {
 	updates chan accountRateFrame
 }
 
+func accountRateValuesEqual(left, right storage.AccountRequestRate) bool {
+	left.SampledAt, right.SampledAt = 0, 0
+	return left == right
+}
+
 // accountRateHub owns the only recurring account-rate query loop in a process.
 // Browser tabs subscribe to subsets; each tick queries the union and fans the same
 // sampled snapshot out, preventing per-tab database polling amplification.
@@ -195,17 +200,80 @@ func parseAccountRateIDs(rawValues []string) ([]string, error) {
 	return ids, nil
 }
 
-func (s *Server) ObserveAccountRequestAttempt(accountID, provider, routeKind string) {
+func (s *Server) ObserveAccountRequestAttempt(accountID, provider, routeKind string, contexts ...context.Context) {
 	if s != nil && s.accountRateMeter != nil {
-		s.accountRateMeter.ObserveAttempt(accountID, provider, routeKind, time.Time{})
+		class := storage.AgentClassUnknown
+		if len(contexts) > 0 {
+			class = accountAgentClassFromContext(contexts[0])
+		}
+		s.accountRateMeter.ObserveAttemptClass(accountID, provider, routeKind, class, time.Time{})
 	}
+}
+
+type accountAgentClassContextKey struct{}
+
+func contextWithAccountAgentClass(ctx context.Context, class string) context.Context {
+	return context.WithValue(ctx, accountAgentClassContextKey{}, storage.NormalizeAgentClass(class))
+}
+
+func accountAgentClassFromContext(ctx context.Context) string {
+	if ctx != nil {
+		if value, ok := ctx.Value(accountAgentClassContextKey{}).(string); ok {
+			return storage.NormalizeAgentClass(value)
+		}
+	}
+	return storage.AgentClassUnknown
+}
+
+func requestAccountAgentClass(r *http.Request) string {
+	if r == nil {
+		return storage.AgentClassUnknown
+	}
+	explicit := func(value string) (string, bool) {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "true", "1", "yes", "subagent", "sub-agent":
+			return storage.AgentClassSubagent, true
+		case "false", "0", "no", "root", "main":
+			return storage.AgentClassRoot, true
+		default:
+			if strings.TrimSpace(value) != "" {
+				// Codex may send an opaque subagent identifier rather than a bool.
+				return storage.AgentClassSubagent, true
+			}
+			return "", false
+		}
+	}
+	if class, ok := explicit(r.Header.Get("x-openai-subagent")); ok {
+		return class
+	}
+	for _, part := range strings.Split(r.Header.Get("x-anthropic-billing-header"), ";") {
+		key, value, found := strings.Cut(strings.TrimSpace(part), "=")
+		if found && strings.EqualFold(strings.TrimSpace(key), "cc_is_subagent") {
+			if class, ok := explicit(value); ok {
+				return class
+			}
+		}
+	}
+	own := strings.TrimSpace(r.Header.Get("thread-id"))
+	parent := strings.TrimSpace(r.Header.Get("x-codex-parent-thread-id"))
+	forkedFrom := strings.TrimSpace(r.Header.Get("x-codex-forked-from-thread-id"))
+	if parent != "" && (own == "" || own != parent) {
+		return storage.AgentClassSubagent
+	}
+	if forkedFrom != "" && (own == "" || own != forkedFrom) {
+		return storage.AgentClassSubagent
+	}
+	if own != "" {
+		return storage.AgentClassRoot
+	}
+	return storage.AgentClassUnknown
 }
 
 // doAccountUpstreamAttempt is the business-request transport boundary for
 // protocols that use upstream.Request. Probes, OAuth and background quota work keep
 // calling the raw client and are therefore deliberately excluded from RPM.
 func (s *Server) doAccountUpstreamAttempt(ctx context.Context, req upstream.Request) (*upstream.Response, error) {
-	s.ObserveAccountRequestAttempt(req.Account.ID, req.Provider, req.DownstreamPath)
+	s.ObserveAccountRequestAttempt(req.Account.ID, req.Provider, req.DownstreamPath, ctx)
 	return s.upstream.Do(ctx, req)
 }
 
@@ -345,7 +413,7 @@ func (s *Server) adminAccountRatesStream(w http.ResponseWriter, r *http.Request)
 			}
 			delta := make(map[string]storage.AccountRequestRate)
 			for id, rate := range frame.Accounts {
-				if previous, exists := seen[id]; !exists || previous.RPM != rate.RPM || previous.State != rate.State {
+				if previous, exists := seen[id]; !exists || !accountRateValuesEqual(previous, rate) {
 					delta[id] = rate
 					seen[id] = rate
 				}

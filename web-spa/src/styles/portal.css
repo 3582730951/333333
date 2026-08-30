@@ -289,6 +289,153 @@
   align-items: start;
 }
 
+/* ---------- Metering, quota, and sessions ---------- */
+
+.pool-portal-filters {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(160px, 220px) auto;
+  gap: var(--pool-space-4);
+  align-items: end;
+}
+
+.pool-portal-filters label {
+  display: grid;
+  gap: var(--pool-space-2);
+  color: var(--pool-text-2);
+  font-size: var(--pool-type-caption);
+}
+
+.pool-portal-filters select {
+  min-height: 40px;
+  padding: 0 var(--pool-space-3);
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-control);
+  color: var(--pool-text);
+  background: var(--pool-bg-surface-2);
+}
+
+.pool-portal-usage__model,
+.pool-portal-token-grid {
+  display: grid;
+  gap: 3px;
+}
+
+.pool-portal-usage__model small,
+.pool-portal-token-grid span {
+  color: var(--pool-text-3);
+  font-size: var(--pool-type-caption);
+}
+
+.pool-portal-token-grid {
+  grid-template-columns: repeat(2, minmax(92px, 1fr));
+}
+
+.pool-portal-token-grid b {
+  color: var(--pool-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.pool-portal-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--pool-space-3);
+  margin-top: var(--pool-space-4);
+  color: var(--pool-text-3);
+  font-size: var(--pool-type-caption);
+}
+
+.pool-portal-quota-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--pool-space-4);
+}
+
+.pool-portal-quota-card {
+  display: grid;
+  gap: var(--pool-space-2);
+  min-height: 150px;
+  align-content: center;
+}
+
+.pool-portal-quota-card > span,
+.pool-portal-quota-card small {
+  color: var(--pool-text-3);
+}
+
+.pool-portal-quota-card strong {
+  color: var(--pool-text);
+  font-size: clamp(26px, 3vw, 38px);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.03em;
+}
+
+.pool-portal-definition-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--pool-space-4);
+  margin: 0;
+}
+
+.pool-portal-definition-list > div {
+  display: grid;
+  gap: 4px;
+  padding-bottom: var(--pool-space-3);
+  border-bottom: 1px solid var(--pool-border-subtle);
+}
+
+.pool-portal-definition-list dt,
+.pool-portal-disclosure {
+  color: var(--pool-text-3);
+  font-size: var(--pool-type-caption);
+}
+
+.pool-portal-definition-list dd {
+  margin: 0;
+  color: var(--pool-text);
+  overflow-wrap: anywhere;
+}
+
+.pool-portal-disclosure {
+  margin: var(--pool-space-5) 0 0;
+  line-height: var(--pool-leading-body);
+}
+
+.pool-portal-session-list {
+  display: grid;
+  gap: var(--pool-space-3);
+}
+
+.pool-portal-session {
+  display: flex;
+  gap: var(--pool-space-4);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--pool-space-4);
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-panel);
+  background: var(--pool-bg-surface-2);
+}
+
+.pool-portal-session__title {
+  display: flex;
+  gap: var(--pool-space-2);
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.pool-portal-session b {
+  display: block;
+  max-width: min(68vw, 760px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-portal-session small {
+  color: var(--pool-text-3);
+}
+
 /* Portal cards read a notch softer and roomier than console cards. */
 .pool-portal-page .pool-chart-card,
 .pool-portal-page .pool-panel {
@@ -347,6 +494,17 @@
   .pool-portal-page .pool-chart-card,
   .pool-portal-page .pool-panel {
     padding: var(--pool-space-4);
+  }
+
+  .pool-portal-filters,
+  .pool-portal-quota-grid,
+  .pool-portal-definition-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pool-portal-session {
+    align-items: stretch;
+    flex-direction: column;
   }
 }
 

@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -66,7 +67,11 @@ func (s *Server) adminCacheHitsExport(w http.ResponseWriter, r *http.Request) {
 		version = strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
 	}
 	legacyV1 := version == "v1" || version == "codex-pool-cache-hits-v1"
-	files, order, err := buildCacheHitsZipFiles(report, win, codebook, usageRows, kiroCapabilities, completeness, now, legacyV1)
+	snapshotAt := completeness.DataSnapshotAt
+	if snapshotAt <= 0 {
+		snapshotAt = win.EffectiveUntilAt
+	}
+	files, order, err := buildCacheHitsZipFiles(report, win, codebook, usageRows, kiroCapabilities, completeness, time.Unix(snapshotAt, 0).UTC(), legacyV1)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -91,10 +96,18 @@ func (s *Server) adminCacheHitsExport(w http.ResponseWriter, r *http.Request) {
 		files["affinity_rebind_events.csv"] = csvString(cacheRebindHeader(), cacheRebindRows(r.Context(), s.store, codebook, usageRows, win.EffectiveStartAt))
 		order = append(order, "account_health.csv", "interval_distribution.csv", "affinity_rebind_events.csv")
 	}
+	order, err = finalizeCacheHitsManifest(files)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	for _, name := range order {
-		fw, err := zw.Create(name)
+		header := &zip.FileHeader{Name: name, Method: zip.Deflate}
+		header.SetModTime(time.Date(1980, time.January, 1, 0, 0, 0, 0, time.UTC))
+		header.SetMode(0o600)
+		fw, err := zw.CreateHeader(header)
 		if err != nil {
 			_ = zw.Close()
 			writeError(w, http.StatusInternalServerError, err)
@@ -117,7 +130,47 @@ func (s *Server) adminCacheHitsExport(w http.ResponseWriter, r *http.Request) {
 	filename := fmt.Sprintf("codex-pool-cache-hits-%s-%s.zip", filenameVersion, now.In(time.Local).Format("20060102-150405"))
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	_, _ = w.Write(buf.Bytes())
+}
+
+func finalizeCacheHitsManifest(files map[string]string) ([]string, error) {
+	var manifest map[string]interface{}
+	if err := json.Unmarshal([]byte(files["manifest.json"]), &manifest); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(files)-1)
+	for name := range files {
+		if name != "manifest.json" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	schemaVersion := "v2"
+	if format, _ := manifest["format"].(string); strings.HasSuffix(format, "-v1") {
+		schemaVersion = "v1"
+	}
+	entries := make([]map[string]interface{}, 0, len(names))
+	for _, name := range names {
+		payload := []byte(files[name])
+		digest := sha256.Sum256(payload)
+		entries = append(entries, map[string]interface{}{
+			"filename": name, "size": len(payload), "sha256": fmt.Sprintf("%x", digest[:]), "schema_version": schemaVersion,
+		})
+	}
+	manifest["files"] = entries
+	manifest["manifest_entry"] = map[string]interface{}{
+		"filename": "manifest.json", "schema_version": schemaVersion,
+		"self_hash_policy": "excluded because a manifest cannot contain its own final digest",
+	}
+	raw, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	files["manifest.json"] = string(raw) + "\n"
+	return append([]string{"manifest.json"}, names...), nil
 }
 
 func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindow, codebook diagnosticCodebook, usageRows []diagnosticUsageRecord, kiroCapabilities []storage.KiroRuntimeCapability, completeness storage.UsageCompleteness, generatedAt time.Time, legacyV1 bool) (map[string]string, []string, error) {
@@ -132,7 +185,9 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 		"route_map.csv",
 	}
 	if !legacyV1 {
-		order = append(order, "by_provider.csv", "by_provider_model.csv", "telemetry_completeness.csv", "kiro_capabilities.csv", "usage_sources.csv")
+		order = append(order,
+			"stable_prefix_diffs.csv", "cache_key_churn.csv", "cache_namespace_moves.csv", "top_miss_explanations.csv",
+			"by_provider.csv", "by_provider_model.csv", "telemetry_completeness.csv", "kiro_capabilities.csv", "usage_sources.csv")
 	}
 	format := "codex-pool-cache-hits-v2"
 	if legacyV1 {
@@ -196,6 +251,10 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 	files["route_map.csv"] = csvString([]string{"route_code", "route_key_hash_prefix", "route_class", "affinity_source"}, routes.rows())
 	if !legacyV1 {
 		files["by_account_model.csv"] = csvString(cacheMetricHeaderV2("account_code", "provider", "model", "cache_capability", "usage_sources"), cacheMetricRowsV2(report.ByAccountModel, codebook, usageRows, kiroCapabilities))
+		files["stable_prefix_diffs.csv"] = csvString(cacheStablePrefixDiffHeader(), cacheStablePrefixDiffRows(usageRows, codebook))
+		files["cache_key_churn.csv"] = csvString(cacheKeyChurnHeader(), cacheKeyChurnRows(usageRows, codebook))
+		files["cache_namespace_moves.csv"] = csvString(cacheNamespaceMovesHeader(), cacheNamespaceMoveRows(usageRows, codebook))
+		files["top_miss_explanations.csv"] = csvString(topCacheMissExplanationHeader(), topCacheMissExplanationRows(usageRows))
 		files["kiro_capabilities.csv"] = csvString([]string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "updated_at", "cache_point_state", "cache_reuse_state", "cache_reuse_evidence", "cache_reuse_credit_reduction_percent", "cache_reuse_probed_at", "window_account_model_requests", "window_account_model_metadata_events", "window_account_model_metering_events", "window_account_model_credits_reported_requests", "window_account_model_credits_total", "window_account_model_token_metadata_reported_requests", "window_account_model_cache_point_injected_requests", "window_account_model_cache_point_accepted_requests", "window_account_model_cache_point_unsupported_requests"}, cacheKiroCapabilityRows(kiroCapabilities, codebook, usageRows))
 		files["usage_sources.csv"] = csvString([]string{"provider", "usage_source", "requests", "cache_read_reported", "cache_creation_reported", "metadata_events", "metering_events", "credits_reported_requests", "credits_total", "token_metadata_reported_requests", "cache_point_injected_requests", "cache_point_accepted_requests", "cache_point_unsupported_requests"}, cacheUsageSourceRows(usageRows))
 	}
@@ -215,11 +274,11 @@ func cacheReportHasRows(report storage.CacheUsageReport) bool {
 }
 
 func cacheMetricHeader(prefix ...string) []string {
-	return append(prefix, "requests", "real_requests", "hit_requests", "request_hit_rate", "prompt_tokens", "cached_tokens", "hit_tokens", "cache_input_tokens", "cache_miss_tokens", "cache_creation_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "cache_creation_5m_share", "token_hit_rate", "cache_write_share", "eligible_cache_hit_rate", "real_token_hit_rate", "estimated_requests", "estimated_rate", "cache_creation_reported_requests")
+	return append(prefix, "requests", "real_requests", "hit_requests", "request_hit_rate", "prompt_tokens", "cached_tokens", "hit_tokens", "cache_input_tokens", "cache_miss_tokens", "cache_creation_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "cache_creation_5m_share", "token_hit_rate", "cache_write_share", "eligible_cache_hit_rate", "actual_only_token_hit_rate", "estimated_requests", "estimated_rate", "cache_creation_reported_requests")
 }
 
 func cacheMetricHeaderV2(prefix ...string) []string {
-	return append(cacheMetricHeader(prefix...), "actual_requests", "actual_prompt_tokens", "actual_completion_tokens", "actual_total_tokens", "estimated_prompt_tokens", "estimated_completion_tokens", "estimated_total_tokens", "combined_requests", "combined_total_tokens", "kiro_credits", "kiro_credits_reported_requests", "cache_reporting_state")
+	return append(cacheMetricHeader(prefix...), "actual_requests", "actual_prompt_tokens", "actual_completion_tokens", "actual_total_tokens", "estimated_prompt_tokens", "estimated_completion_tokens", "estimated_total_tokens", "combined_requests", "combined_total_tokens", "kiro_credits", "kiro_credits_reported_requests", "cache_reporting_state", "cache_write_state", "estimator_coverage")
 }
 
 func cacheProviderRows(rows []storage.CacheUsageMetricRow, includeModel bool) [][]string {
@@ -540,6 +599,9 @@ func cacheMetricFields(row storage.CacheUsageMetricRow) []string {
 		fields[14] = ""
 		fields[15] = ""
 	}
+	if row.CacheCreationReportedRequests > 0 && row.CacheCreationTokens == 0 {
+		fields[15] = "" // zero_reported is not evidence of an eligible denominator
+	}
 	return fields
 }
 
@@ -573,10 +635,23 @@ func cacheMetricFieldsV2(row storage.CacheUsageMetricRow) []string {
 	if row.CacheCreationTokens == 0 {
 		fields[12] = "" // cache_creation_5m_share
 	}
+	cacheWriteState := "unreported"
+	if row.CacheCreationReportedRequests > 0 {
+		cacheWriteState = "zero_reported"
+		if row.CacheCreationTokens > 0 {
+			cacheWriteState = "nonzero_reported"
+		}
+	}
+	estimatedCompletion := ""
+	estimatorCoverage := "not_applicable"
+	if row.EstimatedRequests > 0 {
+		estimatorCoverage = "input_only_output_unavailable"
+	}
 	return append(fields,
 		itoa64(row.ActualRequests), itoa64(row.ActualPromptTokens), itoa64(row.ActualCompletionTokens), itoa64(row.ActualTotalTokens),
-		itoa64(row.EstimatedPromptTokens), itoa64(row.EstimatedCompletionTokens), itoa64(row.EstimatedTotalTokens),
+		itoa64(row.EstimatedPromptTokens), estimatedCompletion, itoa64(row.EstimatedTotalTokens),
 		itoa64(row.CombinedRequests), itoa64(row.CombinedTotalTokens), floatString(row.KiroCredits), itoa64(row.KiroCreditsReportedRequests), row.CacheReportingState,
+		cacheWriteState, estimatorCoverage,
 	)
 }
 

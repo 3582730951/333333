@@ -19,7 +19,7 @@ const api = axios.create({ timeout: 30000, withCredentials: true });
 
 api.interceptors.request.use((cfg) => {
   const t = getToken();
-  if (t) cfg.headers.Authorization = `Bearer ${t}`;
+  if (t && !cfg.skipStoredAdminToken) cfg.headers.Authorization = `Bearer ${t}`;
   const method = (cfg.method || 'get').toLowerCase();
   if (method !== 'get' && method !== 'head') {
     const csrf = getCookie('cp_csrf');
@@ -55,6 +55,12 @@ export const login = (email, password) => post('/auth/login', { email, password 
 export const registerUser = (email, password, name) =>
   post('/auth/register', { email, password, name }, { suppressUnauthorizedEvent: true });
 export const logout = () => post('/auth/logout', {}, { suppressUnauthorizedEvent: true });
+export const setupStatus = () => get('/setup/status', undefined, { suppressUnauthorizedEvent: true });
+export const claimAdminSetup = (body, recoveryToken = '') => post('/setup/claim-admin', body, {
+  suppressUnauthorizedEvent: true,
+  skipStoredAdminToken: true,
+  headers: recoveryToken ? { Authorization: `Bearer ${recoveryToken}` } : undefined,
+});
 
 // ── OAuth login helpers (web-login / paste-back import) ──
 export const oauthStart = (provider, groupName = '') => post('/admin/oauth/start', {

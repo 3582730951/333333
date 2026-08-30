@@ -445,6 +445,10 @@ func (s *Server) captureCodexStreamRateLimits(account storage.Account, limits co
 		return
 	}
 	now := storage.Now()
+	var entitlementPayload map[string]interface{}
+	if raw := limits.rawObservation(); strings.TrimSpace(raw) != "" {
+		_ = json.Unmarshal([]byte(raw), &entitlementPayload)
+	}
 	snapshots := codexStreamBaseSnapshots(account.ID, limits, now)
 	if limits.featureObservationsPresent() {
 		snapshots = append(snapshots, storage.AccountRateLimit{
@@ -469,6 +473,11 @@ func (s *Server) captureCodexStreamRateLimits(account storage.Account, limits co
 	s.enqueueWrite(func() {
 		writeCtx, cancel := s.bgWriteContext()
 		defer cancel()
+		if len(entitlementPayload) > 0 {
+			// Stream rate-limit metadata is a lower-priority quota evidence source;
+			// explicit seat fields remain unknown until a reviewed mapping is enabled.
+			s.captureEntitlementEvidence(writeCtx, account.ID, "quota_metadata", entitlementPayload)
+		}
 		planUpdated := false
 		if planChanged {
 			if err := s.store.SetAccountPlanType(writeCtx, account.ID, limits.planType); err == nil {
