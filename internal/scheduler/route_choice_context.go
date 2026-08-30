@@ -16,6 +16,22 @@ type RouteChoiceClaim func(context.Context, string) (string, error)
 
 type routeChoiceContextKey struct{}
 type routeChoiceBypassKey struct{}
+type cooldownTrialsRestrictedKey struct{}
+
+// WithCooldownTrialsRestrictedToOverrides prevents a non-final routing target
+// from using an ordinary cooled account as an intelligent-routing last-resort
+// probe. Accounts carrying the explicit ForceCodex429 or
+// IgnoreRateLimitControls operator overrides remain probe-eligible. The API
+// enables this only while another replay-safe, explicitly authorized target is
+// available; the final target retains the normal all-targets-exhausted behavior.
+func WithCooldownTrialsRestrictedToOverrides(ctx context.Context) context.Context {
+	return context.WithValue(ctx, cooldownTrialsRestrictedKey{}, true)
+}
+
+func cooldownTrialsRestrictedToOverrides(ctx context.Context) bool {
+	restricted, _ := ctx.Value(cooldownTrialsRestrictedKey{}).(bool)
+	return restricted
+}
 
 // RouteChoiceState exposes the target actually leased by the most recent Select
 // call. A handler may retry account selection several times; each retry updates

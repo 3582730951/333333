@@ -605,6 +605,13 @@ var checkedPostgresMigrations = []checkedPostgresMigration{
 		},
 	},
 	{
+		version: "20260830_capacity_source_plan_v2",
+		statements: []string{
+			`ALTER TABLE account_capacity_estimates ADD COLUMN IF NOT EXISTS source_plan_type TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX IF NOT EXISTS idx_capacity_limiter_updated ON account_capacity_estimates(limiter_kind,updated_at)`,
+		},
+	},
+	{
 		version:    "20260829_admin_setup_v1",
 		statements: splitSQLStatements(postgresSchema(adminSetupSchemaSQL)),
 	},

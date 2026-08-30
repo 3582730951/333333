@@ -968,6 +968,7 @@ func (s *Server) adminSetAccountRateLimitControls(w http.ResponseWriter, r *http
 		s.scheduler.RefreshAccountCache()
 		s.scheduler.NotifyStateChanged()
 	}
+	s.wakeRouteAvailability()
 	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
 		AccountID: accountID,
 		Action:    "set_ignore_rate_limit_controls",
@@ -1009,6 +1010,7 @@ func (s *Server) adminSetAccountForceCodex429(w http.ResponseWriter, r *http.Req
 		s.scheduler.RefreshAccountCache()
 		s.scheduler.NotifyStateChanged()
 	}
+	s.wakeRouteAvailability()
 	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
 		AccountID: accountID,
 		Action:    "set_force_codex_429",
@@ -1121,6 +1123,7 @@ func (s *Server) adminClearCooldown(w http.ResponseWriter, r *http.Request, acco
 		s.scheduler.RefreshAccountCache()
 		s.scheduler.NotifyStateChanged()
 	}
+	s.wakeRouteAvailability()
 	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
 		AccountID: accountID,
 		Action:    "clear_cooldown",

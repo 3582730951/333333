@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode"
 
+	"codex-account-pool/internal/entitlement"
 	"codex-account-pool/internal/plantier"
 	"codex-account-pool/internal/storage"
 )
@@ -473,10 +474,17 @@ func (s *Server) captureCodexStreamRateLimits(account storage.Account, limits co
 	s.enqueueWrite(func() {
 		writeCtx, cancel := s.bgWriteContext()
 		defer cancel()
+		premiumCleanup := false
 		if len(entitlementPayload) > 0 {
-			// Stream rate-limit metadata is a lower-priority quota evidence source;
-			// explicit seat fields remain unknown until a reviewed mapping is enabled.
+			// Stream rate-limit metadata is a lower-priority quota evidence source.
+			// Generic plan labels remain unknown; only a versioned reviewed mapping
+			// may turn the exact 5x subtype + no-5h shape into a seat claim.
 			s.captureEntitlementEvidence(writeCtx, account.ID, "quota_metadata", entitlementPayload)
+			if _, reviewedPremium := entitlement.ReviewedBusinessPremiumQuotaMapping(entitlementPayload, "quota_metadata"); reviewedPremium {
+				if err := s.store.DeleteMisclassifiedLongFiveHourQuotaState(writeCtx, account.ID); err == nil {
+					premiumCleanup = true
+				}
+			}
 		}
 		planUpdated := false
 		if planChanged {
@@ -487,7 +495,7 @@ func (s *Server) captureCodexStreamRateLimits(account storage.Account, limits co
 		for _, snapshot := range snapshots {
 			_ = s.store.UpsertAccountRateLimit(writeCtx, snapshot)
 		}
-		if planUpdated && s.scheduler != nil {
+		if (planUpdated || premiumCleanup) && s.scheduler != nil {
 			s.scheduler.RefreshAccountCache()
 		}
 	})

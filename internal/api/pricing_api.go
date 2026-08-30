@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -16,6 +17,106 @@ import (
 )
 
 const pricingCatalogBodyLimit = 2 << 20
+
+const (
+	businessStandardFromPlusFactorMilli = int64(1250)
+	capacityPriorMaxAgeSeconds          = int64(30 * 24 * 60 * 60)
+)
+
+type businessStandardFiveHourEstimate struct {
+	ModelFamily       string `json:"model_family"`
+	ServiceTier       string `json:"service_tier"`
+	LimitMicroUSD     int64  `json:"limit_micro_usd"`
+	LowerMicroUSD     *int64 `json:"lower_micro_usd,omitempty"`
+	UpperMicroUSD     *int64 `json:"upper_micro_usd,omitempty"`
+	SourceAccountID   string `json:"source_account_id"`
+	SourceSampleCount int64  `json:"source_sample_count"`
+	SourceConfidence  string `json:"source_confidence"`
+	SourceUpdatedAt   int64  `json:"source_updated_at"`
+}
+
+type businessStandardFiveHourPrior struct {
+	Status      string                             `json:"status"`
+	Method      string                             `json:"method"`
+	FactorMilli int64                              `json:"factor_milli"`
+	Role        string                             `json:"role"`
+	Estimates   []businessStandardFiveHourEstimate `json:"estimates"`
+}
+
+func scalePlusRemainingToBusinessStandard(amount *int64, usedRatioPPM *int64) (*int64, bool) {
+	// Near exhaustion, reconstructing a full window amplifies a tiny remaining
+	// value and poll jitter too aggressively. Wait for a healthier Plus sample.
+	if amount == nil || usedRatioPPM == nil || *amount < 0 || *usedRatioPPM < 0 || *usedRatioPPM >= 950_000 {
+		return nil, false
+	}
+	// Standard full-window capacity = Plus remaining / remaining_ratio * 1.25.
+	// Use integer arithmetic throughout so a capacity prior never introduces a
+	// float rounding path into the fixed-point money model.
+	numerator := new(big.Int).SetInt64(*amount)
+	numerator.Mul(numerator, big.NewInt(1_000_000))
+	numerator.Mul(numerator, big.NewInt(businessStandardFromPlusFactorMilli))
+	denominator := big.NewInt((1_000_000 - *usedRatioPPM) * 1000)
+	// Round to the nearest micro-dollar instead of silently biasing every prior
+	// downward. denominator is positive because of the guard above.
+	numerator.Add(numerator, new(big.Int).Quo(new(big.Int).Set(denominator), big.NewInt(2)))
+	numerator.Quo(numerator, denominator)
+	if !numerator.IsInt64() {
+		return nil, false
+	}
+	value := numerator.Int64()
+	return &value, true
+}
+
+func deriveBusinessStandardFiveHourPrior(rows []storage.AccountCapacityEstimatePlan) businessStandardFiveHourPrior {
+	prior := businessStandardFiveHourPrior{
+		Status: "waiting_for_plus_empirical_5h_baseline", Method: "plus_empirical_5h_x_1_25",
+		FactorMilli: businessStandardFromPlusFactorMilli, Role: "capacity_prior_not_entitlement",
+		Estimates: []businessStandardFiveHourEstimate{},
+	}
+	seen := map[string]struct{}{}
+	for _, row := range rows {
+		if entitlement.NormalizePlanFamily(row.PlanType) != entitlement.PlanPlus ||
+			(row.Confidence != "high" && row.Confidence != "medium") || row.SampleCount <= 0 ||
+			row.UnitKind != "api_list_price_equivalent_micro_usd" ||
+			!strings.HasPrefix(row.Method, "empirical_quota_window_") ||
+			strings.TrimSpace(row.ModelFamily) == "" || row.ModelFamily == "mixed_or_unknown" ||
+			(row.ServiceTier != pricing.TierDefault && row.ServiceTier != pricing.TierFast) {
+			continue
+		}
+		center, ok := scalePlusRemainingToBusinessStandard(row.USDEquivalentMicro, row.UsedRatioPPM)
+		if !ok || center == nil || *center <= 0 {
+			continue
+		}
+		key := row.ModelFamily + "\x00" + row.ServiceTier
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		lower, _ := scalePlusRemainingToBusinessStandard(row.LowerBoundUnits, row.UsedRatioPPM)
+		upper, _ := scalePlusRemainingToBusinessStandard(row.UpperBoundUnits, row.UsedRatioPPM)
+		prior.Estimates = append(prior.Estimates, businessStandardFiveHourEstimate{
+			ModelFamily: row.ModelFamily, ServiceTier: row.ServiceTier, LimitMicroUSD: *center,
+			LowerMicroUSD: lower, UpperMicroUSD: upper, SourceAccountID: row.AccountID,
+			SourceSampleCount: row.SampleCount, SourceConfidence: row.Confidence, SourceUpdatedAt: row.UpdatedAt,
+		})
+	}
+	if len(prior.Estimates) > 0 {
+		prior.Status = "derived_from_plus_empirical_5h"
+	}
+	return prior
+}
+
+func premiumFixtureStatus(current *storage.AccountEntitlementEvidence, conflict bool) string {
+	if conflict {
+		return "reviewed_mapping_active_evidence_conflict"
+	}
+	if current != nil && current.SeatType == entitlement.SeatBusinessPremium &&
+		current.Confidence == "high" && current.UsageMultiplierMilli != nil &&
+		*current.UsageMultiplierMilli == 5000 && current.NoFiveHourLimit != nil && *current.NoFiveHourLimit {
+		return "recognized_reviewed_5x_fixture_v1"
+	}
+	return "reviewed_mapping_active_waiting_for_match"
+}
 
 func (s *Server) adminPricingCatalogs(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
@@ -85,16 +186,25 @@ func (s *Server) adminAccountCapacity(w http.ResponseWriter, r *http.Request, ac
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	baselineRows, err := s.store.ListRecentFiveHourCapacityBaselines(r.Context(), now-capacityPriorMaxAgeSeconds, 512)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	standardFiveHourPrior := deriveBusinessStandardFiveHourPrior(baselineRows)
 	planOnly := entitlement.FromPlanLabel(account.PlanType)
+	premiumStatus := premiumFixtureStatus(currentEvidence, entitlementConflict)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"account_id":             accountID,
-		"capacity_estimates":     estimates,
-		"upstream_quota_windows": rateLimits,
-		"last_30d_valuation":     valuation,
+		"account_id":                 accountID,
+		"capacity_estimates":         estimates,
+		"upstream_quota_windows":     rateLimits,
+		"last_30d_valuation":         valuation,
+		"business_standard_5h_prior": standardFiveHourPrior,
 		"entitlement": map[string]interface{}{
 			"plan_only": planOnly, "current_evidence": currentEvidence, "evidence": evidence,
-			"conflict":               entitlementConflict,
-			"premium_fixture_status": "blocked_until_reviewed_real_fixture",
+			"conflict":                        entitlementConflict,
+			"premium_fixture_status":          premiumStatus,
+			"premium_fixture_mapping_version": entitlement.BusinessPremiumMappingVersion,
 		},
 		"labels": map[string]string{
 			"usd":     "API list-price equivalent; not an account cash balance",

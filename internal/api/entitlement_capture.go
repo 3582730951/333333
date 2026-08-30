@@ -13,10 +13,11 @@ import (
 	"codex-account-pool/internal/storage"
 )
 
-// captureEntitlementEvidence is intentionally conservative.  Wire fields are
-// parsed and persisted for audit, but Premium/5x is emitted only when an
-// operator has explicitly enabled a reviewed mapping.  This keeps a rolling
-// upstream schema from silently changing scheduling or billing semantics.
+// captureEntitlementEvidence is intentionally conservative. Wire fields are
+// parsed and persisted for audit, but Premium/5x is emitted only by a built-in,
+// versioned real-fixture mapping or an operator-enabled explicit seat mapping.
+// This keeps a rolling upstream schema from silently changing scheduling or
+// billing semantics.
 func (s *Server) captureEntitlementEvidence(ctx context.Context, accountID, source string, root map[string]interface{}) {
 	if s == nil || s.store == nil || strings.TrimSpace(accountID) == "" || len(root) == 0 {
 		return
@@ -62,9 +63,10 @@ func normalizedEntitlementSource(source string) string {
 }
 
 func entitlementMappingReviewed() bool {
-	// The production default is false until a real, reviewed Business Premium
-	// fixture is installed.  An explicit deployment opt-in is required to turn
-	// the mapping on; it is not inferred from plan labels or capacity.
+	// The built-in Business Premium quota mapping reviews its own exact wire
+	// shape and does not depend on this switch. This legacy opt-in remains only
+	// for deployments with separately reviewed, explicit seat fields; it never
+	// makes a generic team/business plan label sufficient.
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("CODEX_POOL_ENTITLEMENT_MAPPING_REVIEWED")), "true")
 }
 

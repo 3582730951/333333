@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -87,6 +88,41 @@ type QuotaWindowEstimateSummary struct {
 	QualityScore float64
 	Confidence   string
 	FinalizedAt  int64
+}
+
+// DeleteMisclassifiedLongFiveHourQuotaState removes only state produced by the
+// historical bug that stored a sole long (normally seven-day) Codex primary
+// window under the 5h bucket. Callers must first prove the reviewed Premium/5x
+// wire mapping; this method deliberately does not infer entitlement itself.
+func (s *Store) DeleteMisclassifiedLongFiveHourQuotaState(ctx context.Context, accountID string) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return fmt.Errorf("account id is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Capture affected long-cycle starts before removing the current cycle row.
+	for _, statement := range []string{
+		`DELETE FROM quota_window_estimates WHERE account_id=? AND window_kind='5h' AND cycle_start IN
+			(SELECT cycle_start FROM quota_window_cycles WHERE account_id=? AND window_kind='5h' AND window_minutes>=1440)`,
+		`DELETE FROM quota_window_samples WHERE account_id=? AND window_kind='5h' AND cycle_start IN
+			(SELECT cycle_start FROM quota_window_cycles WHERE account_id=? AND window_kind='5h' AND window_minutes>=1440)`,
+		`DELETE FROM quota_window_cycles WHERE account_id=? AND window_kind='5h' AND window_minutes>=1440`,
+		`DELETE FROM account_capacity_estimates WHERE account_id=? AND limiter_kind='5h' AND cycle_end-cycle_start>=86400`,
+		`DELETE FROM account_rate_limits WHERE account_id=? AND limiter_type='5h_polled' AND source='5h_polled'`,
+	} {
+		args := []interface{}{accountID}
+		if strings.Count(statement, "?") == 2 {
+			args = append(args, accountID)
+		}
+		if _, err := tx.ExecContext(ctx, statement, args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) UpsertQuotaWindowCycle(ctx context.Context, c QuotaWindowCycle) error {

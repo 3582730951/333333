@@ -726,6 +726,14 @@ retryUserGroupRoute:
 			Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver, TempFileNamePrefix: "codex-pool-route-response-*",
 		}, speculative)
 		candidateContext := withUserGroupRouteOverride(r.Context(), target)
+		if replaySafe && moreUnits {
+			// An ordinary locally cooled account is not a last resort while another
+			// target explicitly authorized by this user group remains. Explicit
+			// ForceCodex429/IgnoreRateLimitControls accounts retain their operator-
+			// selected behavior; the final unit also retains the established
+			// all-targets-exhausted recovery path.
+			candidateContext = scheduler.WithCooldownTrialsRestrictedToOverrides(candidateContext)
+		}
 		stopCapacityHeartbeat := func() {}
 		if capacityWait.started {
 			// The outer response has already emitted a protocol heartbeat. Keep
@@ -946,13 +954,15 @@ type userGroupDispatchUnit struct {
 
 type userGroupAvailabilityDecision struct {
 	unavailable bool
+	state       routeAvailabilityState
 }
 
-// filterUnavailableUserGroupDispatchUnits removes targets carrying a current,
-// structural zero-candidate mark before any upstream request is attempted. It
-// always keeps a bound target and, if every configured target is marked empty,
-// keeps the final target so the established capacity-wait/error contract remains
-// authoritative instead of turning an optimization into a behavior change.
+// filterUnavailableUserGroupDispatchUnits removes targets carrying a current
+// structural-zero or all-ordinary-accounts-cooling mark before any upstream
+// request is attempted. A structural mark keeps a bound target so permanent
+// migration semantics still run; a transient cooling mark may skip the bound
+// target for this request without changing its durable binding. If every target
+// is marked, the final target is retained so last-resort recovery stays intact.
 func (s *Server) filterUnavailableUserGroupDispatchUnits(r *http.Request, pol downstreamPolicy, model string, plan userGroupRoutePlan, units []userGroupDispatchUnit) []userGroupDispatchUnit {
 	if s == nil || s.routeAvailability == nil || len(units) == 0 {
 		return units
@@ -972,14 +982,16 @@ func (s *Server) filterUnavailableUserGroupDispatchUnits(r *http.Request, pol do
 			if _, known := decisions[key]; known {
 				continue
 			}
-			if plan.Bound && target == plan.BoundTarget {
-				decisions[key] = userGroupAvailabilityDecision{}
-				kept++
-				continue
-			}
 			routes, ok := s.userGroupAvailabilityRoutes(r, pol, target, model, customProviders)
-			unavailable := ok && s.routeAvailability.allDefinitelyUnavailable(r.Context(), routes)
-			decisions[key] = userGroupAvailabilityDecision{unavailable: unavailable}
+			state := routeAvailabilityReady
+			if ok {
+				state = s.routeAvailability.allUnavailableState(r.Context(), routes)
+			}
+			unavailable := state != routeAvailabilityReady
+			if plan.Bound && target == plan.BoundTarget && state == routeAvailabilityStructurallyUnavailable {
+				unavailable = false
+			}
+			decisions[key] = userGroupAvailabilityDecision{unavailable: unavailable, state: state}
 			if !unavailable {
 				kept++
 			}
@@ -1027,11 +1039,16 @@ func (s *Server) recordUnavailableUserGroupTargets(r *http.Request, model string
 	requestID := requestIDFromContext(r.Context())
 	for unitIndex, unit := range units {
 		for _, target := range unit.Targets {
-			if !decisions[userGroupTargetChoiceKey(target)].unavailable {
+			decision := decisions[userGroupTargetChoiceKey(target)]
+			if !decision.unavailable {
 				continue
 			}
 			fallback := nextAvailableUserGroupTarget(units, decisions, unitIndex)
-			s.recordRouteAttempt(requestID, unit.Tier, userGroupTargetDiagnosticName(target), "availability_marker", "structurally_unavailable", fallback, diagnosticRouteDetail{
+			statusClass := "structurally_unavailable"
+			if decision.state == routeAvailabilityCoolingBackoff {
+				statusClass = "cooldown_backoff_unavailable"
+			}
+			s.recordRouteAttempt(requestID, unit.Tier, userGroupTargetDiagnosticName(target), "availability_marker", statusClass, fallback, diagnosticRouteDetail{
 				TerminalErrorClass:            "none",
 				SuperInstructClientChoice:     superInstructClientChoiceClass(r),
 				SuperInstructEffectiveModules: superInstructEffectiveModules(requestUserGroupPolicy(r.Context()), model),

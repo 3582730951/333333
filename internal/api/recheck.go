@@ -132,6 +132,7 @@ func (s *Server) recheckPendingAccounts(ctx context.Context) {
 		if s.scheduler != nil {
 			s.scheduler.NotifyStateChanged()
 		}
+		s.wakeRouteAvailability()
 		log.Printf("[RECHECK] sweep: restored=%d re-benched=%d removed=%d", restored, benched, removed)
 	}
 }

@@ -4232,6 +4232,7 @@ func (s *Server) solveAndInject(ctx context.Context, account storage.Account, eg
 	if s.scheduler != nil {
 		s.scheduler.NotifyStateChanged()
 	}
+	s.wakeRouteAvailability()
 	return nil
 }
 

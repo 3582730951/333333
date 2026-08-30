@@ -50,6 +50,44 @@ func (s *Store) ensurePricingCatalogExpiryColumn(ctx context.Context) error {
 	return err
 }
 
+// ensureAccountCapacitySourcePlanColumn keeps the Plus baseline fail-closed on
+// upgraded SQLite databases. A current accounts.plan_type join cannot prove
+// what plan produced a historical estimate after an account changes plans, so
+// only newly sampled rows carry immutable source-plan provenance.
+func (s *Store) ensureAccountCapacitySourcePlanColumn(ctx context.Context) error {
+	if s == nil || s.driver == "postgres" {
+		return nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `PRAGMA table_info(account_capacity_estimates)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(name, "source_plan_type") {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !found {
+		if _, err = s.db.ExecContext(ctx, `ALTER TABLE account_capacity_estimates ADD COLUMN source_plan_type TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	_, err = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_capacity_limiter_updated ON account_capacity_estimates(limiter_kind,updated_at)`)
+	return err
+}
+
 // StagePricingCatalog validates and persists a new immutable draft. Reusing an
 // ID with different content is always rejected, including while still a draft.
 func (s *Store) StagePricingCatalog(ctx context.Context, catalog pricing.Catalog) error {
@@ -587,6 +625,7 @@ type AccountCapacityEstimate struct {
 	LimiterKind           string `json:"limiter_kind"`
 	ModelFamily           string `json:"model_family"`
 	ServiceTier           string `json:"service_tier"`
+	SourcePlanType        string `json:"source_plan_type"`
 	CycleStart            int64  `json:"cycle_start"`
 	CycleEnd              int64  `json:"cycle_end"`
 	UsedRatioPPM          *int64 `json:"used_ratio_ppm"`
@@ -602,19 +641,30 @@ type AccountCapacityEstimate struct {
 	UpdatedAt             int64  `json:"updated_at"`
 }
 
+// AccountCapacityEstimatePlan joins an empirical capacity estimate to the raw
+// account plan that produced it. It is used only to build cross-account capacity
+// priors; the raw plan still has to be normalized by the caller and never becomes
+// seat entitlement evidence.
+type AccountCapacityEstimatePlan struct {
+	AccountCapacityEstimate
+	PlanType string `json:"plan_type"`
+}
+
 func (s *Store) UpsertAccountCapacityEstimate(ctx context.Context, estimate AccountCapacityEstimate) error {
 	if estimate.UpdatedAt == 0 {
 		estimate.UpdatedAt = Now()
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO account_capacity_estimates(account_id,limiter_kind,model_family,service_tier,cycle_start,cycle_end,
+	_, err := s.db.ExecContext(ctx, `INSERT INTO account_capacity_estimates(account_id,limiter_kind,model_family,service_tier,source_plan_type,cycle_start,cycle_end,
 used_ratio_ppm,remaining_units,unit_kind,usd_equivalent_micro,credits_remaining_milli,method,sample_count,confidence,lower_bound_units,upper_bound_units,updated_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(account_id,limiter_kind,model_family,service_tier,cycle_start) DO UPDATE SET cycle_end=excluded.cycle_end,
 used_ratio_ppm=excluded.used_ratio_ppm,remaining_units=excluded.remaining_units,unit_kind=excluded.unit_kind,
 usd_equivalent_micro=excluded.usd_equivalent_micro,credits_remaining_milli=excluded.credits_remaining_milli,method=excluded.method,
 sample_count=excluded.sample_count,confidence=excluded.confidence,lower_bound_units=excluded.lower_bound_units,
-upper_bound_units=excluded.upper_bound_units,updated_at=excluded.updated_at`, estimate.AccountID, estimate.LimiterKind,
-		estimate.ModelFamily, estimate.ServiceTier, estimate.CycleStart, estimate.CycleEnd, nullableInt64(estimate.UsedRatioPPM),
+upper_bound_units=excluded.upper_bound_units,
+source_plan_type=CASE WHEN account_capacity_estimates.source_plan_type=excluded.source_plan_type THEN account_capacity_estimates.source_plan_type ELSE '' END,
+updated_at=excluded.updated_at`, estimate.AccountID, estimate.LimiterKind,
+		estimate.ModelFamily, estimate.ServiceTier, estimate.SourcePlanType, estimate.CycleStart, estimate.CycleEnd, nullableInt64(estimate.UsedRatioPPM),
 		nullableInt64(estimate.RemainingUnits), estimate.UnitKind, nullableInt64(estimate.USDEquivalentMicro),
 		nullableInt64(estimate.CreditsRemainingMilli), estimate.Method, estimate.SampleCount, estimate.Confidence,
 		nullableInt64(estimate.LowerBoundUnits), nullableInt64(estimate.UpperBoundUnits), estimate.UpdatedAt)
@@ -622,7 +672,7 @@ upper_bound_units=excluded.upper_bound_units,updated_at=excluded.updated_at`, es
 }
 
 func (s *Store) ListAccountCapacityEstimates(ctx context.Context, accountID string) ([]AccountCapacityEstimate, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id,limiter_kind,model_family,service_tier,cycle_start,cycle_end,used_ratio_ppm,
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id,limiter_kind,model_family,service_tier,source_plan_type,cycle_start,cycle_end,used_ratio_ppm,
 remaining_units,unit_kind,usd_equivalent_micro,credits_remaining_milli,method,sample_count,confidence,lower_bound_units,upper_bound_units,updated_at
 FROM account_capacity_estimates WHERE account_id=? ORDER BY updated_at DESC,limiter_kind,model_family,service_tier`, strings.TrimSpace(accountID))
 	if err != nil {
@@ -633,9 +683,53 @@ FROM account_capacity_estimates WHERE account_id=? ORDER BY updated_at DESC,limi
 	for rows.Next() {
 		var item AccountCapacityEstimate
 		var usedRatio, remaining, usd, credits, lower, upper sql.NullInt64
-		if err := rows.Scan(&item.AccountID, &item.LimiterKind, &item.ModelFamily, &item.ServiceTier, &item.CycleStart,
+		if err := rows.Scan(&item.AccountID, &item.LimiterKind, &item.ModelFamily, &item.ServiceTier, &item.SourcePlanType, &item.CycleStart,
 			&item.CycleEnd, &usedRatio, &remaining, &item.UnitKind, &usd, &credits, &item.Method, &item.SampleCount,
 			&item.Confidence, &lower, &upper, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		item.UsedRatioPPM, item.RemainingUnits = nullableScanPointer(usedRatio), nullableScanPointer(remaining)
+		item.USDEquivalentMicro, item.CreditsRemainingMilli = nullableScanPointer(usd), nullableScanPointer(credits)
+		item.LowerBoundUnits, item.UpperBoundUnits = nullableScanPointer(lower), nullableScanPointer(upper)
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+// ListRecentFiveHourCapacityBaselines returns a bounded set of empirical 5h
+// estimates together with their sampling-time plan labels. The API layer applies the
+// closed plan-family normalizer and fixed-point calibration policy; storage does
+// not infer Plus, Team, or Premium from strings.
+func (s *Store) ListRecentFiveHourCapacityBaselines(ctx context.Context, since int64, limit int) ([]AccountCapacityEstimatePlan, error) {
+	if limit <= 0 {
+		limit = 256
+	}
+	if limit > 1024 {
+		limit = 1024
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT e.account_id,e.limiter_kind,e.model_family,e.service_tier,e.cycle_start,e.cycle_end,
+e.used_ratio_ppm,e.remaining_units,e.unit_kind,e.usd_equivalent_micro,e.credits_remaining_milli,e.method,e.sample_count,
+e.confidence,e.lower_bound_units,e.upper_bound_units,e.updated_at,e.source_plan_type
+FROM account_capacity_estimates e
+WHERE e.limiter_kind='5h' AND e.updated_at>=? AND LOWER(e.source_plan_type) LIKE '%plus%'
+AND e.confidence IN ('high','medium') AND e.sample_count>0
+AND e.unit_kind='api_list_price_equivalent_micro_usd' AND e.method LIKE 'empirical_quota_window_%'
+AND e.usd_equivalent_micro IS NOT NULL AND e.usd_equivalent_micro>0
+AND e.used_ratio_ppm IS NOT NULL AND e.used_ratio_ppm>=0 AND e.used_ratio_ppm<950000
+AND e.model_family<>'' AND e.model_family<>'mixed_or_unknown' AND e.service_tier IN ('default','fast')
+ORDER BY CASE e.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END DESC,
+e.sample_count DESC,e.updated_at DESC,e.account_id LIMIT ?`, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []AccountCapacityEstimatePlan{}
+	for rows.Next() {
+		var item AccountCapacityEstimatePlan
+		var usedRatio, remaining, usd, credits, lower, upper sql.NullInt64
+		if err := rows.Scan(&item.AccountID, &item.LimiterKind, &item.ModelFamily, &item.ServiceTier, &item.CycleStart,
+			&item.CycleEnd, &usedRatio, &remaining, &item.UnitKind, &usd, &credits, &item.Method, &item.SampleCount,
+			&item.Confidence, &lower, &upper, &item.UpdatedAt, &item.PlanType); err != nil {
 			return nil, err
 		}
 		item.UsedRatioPPM, item.RemainingUnits = nullableScanPointer(usedRatio), nullableScanPointer(remaining)

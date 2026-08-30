@@ -39,6 +39,33 @@ type ProviderPressureSnapshot struct {
 	PressurePercent   float64 `json:"pressure_percent"`
 }
 
+// RouteAvailabilityProbe is the low-cost, non-leasing view consumed by the
+// user-group negative-route cache. StructuralCandidates match group/provider/
+// model. EligibleCandidates can be selected immediately. CooldownBackoffCandidates
+// are blocked only by account quarantine, quota/binding cooldown, recheck, or an
+// egress cooldown. RateLimitOverrideCandidates carry an explicit operator choice
+// (ForceCodex429 for Codex, or IgnoreRateLimitControls) and therefore must never
+// be hidden behind an automatic fast-skip marker.
+type RouteAvailabilityProbe struct {
+	StructuralCandidates        int
+	EligibleCandidates          int
+	CooldownBackoffCandidates   int
+	OtherUnavailableCandidates  int
+	RateLimitOverrideCandidates int
+}
+
+// CoolingWithoutOverrides is deliberately strict: every structurally compatible
+// account must be unavailable for a cooldown/backoff reason, and no compatible
+// account may carry an explicit 429/rate-limit override. Concurrency, token budget,
+// unhealthy outlets, and mixed failure modes remain request-time decisions.
+func (p RouteAvailabilityProbe) CoolingWithoutOverrides() bool {
+	return p.StructuralCandidates > 0 &&
+		p.EligibleCandidates == 0 &&
+		p.RateLimitOverrideCandidates == 0 &&
+		p.CooldownBackoffCandidates == p.StructuralCandidates &&
+		p.OtherUnavailableCandidates == 0
+}
+
 // ShouldSpillover reports whether a caller should expand an auto route to its
 // fallback provider. Non-positive arguments select the GPT/Kiro defaults.
 func (p ProviderPressureSnapshot) ShouldSpillover(minAvailable int, pressurePercent float64) bool {
@@ -111,6 +138,62 @@ func (s *Scheduler) StructuralCandidateCount(ctx context.Context, route Route) (
 		return 0, err
 	}
 	return len(index.candidates), nil
+}
+
+// ProbeRouteAvailability evaluates a complete route without acquiring a lease.
+// It reuses the scheduler's one-second account/quota snapshots and candidate
+// index, so the route-availability worker can refresh hundreds of tracked routes
+// without creating a second polling/query pipeline.
+func (s *Scheduler) ProbeRouteAvailability(ctx context.Context, route Route) (RouteAvailabilityProbe, error) {
+	if route.Group == "" {
+		route.Group = s.Config().DefaultGroup
+	}
+	selection, err := s.accountsSnapshot(ctx, route.Group)
+	if err != nil {
+		return RouteAvailabilityProbe{}, err
+	}
+	index, err := s.candidateIndexSnapshot(ctx, selection, route)
+	if err != nil {
+		return RouteAvailabilityProbe{}, err
+	}
+	probe := RouteAvailabilityProbe{StructuralCandidates: len(index.candidates)}
+	if len(index.candidates) == 0 {
+		return probe, nil
+	}
+	evaluation := s.newCandidateEvaluationContext(ctx, route, selection)
+	for _, indexed := range index.candidates {
+		account := indexed.snapshot.Account
+		if account.IgnoreRateLimitControls || (indexed.provider == "codex" && account.ForceCodex429) {
+			probe.RateLimitOverrideCandidates++
+		}
+		candidateCounters := NoAccountCounters{}
+		if _, ok := s.evaluateIndexedCandidate(indexed, &evaluation, &candidateCounters); ok {
+			probe.EligibleCandidates++
+			continue
+		}
+		cooldownBackoff := candidateCounters.Quarantined +
+			candidateCounters.RateLimitCooldown +
+			candidateCounters.RecheckPending +
+			candidateCounters.EgressCooldown
+		allFailures := candidateCounters.Inactive +
+			candidateCounters.Quarantined +
+			candidateCounters.Excluded +
+			candidateCounters.ProviderMismatch +
+			candidateCounters.ModelUnsupported +
+			candidateCounters.RateLimitCooldown +
+			candidateCounters.RecheckPending +
+			candidateCounters.EgressUnavailable +
+			candidateCounters.EgressCooldown +
+			candidateCounters.Concurrency +
+			candidateCounters.TokenBudget +
+			candidateCounters.Coordinator
+		if cooldownBackoff > 0 && cooldownBackoff == allFailures {
+			probe.CooldownBackoffCandidates++
+		} else {
+			probe.OtherUnavailableCandidates++
+		}
+	}
+	return probe, nil
 }
 
 func (s *Scheduler) providerPressureSnapshot(ctx context.Context, route Route) (ProviderPressureSnapshot, error) {

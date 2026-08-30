@@ -26,10 +26,13 @@ const (
 // targets. The background worker continuously scans routes that traffic has
 // observed; the request path can synchronously refresh a missing/stale key.
 //
-// Only structural impossibility (no active account matching group/provider/model)
-// is used to skip a target. Quota, quarantine, recheck, egress health and
-// concurrency remain request-time scheduler decisions, so a transient outage can
-// never become a stale fast-path rejection.
+// It publishes two narrowly proven labels: structural impossibility, and a
+// transient "every compatible ordinary account is cooling/backing off" state.
+// The transient label is forbidden when any compatible account opted into
+// ForceCodex429 or IgnoreRateLimitControls, and it is refreshed every second so
+// quota recovery/cooldown expiry removes the fast skip without request traffic.
+// Concurrency, token pressure, hard egress failure and mixed states remain
+// request-time scheduler decisions.
 type routeAvailabilityIndex struct {
 	scheduler *scheduler.Scheduler
 	store     *storage.Store
@@ -49,15 +52,34 @@ type routeAvailabilityIndex struct {
 }
 
 type routeAvailabilityMark struct {
-	structuralCandidates int
-	schedulerVersion     uint64
-	checkedAt            time.Time
+	probe            scheduler.RouteAvailabilityProbe
+	schedulerVersion uint64
+	checkedAt        time.Time
+}
+
+type routeAvailabilityState uint8
+
+const (
+	routeAvailabilityReady routeAvailabilityState = iota
+	routeAvailabilityStructurallyUnavailable
+	routeAvailabilityCoolingBackoff
+)
+
+func (m routeAvailabilityMark) state() routeAvailabilityState {
+	if m.probe.StructuralCandidates == 0 {
+		return routeAvailabilityStructurallyUnavailable
+	}
+	if m.probe.CoolingWithoutOverrides() {
+		return routeAvailabilityCoolingBackoff
+	}
+	return routeAvailabilityReady
 }
 
 type routeAvailabilitySnapshot struct {
 	Enabled       bool   `json:"enabled"`
 	TrackedRoutes int    `json:"tracked_routes"`
 	MarkedEmpty   int    `json:"marked_empty"`
+	MarkedCooling int    `json:"marked_cooling"`
 	Scans         uint64 `json:"scans"`
 	Skips         uint64 `json:"skips"`
 	LastScanAt    int64  `json:"last_scan_at"`
@@ -99,6 +121,22 @@ func (i *routeAvailabilityIndex) Start(ctx context.Context) {
 func (i *routeAvailabilityIndex) Enable() {
 	if i != nil {
 		i.enabled.Store(true)
+	}
+}
+
+func (i *routeAvailabilityIndex) Wake() {
+	if i == nil {
+		return
+	}
+	select {
+	case i.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Server) wakeRouteAvailability() {
+	if s != nil && s.routeAvailability != nil {
+		s.routeAvailability.Wake()
 	}
 }
 
@@ -193,12 +231,12 @@ func (i *routeAvailabilityIndex) refreshTracked(parent context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		count, err := i.scheduler.StructuralCandidateCount(ctx, item.route)
+		probe, err := i.scheduler.ProbeRouteAvailability(ctx, item.route)
 		if err == nil {
 			i.storeMark(item.key, routeAvailabilityMark{
-				structuralCandidates: count,
-				schedulerVersion:     version,
-				checkedAt:            time.Now(),
+				probe:            probe,
+				schedulerVersion: version,
+				checkedAt:        time.Now(),
 			})
 		}
 		if err != nil && parent.Err() == nil {
@@ -269,9 +307,9 @@ func (i *routeAvailabilityIndex) publishCustomProviderSurface(providers []routeA
 	return false
 }
 
-// definitelyUnavailable is fail-open. It returns true only for an exact,
-// current structural zero. A scheduler structural change between the scan and this
-// decision invalidates the mark and forces a synchronous re-evaluation.
+// definitelyUnavailable is fail-open. It accepts either an exact structural zero
+// or the narrowly proven all-ordinary-candidates cooling/backoff state. A stale
+// mark or concurrent structural publication forces synchronous re-evaluation.
 func (i *routeAvailabilityIndex) definitelyUnavailable(ctx context.Context, route scheduler.Route) bool {
 	return i.allDefinitelyUnavailable(ctx, []scheduler.Route{route})
 }
@@ -279,11 +317,15 @@ func (i *routeAvailabilityIndex) definitelyUnavailable(ctx context.Context, rout
 // allDefinitelyUnavailable treats several provider-specific routes as one target.
 // This is needed for automatic GPT routing: a pool can execute through native
 // Codex/Kiro or through any enabled custom provider advertising the downstream
-// model. The target is skipped only when every concrete route is a structural zero
-// under one stable scheduler generation.
+// model. The target is skipped only when every concrete route has a current
+// unavailable label under one stable scheduler generation.
 func (i *routeAvailabilityIndex) allDefinitelyUnavailable(ctx context.Context, routes []scheduler.Route) bool {
+	return i.allUnavailableState(ctx, routes) != routeAvailabilityReady
+}
+
+func (i *routeAvailabilityIndex) allUnavailableState(ctx context.Context, routes []scheduler.Route) routeAvailabilityState {
 	if i == nil || i.scheduler == nil || ctx == nil || !i.enabled.Load() || len(routes) == 0 {
-		return false
+		return routeAvailabilityReady
 	}
 	version := i.scheduler.RouteStructureVersion()
 	refreshNeeded := false
@@ -309,21 +351,26 @@ func (i *routeAvailabilityIndex) allDefinitelyUnavailable(ctx context.Context, r
 		// re-evaluate every concrete provider route from storage.
 		i.scheduler.RefreshAccountCache()
 	}
+	combined := routeAvailabilityStructurallyUnavailable
 	for _, route := range routes {
-		if !i.routeDefinitelyUnavailable(ctx, route) || version != i.scheduler.RouteStructureVersion() {
-			return false
+		state := i.routeUnavailableState(ctx, route)
+		if state == routeAvailabilityReady || version != i.scheduler.RouteStructureVersion() {
+			return routeAvailabilityReady
+		}
+		if state == routeAvailabilityCoolingBackoff {
+			combined = routeAvailabilityCoolingBackoff
 		}
 	}
 	if version != i.scheduler.RouteStructureVersion() {
-		return false
+		return routeAvailabilityReady
 	}
 	i.skips.Add(1)
-	return true
+	return combined
 }
 
-func (i *routeAvailabilityIndex) routeDefinitelyUnavailable(ctx context.Context, route scheduler.Route) bool {
+func (i *routeAvailabilityIndex) routeUnavailableState(ctx context.Context, route scheduler.Route) routeAvailabilityState {
 	if i == nil || i.scheduler == nil || ctx == nil || !i.enabled.Load() || strings.TrimSpace(route.Group) == "" {
-		return false
+		return routeAvailabilityReady
 	}
 	route = normalizeAvailabilityRoute(route)
 	key := routeAvailabilityKey(route)
@@ -338,24 +385,24 @@ func (i *routeAvailabilityIndex) routeDefinitelyUnavailable(ctx context.Context,
 		age = time.Since(mark.checkedAt)
 	}
 	if found && mark.schedulerVersion == version && age >= 0 && age < routeAvailabilityRefreshInterval*2 {
-		if mark.structuralCandidates == 0 {
+		if state := mark.state(); state != routeAvailabilityReady {
 			// Linearize the skip after the mark read. An account/capability publication
 			// racing this request changes the generation and forces a fail-open retry.
 			if version == i.scheduler.RouteStructureVersion() {
-				return true
+				return state
 			}
-			return false
+			return routeAvailabilityReady
 		}
-		return false
+		return routeAvailabilityReady
 	}
 	mark, err := i.refresh(ctx, key)
 	if err != nil || mark.schedulerVersion != i.scheduler.RouteStructureVersion() {
-		return false
+		return routeAvailabilityReady
 	}
-	if mark.structuralCandidates == 0 {
-		return mark.schedulerVersion == i.scheduler.RouteStructureVersion()
+	if state := mark.state(); state != routeAvailabilityReady && mark.schedulerVersion == i.scheduler.RouteStructureVersion() {
+		return state
 	}
-	return false
+	return routeAvailabilityReady
 }
 
 func (i *routeAvailabilityIndex) track(key string, route scheduler.Route) {
@@ -391,14 +438,14 @@ func (i *routeAvailabilityIndex) refresh(ctx context.Context, key string) (route
 		return routeAvailabilityMark{}, nil
 	}
 	version := i.scheduler.RouteStructureVersion()
-	count, err := i.scheduler.StructuralCandidateCount(ctx, route)
+	probe, err := i.scheduler.ProbeRouteAvailability(ctx, route)
 	if err != nil {
 		return routeAvailabilityMark{}, err
 	}
 	mark := routeAvailabilityMark{
-		structuralCandidates: count,
-		schedulerVersion:     version,
-		checkedAt:            time.Now(),
+		probe:            probe,
+		schedulerVersion: version,
+		checkedAt:        time.Now(),
 	}
 	// If the scheduler changed while the scan was running, retain the old mark
 	// only as diagnostic history; no request will trust its older generation.
@@ -419,12 +466,18 @@ func (i *routeAvailabilityIndex) Snapshot() routeAvailabilitySnapshot {
 		return routeAvailabilitySnapshot{}
 	}
 	version := i.scheduler.RouteStructureVersion()
-	empty := 0
+	empty, cooling := 0, 0
 	i.mu.RLock()
 	tracked := len(i.routes)
 	for _, mark := range i.marks {
-		if mark.schedulerVersion == version && mark.structuralCandidates == 0 {
+		if mark.schedulerVersion != version {
+			continue
+		}
+		switch mark.state() {
+		case routeAvailabilityStructurallyUnavailable:
 			empty++
+		case routeAvailabilityCoolingBackoff:
+			cooling++
 		}
 	}
 	i.mu.RUnlock()
@@ -432,6 +485,7 @@ func (i *routeAvailabilityIndex) Snapshot() routeAvailabilitySnapshot {
 		Enabled:       i.enabled.Load(),
 		TrackedRoutes: tracked,
 		MarkedEmpty:   empty,
+		MarkedCooling: cooling,
 		Scans:         i.scans.Load(),
 		Skips:         i.skips.Load(),
 		LastScanAt:    i.lastScanAt.Load(),

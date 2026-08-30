@@ -68,6 +68,9 @@ const userPages = [
   ['PortalKeys', '/portal/keys'],
   ['PortalModels', '/portal/models'],
   ['PortalProfile', '/portal/profile'],
+  ['PortalUsage', '/portal/usage'],
+  ['PortalQuota', '/portal/quota'],
+  ['PortalSessions', '/portal/sessions'],
 ];
 
 // The two lists above are hand-maintained, and for a while eight admin routes were missing from

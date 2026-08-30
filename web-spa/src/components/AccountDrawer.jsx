@@ -27,6 +27,30 @@ function formatResetCredits(credits) {
   return `${credits.available_count} 次`;
 }
 
+function entitlementSeatLabel(seat) {
+  return ({
+    business_premium: 'Business Premium（5×）',
+    business_standard: 'Business Standard',
+    legacy_codex: 'Legacy Codex',
+    enterprise_standard: 'Enterprise Standard',
+    personal: '个人席位',
+    unknown: '未确认',
+  })[String(seat || 'unknown')] || String(seat || '未确认');
+}
+
+function premiumFixturePresentation(status) {
+  switch (String(status || '')) {
+    case 'recognized_reviewed_5x_fixture_v1':
+      return { color: 'green', label: '已识别：Premium（5×，无 5h）' };
+    case 'reviewed_mapping_active_evidence_conflict':
+      return { color: 'amber', label: '证据冲突，已保守降级' };
+    case 'reviewed_mapping_active_waiting_for_match':
+      return { color: 'blue', label: '真实样本映射已启用，等待双证据' };
+    default:
+      return status ? { color: 'grey', label: String(status) } : null;
+  }
+}
+
 function AccountRatePanel({ account }) {
   const rate = useAccountRequestRate(account.id, account.request_rate);
   const known = rate.state === 'live' || rate.state === 'stale';
@@ -326,6 +350,12 @@ export default function AccountDrawer({
   const capacity = details.capacity || null;
   const capacityEstimates = Array.isArray(capacity?.capacity_estimates) ? capacity.capacity_estimates : [];
   const capacityEntitlement = capacity?.entitlement || {};
+  const currentEntitlementEvidence = capacityEntitlement.current_evidence || null;
+  const premiumFixtureState = premiumFixturePresentation(capacityEntitlement.premium_fixture_status);
+  const standardFiveHourPrior = capacity?.business_standard_5h_prior || null;
+  const standardFiveHourEstimate = Array.isArray(standardFiveHourPrior?.estimates)
+    ? standardFiveHourPrior.estimates[0] || null
+    : null;
 
   const formatCapacityUSD = (micro) => {
     const value = Number(micro);
@@ -437,9 +467,20 @@ export default function AccountDrawer({
             <Row k="API 公价等价（近 30 天）" v={capacity?.last_30d_valuation?.api_micro_usd_settled != null ? formatCapacityUSD(capacity.last_30d_valuation.api_micro_usd_settled) : '不可用'} />
             <Row k="ChatGPT Credits" v={capacity?.last_30d_valuation?.chatgpt_milli_credits_settled != null ? formatCapacityCredits(capacity.last_30d_valuation.chatgpt_milli_credits_settled) : '无订阅证据'} />
             <Row k="套餐先验" v={capacityEntitlement.plan_only?.plan_family || 'unknown'} />
-            <Row k="席位证据" v={capacityEntitlement.current_evidence ? <Tag size="small" color={capacityEntitlement.current_evidence.confidence === 'high' ? 'green' : 'amber'}>{capacityEntitlement.current_evidence.seat_type || 'unknown'} · {capacityEntitlement.current_evidence.confidence || 'unknown'}</Tag> : <Tag size="small">未确认</Tag>} />
+            {capacityEntitlement.plan_only?.plan_family === 'business' ? (
+              <Row
+                k="Standard 5h 容量先验"
+                v={standardFiveHourEstimate
+                  ? `≈ ${formatCapacityUSD(standardFiveHourEstimate.limit_micro_usd)} · ${standardFiveHourEstimate.model_family}/${standardFiveHourEstimate.service_tier} · Plus×1.25`
+                  : '等待合格的 Plus 5h 实测样本'}
+              />
+            ) : null}
+            <Row k="席位证据" v={currentEntitlementEvidence ? <Tag size="small" color={currentEntitlementEvidence.confidence === 'high' ? 'green' : 'amber'}>{entitlementSeatLabel(currentEntitlementEvidence.seat_type)} · {currentEntitlementEvidence.confidence || 'unknown'}</Tag> : <Tag size="small">未确认</Tag>} />
+            {currentEntitlementEvidence?.usage_multiplier_milli != null ? <Row k="席位容量" v={`${Number(currentEntitlementEvidence.usage_multiplier_milli) / 1000}× Standard${currentEntitlementEvidence.no_five_hour_limit === true ? ' · 无 5 小时窗口' : ''}`} /> : null}
             {capacityEntitlement.conflict ? <Typography.Text type="warning" as="p">检测到多来源权益冲突，当前显示按保守规则降级。</Typography.Text> : null}
-            {capacityEntitlement.premium_fixture_status ? <Typography.Text type="tertiary" size="small" as="p">Premium/5x Team：{capacityEntitlement.premium_fixture_status}</Typography.Text> : null}
+            {premiumFixtureState ? <Typography.Text type="tertiary" size="small" as="p">Premium/5x Team：<Tag size="small" color={premiumFixtureState.color}>{premiumFixtureState.label}</Tag></Typography.Text> : null}
+            {capacityEntitlement.plan_only?.plan_family === 'business' ? <Typography.Text type="tertiary" size="small" as="p">Plus×1.25 仅用于普通 Team 的容量参考，不参与 Premium 席位判定，也不覆盖上游真实窗口。</Typography.Text> : null}
+            {capacityEntitlement.premium_fixture_mapping_version ? <Row k="映射版本" v={<span className="pool-mono">{capacityEntitlement.premium_fixture_mapping_version}</span>} /> : null}
             {capacityEstimates.length ? <div className="pool-capacity-estimates">{capacityEstimates.slice(0, 4).map((estimate) => (
               <div className="pool-capacity-estimate" key={`${estimate.limiter_kind}:${estimate.model_family}:${estimate.service_tier}:${estimate.cycle_start}`}>
                 <div><b>{estimate.model_family || 'unknown'}</b><Tag size="small" color={estimate.service_tier === 'fast' ? 'violet' : 'blue'}>{estimate.service_tier || 'unknown'}</Tag><Tag size="small">置信度 {estimate.confidence || 'unavailable'}</Tag></div>

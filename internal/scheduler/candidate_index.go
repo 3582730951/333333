@@ -321,10 +321,10 @@ func (s *Scheduler) evaluateIndexedCandidate(indexed indexedCandidate, evaluatio
 	return candidate{account: account, egress: egress, binding: binding, resolvedModel: indexed.resolvedModel, bootstrap: bootstrap, score: score}, true
 }
 
-// trialRateLimitExhausted mirrors storage's exhausted test without the rejected
-// status: a rejected row is the quota poller's hard verdict and is never
-// trial-worthy; a zero-remaining row may be a stale snapshot and is worth one
-// probe (see evaluateIndexedTrialCandidate).
+// trialRateLimitExhausted mirrors storage's exhausted test. A rejected row is
+// normally the quota poller's hard verdict; only an explicit ForceCodex429
+// account may probe it. A zero-remaining row may be stale and is worth one probe
+// (see evaluateIndexedTrialCandidate).
 func trialRateLimitExhausted(r storage.AccountRateLimit) bool {
 	switch strings.TrimSpace(r.LimiterType) {
 	case "requests":
@@ -356,14 +356,14 @@ func (s *Scheduler) evaluateIndexedTrialCandidate(indexed indexedCandidate, eval
 	}
 	candidateRoute := routeForProviderModel(evaluation.route, indexed.provider)
 	var cooldownUntil int64
-	// Rate-limit cooldown only makes an account trial-eligible when the limiter
-	// snapshot is NOT hard-rejected. A rejected row is the quota poller's explicit
-	// "no quota" verdict and must be respected (the account would just 429 again);
-	// a zero-remaining row from an older poll may simply be stale and is worth
-	// exactly one probe, which the API layer converts into a cooldown clear.
+	// Rate-limit cooldown normally makes an account trial-eligible only when the
+	// limiter snapshot is not hard-rejected. ForceCodex429 is the explicit operator
+	// exception: it must be allowed to reach the same-account 429 state machine.
+	// Otherwise a zero-remaining row from an older poll may simply be stale and is
+	// worth exactly one probe, which the API layer converts into a cooldown clear.
 	if !account.IgnoreRateLimitControls {
 		for _, r := range evaluation.rateLimits[account.ID] {
-			if r.ResetAt <= evaluation.now || strings.EqualFold(strings.TrimSpace(r.Status), "rejected") {
+			if r.ResetAt <= evaluation.now || (strings.EqualFold(strings.TrimSpace(r.Status), "rejected") && !account.ForceCodex429) {
 				continue
 			}
 			if p := strings.TrimSpace(r.Provider); p != "" && p != indexed.provider {
@@ -449,6 +449,10 @@ func (s *Scheduler) tryCooldownTrial(ctx context.Context, route Route, index *ro
 	}
 	trials := make([]trialCandidate, 0, maxCooldownTrialAttempts)
 	for _, indexed := range index.candidates {
+		account := indexed.snapshot.Account
+		if cooldownTrialsRestrictedToOverrides(ctx) && !account.ForceCodex429 && !account.IgnoreRateLimitControls {
+			continue
+		}
 		if choice, until, ok := s.evaluateIndexedTrialCandidate(indexed, evaluation); ok {
 			trials = append(trials, trialCandidate{choice: choice, cooldownUntil: until})
 		}

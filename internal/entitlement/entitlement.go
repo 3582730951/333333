@@ -30,6 +30,13 @@ const (
 	SeatBusinessPremium    SeatType = "business_premium"
 	SeatLegacyCodex        SeatType = "legacy_codex"
 	SeatEnterpriseStandard SeatType = "enterprise_standard"
+
+	// BusinessPremiumMappingVersion identifies the only built-in mapping that
+	// may derive a Premium seat from Codex quota metadata. The versioned review
+	// binds the operator-confirmed 5x subtype self_serve_business_prolite to the
+	// fixture's single seven-day window with no five-hour window. Neither the
+	// subtype nor the missing window is sufficient on its own.
+	BusinessPremiumMappingVersion = "codex_quota_business_prolite_5x_no_5h_v1"
 )
 
 type Normalized struct {
@@ -92,8 +99,8 @@ type ReviewedSeatObservation struct {
 
 // FromReviewedSeatObservation is the only constructor that emits Premium 5x
 // flags. Callers must first match a versioned, human-reviewed wire mapping and,
-// for JWT evidence, verify the signature. With no real Premium fixture/mapping,
-// callers cannot satisfy these gates and safely remain unknown.
+// for JWT evidence, verify the signature. Generic or contradictory payloads
+// cannot satisfy these gates and safely remain unknown.
 func FromReviewedSeatObservation(observation ReviewedSeatObservation) Normalized {
 	result := FromPlanLabel(observation.PlanLabel)
 	if !observation.MappingReviewed {
@@ -142,6 +149,7 @@ type WireObservation struct {
 	NoFiveHour      *bool
 	SourceKind      string
 	MappingReviewed bool
+	MappingVersion  string
 	SignatureValid  bool
 	Payload         map[string]interface{}
 }
@@ -180,7 +188,88 @@ func ParseWireObservation(root map[string]interface{}, sourceKind string) WireOb
 			out.Payload[key] = value
 		}
 	}
+	if version, reviewed := ReviewedBusinessPremiumQuotaMapping(root, sourceKind); reviewed &&
+		(out.SeatRaw == "" || premiumSeatRaw(out.SeatRaw)) &&
+		(out.MultiplierMilli == nil || *out.MultiplierMilli == 5000) &&
+		(out.NoFiveHour == nil || *out.NoFiveHour) {
+		multiplier, noFiveHour := int64(5000), true
+		out.SeatRaw = string(SeatBusinessPremium)
+		out.MultiplierMilli = &multiplier
+		out.NoFiveHour = &noFiveHour
+		out.MappingReviewed = true
+		out.MappingVersion = version
+		// Persist only the reviewed, credential-free projection. Including the
+		// mapping version also gives upgraded evidence a new immutable HMAC
+		// fingerprint instead of colliding with an older plan-only observation.
+		out.Payload["mapping_version"] = version
+		out.Payload["observed_5x_subtype"] = true
+		out.Payload["observed_primary_window_minutes"] = int64(7 * 24 * 60)
+		out.Payload["observed_no_five_hour_window"] = true
+	}
 	return out
+}
+
+// ReviewedBusinessPremiumQuotaMapping recognizes the exact, reviewed Codex
+// quota shape from the authorized 2026-08-30 fixture. Generic team/business
+// labels, a missing five-hour window, or the 5x subtype by itself never pass.
+// self_serve_business_usage_based deliberately remains unknown.
+func ReviewedBusinessPremiumQuotaMapping(root map[string]interface{}, sourceKind string) (string, bool) {
+	if strings.TrimSpace(sourceKind) != "quota_metadata" || len(root) == 0 {
+		return "", false
+	}
+	plan := firstStringAt(root, "plan_type", "planType", "subscription_type", "subscriptionType", "plan")
+	if !strings.EqualFold(strings.TrimSpace(plan), "self_serve_business_prolite") {
+		return "", false
+	}
+
+	limits := firstMapAt(root, "rate_limits", "rateLimit", "rateLimits")
+	primaryKeys, secondaryKeys := []string{"primary", "primary_window", "primaryWindow"}, []string{"secondary", "secondary_window", "secondaryWindow"}
+	if limits == nil {
+		limits = firstMapAt(root, "rate_limit")
+		primaryKeys, secondaryKeys = []string{"primary_window", "primaryWindow", "primary"}, []string{"secondary_window", "secondaryWindow", "secondary"}
+	}
+	if limits == nil {
+		return "", false
+	}
+	primary := firstMapAt(limits, primaryKeys...)
+	if quotaWindowDurationSeconds(primary) != 7*24*60*60 {
+		return "", false
+	}
+	if secondary := firstMapAt(limits, secondaryKeys...); quotaWindowDurationSeconds(secondary) > 0 {
+		return "", false
+	}
+	return BusinessPremiumMappingVersion, true
+}
+
+func firstMapAt(root map[string]interface{}, keys ...string) map[string]interface{} {
+	for _, key := range keys {
+		if value, ok := root[key].(map[string]interface{}); ok {
+			return value
+		}
+	}
+	return nil
+}
+
+func quotaWindowDurationSeconds(window map[string]interface{}) int64 {
+	if len(window) == 0 {
+		return 0
+	}
+	if minutes, ok := firstNumberAt(window, "window_minutes", "windowMinutes"); ok && minutes > 0 && minutes <= math.MaxInt64/60 {
+		return minutes * 60
+	}
+	if seconds, ok := firstNumberAt(window, "limit_window_seconds", "limitWindowSeconds", "window_seconds", "windowSeconds"); ok && seconds > 0 {
+		return seconds
+	}
+	return 0
+}
+
+func premiumSeatRaw(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "business_premium", "premium", "premium_5x", "5x", "5x_team", "business_5x":
+		return true
+	default:
+		return false
+	}
 }
 
 func scalarEvidenceValue(value interface{}) bool {
@@ -314,7 +403,7 @@ func nonNegativeNumber(value interface{}) (int64, bool) {
 // the payload contains words such as "premium".
 func NormalizedFromWire(root map[string]interface{}, sourceKind string, mappingReviewed, signatureValid bool) (Normalized, WireObservation) {
 	observation := ParseWireObservation(root, sourceKind)
-	observation.MappingReviewed, observation.SignatureValid = mappingReviewed, signatureValid
+	observation.MappingReviewed, observation.SignatureValid = mappingReviewed || observation.MappingReviewed, signatureValid
 	seat := SeatUnknown
 	switch strings.ToLower(strings.TrimSpace(observation.SeatRaw)) {
 	case "business_premium", "premium", "premium_5x", "5x", "5x_team", "business_5x":
@@ -325,6 +414,14 @@ func NormalizedFromWire(root map[string]interface{}, sourceKind string, mappingR
 		seat = SeatLegacyCodex
 	case "personal", "plus", "pro":
 		seat = SeatPersonal
+	}
+	// Contradictory explicit flags always fail closed, including when a legacy
+	// deployment-wide mapping opt-in is enabled. A Premium spelling cannot turn
+	// a 1x seat or a seat with a five-hour limit into a 5x entitlement.
+	if seat == SeatBusinessPremium &&
+		((observation.MultiplierMilli != nil && *observation.MultiplierMilli != 5000) ||
+			(observation.NoFiveHour != nil && !*observation.NoFiveHour)) {
+		seat = SeatUnknown
 	}
 	result := FromReviewedSeatObservation(ReviewedSeatObservation{
 		PlanLabel: observation.PlanLabel, SeatType: seat, SourceKind: observation.SourceKind,

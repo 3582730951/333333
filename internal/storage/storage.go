@@ -1526,6 +1526,9 @@ func (s *Store) init(ctx context.Context, progress func(string), expandOnly bool
 	if err := s.ensurePricingCatalogExpiryColumn(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureAccountCapacitySourcePlanColumn(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureBuiltinPricingCatalog(ctx); err != nil {
 		return err
 	}

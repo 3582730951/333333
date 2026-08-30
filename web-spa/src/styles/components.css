@@ -8758,13 +8758,37 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   color: var(--pool-warning);
 }
 
-.pool-callout--warning {
+.pool-callout {
   padding: 10px 12px;
-  border: 1px solid var(--pool-warning);
+  border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-control);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.pool-callout--info {
+  border-color: color-mix(in srgb, var(--pool-info) 56%, var(--pool-border));
+  color: var(--pool-info);
+  background: var(--pool-info-soft);
+}
+
+.pool-callout--warning {
+  border-color: var(--pool-warning);
   color: var(--pool-warning);
   background: var(--pool-warning-soft);
 }
+
+.pool-hub-entry-button {
+  border-color: color-mix(in srgb, var(--pool-accent) 48%, var(--pool-border));
+  background: linear-gradient(135deg, var(--pool-accent-soft), var(--pool-bg-elevated));
+  box-shadow: inset 0 1px 0 var(--pool-glass-sheen), 0 0 18px color-mix(in srgb, var(--pool-accent) 12%, transparent);
+}
+
+.pool-hub-entry-button:hover {
+  border-color: var(--pool-accent);
+  box-shadow: inset 0 1px 0 var(--pool-glass-sheen), 0 0 24px color-mix(in srgb, var(--pool-accent) 20%, transparent);
+}
+
 /* Sub2API Hub connection surface: dense enough for operators, calm enough for
    a first-run setup. The panel intentionally uses existing pool tokens so the
    same light/glow treatment follows the active theme and reduced-motion rules. */
@@ -8783,7 +8807,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-hub-connection-card__metrics span { padding: 5px 8px; border-radius: 8px; background: color-mix(in srgb, var(--pool-accent) 8%, transparent); }
 .pool-hub-connection-card__meta { margin-top: 10px; font-size: 11px; }
 .pool-hub-connection-card__actions { margin-top: 14px; }
-.pool-hub-connection-card__config { display: grid; gap: 8px; margin-top: 12px; padding: 10px; border: 1px solid var(--pool-border); border-radius: 9px; background: color-mix(in srgb, var(--pool-bg-elevated, #fff) 92%, var(--pool-accent)); }
+.pool-hub-connection-card__config { display: grid; gap: 8px; margin-top: 12px; padding: 10px; border: 1px solid var(--pool-border); border-radius: 9px; background: color-mix(in srgb, var(--pool-bg-elevated) 92%, var(--pool-accent)); }
 .pool-hub-connection-card__config-row, .pool-hub-secret__row { display: grid; grid-template-columns: 92px minmax(0, 1fr) auto; align-items: center; gap: 8px; font-size: 12px; }
 .pool-hub-connection-card__config code, .pool-hub-secret code { overflow-wrap: anywhere; font: 11px/1.4 var(--pool-mono, ui-monospace, monospace); }
 .pool-hub-empty { min-height: 230px; display: grid; place-items: center; align-content: center; gap: 10px; padding: 24px; text-align: center; color: var(--pool-text-secondary); border: 1px dashed var(--pool-border); border-radius: 12px; }

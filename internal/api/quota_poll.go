@@ -18,6 +18,7 @@ import (
 
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/cursorproxy"
+	"codex-account-pool/internal/entitlement"
 	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
@@ -48,6 +49,16 @@ const (
 )
 
 var whamUsageURL = "https://chatgpt.com/backend-api/wham/usage"
+
+func codexWhamPrimaryWindowKind(primarySeconds, secondarySeconds int64) string {
+	if primarySeconds <= 0 {
+		return ""
+	}
+	if secondarySeconds <= 0 && primarySeconds >= 24*60*60 {
+		return quotaWindowKind7d
+	}
+	return quotaWindowKind5h
+}
 
 // whamUsageResponse mirrors the JSON shape returned by /backend-api/wham/usage.
 // Field names follow the codex-backend OpenAPI models (RateLimitStatusPayload):
@@ -481,6 +492,9 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) (result quotaRefreshRes
 	wg.Wait()
 	if updated > 0 && s.scheduler != nil {
 		s.scheduler.NotifyStateChanged()
+	}
+	if updated > 0 {
+		s.wakeRouteAvailability()
 	}
 	if updated > 0 || failed > 0 {
 		log.Printf("[QUOTA-POLL] tick complete: updated=%d failed=%d total_codex=%d total_claude=%d total_kiro=%d total_cursor=%d", updated, failed, len(codex), len(claude), len(kiro), len(cursor))
@@ -1007,12 +1021,15 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 	}
 
 	var rawDetail []byte
-	if wham.RateLimit.SecondaryWindow.LimitWindowSeconds > 0 {
-		raw, _ := json.Marshal(map[string]interface{}{
-			"primary":   wham.RateLimit.PrimaryWindow,
-			"secondary": wham.RateLimit.SecondaryWindow,
-			"plan_type": wham.PlanType,
-		})
+	if wham.RateLimit.PrimaryWindow.LimitWindowSeconds > 0 || wham.RateLimit.SecondaryWindow.LimitWindowSeconds > 0 {
+		detail := map[string]interface{}{"plan_type": wham.PlanType}
+		if wham.RateLimit.PrimaryWindow.LimitWindowSeconds > 0 {
+			detail["primary"] = wham.RateLimit.PrimaryWindow
+		}
+		if wham.RateLimit.SecondaryWindow.LimitWindowSeconds > 0 {
+			detail["secondary"] = wham.RateLimit.SecondaryWindow
+		}
+		raw, _ := json.Marshal(detail)
 		rawDetail = raw
 	}
 
@@ -1050,6 +1067,31 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 	s.upsertCodexCreditsSnapshot(ctx, acc.ID, wham, now)
 	if pw.LimitWindowSeconds <= 0 {
 		return newQuotaPollError("partial", 0, rawDetail, fmt.Errorf("no primary window in wham response"))
+	}
+
+	// Premium/5x Business responses have no five-hour window: their sole
+	// primary window is the seven-day window. The old path unconditionally
+	// labeled every primary as 5h, which created a fake 5h card, polluted the
+	// empirical capacity baseline, and made Premium detection contradict itself.
+	// Duration chooses the storage bucket; entitlement cleanup additionally
+	// requires the reviewed 5x subtype so an ordinary Team missing a window due
+	// to an upstream bug is never promoted to Premium.
+	if codexWhamPrimaryWindowKind(pw.LimitWindowSeconds, sw.LimitWindowSeconds) == quotaWindowKind7d {
+		snap := storage.AccountRateLimit{
+			AccountID: acc.ID, Provider: "codex", LimiterType: "7d_polled", Source: "7d_polled",
+			UsedPercent: pw.UsedPercent, RemainingTokens: -1, LimitTokens: -1,
+			LimitRequests: -1, RemainingRequests: -1, ResetAt: now + pw.ResetAfterSeconds,
+			Status: statusFromReached(wham.RateLimit.LimitReached), Raw: string(rawDetail), UpdatedAt: now,
+		}
+		_ = s.store.UpsertAccountRateLimit(ctx, snap)
+		s.recordQuotaWindowSample(ctx, acc.ID, quotaWindowKind7d,
+			quotaWindowMinutesForCodex(pw.LimitWindowSeconds), now+pw.ResetAfterSeconds, now, pw.UsedPercent)
+		if _, reviewedPremium := entitlement.ReviewedBusinessPremiumQuotaMapping(whamEvidence, "quota_metadata"); reviewedPremium {
+			if err := s.store.DeleteMisclassifiedLongFiveHourQuotaState(ctx, acc.ID); err == nil && s.scheduler != nil {
+				s.scheduler.RefreshAccountCache()
+			}
+		}
+		return nil
 	}
 
 	snap := storage.AccountRateLimit{

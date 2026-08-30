@@ -44,6 +44,36 @@ func entitlementSourcePriority(source string) int {
 	}
 }
 
+func entitlementEvidenceQuality(evidence AccountEntitlementEvidence) int {
+	quality := 0
+	switch evidence.Confidence {
+	case "high":
+		quality = 300
+	case "medium":
+		quality = 200
+	case "low":
+		quality = 100
+	}
+	if evidence.SeatType != entitlement.SeatUnknown {
+		quality += 40
+	}
+	if evidence.UsageMultiplierMilli != nil && evidence.NoFiveHourLimit != nil {
+		quality += 20
+	}
+	if evidence.PlanFamily != entitlement.PlanUnknown {
+		quality += 10
+	}
+	return quality
+}
+
+func entitlementEvidenceConflicts(left, right AccountEntitlementEvidence) bool {
+	planConflict := left.PlanFamily != entitlement.PlanUnknown && right.PlanFamily != entitlement.PlanUnknown &&
+		left.PlanFamily != right.PlanFamily
+	seatConflict := left.SeatType != entitlement.SeatUnknown && right.SeatType != entitlement.SeatUnknown &&
+		left.SeatType != right.SeatType
+	return planConflict || seatConflict
+}
+
 func validateEntitlementEvidence(evidence AccountEntitlementEvidence) error {
 	if strings.TrimSpace(evidence.AccountID) == "" || len(strings.TrimSpace(evidence.SourceFingerprint)) < 16 {
 		return fmt.Errorf("entitlement account and source fingerprint are required")
@@ -152,6 +182,7 @@ func (s *Store) CurrentAccountEntitlementEvidence(ctx context.Context, accountID
 		at = Now()
 	}
 	bestPriority := -1
+	bestQuality := -1
 	var best *AccountEntitlementEvidence
 	conflict := false
 	for index := range rows {
@@ -160,13 +191,24 @@ func (s *Store) CurrentAccountEntitlementEvidence(ctx context.Context, accountID
 			continue
 		}
 		priority := entitlementSourcePriority(item.SourceKind)
+		quality := entitlementEvidenceQuality(*item)
 		if priority > bestPriority {
 			copy := *item
-			best, bestPriority, conflict = &copy, priority, false
+			best, bestPriority, bestQuality, conflict = &copy, priority, quality, false
 			continue
 		}
-		if priority == bestPriority && best != nil && (item.SeatType != best.SeatType || item.PlanFamily != best.PlanFamily) {
+		if priority != bestPriority || best == nil {
+			continue
+		}
+		if entitlementEvidenceConflicts(*best, *item) {
 			conflict = true
+		}
+		// Rows are ordered newest-first, so an equal-quality observation keeps
+		// the existing (newer) winner. A later low-confidence plan-only poll can
+		// therefore never hide a still-valid reviewed Premium observation.
+		if quality > bestQuality {
+			copy := *item
+			best, bestQuality = &copy, quality
 		}
 	}
 	return best, conflict, nil

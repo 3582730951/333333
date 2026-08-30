@@ -131,6 +131,11 @@ func (s *Server) persistCurrentAccountCapacityEstimate(ctx context.Context, acco
 	if !dimensions.Homogeneous || valuationWindow.UnavailableEvents > 0 {
 		confidence = "low"
 	}
+	sourcePlanType := ""
+	if account, accountErr := s.store.GetAccount(ctx, accountID); accountErr == nil &&
+		strings.EqualFold(strings.TrimSpace(account.Provider), "codex") {
+		sourcePlanType = strings.TrimSpace(account.PlanType)
+	}
 	usedRatio := int64(math.Round(estimate.UsedPercent * 10_000))
 	remaining := quotaUSDToMicro(estimate.RemainingCost.Center)
 	lower := quotaUSDToMicro(estimate.RemainingCost.Lower)
@@ -153,7 +158,7 @@ func (s *Server) persistCurrentAccountCapacityEstimate(ctx context.Context, acco
 	}
 	_ = s.store.UpsertAccountCapacityEstimate(ctx, storage.AccountCapacityEstimate{
 		AccountID: accountID, LimiterKind: windowKind, ModelFamily: dimensions.ModelFamily,
-		ServiceTier: dimensions.ServiceTier, CycleStart: cycleStart, CycleEnd: cycleStart + windowSeconds,
+		ServiceTier: dimensions.ServiceTier, SourcePlanType: sourcePlanType, CycleStart: cycleStart, CycleEnd: cycleStart + windowSeconds,
 		UsedRatioPPM: &usedRatio, RemainingUnits: remaining, UnitKind: "api_list_price_equivalent_micro_usd",
 		USDEquivalentMicro: remaining, CreditsRemainingMilli: creditsRemaining, Method: method, SampleCount: int64(estimate.Evidence.SampleCount),
 		Confidence: confidence, LowerBoundUnits: lower, UpperBoundUnits: upper, UpdatedAt: now,

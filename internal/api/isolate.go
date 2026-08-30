@@ -512,8 +512,11 @@ func (s *Server) guardRateLimitForAccount(ctx context.Context, account storage.A
 	if trial {
 		if err := s.store.SetBindingCooldown(ctx, account.ID, 0); err != nil {
 			log.Printf("[INTELLIGENT-ROUTING] trial cooldown clear failed account=%s err=%v", account.ID, err)
-		} else if s.scheduler != nil {
-			s.scheduler.NotifyStateChanged()
+		} else {
+			if s.scheduler != nil {
+				s.scheduler.NotifyStateChanged()
+			}
+			s.wakeRouteAvailability()
 		}
 	}
 	if account.IgnoreRateLimitControls {

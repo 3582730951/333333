@@ -6,6 +6,8 @@ import { showErrorToast } from './ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
 import CopyCodeBlock from './CopyCodeBlock.jsx';
+import { copyText } from './KeySecretTools.jsx';
+import { browserOrigin } from '../lib/browserNavigation.js';
 import {
   createSub2APIHubConnection,
   fetchSub2APIHubConnections,
@@ -50,6 +52,11 @@ function keyCommand(baseURL, key) {
   return `curl -fsS '${baseURL}/admin/accounts?page=1&page_size=20' \\\n+  -H 'x-api-key: ${key}' \\\n+  -H 'Accept: application/json'`;
 }
 
+function defaultHubBaseURL() {
+  const origin = browserOrigin();
+  return origin ? `${origin}/api/v1` : '/api/v1';
+}
+
 function ConnectionStatus({ row }) {
   const expired = Number(row?.expires_at) > 0 && Number(row.expires_at) <= Math.floor(Date.now() / 1000);
   if (!row?.enabled || expired) return <Tag color="grey">已停用</Tag>;
@@ -58,7 +65,7 @@ function ConnectionStatus({ row }) {
 
 function HubConnectionCard({ row, onEdit, onRotate, onTest, onRevoke, busy }) {
   const [showConfig, setShowConfig] = useState(false);
-  const baseURL = row.base_url || `${window.location.origin}/api/v1`;
+  const baseURL = row.base_url || defaultHubBaseURL();
   return (
     <Card className="pool-hub-connection-card">
       <div className="pool-hub-connection-card__head">
@@ -139,14 +146,14 @@ function ConnectionEditor({ open, initial, groups, proxies, saving, onCancel, on
 
 function OneTimeKey({ credential, onClose }) {
   if (!credential) return null;
-  const baseURL = credential.base_url || `${window.location.origin}/api/v1`;
+  const baseURL = credential.base_url || defaultHubBaseURL();
   const key = credential.api_key || '';
   return (
     <Modal visible title="请立即保存 Hub 连接凭据" onCancel={onClose} footer={null} width={680}>
       <div className="pool-hub-secret">
         <Banner type="warning" title="Admin API Key 只显示一次" description="关闭此窗口后无法恢复旧 Key；如遗失，请在连接卡片中轮换 Key。" />
-        <div className="pool-hub-secret__row"><span>Sub2API Base URL</span><code>{baseURL}</code><Button size="small" icon={<IconCopy />} onClick={() => navigator.clipboard?.writeText(baseURL)}>复制</Button></div>
-        <div className="pool-hub-secret__row"><span>Admin API Key</span><code className="pool-secret-value">{key}</code><Button size="small" icon={<IconCopy />} onClick={() => navigator.clipboard?.writeText(key)}>复制</Button></div>
+        <div className="pool-hub-secret__row"><span>Sub2API Base URL</span><code>{baseURL}</code><Button size="small" icon={<IconCopy />} onClick={() => void copyText(baseURL, 'Base URL 已复制')}>复制</Button></div>
+        <div className="pool-hub-secret__row"><span>Admin API Key</span><code className="pool-secret-value">{key}</code><Button size="small" icon={<IconCopy />} onClick={() => void copyText(key, 'Admin API Key 已复制')}>复制</Button></div>
         <CopyCodeBlock code={keyCommand(baseURL, key)} label="复制 curl 示例" />
         <Typography.Text type="tertiary" size="small">不要把 Key 放进 URL、日志或前端代码；建议通过上游的 Secret 环境变量注入。</Typography.Text>
         <div className="pool-hub-secret__footer"><Button theme="solid" onClick={onClose}>我已安全保存</Button></div>
