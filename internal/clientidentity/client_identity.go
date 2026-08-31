@@ -64,7 +64,7 @@ type Evidence struct {
 	Source string     `json:"source"`
 	Kind   string     `json:"kind"`
 	Grade  Confidence `json:"grade"`
-	Value  string     `json:"value,omitempty"`
+	Value  string     `json:"-"`
 }
 
 // RequestClientIdentity is the stable DTO shared by HTTP, WebSocket and body
