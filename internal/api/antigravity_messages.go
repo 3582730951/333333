@@ -501,16 +501,17 @@ func (s *Server) recordAntigravityUsage(r *http.Request, accountID, model string
 		"provider":              "antigravity",
 		"cached_content_tokens": cachedTok,
 	})
+	diagnostics := usageDiagnosticsWithFrozenClientIdentity(r.Context(), storage.UsageDiagnostics{
+		UsageEventID:     firstNonEmpty(usageEventIDFromContext(r.Context()), requestIDFromContext(r.Context())),
+		AgentClass:       accountAgentClassFromContext(r.Context()),
+		UsageProvider:    "antigravity",
+		UsageSource:      "upstream",
+		CacheReadPresent: cachedTok > 0,
+		AffinitySource:   affinity.Source,
+	})
 	s.enqueueUsage(storage.UsageRecordWrite{
 		AccountID: accountID, RouteKeyHash: affinity.Hash, APIKeyHash: keyHash, UserID: userID, Model: model,
 		Prompt: inputTok, Completion: outputTok, Total: inputTok + outputTok, Cached: cachedTok,
-		CacheRead: cachedTok, Raw: json.RawMessage(raw), Diagnostics: storage.UsageDiagnostics{
-			UsageEventID:     firstNonEmpty(usageEventIDFromContext(r.Context()), requestIDFromContext(r.Context())),
-			AgentClass:       accountAgentClassFromContext(r.Context()),
-			UsageProvider:    "antigravity",
-			UsageSource:      "upstream",
-			CacheReadPresent: cachedTok > 0,
-			AffinitySource:   affinity.Source,
-		},
+		CacheRead: cachedTok, Raw: json.RawMessage(raw), Diagnostics: diagnostics,
 	})
 }

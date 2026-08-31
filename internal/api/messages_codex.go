@@ -63,6 +63,10 @@ func (s *Server) handleMessagesViaCodex(w http.ResponseWriter, r *http.Request, 
 	inner.ContentLength = int64(len(converted.Body))
 	convertedSource := bodysource.Bytes(converted.Body)
 	defer convertedSource.Close()
+	// Keep the middleware-frozen downstream identity on the bridge context. The
+	// converted Responses body deliberately has no identity metadata: attribution
+	// must remain that of the original Messages caller, not the compatibility
+	// adapter we synthesize here.
 	inner = inner.WithContext(contextWithBodyMeta(contextWithBodySource(inner.Context(), convertedSource), bodysource.BodyMeta{}))
 	inner.GetBody = convertedSource.Open
 	inner.Header.Set("Content-Type", "application/json")

@@ -1,3 +1,5 @@
+import type { PlanPresentation } from './planFormatter';
+
 export interface AccountUsage {
   requests?: number;
   total_tokens?: number;
@@ -48,6 +50,7 @@ export interface AccountRow {
   status?: string;
   group_name?: string;
   plan_type?: string;
+  plan_presentation?: PlanPresentation;
   auth_method?: 'oauth' | 'access_token' | 'api_key' | string;
   credential_mode?: 'agent_identity' | string;
   billing_mode?: 'subscription' | 'pay_as_you_go' | string;

@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -40,11 +41,9 @@ func codexSyntheticPairEligibleTail(raw json.RawMessage) bool {
 		Role string `json:"role"`
 	}
 	if json.Unmarshal(raw, &role) != nil {
-		// Unparseable items are still plain-message-shaped from the eligibility
-		// standpoint; the upstream would have rejected the body anyway.
-		return true
+		return false
 	}
-	return role.Role != "tool" && role.Role != "function"
+	return role.Role == "" || role.Role == "user" || role.Role == "assistant" || role.Role == "developer" || role.Role == "system"
 }
 
 // codexBodyHasSyntheticPair reports whether any input item already carries our
@@ -55,23 +54,70 @@ func codexBodyHasSyntheticPair(input []json.RawMessage) bool {
 		var probe struct {
 			CallID string `json:"call_id"`
 		}
-		if json.Unmarshal(item, &probe) == nil && strings.HasPrefix(probe.CallID, codexSyntheticAgentContextCallPrefix) {
+		if json.Unmarshal(item, &probe) == nil && IsForceCodex429SyntheticCallID(probe.CallID) {
 			return true
 		}
 	}
 	return false
 }
 
-func newCodexSyntheticCallID() string {
+func newCodexSyntheticCallID() (string, bool) {
 	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand failure is effectively impossible; fall back to a
-		// deterministic suffix rather than refusing to build the body.
-		for i := range b {
-			b[i] = byte(i*7 + 3)
+		return "", false
+	}
+	return codexSyntheticAgentContextCallPrefix + hex.EncodeToString(b[:]), true
+}
+
+// IsForceCodex429SyntheticCallID identifies synthetic guard call IDs emitted by
+// this package and compatible historical prefixes.
+func IsForceCodex429SyntheticCallID(callID string) bool {
+	callID = strings.TrimSpace(callID)
+	for _, prefix := range []string{"call_codexpool_overdraft_", "call_sub2api_overdraft_", "fc_", "ctc_"} {
+		if strings.HasPrefix(callID, prefix) {
+			return true
 		}
 	}
-	return codexSyntheticAgentContextCallPrefix + hex.EncodeToString(b[:])
+	return false
+}
+
+// IsForceCodex429SyntheticItem reports whether an input item is a synthetic
+// guard call or output pair.
+func IsForceCodex429SyntheticItem(raw json.RawMessage) bool {
+	var probe struct {
+		Type   string `json:"type"`
+		CallID string `json:"call_id"`
+	}
+	if json.Unmarshal(raw, &probe) != nil || !IsForceCodex429SyntheticCallID(probe.CallID) {
+		return false
+	}
+	return probe.Type == "custom_tool_call" || probe.Type == "custom_tool_call_output"
+}
+
+func normalizeForceCodex429Input(raw json.RawMessage) ([]json.RawMessage, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, false
+	}
+	if items, ok := codexResponsesInputItems(trimmed); ok {
+		return items, true
+	}
+	if trimmed[0] == '{' {
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(trimmed, &obj) != nil || obj == nil {
+			return nil, false
+		}
+		return []json.RawMessage{append(json.RawMessage(nil), trimmed...)}, true
+	}
+	if trimmed[0] == '"' {
+		var text string
+		if json.Unmarshal(trimmed, &text) != nil || strings.TrimSpace(text) == "" {
+			return nil, false
+		}
+		item, _ := json.Marshal(map[string]any{"type": "message", "role": "user", "content": text})
+		return []json.RawMessage{item}, true
+	}
+	return nil, false
 }
 
 // AppendForceCodex429SyntheticPair appends the synthetic custom_tool_call +
@@ -95,7 +141,7 @@ func AppendForceCodex429SyntheticPair(body []byte) ([]byte, bool) {
 	if !ok {
 		return body, false
 	}
-	input, ok := codexResponsesInputItems(inputRaw)
+	input, ok := normalizeForceCodex429Input(inputRaw)
 	if !ok || len(input) == 0 {
 		return body, false
 	}
@@ -105,7 +151,10 @@ func AppendForceCodex429SyntheticPair(body []byte) ([]byte, bool) {
 	if codexBodyHasSyntheticPair(input) {
 		return body, false
 	}
-	callID := newCodexSyntheticCallID()
+	callID, ok := newCodexSyntheticCallID()
+	if !ok {
+		return body, false
+	}
 	callItem, err := json.Marshal(struct {
 		Type   string `json:"type"`
 		CallID string `json:"call_id"`

@@ -34,6 +34,7 @@ import {
   healthBatchPresentation, healthResultPresentation, healthTestRequestBody,
   isKiroSuspended, isProtectedProbeQuarantine, requiresPaidHealthTest, selectedHasPaidProbe,
 } from '../features/accounts/model/healthTest.ts';
+import { formatPlanLabel } from '../features/accounts/model/planFormatter.ts';
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -793,7 +794,7 @@ export default function Accounts() {
     const cols = [
       { title: 'id', get: (r) => r.id }, { title: 'label', get: (r) => r.label }, { title: 'email', get: (r) => r.email },
       { title: 'provider', get: (r) => r.provider }, { title: 'group', get: (r) => r.group_name },
-      { title: 'plan', get: (r) => r.plan_type }, { title: 'auth_method', get: (r) => `${r.auth_method || ''} ${r.credential_mode || ''}` },
+      { title: 'plan', get: (r) => formatPlanLabel(r.plan_type, r.plan_presentation) }, { title: 'auth_method', get: (r) => `${r.auth_method || ''} ${r.credential_mode || ''}` },
       { title: 'billing_mode', get: (r) => r.billing_mode }, { title: 'status', get: (r) => r.status },
 		{ title: 'logical_rpm_60s', get: (r) => r.request_rate?.state === 'unavailable' ? '' : r.request_rate?.logical_rpm },
 		{ title: 'attempt_rpm_60s', get: (r) => r.request_rate?.state === 'unavailable' ? '' : r.request_rate?.attempt_rpm },
@@ -871,7 +872,7 @@ export default function Accounts() {
         return (
           <div className="pool-resource-summary">
             <TextClamp>{r.group_name || '默认'}</TextClamp>
-            <div className="pool-resource-summary__meta">{r.billing_mode === 'pay_as_you_go' ? '按量计费' : (r.plan_type || '未设置套餐')}</div>
+            <div className="pool-resource-summary__meta">{r.billing_mode === 'pay_as_you_go' ? '按量计费' : formatPlanLabel(r.plan_type, r.plan_presentation)}</div>
           </div>
         );
       },
@@ -949,7 +950,7 @@ export default function Accounts() {
           <Tag size="small">{r.provider || 'codex'}</Tag>
           <Tag size="small" color={credential.color}>{credential.label}</Tag>
           <Tag size="small" title={r.group_name || '默认'}>{middleEllipsis(r.group_name || '默认', 12, 6)}</Tag>
-          {r.plan_type ? <Tag size="small">{r.plan_type}</Tag> : null}
+          {r.plan_type || r.plan_presentation ? <Tag size="small">{formatPlanLabel(r.plan_type, r.plan_presentation)}</Tag> : null}
           {r.billing_mode === 'pay_as_you_go' ? <Tag size="small" color="violet">按量计费</Tag> : null}
           <Tag size="small" color="blue" title={route.primary}>{middleEllipsis(route.primary, 14, 8)}</Tag>
 			<AccountRateMetric account={r} compact />

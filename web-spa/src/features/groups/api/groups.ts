@@ -4,6 +4,8 @@ export type UserGroup = {
   id?: string;
   name: string;
   pinned_egress_no_fallback?: boolean;
+	 gpt_safety_buffering_session_rollover_enabled?: boolean;
+	 gpt_text_refusal_session_rollover_enabled?: boolean;
   [key: string]: unknown;
 };
 

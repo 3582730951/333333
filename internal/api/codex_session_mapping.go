@@ -174,9 +174,15 @@ type codexSessionMapping struct {
 	// safetyDetachRequest marks the single request immediately after a rotation,
 	// which detaches from the retired response chain by stripping CPA state pointers
 	// before the upstream request is built.
-	rotateUpstreamSessionOnSafety bool
-	safetyRotationPending         bool
-	safetyDetachRequest           bool
+	rotateUpstreamSessionOnSafety  bool
+	rolloverTextRefusalEnabled     bool
+	rolloverRuntimeEnabled         bool
+	safetyRotationPending          bool
+	safetyDetachRequest            bool
+	pendingRolloverCause           string
+	pendingRolloverDetectorVersion string
+	pendingRolloverCheckpointRef   string
+	rolloverReplayPrepared         bool
 }
 
 // codexContextMigration is a fresh, self-contained replay of a native Codex
@@ -799,14 +805,34 @@ func stripCodexStateForRecoveredRoot(body []byte, header http.Header) ([]byte, h
 	return out, nextHeader, true
 }
 
-// safetySessionRotationEnabledFor reports whether the user-group safety-rotation
-// toggle is on for a request. Opt-in is per user group via
-// config.SafetySessionRotationGroups; legacy keys without a user group are off.
+// safetySessionRotationEnabledFor reports the legacy safety_buffering toggle.
+// It remains readable for one compatibility cycle; text refusal never consults
+// this map.
 func (s *Server) safetySessionRotationEnabledFor(userGroupID string) bool {
 	if s == nil {
 		return false
 	}
 	return s.cfg.SafetySessionRotationGroups[strings.TrimSpace(userGroupID)]
+}
+
+// effectiveRolloverPolicyFor resolves the immutable policy scope. A traffic
+// fallback may rewrite the routing UserGroupID, but it must never grant a feature
+// enabled only on the original authenticated group.
+func (s *Server) effectiveRolloverPolicyFor(ctx context.Context, pol downstreamPolicy) (safety, text bool) {
+	if s == nil {
+		return false, false
+	}
+	groupID := strings.TrimSpace(pol.PolicyUserGroupID)
+	if groupID == "" {
+		groupID = strings.TrimSpace(pol.UserGroupID)
+	}
+	if groupID != "" && s.store != nil {
+		if group, ok, err := s.store.GetUserGroup(ctx, groupID); err == nil && ok {
+			return group.GPTSafetyBufferingSessionRolloverEnabled, group.GPTTextRefusalSessionRolloverEnabled
+		}
+	}
+	// Legacy config is safety_buffering only and is never a text-refusal grant.
+	return s.safetySessionRotationEnabledFor(groupID), false
 }
 
 // codexSafetyRotationFreshRequest detaches the single post-rotation turn from the
@@ -862,13 +888,155 @@ func (m *codexSessionMapping) bindingHasSafetyRotation() bool {
 
 // noteSafetyBuffering latches that the current terminal carried the upstream
 // safety_buffering field so the commit rotates the binding to a fresh session id.
-func (m *codexSessionMapping) noteSafetyBuffering() {
+func (m *codexSessionMapping) noteSafetyBuffering(checkpointRef ...string) {
 	if m == nil {
 		return
 	}
+	ref := ""
+	if len(checkpointRef) > 0 {
+		ref = checkpointRef[0]
+	}
+	m.noteRollover("protocol_safety_buffering", "", ref)
+}
+
+// noteTextRefusal records a detector decision after a completed terminal. It is
+// deliberately separate from the protocol signal so the two user-group flags
+// cannot accidentally enable one another.
+func (m *codexSessionMapping) noteTextRefusal(detectorVersion, checkpointRef string) {
+	if m == nil || !m.rolloverTextRefusalEnabled || !m.rolloverRuntimeEnabled {
+		return
+	}
+	m.noteRollover("text_high_confidence_refusal", detectorVersion, checkpointRef)
+}
+
+func (m *codexSessionMapping) noteRollover(cause, detectorVersion, checkpointRef string) {
+	if m == nil {
+		return
+	}
+	checkpointRef = strings.TrimSpace(checkpointRef)
+	if checkpointRef == "" {
+		return
+	}
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	// A single terminal can carry both signals; protocol reason remains the
+	// canonical cause and repeated observations are idempotent.
+	if m.safetyRotationPending && m.pendingRolloverCause == "protocol_safety_buffering" {
+		return
+	}
 	m.safetyRotationPending = true
-	m.mu.Unlock()
+	m.pendingRolloverCause = strings.TrimSpace(cause)
+	m.pendingRolloverDetectorVersion = strings.TrimSpace(detectorVersion)
+	m.pendingRolloverCheckpointRef = checkpointRef
+}
+
+// pendingRolloverReady reports a policy-authorized durable terminal intent. It
+// intentionally does not mutate in-memory state: the subsequent storage claim is
+// the cross-process single-winner transition.
+func (m *codexSessionMapping) pendingRolloverReady() bool {
+	if m == nil || !m.enabled {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	binding := m.binding
+	if binding == nil || binding.PendingRolloverAt == 0 || strings.TrimSpace(binding.PendingRolloverCheckpointRef) == "" {
+		return false
+	}
+	allowed := false
+	switch binding.PendingRolloverCause {
+	case "protocol_safety_buffering":
+		allowed = m.rolloverRuntimeEnabled && m.rotateUpstreamSessionOnSafety
+	case "text_high_confidence_refusal":
+		allowed = m.rolloverRuntimeEnabled && m.rolloverTextRefusalEnabled
+	}
+	if !allowed {
+		return false
+	}
+	return true
+}
+
+func (m *codexSessionMapping) pendingRolloverCheckpoint() string {
+	if m == nil || !m.enabled {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.binding == nil {
+		return ""
+	}
+	return strings.TrimSpace(m.binding.PendingRolloverCheckpointRef)
+}
+
+// claimPendingCodexRollover consumes a pending terminal intent only after the
+// caller has reconstructed and validated the exact durable Goal replay. The
+// storage CAS persists the fresh upstream identity, allowing a process restart to
+// resume precisely the same downstream request but rejecting a different body.
+func (s *Server) claimPendingCodexRollover(ctx context.Context, mapping *codexSessionMapping, requestBody []byte) error {
+	if s == nil || s.store == nil || mapping == nil || !mapping.pendingRolloverReady() {
+		return storage.ErrCodexSessionRolloverNotPending
+	}
+	mapping.mu.Lock()
+	binding := mapping.binding
+	if binding == nil {
+		mapping.mu.Unlock()
+		return storage.ErrCodexSessionRolloverNotPending
+	}
+	copy := *binding
+	// A root gets a new upstream session; a child retains the root/session but
+	// receives a new branch identity.  Derive it from the durable pending nonce
+	// rather than local randomness: the CAS still elects exactly one claimant,
+	// while an interrupted claimant cannot accidentally mint a different identity
+	// before its state is committed. Neither route carries old parent/fork state.
+	rootID, threadID := codexRolloverFreshIdentity(copy)
+	nonce := copy.PendingRolloverNonce
+	expectedEpoch := copy.Epoch
+	bindingID := copy.ID
+	mapping.mu.Unlock()
+
+	claimCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), codexStateCommitTimeout)
+	defer cancel()
+	claimed, err := s.store.ClaimCodexSessionRollover(claimCtx, storage.CodexSessionRolloverClaim{
+		BindingID:          bindingID,
+		ExpectedEpoch:      expectedEpoch,
+		PendingNonce:       nonce,
+		RequestFingerprint: s.store.CodexRolloverRequestFingerprint(requestBody),
+		RootSessionID:      rootID,
+		ThreadID:           threadID,
+	})
+	if err != nil {
+		return err
+	}
+	mapping.mu.Lock()
+	mapping.binding = &claimed
+	mapping.prospective = nil
+	mapping.requiredAccount = claimed.AccountID
+	mapping.requiredEgress = claimed.EgressID
+	mapping.snapshot = nil
+	mapping.snapshotAcc, mapping.snapshotEgr = "", ""
+	mapping.rolloverReplayPrepared = true
+	mapping.safetyDetachRequest = true
+	mapping.mu.Unlock()
+	return nil
+}
+
+// codexRolloverFreshIdentity derives the fresh identity from the encrypted
+// pending intent.  It is deliberately independent of request contents: request
+// equality is enforced separately by the keyed claim fingerprint, and an exact
+// retry must recover the same persisted fresh epoch without exposing either
+// source IDs or the nonce outside the encrypted mapping payload.
+func codexRolloverFreshIdentity(binding storage.CodexSessionBinding) (rootID, threadID string) {
+	nonce := strings.TrimSpace(binding.PendingRolloverNonce)
+	rootSource := firstNonEmpty(strings.TrimSpace(binding.RootSessionID), strings.TrimSpace(binding.ID), "codex-rollover-root")
+	threadSource := firstNonEmpty(strings.TrimSpace(binding.ThreadID), rootSource)
+	if strings.TrimSpace(binding.ThreadID) != "" && binding.ThreadID != binding.RootSessionID {
+		// A child branch keeps the root session and rotates only its upstream
+		// thread. Its old parent/fork pointers are intentionally cleared by the
+		// claim so no old-epoch state is sent with the rebuilt request.
+		return rootSource, identity.DerivedUUIDv7("codex-rollover-branch/v1\x00"+nonce, threadSource)
+	}
+	rootID = identity.DerivedUUIDv7("codex-rollover-root/v1\x00"+nonce, rootSource)
+	return rootID, rootID
 }
 
 // markSafetyDetached records that this request was the post-rotation detach turn,
@@ -1205,7 +1373,15 @@ func (s *Server) resolveCodexSessionMappingInNamespace(ctx context.Context, r *h
 	if !mapping.enabled {
 		return mapping, nil
 	}
-	mapping.rotateUpstreamSessionOnSafety = s.safetySessionRotationEnabledFor(pol.UserGroupID)
+	legacySafety := s.safetySessionRotationEnabledFor(firstNonEmpty(pol.PolicyUserGroupID, pol.UserGroupID))
+	dbSafety, dbText := s.effectiveRolloverPolicyFor(ctx, pol)
+	runtimeRollover := s.flagEnabled(ctx, "gpt_session_rollover_runtime_enabled", s.cfg.GPTSessionRolloverRuntimeEnabled)
+	// Preserve legacy safety-map behavior for one release cycle, but the global
+	// runtime kill switch remains a true kill switch for both old and new paths.
+	// Text refusal has no legacy path and therefore stays independently opted in.
+	mapping.rotateUpstreamSessionOnSafety = runtimeRollover && (legacySafety || dbSafety)
+	mapping.rolloverTextRefusalEnabled = runtimeRollover && dbText
+	mapping.rolloverRuntimeEnabled = runtimeRollover
 	keyPart := strings.TrimSpace(pol.KeyHash)
 	if keyPart == "" && r != nil {
 		if token := strings.TrimSpace(downstreamBearer(r)); token != "" {
@@ -1722,6 +1898,9 @@ func (m *codexSessionMapping) identitySnapshot(secret []byte, lease scheduler.Le
 		m.prospective = &created
 		binding = &created
 	}
+	// A claimed rollover already persisted its fresh upstream identity through the
+	// storage CAS. Never mint another UUID here: a restart must reuse the exact
+	// claimed identity for the same downstream request.
 	// `identity_os_source=downstream` can legitimately infer different OS
 	// families from a user turn and a later tool-result turn. The upstream
 	// associates a previous_response_id with the full device identity, including
@@ -1976,42 +2155,39 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 	binding.ParentThreadID = mapping.snapshot.ParentThreadID
 	binding.ForkedFromThreadID = mapping.snapshot.ForkedFromThreadID
 	binding.WindowGeneration = mapping.snapshot.WindowGeneration
-	// Safety-buffering rotation: when the terminal carried the Responses
-	// safety_buffering field under the user-group toggle, present a fresh upstream
-	// session id on the binding while the downstream aliases (which resolve this
-	// same binding) stay untouched. The single following turn detaches from the
-	// retired response chain and then clears the marker. The in-flight snapshot is
-	// deliberately left alone: a separately issued native continue within this
-	// request still owns the old session chain.
-	if mapping.rotateUpstreamSessionOnSafety {
-		if mapping.safetyRotationPending {
-			if binding.ThreadID != "" && binding.ThreadID != binding.RootSessionID {
-				// Child branch: the safety-buffered turn lived in a child thread
-				// under a still-valid root session. Rotating the root here would
-				// leave ThreadID/ParentThreadID pointing into the old (retired)
-				// tree while the root names a new session — an upstream thread can
-				// never sit under a different session id, so the next continuation
-				// surfaces as a corrupt session. Instead open a fresh child thread
-				// under the same parent: session-id and x-codex-parent-thread-id
-				// stay valid, the child thread id is new, and the stripped
-				// previous_response_id cannot resolve into the retired child chain.
-				binding.ThreadID = identity.NewUUIDv7()
-			} else {
-				previousSession := binding.RootSessionID
-				binding.RootSessionID = identity.NewUUIDv7()
-				if binding.ThreadID != "" && binding.ThreadID == previousSession {
-					binding.ThreadID = binding.RootSessionID
-				}
-			}
-			binding.SafetyRotatedAt = storage.Now()
-			s.enqueueAudit(storage.AuditLogRow{
-				Action: "codex_upstream_session_safety_rotated",
-				State:  "active",
-				Reason: "safety_buffering",
-				Detail: "downstream_mapping_preserved_upstream_session_rotated",
-			})
-		} else if mapping.safetyDetachRequest {
-			binding.SafetyRotatedAt = 0
+	// Terminal intent is persisted only after the encrypted Goal checkpoint has
+	// committed. It never changes the current terminal's upstream identity. The
+	// next turn claims this marker through a storage CAS and supplies its already
+	// persisted fresh identity; only its successful terminal clears the claim.
+	rolloverCompleted := false
+	rolloverPending := false
+	rolloverCause := ""
+	if mapping.safetyDetachRequest && mapping.rolloverReplayPrepared && binding.SafetyRotatedAt != 0 {
+		binding.SafetyRotatedAt = 0
+		binding.PendingRolloverAt = 0
+		binding.PendingRolloverCause = ""
+		binding.PendingRolloverDetectorVersion = ""
+		binding.PendingRolloverCheckpointRef = ""
+		binding.PendingRolloverSourceEpoch = 0
+		binding.PendingRolloverNonce = ""
+		binding.PendingRolloverRequestFingerprint = ""
+		rolloverCompleted = true
+	}
+	if mapping.safetyRotationPending && strings.TrimSpace(mapping.pendingRolloverCheckpointRef) != "" {
+		cause := strings.TrimSpace(mapping.pendingRolloverCause)
+		if cause == "protocol_safety_buffering" || cause == "text_high_confidence_refusal" {
+			sourceEpoch := binding.Epoch
+			nonceInput := fmt.Sprintf("codex-rollover/v1\x00%s\x00%d\x00%s\x00%s", binding.TreeID, sourceEpoch, mapping.pendingRolloverCheckpointRef, cause)
+			nonceSum := sha256.Sum256([]byte(nonceInput))
+			binding.PendingRolloverAt = storage.Now()
+			binding.PendingRolloverCause = cause
+			binding.PendingRolloverDetectorVersion = strings.TrimSpace(mapping.pendingRolloverDetectorVersion)
+			binding.PendingRolloverCheckpointRef = strings.TrimSpace(mapping.pendingRolloverCheckpointRef)
+			binding.PendingRolloverSourceEpoch = sourceEpoch
+			binding.PendingRolloverNonce = fmt.Sprintf("%x", nonceSum[:])
+			binding.PendingRolloverRequestFingerprint = ""
+			rolloverPending = true
+			rolloverCause = cause
 		}
 	}
 	created := binding.ID == ""
@@ -2035,6 +2211,12 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 	mapping.binding = &committed
 	mapping.prospective = nil
 	mapping.requiredAccount, mapping.requiredEgress = committed.AccountID, committed.EgressID
+	if rolloverPending {
+		s.enqueueAudit(storage.AuditLogRow{Action: "codex_rollover_pending", State: "pending", Reason: rolloverCause, Detail: "checkpoint_durable;metadata_only"})
+	}
+	if rolloverCompleted {
+		s.enqueueAudit(storage.AuditLogRow{Action: "codex_rollover_completed", State: "stable", Reason: "fresh_epoch_terminal", Detail: "metadata_only"})
+	}
 	if created {
 		atomic.AddUint64(&s.codexMappingBindingsCreated, 1)
 		s.enqueueAudit(storage.AuditLogRow{
@@ -2126,10 +2308,12 @@ func (s *Server) retireCodexSessionMapping(ctx context.Context, mapping *codexSe
 
 func (s *Server) writeCodexSessionMappingError(w http.ResponseWriter, stream bool, code string) {
 	message := map[string]string{
-		"codex_session_mapping_unidentified": "Codex stateful request has no exact session mapping; start a new session or retry with its original response id.",
-		"codex_session_mapping_ambiguous":    "Codex session aliases resolve to more than one internal session.",
-		"codex_context_epoch_retired":        "Codex context epoch was retired and no recoverable checkpoint is available for this previous_response_id.",
-		"codex_tool_context_unrecoverable":   "The mapped session cannot be rotated because this tool result has no recoverable matching call. Start a new root turn instead of replaying the tool result.",
+		"codex_session_mapping_unidentified":   "Codex stateful request has no exact session mapping; start a new session or retry with its original response id.",
+		"codex_session_mapping_ambiguous":      "Codex session aliases resolve to more than one internal session.",
+		"codex_context_epoch_retired":          "Codex context epoch was retired and no recoverable checkpoint is available for this previous_response_id.",
+		"codex_tool_context_unrecoverable":     "The mapped session cannot be rotated because this tool result has no recoverable matching call. Start a new root turn instead of replaying the tool result.",
+		"codex_rollover_context_unrecoverable": "The requested session rollover cannot safely reconstruct its durable context. Retry the same turn after resolving the checkpoint issue.",
+		"codex_rollover_in_progress":           "A session rollover is already in progress for this thread. Retry the same turn after it completes.",
 	}[code]
 	if message == "" {
 		message = "Codex session mapping failed."

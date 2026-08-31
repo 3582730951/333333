@@ -110,9 +110,7 @@ func premiumFixtureStatus(current *storage.AccountEntitlementEvidence, conflict 
 	if conflict {
 		return "reviewed_mapping_active_evidence_conflict"
 	}
-	if current != nil && current.SeatType == entitlement.SeatBusinessPremium &&
-		current.Confidence == "high" && current.UsageMultiplierMilli != nil &&
-		*current.UsageMultiplierMilli == 5000 && current.NoFiveHourLimit != nil && *current.NoFiveHourLimit {
+	if hasReviewedBusinessPremiumEvidence(current) {
 		return "recognized_reviewed_5x_fixture_v1"
 	}
 	return "reviewed_mapping_active_waiting_for_match"
@@ -171,7 +169,8 @@ func (s *Server) adminAccountCapacity(w http.ResponseWriter, r *http.Request, ac
 		rateLimits[index].Raw = ""
 	}
 	now := time.Now().Unix()
-	valuation, err := s.store.AccountValuationTotals(r.Context(), accountID, "", now-30*24*60*60, now)
+	valuationFrom := now - 30*24*60*60
+	valuation, err := s.store.AccountValuationTotals(r.Context(), accountID, "", valuationFrom, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -194,18 +193,30 @@ func (s *Server) adminAccountCapacity(w http.ResponseWriter, r *http.Request, ac
 	standardFiveHourPrior := deriveBusinessStandardFiveHourPrior(baselineRows)
 	planOnly := entitlement.FromPlanLabel(account.PlanType)
 	premiumStatus := premiumFixtureStatus(currentEvidence, entitlementConflict)
+	// A Premium 5x seat has no five-hour entitlement; suppress any Plus-derived
+	// Standard prior so capacity evidence cannot accidentally display a 5h budget.
+	if hasReviewedBusinessPremiumEvidence(currentEvidence) {
+		standardFiveHourPrior = businessStandardFiveHourPrior{
+			Status: "suppressed_for_premium_5x", Method: "premium_5x_no_five_hour_window",
+			FactorMilli: businessStandardFromPlusFactorMilli, Role: "capacity_prior_not_entitlement",
+			Estimates: []businessStandardFiveHourEstimate{},
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"account_id":                 accountID,
 		"capacity_estimates":         estimates,
 		"upstream_quota_windows":     rateLimits,
 		"last_30d_valuation":         valuation,
+		"valuation_window":           map[string]int64{"from_at": valuationFrom, "to_at": now},
 		"business_standard_5h_prior": standardFiveHourPrior,
 		"entitlement": map[string]interface{}{
 			"plan_only": planOnly, "current_evidence": currentEvidence, "evidence": evidence,
 			"conflict":                        entitlementConflict,
+			"evidence_freshness":              storage.EntitlementEvidenceFreshness(evidence, now),
 			"premium_fixture_status":          premiumStatus,
 			"premium_fixture_mapping_version": entitlement.BusinessPremiumMappingVersion,
 		},
+		"plan_presentation": accountPlanPresentationFor(account.PlanType, currentEvidence, entitlementConflict),
 		"labels": map[string]string{
 			"usd":     "API list-price equivalent; not an account cash balance",
 			"credits": "ChatGPT Credits estimate only when subscription evidence is available",

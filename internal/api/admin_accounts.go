@@ -90,6 +90,7 @@ type accountView struct {
 	Egress                 *storage.AccountEgressBinding `json:"egress_binding,omitempty"`
 	Usage                  *storage.UsageSummaryRow      `json:"usage,omitempty"`
 	QuotaSummary           QuotaSummary                  `json:"quota_summary"`
+	PlanPresentation       accountPlanPresentation       `json:"plan_presentation"`
 	CodexReauthConfigured  bool                          `json:"codex_reauth_configured,omitempty"`
 	CodexReauthAutoEnabled bool                          `json:"codex_reauth_auto_enabled,omitempty"`
 	CodexReauthLastStatus  string                        `json:"codex_reauth_last_status,omitempty"`
@@ -125,16 +126,18 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 		accountIDs = append(accountIDs, account.ID)
 	}
 	var (
-		providers      map[string]string
-		capabilities   map[string][]storage.ModelCapability
-		bindings       map[string]storage.AccountEgressBinding
-		groups         []storage.Group
-		usages         map[string]storage.UsageSummaryRow
-		tokens         map[string]storage.AccountToken
-		quotaSnapshots map[string][]storage.AccountRateLimit
-		reauthConfigs  map[string]storage.AccountCodexReauthConfig
-		kiroSummaries  map[string]storage.KiroAuthSummary
-		requestRates   map[string]storage.AccountRequestRate
+		providers            map[string]string
+		capabilities         map[string][]storage.ModelCapability
+		bindings             map[string]storage.AccountEgressBinding
+		groups               []storage.Group
+		usages               map[string]storage.UsageSummaryRow
+		tokens               map[string]storage.AccountToken
+		quotaSnapshots       map[string][]storage.AccountRateLimit
+		entitlements         map[string]*storage.AccountEntitlementEvidence
+		entitlementConflicts map[string]bool
+		reauthConfigs        map[string]storage.AccountCodexReauthConfig
+		kiroSummaries        map[string]storage.KiroAuthSummary
+		requestRates         map[string]storage.AccountRequestRate
 	)
 	loadCtx, cancelLoads := context.WithCancel(ctx)
 	defer cancelLoads()
@@ -153,6 +156,10 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 		func() (err error) { tokens, err = s.store.ListTokensByAccountIDs(loadCtx, accountIDs); return err },
 		func() (err error) {
 			quotaSnapshots, err = s.store.ListAccountRateLimitsByAccountIDs(loadCtx, accountIDs)
+			return err
+		},
+		func() (err error) {
+			entitlements, entitlementConflicts, err = s.store.CurrentAccountEntitlementEvidenceByAccountIDs(loadCtx, accountIDs, storage.Now())
 			return err
 		},
 		func() (err error) {
@@ -233,12 +240,18 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 			token = &t
 		}
 		summary := quotaSummaries[index]
+		// PlanType is retained in storage for evidence and audit, but the normal
+		// account list deliberately exposes only the reviewed presentation. This
+		// prevents a raw upstream subtype from becoming a product label by accident.
+		publicAccount := account
+		publicAccount.PlanType = ""
 		view := accountView{
-			Account:      account,
-			Provider:     providers[account.ID],
-			Capabilities: capabilities[account.ID],
-			QuotaSummary: summary,
-			RequestRate:  requestRates[account.ID],
+			Account:          publicAccount,
+			Provider:         providers[account.ID],
+			Capabilities:     capabilities[account.ID],
+			QuotaSummary:     summary,
+			PlanPresentation: accountPlanPresentationFor(account.PlanType, entitlements[account.ID], entitlementConflicts[account.ID]),
+			RequestRate:      requestRates[account.ID],
 		}
 		if token != nil {
 			view.AuthMethod = accountprovider.EffectiveAuthMethod(view.Provider, *token)
@@ -981,11 +994,9 @@ func (s *Server) adminSetAccountRateLimitControls(w http.ResponseWriter, r *http
 	})
 }
 
-// adminSetAccountForceCodex429 updates the account-local "强制卡429" opt-in
-// exposed by the account drawer. Like the rate-limit-controls override it does
-// not clear stored cooldown/quarantine state; switching it back off restores the
-// normal protections immediately. The flag only takes effect at runtime for
-// OpenAI OAuth Codex requests (see codexAttempt); API-key accounts ignore it.
+// adminSetAccountForceCodex429 updates the account-local Codex 429 Guard / 奸商模式
+// setting. Disabling clears only its pending confirmation streak; it deliberately
+// does not clear any authoritative quota or cooldown state.
 func (s *Server) adminSetAccountForceCodex429(w http.ResponseWriter, r *http.Request, accountID string) {
 	if r.Method != http.MethodPost && r.Method != http.MethodPatch {
 		methodNotAllowed(w)
@@ -998,13 +1009,47 @@ func (s *Server) adminSetAccountForceCodex429(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if _, err := s.store.GetAccount(r.Context(), accountID); err != nil {
+	account, err := s.store.GetAccount(r.Context(), accountID)
+	if err != nil {
 		writeError(w, http.StatusNotFound, err)
 		return
+	}
+	if req.ForceCodex429 {
+		token, tokenErr := s.store.GetToken(r.Context(), accountID)
+		if tokenErr != nil {
+			if errors.Is(tokenErr, sql.ErrNoRows) {
+				writeError(w, http.StatusBadRequest, errors.New("force_codex_429 requires an OAuth or SetupToken credential; no account credential was found"))
+			} else {
+				writeError(w, http.StatusInternalServerError, tokenErr)
+			}
+			return
+		}
+		provider := forceCodex429GuardProvider(account, token)
+		if !forceCodex429GuardProviderEligible(provider) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("force_codex_429 only applies to Codex/OpenAI accounts; account provider %q is not eligible", provider))
+			return
+		}
+		if !forceCodex429GuardCredentialEligible(provider, token) {
+			if accountprovider.UsesAPIKey(provider, token) {
+				writeError(w, http.StatusBadRequest, errors.New("force_codex_429 requires an OAuth or SetupToken credential; API-key accounts are not eligible"))
+			} else {
+				writeError(w, http.StatusBadRequest, errors.New("force_codex_429 requires a non-empty OAuth or SetupToken credential"))
+			}
+			return
+		}
 	}
 	if err := s.store.SetAccountForceCodex429(r.Context(), accountID, req.ForceCodex429); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if !req.ForceCodex429 {
+		s.clearForceCodex429Confirmation(accountID)
+		_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+			AccountID: accountID,
+			Action:    "codex_429_admin_cleared",
+			State:     "manual",
+			Reason:    "confirmation_streak_only",
+		})
 	}
 	if s.scheduler != nil {
 		s.scheduler.RefreshAccountCache()
@@ -1013,7 +1058,7 @@ func (s *Server) adminSetAccountForceCodex429(w http.ResponseWriter, r *http.Req
 	s.wakeRouteAvailability()
 	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
 		AccountID: accountID,
-		Action:    "set_force_codex_429",
+		Action:    "codex_429_guard_setting_changed",
 		State:     "manual",
 		Reason:    strconv.FormatBool(req.ForceCodex429),
 	})

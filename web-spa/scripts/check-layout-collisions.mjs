@@ -48,6 +48,7 @@ const adminPages = [
   ['TeamLifecycle', '/team-lifecycle'],
   ['CFEvents', '/cf-events'],
   ['UpstreamErrorRules', '/upstream-error-rules'],
+  ['CodexThreads', '/codex-threads'],
   // The last eight admin routes, none of which had ever been overlap-checked. The six AI provider
   // routes are one component (AISettings) reached with different params, but each renders a
   // different field set, so one standing in for the others would not prove much: a long label

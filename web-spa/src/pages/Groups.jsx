@@ -200,6 +200,8 @@ function blankUserGroup() {
     traffic_fallback_groups: blankTrafficFallbackGroups(),
     traffic_fallback_model_mappings: [],
     pinned_egress_no_fallback: false,
+	 gpt_safety_buffering_session_rollover_enabled: false,
+	 gpt_text_refusal_session_rollover_enabled: false,
     target_keys: [],
     model_routing: [],
   };
@@ -246,6 +248,8 @@ function userGroupDraft(row) {
       target_model: String(mapping.target_model || ''),
     })),
     pinned_egress_no_fallback: Boolean(row.pinned_egress_no_fallback),
+	 gpt_safety_buffering_session_rollover_enabled: Boolean(row.gpt_safety_buffering_session_rollover_enabled),
+	 gpt_text_refusal_session_rollover_enabled: Boolean(row.gpt_text_refusal_session_rollover_enabled),
     model_routing: (row.model_routing || []).map((rule) => ({
       model: rule.model || '',
       tiers: (rule.tiers || []).map((tier) => (tier || []).map(targetKey)),
@@ -313,6 +317,8 @@ function normalizedUserGroupPayload(draft, providers = []) {
     traffic_fallback_groups: trafficFallbackGroups,
     traffic_fallback_model_mappings: trafficFallbackModelMappings,
     pinned_egress_no_fallback: Boolean(draft.pinned_egress_no_fallback),
+	 gpt_safety_buffering_session_rollover_enabled: Boolean(draft.gpt_safety_buffering_session_rollover_enabled),
+	 gpt_text_refusal_session_rollover_enabled: Boolean(draft.gpt_text_refusal_session_rollover_enabled),
     targets,
     model_routing: (draft.model_routing || []).filter((rule) => String(rule.model || '').trim()).map((rule) => {
       const mentioned = new Set();
@@ -904,7 +910,16 @@ function UserGroupEditor({
             <Switch checked={draft.pinned_egress_no_fallback} onChange={(value) => setDraft((current) => ({ ...current, pinned_egress_no_fallback: value }))} />
             <span>出口固定·不回退（出错不切换流量/出口/账号）</span>
           </label>
+		  <label className="pool-inline-switch">
+			<Switch checked={draft.gpt_safety_buffering_session_rollover_enabled} onChange={(value) => setDraft((current) => ({ ...current, gpt_safety_buffering_session_rollover_enabled: value }))} />
+			<span>GPT/Codex 协议 safety_buffering 后在下一轮切换会话</span>
+		  </label>
+		  <label className="pool-inline-switch">
+			<Switch checked={draft.gpt_text_refusal_session_rollover_enabled} onChange={(value) => setDraft((current) => ({ ...current, gpt_text_refusal_session_rollover_enabled: value }))} />
+			<span>GPT/Codex 高置信文本拒绝后在下一轮切换会话</span>
+		  </label>
         </div>
+		<div className="pool-field__help">两项均默认关闭，并且还需要系统级 GPT 会话轮换运行开关。文本拒绝不会由旧版 safety 配置自动开启。</div>
         <div className="pool-instruction-profiles">
           {INSTRUCTION_FAMILIES.map((family) => {
             const profile = draft.model_instruction_profiles?.[family.key] || { enabled: false, files: [] };

@@ -478,6 +478,13 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 			turnBaseCtx = contextWithUsageEventID(turnBaseCtx, newRequestID())
 			turnBaseCtx = contextWithBodySource(turnBaseCtx, source)
 			turnBaseCtx = contextWithBodyMeta(turnBaseCtx, meta)
+			// The upgrade request's headers are connection-scoped, while each
+			// response.create/append frame can carry its own explicit lineage.  Freeze
+			// a fresh identity for this turn before any Responses normalization or
+			// HTTP recovery bridge rewrites the body.
+			identity := frozenRequestClientIdentity(r, meta)
+			turnBaseCtx = contextWithRequestClientIdentity(turnBaseCtx, identity)
+			turnBaseCtx = contextWithAccountAgentClass(turnBaseCtx, string(identity.AgentClass))
 			if prewarm {
 				turnBaseCtx = context.WithValue(turnBaseCtx, codexResponsesWebSocketPrewarmKey{}, true)
 			}

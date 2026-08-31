@@ -219,9 +219,11 @@ func FromHeadersAndBody(headers http.Header, body []byte, protocol string) Reque
 	if json.Unmarshal(body, &root) != nil {
 		return out
 	}
-	var model, originator, agent string
+	var model, originator, clientFamily, clientType, agent string
 	_ = json.Unmarshal(root["model"], &model)
 	_ = json.Unmarshal(root["originator"], &originator)
+	_ = json.Unmarshal(root["client_family"], &clientFamily)
+	_ = json.Unmarshal(root["client_type"], &clientType)
 	_ = json.Unmarshal(root["agent_class"], &agent)
 	// Re-run resolution with body evidence so incompatible strong signals are
 	// represented as an explicit conflict instead of one silently overriding the
@@ -231,6 +233,17 @@ func FromHeadersAndBody(headers http.Header, body []byte, protocol string) Reque
 		out.Evidence = append(out.Evidence, bodyEvidence)
 		out = resolve(out.Evidence)
 		out.InboundProtocol = strings.ToLower(strings.TrimSpace(protocol))
+	}
+	// These are attribution markers, never authentication input.  They are
+	// useful for transports (notably WebSocket turns) that have already scanned
+	// the body into bounded top-level metadata before classification.
+	for _, value := range []string{clientFamily, clientType} {
+		if client := NormalizeClient(value); client != ClientUnknown {
+			out.Evidence = append(out.Evidence, Evidence{Source: "body_client_family", Kind: string(client), Value: "present", Grade: ConfidenceMedium})
+			out = resolve(out.Evidence)
+			out.InboundProtocol = strings.ToLower(strings.TrimSpace(protocol))
+			break
+		}
 	}
 	if agent != "" {
 		out.AgentClass = NormalizeAgent(agent)
@@ -246,7 +259,7 @@ func modelFamily(model string) string {
 	m := strings.ToLower(strings.TrimSpace(model))
 	switch {
 	case strings.HasPrefix(m, "gpt"), strings.HasPrefix(m, "o1"), strings.HasPrefix(m, "o3"), strings.HasPrefix(m, "o4"):
-		return "openai"
+		return "gpt"
 	case strings.HasPrefix(m, "claude"):
 		return "claude"
 	default:
@@ -285,10 +298,11 @@ func resolve(ev []Evidence) RequestClientIdentity {
 		}
 		c := NormalizeClient(e.Kind)
 		p := priority[e.Grade]
+		previous := out.Client
 		if p > best {
 			out.ClientFamily, out.Client, out.ClientType, out.Confidence, best = c, c, c, e.Grade, p
 		}
-		if out.Client != ClientUnknown && c != ClientUnknown && c != out.Client {
+		if previous != ClientUnknown && c != ClientUnknown && c != previous {
 			out.Conflict = true
 			out.ConflictKeys = append(out.ConflictKeys, "client")
 		}
@@ -315,7 +329,7 @@ func resolve(ev []Evidence) RequestClientIdentity {
 			out.EvidenceBits |= EvidenceBodyMarker
 		case "x-openai-subagent", "x-claude-code-is-subagent":
 			out.EvidenceBits |= EvidenceSubagentMarker
-		case "body_originator", "body_agent_class":
+		case "body_originator", "body_agent_class", "body_client_family":
 			out.EvidenceBits |= EvidenceBodyMarker
 		}
 	}

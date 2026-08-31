@@ -302,8 +302,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if bodyMeta.Size > 0 {
 		ctx = contextWithBodyMeta(ctx, bodyMeta)
 	}
+	// Freeze attribution from the original inbound headers/body before any
+	// handler virtualizes Claude Code, bridges Messages to Responses, or applies
+	// a model/body override.  The frozen value follows derived request contexts
+	// and is therefore stable across retries and stream callbacks.
+	identity := frozenRequestClientIdentity(r, bodyMeta)
+	ctx = contextWithRequestClientIdentity(ctx, identity)
 	ctx = contextWithUsageEventID(ctx, newRequestID())
-	ctx = contextWithAccountAgentClass(ctx, requestAccountAgentClass(r))
+	ctx = contextWithAccountAgentClass(ctx, string(identity.AgentClass))
 	ctx = contextWithRuntimeSettingsCache(ctx)
 	r = r.WithContext(ctx)
 	s.mux.ServeHTTP(rec, r)

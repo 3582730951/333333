@@ -201,12 +201,40 @@ func parseAccountRateIDs(rawValues []string) ([]string, error) {
 }
 
 func (s *Server) ObserveAccountRequestAttempt(accountID, provider, routeKind string, contexts ...context.Context) {
-	if s != nil && s.accountRateMeter != nil {
-		class := storage.AgentClassUnknown
-		if len(contexts) > 0 {
-			class = accountAgentClassFromContext(contexts[0])
+	if s == nil {
+		return
+	}
+	ctx := context.Background()
+	if len(contexts) > 0 && contexts[0] != nil {
+		ctx = contexts[0]
+	}
+	identity := requestClientIdentityFromContext(ctx)
+	class := storage.NormalizeAgentClass(string(identity.AgentClass))
+	if class == storage.AgentClassUnknown {
+		class = accountAgentClassFromContext(ctx)
+	}
+	clientFamily := storage.NormalizeClientFamily(string(identity.ClientFamily))
+	if s.accountRateMeter != nil {
+		s.accountRateMeter.ObserveAttemptDimensions(accountID, provider, routeKind, class, clientFamily, time.Time{})
+	}
+	// The first account transport attempt is the durable logical-arrival
+	// boundary. Retries reuse the server-owned event id and therefore leave this
+	// shell unchanged while their attempt RPM remains separately observable.
+	eventID := usageEventIDFromContext(ctx)
+	if eventID == "" {
+		eventID = requestIDFromContext(ctx)
+	}
+	if s.store != nil && eventID != "" && strings.TrimSpace(accountID) != "" {
+		arrivalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		err := s.store.RecordAccountRequestRateArrival(arrivalCtx, storage.AccountUsageRateEvent{
+			EventID: eventID, AccountID: accountID, AgentClass: class,
+			ClientFamily: clientFamily, ClientConfidence: string(identity.Confidence),
+			SettlementState: "unsettled",
+		})
+		cancel()
+		if err != nil {
+			log.Printf("account rate arrival degraded account=%s: %v", accountID, err)
 		}
-		s.accountRateMeter.ObserveAttemptClass(accountID, provider, routeKind, class, time.Time{})
 	}
 }
 

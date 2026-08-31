@@ -564,6 +564,9 @@ VALUES(?,'direct','direct','','',1,'healthy',0,0,'',0,0,?,?) ON CONFLICT(id) DO 
 	if err = s.migrate(ctx); err != nil {
 		return fmt.Errorf("apply PostgreSQL additive migrations: %w", err)
 	}
+	if err = s.EnsureCodex429ConfirmationState(ctx); err != nil {
+		return fmt.Errorf("apply Codex 429 confirmation schema: %w", err)
+	}
 	if err = s.applyCheckedPostgresMigrations(ctx); err != nil {
 		return err
 	}
@@ -627,6 +630,13 @@ var checkedPostgresMigrations = []checkedPostgresMigration{
 		version: "20260830_account_request_rate_settlement_v3",
 		statements: []string{
 			`ALTER TABLE account_usage_rate_events ADD COLUMN IF NOT EXISTS settlement_state TEXT NOT NULL DEFAULT 'unsettled'`,
+		},
+	},
+	{
+		version: "20260830_account_request_rate_client_identity_v4",
+		statements: []string{
+			`ALTER TABLE account_usage_rate_events ADD COLUMN IF NOT EXISTS client_family TEXT NOT NULL DEFAULT 'unknown'`,
+			`ALTER TABLE account_usage_rate_events ADD COLUMN IF NOT EXISTS client_confidence TEXT NOT NULL DEFAULT 'low'`,
 		},
 	},
 	{

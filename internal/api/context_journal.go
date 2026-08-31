@@ -13,6 +13,7 @@ import (
 
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/upstream"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -102,6 +103,11 @@ func (s *Server) persistContextJournalFallback(ctx context.Context, requestBody,
 	id, _ := resp["id"].(string)
 	if id == "" {
 		return errors.New("context journal response id missing")
+	}
+	// The 429 Guard's matching pair is upstream-only transport scaffolding. It
+	// must not become durable replay history or a later client-tool continuation.
+	if input, ok := req["input"]; ok {
+		req["input"] = withoutForceCodex429SyntheticItems(input)
 	}
 	if prev, _ := req["previous_response_id"].(string); prev != "" {
 		if j, e := s.store.GetContextJournal(ctx, prev); e == nil {
@@ -292,6 +298,9 @@ func neutralizeCompletedToolExchanges(input []interface{}, discardEncryptedConte
 		if !ok {
 			continue
 		}
+		if isForceCodex429SyntheticMap(m) {
+			continue
+		}
 		kind := toolOutputPairKind(m)
 		if kind == "" || kind == "tool_search_server" {
 			continue
@@ -307,6 +316,9 @@ func neutralizeCompletedToolExchanges(input []interface{}, discardEncryptedConte
 		m, ok := it.(map[string]interface{})
 		if !ok {
 			out = append(out, it)
+			continue
+		}
+		if isForceCodex429SyntheticMap(m) {
 			continue
 		}
 		callKind := toolCallPairKind(streamString(m["type"]))
@@ -347,6 +359,9 @@ func neutralizeOrphanedToolOutputs(input []interface{}) ([]interface{}, int) {
 		if !ok {
 			continue
 		}
+		if isForceCodex429SyntheticMap(m) {
+			continue
+		}
 		if kind := toolCallPairKind(streamString(m["type"])); kind != "" {
 			if cid := streamString(m["call_id"]); cid != "" {
 				calls[kind+"\x00"+cid] = true
@@ -357,6 +372,9 @@ func neutralizeOrphanedToolOutputs(input []interface{}) ([]interface{}, int) {
 	out := make([]interface{}, 0, len(input))
 	for _, it := range input {
 		if m, ok := it.(map[string]interface{}); ok {
+			if isForceCodex429SyntheticMap(m) {
+				continue
+			}
 			if kind := toolOutputPairKind(m); kind != "" {
 				// A server-executed tool search is already resolved by the Responses
 				// service and is explicitly allowed to omit call_id in stable Codex.
@@ -409,6 +427,9 @@ func hasPendingClientToolCall(input interface{}) bool {
 		if !ok {
 			continue
 		}
+		if isForceCodex429SyntheticMap(item) {
+			continue
+		}
 		if kind := clientToolCallPairKind(item); kind != "" {
 			if callID := streamString(item["call_id"]); callID != "" {
 				pending[kind+"\x00"+callID] = struct{}{}
@@ -458,6 +479,39 @@ func isToolOutputItemType(t string) bool {
 
 func isToolCallItemType(t string) bool {
 	return toolCallPairKind(t) != ""
+}
+
+// isForceCodex429SyntheticMap identifies only the fully paired synthetic Guard
+// item shape. Call-ID prefix alone is not enough, so an ordinary user custom
+// tool that happens to use a similar value cannot be hidden or reclassified.
+func isForceCodex429SyntheticMap(item map[string]interface{}) bool {
+	if item == nil {
+		return false
+	}
+	typ := strings.ToLower(strings.TrimSpace(streamString(item["type"])))
+	if typ != "custom_tool_call" && typ != "custom_tool_call_output" {
+		return false
+	}
+	return upstream.IsForceCodex429SyntheticCallID(streamString(item["call_id"]))
+}
+
+// withoutForceCodex429SyntheticItems removes only Guard scaffolding from a
+// durable replay history. It preserves the original value shape when it is not
+// an array so malformed inputs remain upstream-visible and are not normalized
+// by a recovery path.
+func withoutForceCodex429SyntheticItems(value interface{}) interface{} {
+	items, ok := value.([]interface{})
+	if !ok {
+		return value
+	}
+	out := make([]interface{}, 0, len(items))
+	for _, item := range items {
+		if asMap, ok := item.(map[string]interface{}); ok && isForceCodex429SyntheticMap(asMap) {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func orphanedToolOutputAsUserMessage(m map[string]interface{}) map[string]interface{} {
@@ -573,7 +627,7 @@ func responsesHasEncryptedToolOutput(body []byte) bool {
 	input, _ := root["input"].([]interface{})
 	for _, raw := range input {
 		item, ok := raw.(map[string]interface{})
-		if !ok || toolOutputPairKind(item) == "" {
+		if !ok || isForceCodex429SyntheticMap(item) || toolOutputPairKind(item) == "" {
 			continue
 		}
 		if encrypted, present := item["encrypted_content"]; present && encrypted != nil && strings.TrimSpace(streamString(encrypted)) != "" {

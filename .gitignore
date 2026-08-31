@@ -80,6 +80,26 @@ jest.config.*
 /tools/e2e/
 /tools/visual/
 
+# P0 implementation coverage must remain in version control and CI. Keep the
+# broader local-test policy unchanged for every other test path.
+!internal/api/force_codex_429_test.go
+!internal/api/force_codex_429_synthetic_test.go
+!internal/api/codex_thread_admin_test.go
+!internal/api/codex_rollover_identity_test.go
+!internal/api/entitlement_capture_test.go
+!internal/api/quota_premium_window_test.go
+!internal/api/client_identity_context_test.go
+!internal/clientidentity/client_identity_test.go
+!internal/entitlement/entitlement_test.go
+!internal/refusaldetect/detector_test.go
+!internal/storage/account_request_rate_v2_test.go
+!internal/storage/codex_429_confirmation_test.go
+!internal/storage/codex_session_rollover_claim_test.go
+!internal/upstream/force_codex_429_test.go
+!web-spa/tests/
+web-spa/tests/*
+!web-spa/tests/capacity-contract.test.ts
+
 # Python caches and captured traffic artifacts
 __pycache__/
 *.pyc

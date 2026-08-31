@@ -37,6 +37,11 @@ const (
 	// fixture's single seven-day window with no five-hour window. Neither the
 	// subtype nor the missing window is sufficient on its own.
 	BusinessPremiumMappingVersion = "codex_quota_business_prolite_5x_no_5h_v1"
+	// BusinessPremiumRawPlanLabel is the exact upstream plan label covered by
+	// BusinessPremiumMappingVersion. It intentionally is not a generic Team or
+	// Business classifier: presentation may call a seat Premium only when the
+	// reviewed evidence contract below is complete.
+	BusinessPremiumRawPlanLabel = "self_serve_business_prolite"
 )
 
 type Normalized struct {
@@ -46,6 +51,9 @@ type Normalized struct {
 	NoFiveHourLimit      *bool      `json:"no_five_hour_limit"`
 	Confidence           string     `json:"confidence"`
 	Reason               string     `json:"reason"`
+	// FlagsState is a fail-closed three-state marker for capacity flags:
+	// known (both flags observed), unknown (not signalled), or contradictory.
+	FlagsState string `json:"flags_state"`
 }
 
 func tokenized(raw string) []string {
@@ -86,7 +94,7 @@ func NormalizePlanFamily(raw string) PlanFamily {
 // FromPlanLabel deliberately returns an unknown seat. Email domains, the words
 // team/business, dates, and measured capacity are not seat evidence.
 func FromPlanLabel(raw string) Normalized {
-	return Normalized{PlanFamily: NormalizePlanFamily(raw), SeatType: SeatUnknown, Confidence: "low", Reason: "plan_label_has_no_seat_evidence"}
+	return Normalized{PlanFamily: NormalizePlanFamily(raw), SeatType: SeatUnknown, Confidence: "low", Reason: "plan_label_has_no_seat_evidence", FlagsState: "unknown"}
 }
 
 type ReviewedSeatObservation struct {
@@ -119,8 +127,15 @@ func FromReviewedSeatObservation(observation ReviewedSeatObservation) Normalized
 		return result
 	}
 	result.SeatType = observation.SeatType
+	if observation.SeatType == SeatUnknown {
+		result.Reason = "reviewed_mapping_has_no_seat"
+		return result
+	}
 	result.Confidence = "high"
 	result.Reason = "reviewed_authoritative_mapping"
+	if observation.SeatType == SeatBusinessPremium || observation.SeatType == SeatBusinessStandard {
+		result.FlagsState = "known"
+	}
 	switch observation.SeatType {
 	case SeatBusinessPremium:
 		multiplier, noFiveHour := int64(5000), true
@@ -138,20 +153,38 @@ func FromReviewedSeatObservation(observation ReviewedSeatObservation) Normalized
 	return result
 }
 
+// IsReviewedBusinessPremiumEvidence is the shared, fail-closed predicate for
+// the reviewed Team (5x) fixture. It does not infer a seat from a plan label;
+// callers must supply a current, validated evidence row captured from the
+// exact quota-metadata shape. Keeping this predicate here prevents API/UI
+// surfaces from growing their own slightly different Premium classifiers.
+func IsReviewedBusinessPremiumEvidence(planLabel, sourceKind string, seat SeatType, confidence string, multiplier *int64, noFiveHour *bool) bool {
+	return strings.EqualFold(strings.TrimSpace(planLabel), BusinessPremiumRawPlanLabel) &&
+		strings.TrimSpace(sourceKind) == "quota_metadata" &&
+		seat == SeatBusinessPremium &&
+		strings.TrimSpace(confidence) == "high" &&
+		multiplier != nil && *multiplier == 5000 &&
+		noFiveHour != nil && *noFiveHour
+}
+
 // WireObservation is a deliberately small, credential-free projection of an
 // upstream entitlement response.  It is useful for collectors that receive
 // rolling wire schemas without making the collector itself a source of seat
 // claims.
 type WireObservation struct {
-	PlanLabel       string
-	SeatRaw         string
-	MultiplierMilli *int64
-	NoFiveHour      *bool
-	SourceKind      string
-	MappingReviewed bool
-	MappingVersion  string
-	SignatureValid  bool
-	Payload         map[string]interface{}
+	PlanLabel         string
+	SeatRaw           string
+	MultiplierMilli   *int64
+	MultiplierPresent bool
+	MultiplierValid   bool
+	NoFiveHour        *bool
+	NoFiveHourPresent bool
+	NoFiveHourValid   bool
+	SourceKind        string
+	MappingReviewed   bool
+	MappingVersion    string
+	SignatureValid    bool
+	Payload           map[string]interface{}
 }
 
 // ParseWireObservation extracts only explicit entitlement fields.  It never
@@ -169,17 +202,20 @@ func ParseWireObservation(root map[string]interface{}, sourceKind string) WireOb
 	if out.SeatRaw == "" {
 		out.SeatRaw = nestedStringAt(root, []string{"entitlement", "seat_type"}, []string{"entitlement", "seatType"}, []string{"workspace_entitlement", "seat_type"}, []string{"workspaceEntitlement", "seatType"})
 	}
-	if value, ok := firstNumberAt(root, "usage_multiplier_milli", "usageMultiplierMilli"); ok {
-		out.MultiplierMilli = &value
-	} else if value, ok := firstNumberAt(root, "usage_multiplier", "usageMultiplier", "multiplier"); ok {
-		// Wire APIs commonly express this as 5 or 5.0 rather than 5000.
-		if value > 0 && value < 100 {
-			value *= 1000
+	// Keep presence and validity distinct. An explicitly malformed wire field is
+	// evidence against a reviewed Premium mapping, never an absent field that can
+	// be silently filled with the fixture defaults below.
+	if value, present, valid := explicitMultiplierAt(root); present {
+		out.MultiplierPresent, out.MultiplierValid = true, valid
+		if valid {
+			out.MultiplierMilli = &value
 		}
-		out.MultiplierMilli = &value
 	}
-	if value, ok := firstBoolAt(root, "no_five_hour_limit", "noFiveHourLimit", "has_no_five_hour_limit"); ok {
-		out.NoFiveHour = &value
+	if value, present, valid := explicitBoolAt(root, "no_five_hour_limit", "noFiveHourLimit", "has_no_five_hour_limit"); present {
+		out.NoFiveHourPresent, out.NoFiveHourValid = true, valid
+		if valid {
+			out.NoFiveHour = &value
+		}
 	}
 	// Only copy scalar, non-secret evidence fields into the optional redacted
 	// payload.  The storage validator applies a second forbidden-key check.
@@ -188,7 +224,10 @@ func ParseWireObservation(root map[string]interface{}, sourceKind string) WireOb
 			out.Payload[key] = value
 		}
 	}
-	if version, reviewed := ReviewedBusinessPremiumQuotaMapping(root, sourceKind); reviewed &&
+	explicitFlagsCompatible :=
+		(!out.MultiplierPresent || (out.MultiplierValid && out.MultiplierMilli != nil && *out.MultiplierMilli == 5000)) &&
+			(!out.NoFiveHourPresent || (out.NoFiveHourValid && out.NoFiveHour != nil && *out.NoFiveHour))
+	if version, reviewed := ReviewedBusinessPremiumQuotaMapping(root, sourceKind); reviewed && explicitFlagsCompatible &&
 		(out.SeatRaw == "" || premiumSeatRaw(out.SeatRaw)) &&
 		(out.MultiplierMilli == nil || *out.MultiplierMilli == 5000) &&
 		(out.NoFiveHour == nil || *out.NoFiveHour) {
@@ -218,7 +257,7 @@ func ReviewedBusinessPremiumQuotaMapping(root map[string]interface{}, sourceKind
 		return "", false
 	}
 	plan := firstStringAt(root, "plan_type", "planType", "subscription_type", "subscriptionType", "plan")
-	if !strings.EqualFold(strings.TrimSpace(plan), "self_serve_business_prolite") {
+	if !strings.EqualFold(strings.TrimSpace(plan), BusinessPremiumRawPlanLabel) {
 		return "", false
 	}
 
@@ -317,6 +356,64 @@ func firstNumberAt(root map[string]interface{}, keys ...string) (int64, bool) {
 		}
 	}
 	return 0, false
+}
+
+// explicitMultiplierAt accepts only positive integral numeric values. It checks
+// every supported alias so a malformed or conflicting duplicate cannot hide
+// behind a valid sibling field. `usage_multiplier` is normalized from 5 to
+// 5000 milli-units, while an explicit milli-unit field is left as-is.
+func explicitMultiplierAt(root map[string]interface{}) (int64, bool, bool) {
+	var value int64
+	have := false
+	for _, candidate := range []struct {
+		key   string
+		scale bool
+	}{
+		{key: "usage_multiplier_milli"},
+		{key: "usageMultiplierMilli"},
+		{key: "usage_multiplier", scale: true},
+		{key: "usageMultiplier", scale: true},
+		{key: "multiplier", scale: true},
+	} {
+		raw, present := root[candidate.key]
+		if !present {
+			continue
+		}
+		parsed, valid := nonNegativeNumber(raw)
+		if !valid || parsed <= 0 {
+			return 0, true, false
+		}
+		if candidate.scale && parsed < 100 {
+			parsed *= 1000
+		}
+		if have && value != parsed {
+			return 0, true, false
+		}
+		value, have = parsed, true
+	}
+	return value, have, have
+}
+
+// explicitBoolAt preserves the same three-state contract for booleans. JSON
+// strings such as "true" are intentionally invalid instead of coerced.
+func explicitBoolAt(root map[string]interface{}, keys ...string) (bool, bool, bool) {
+	var value bool
+	have := false
+	for _, key := range keys {
+		raw, present := root[key]
+		if !present {
+			continue
+		}
+		parsed, valid := raw.(bool)
+		if !valid {
+			return false, true, false
+		}
+		if have && value != parsed {
+			return false, true, false
+		}
+		value, have = parsed, true
+	}
+	return value, have, have
 }
 
 func firstBoolAt(root map[string]interface{}, keys ...string) (bool, bool) {
@@ -418,8 +515,11 @@ func NormalizedFromWire(root map[string]interface{}, sourceKind string, mappingR
 	// Contradictory explicit flags always fail closed, including when a legacy
 	// deployment-wide mapping opt-in is enabled. A Premium spelling cannot turn
 	// a 1x seat or a seat with a five-hour limit into a 5x entitlement.
+	invalidExplicitFlags := (observation.MultiplierPresent && !observation.MultiplierValid) ||
+		(observation.NoFiveHourPresent && !observation.NoFiveHourValid)
 	if seat == SeatBusinessPremium &&
-		((observation.MultiplierMilli != nil && *observation.MultiplierMilli != 5000) ||
+		(invalidExplicitFlags ||
+			(observation.MultiplierMilli != nil && *observation.MultiplierMilli != 5000) ||
 			(observation.NoFiveHour != nil && !*observation.NoFiveHour)) {
 		seat = SeatUnknown
 	}
@@ -429,6 +529,17 @@ func NormalizedFromWire(root map[string]interface{}, sourceKind string, mappingR
 	})
 	if result.SeatType == SeatUnknown && observation.PlanLabel == "" {
 		result.Reason = fmt.Sprintf("%s_no_plan_or_seat_evidence", firstNonEmpty(sourceKind, "wire"))
+	}
+	if invalidExplicitFlags {
+		result.FlagsState = "contradictory"
+	} else if observation.MultiplierMilli != nil || observation.NoFiveHour != nil {
+		if observation.MultiplierMilli == nil || observation.NoFiveHour == nil {
+			result.FlagsState = "unknown"
+		} else if *observation.MultiplierMilli != 5000 || !*observation.NoFiveHour {
+			result.FlagsState = "contradictory"
+		} else {
+			result.FlagsState = "known"
+		}
 	}
 	return result, observation
 }

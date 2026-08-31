@@ -756,6 +756,18 @@ type Config struct {
 	// remaining headers approach zero, so the pool rotates BEFORE hitting the wall.
 	// Default on. Reduces limit-hits without touching quality/experience.
 	RateLimitGuardEnabled bool `json:"rate_limit_guard_enabled"`
+	// Codex429GuardRuntimeEnabled is the global kill switch for account-level
+	// Codex 429 Guard behavior. It defaults to false so existing account flags
+	// remain inert until an operator explicitly enables the runtime.
+	Codex429GuardRuntimeEnabled bool `json:"codex_429_guard_runtime_enabled"`
+	// Codex429GuardFallbackCooldownSeconds is used only after two explicit
+	// confirmed 429 responses when no trustworthy upstream reset is available.
+	// Zero disables this synthetic fallback; authoritative quota resets still win.
+	Codex429GuardFallbackCooldownSeconds int `json:"codex_429_guard_fallback_cooldown_seconds"`
+	// GPTSessionRolloverRuntimeEnabled is the global operational kill switch for
+	// optional refusal/safety session rollover. It can only disable the feature;
+	// user-group flags remain independent and default to false.
+	GPTSessionRolloverRuntimeEnabled bool `json:"gpt_session_rollover_runtime_enabled"`
 	// Codex reset credits are ChatGPT-side active reset credits for the Codex 7d
 	// rate-limit window. Auto consume is default-on; allow/deny lists are emergency
 	// rollout controls.
@@ -1194,6 +1206,9 @@ func Default() Config {
 		// gets a 429, causing poor UX. The guard honors rate-limit headers from
 		// successful responses and preemptively rotates to fresh accounts.
 		RateLimitGuardEnabled:                  true,
+		Codex429GuardRuntimeEnabled:            false,
+		Codex429GuardFallbackCooldownSeconds:   5,
+		GPTSessionRolloverRuntimeEnabled:       false,
 		CodexResetCreditsAutoEnabled:           true,
 		CodexResetCreditsUnknownConsumeEnabled: true,
 		SeamlessFailover:                       true,

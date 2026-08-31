@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"strconv"
 	"strings"
 
 	"codex-account-pool/internal/entitlement"
@@ -35,7 +36,7 @@ func (s *Server) captureEntitlementEvidence(ctx context.Context, accountID, sour
 		return
 	}
 	now := storage.Now()
-	fingerprint := entitlementEvidenceFingerprint(s.identitySecretCached, accountID, source, payloadJSON)
+	fingerprint := entitlementEvidenceFingerprint(s.identitySecretCached, accountID, source, payloadJSON, now)
 	if fingerprint == "" {
 		return
 	}
@@ -70,14 +71,24 @@ func entitlementMappingReviewed() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("CODEX_POOL_ENTITLEMENT_MAPPING_REVIEWED")), "true")
 }
 
-func entitlementEvidenceFingerprint(secret []byte, accountID, source string, payload []byte) string {
+const entitlementEvidenceRefreshBucketSeconds int64 = 60 * 60
+
+// entitlementEvidenceFingerprint is content- and observation-time-derived.
+// The hourly bucket makes a poll/stream observation of the same response
+// idempotent during normal convergence, while a later successful observation
+// gets a fresh evidence ID and can extend the 24-hour freshness interval.
+func entitlementEvidenceFingerprint(secret []byte, accountID, source string, payload []byte, observedAt int64) string {
 	if len(secret) < 16 || strings.TrimSpace(accountID) == "" {
 		return ""
+	}
+	if observedAt <= 0 {
+		observedAt = storage.Now()
 	}
 	mac := hmac.New(sha256.New, secret)
 	_, _ = mac.Write([]byte("entitlement-evidence-v1\x00"))
 	_, _ = mac.Write([]byte(accountID))
 	_, _ = mac.Write([]byte("\x00" + normalizedEntitlementSource(source) + "\x00"))
 	_, _ = mac.Write(payload)
+	_, _ = mac.Write([]byte("\x00bucket=" + strconv.FormatInt(observedAt/entitlementEvidenceRefreshBucketSeconds, 10)))
 	return hex.EncodeToString(mac.Sum(nil))
 }

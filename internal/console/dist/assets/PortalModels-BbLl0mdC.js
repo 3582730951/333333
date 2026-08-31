@@ -1,0 +1,1 @@
+import"./browserStorage-BOQnGVsI.js";import{n as e,t}from"./jsx-runtime-B2iFcflP.js";import{t as n}from"./ModelNameList-BIYXEIUw.js";e();var r=t();function i(){return(0,r.jsx)(n,{endpoint:`/user/models`,title:`可用模型`,subtitle:`你的启用推理 Key 所属分组可访问的模型名称`})}export{i as default};

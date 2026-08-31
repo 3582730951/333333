@@ -728,9 +728,10 @@ retryUserGroupRoute:
 		candidateContext := withUserGroupRouteOverride(r.Context(), target)
 		if replaySafe && moreUnits {
 			// An ordinary locally cooled account is not a last resort while another
-			// target explicitly authorized by this user group remains. Explicit
-			// ForceCodex429/IgnoreRateLimitControls accounts retain their operator-
-			// selected behavior; the final unit also retains the established
+			// target explicitly authorized by this user group remains. Only the
+			// separate IgnoreRateLimitControls operator override remains probe-
+			// eligible; ForceCodex429 never bypasses cooldown. The final unit retains
+			// the established
 			// all-targets-exhausted recovery path.
 			candidateContext = scheduler.WithCooldownTrialsRestrictedToOverrides(candidateContext)
 		}

@@ -73,15 +73,16 @@ type Dependencies struct {
 }
 
 type Server struct {
-	cfg               config.Config
-	releaseID         string
-	store             *storage.Store
-	accountRateMeter  *storage.AccountRateMeter
-	accountRateHub    *accountRateHub
-	incidentReporter  *incident.Reporter
-	scheduler         *scheduler.Scheduler
-	routeAvailability *routeAvailabilityIndex
-	upstream          *upstream.Client
+	cfg                  config.Config
+	releaseID            string
+	store                *storage.Store
+	accountRateMeter     *storage.AccountRateMeter
+	accountRateHub       *accountRateHub
+	incidentReporter     *incident.Reporter
+	scheduler            *scheduler.Scheduler
+	routeAvailability    *routeAvailabilityIndex
+	upstream             *upstream.Client
+	codexRuntimeRegistry *CodexRuntimeRegistry
 	// upstreamConfigPublishMu linearizes every persisted effectUpstream change with
 	// the DB snapshot published to the live client. Without this, an older request can
 	// resolve its snapshot, pause, and overwrite a newer request's live configuration.
@@ -352,6 +353,7 @@ func NewServer(dep Dependencies) *Server {
 	} else {
 		s.identitySecretCached = identity.ResolveSecret([]byte(dep.Config.IdentitySecret))
 	}
+	s.codexRuntimeRegistry = NewCodexRuntimeRegistry(s.identitySecretCached)
 	// Loading a small, checksum-verified local LKG profile is best-effort and never
 	// participates in startup readiness. Network refreshes run only in the active
 	// background role below.
@@ -447,6 +449,20 @@ func (s *Server) StartRuntime() error {
 		return errors.New("server runtime is nil")
 	}
 	s.runtimeStartOnce.Do(func() {
+		// Legacy safety_session_rotation_groups remains dual-read for a full
+		// compatibility cycle. Backfill only its true, existing group IDs; the
+		// independent text-refusal flag is never inferred from legacy config.
+		if s.store != nil && len(s.cfg.SafetySessionRotationGroups) > 0 {
+			groupIDs := make([]string, 0, len(s.cfg.SafetySessionRotationGroups))
+			for groupID, enabled := range s.cfg.SafetySessionRotationGroups {
+				if enabled {
+					groupIDs = append(groupIDs, groupID)
+				}
+			}
+			if err := s.store.BackfillGPTSafetyBufferingSessionRollover(context.Background(), groupIDs); err != nil {
+				log.Printf("[SESSION-ROLLOVER] legacy safety backfill degraded: %v", err)
+			}
+		}
 		if s.cfg.UsageJournalEnabled && s.store != nil && !s.store.InMemory() {
 			journalDir, err := usageJournalDirectory(s.cfg, s.store.Path())
 			if err != nil {
@@ -606,6 +622,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/accounts", s.adminAccounts)
 	s.mux.HandleFunc("/admin/accounts/rates", s.adminAccountRates)
 	s.mux.HandleFunc("/admin/stream/account-rates", s.adminAccountRatesStream)
+	// App-server threads are a separate control-plane resource. They intentionally
+	// do not reuse browser login sessions, account affinity sessions, CPA mappings,
+	// or the deployment-drain WebSocket registry.
+	s.mux.HandleFunc("/admin/codex-runtimes", s.adminCodexRuntimes)
+	s.mux.HandleFunc("/admin/codex-threads", s.adminCodexThreads)
+	s.mux.HandleFunc("/admin/codex-threads/events", s.adminCodexThreadEvents)
+	s.mux.HandleFunc("/admin/codex-threads/", s.adminCodexThreadAction)
 	s.mux.HandleFunc("/admin/models", s.handleAdminModels)
 	s.mux.HandleFunc("/admin/accounts/summary", s.adminAccountsSummary)
 	s.mux.HandleFunc("/admin/accounts/export", s.adminAccountsExport)
@@ -1513,6 +1536,41 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// A refusal terminal leaves the old CPA binding stable and records only a
+		// durable intent. The following turn must first reconstruct the exact Goal
+		// checkpoint, then win the storage CAS before any old upstream pointer is
+		// stripped or a fresh identity is selected.
+		if mappingErr == nil && codexMapping != nil && codexMapping.pendingRolloverReady() {
+			originalRolloverRequest := append([]byte(nil), raw...)
+			checkpointRef := codexMapping.pendingRolloverCheckpoint()
+			replay := s.goalReplayBody(r.Context(), r, "codex", raw)
+			if replay.Kind != goalResumeFound || checkpointRef == "" || replay.Session.CurrentCheckpoint != checkpointRef {
+				s.enqueueAudit(storage.AuditLogRow{Action: "codex_rollover_context_unrecoverable", State: "failed", Reason: "checkpoint_mismatch", Detail: "old_epoch_preserved"})
+				s.writeCodexSessionMappingError(w, isStreamRequest(raw), "codex_rollover_context_unrecoverable")
+				return
+			}
+			cleanBody, cleanHeader, clean := stripCodexStateForRecoveredRoot(replay.Body, r.Header)
+			if !clean {
+				s.enqueueAudit(storage.AuditLogRow{Action: "codex_rollover_context_unrecoverable", State: "failed", Reason: "state_pointer_not_removable", Detail: "old_epoch_preserved"})
+				s.writeCodexSessionMappingError(w, isStreamRequest(raw), "codex_rollover_context_unrecoverable")
+				return
+			}
+			if claimErr := s.claimPendingCodexRollover(r.Context(), codexMapping, originalRolloverRequest); claimErr != nil {
+				code := "codex_rollover_context_unrecoverable"
+				if errors.Is(claimErr, storage.ErrCodexSessionRolloverInProgress) || errors.Is(claimErr, storage.ErrCodexSessionEpochConflict) {
+					code = "codex_rollover_in_progress"
+				}
+				s.enqueueAudit(storage.AuditLogRow{Action: code, State: "failed", Reason: "claim_rejected", Detail: "old_epoch_preserved"})
+				s.writeCodexSessionMappingError(w, isStreamRequest(raw), code)
+				return
+			}
+			raw = cleanBody
+			r = r.Clone(r.Context())
+			r.Header = cleanHeader
+			freshRootAfterContextLoss = true
+			contextRecoveryStatus = "rollover_rebuilt"
+			s.enqueueAudit(storage.AuditLogRow{Action: "codex_rollover_claimed", State: "fresh_epoch_in_progress", Reason: "durable_replay", Detail: "metadata_only"})
+		}
 		if freshRootAfterContextLoss {
 			w.Header().Set("X-MiCliProxy-Context-Status", firstNonEmpty(contextRecoveryStatus, "new_root_after_context_loss"))
 		}
@@ -2031,12 +2089,12 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 	}
 
-	// 强制卡429 (opt-in, per OpenAI OAuth account): append the synthetic
-	// custom_tool_call + custom_tool_call_output pair so the upstream keeps the
-	// agent tool context alive. Skipped for compaction turns and the
-	// chat→responses bridge; the helper itself dedupes prepared retries and
-	// enforces tail eligibility and the size guard.
-	if !isCompact && !isChat && !upstream.AccountUsesAPIKey(token) && lease.Account.ForceCodex429 {
+	// Codex 429 Guard may append a synthetic custom_tool_call +
+	// custom_tool_call_output checkpoint only when its global kill switch and the
+	// account's eligible non-API-key credential are both enabled. It is skipped
+	// for compaction turns and the chat→responses bridge.
+	codex429ConfirmationActive := s.codex429ConfirmationEnabled(r.Context(), lease.Account, token)
+	if !isCompact && !isChat && s.codex429GuardEnabled(r.Context(), lease.Account, token) {
 		if updated, ok := upstream.AppendForceCodex429SyntheticPair(body); ok {
 			body = updated
 		}
@@ -2439,7 +2497,12 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		writeError(w, http.StatusBadGateway, err)
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
-	if attemptedWebSocket && resp.StatusCode >= http.StatusBadRequest {
+	// A first explicit 429 eligible for two-signal confirmation must retain its
+	// original WebSocket transport. Falling back to HTTP here would turn the
+	// confirmation attempt into a different transport/connection and violate the
+	// exact same-lease confirmation contract.
+	if attemptedWebSocket && resp.StatusCode >= http.StatusBadRequest &&
+		!(codex429ConfirmationActive && resp.StatusCode == http.StatusTooManyRequests) {
 		s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, finalEgress, "websocket_handshake_response", resp.StatusCode)
 		originalStatus := resp.StatusCode
 		originalHeader := resp.Header.Clone()
@@ -2469,8 +2532,8 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 	}()
 	codexResetRetried := false
-	forceCodex429StormAttempted := false
 	statefulRuleRecoveryAttempted := false
+	codex429ConfirmationAttempted := false
 	handleResponsesContextAttemptError := func(status int, header http.Header, body []byte, reason string) (codexAttemptResult, bool) {
 		contextError := responsesContextError(status, body)
 		if contextError == leakfilter.ResponsesContextErrorNone {
@@ -2546,63 +2609,69 @@ codexResponse:
 	if resp.StatusCode >= 400 {
 		errorBody := readUpstreamErrorBody(resp.Body)
 		errorBody = redactAgentIdentityError(token, errorBody)
-		if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error"); ok {
-			return handled
-		}
-		// 强制卡429 (opt-in, per OpenAI OAuth account): the trigger remains exactly
-		// two explicit 429s in the existing confirmation window.  Once confirmed,
-		// retain this account/egress and run a 100-worker, no-cooldown storm for up
-		// to fifteen minutes.  The first non-429 response wins; only expiry permits
-		// this request to fail over to another account.
-		if !forceCodex429StormAttempted && lease.Account.ForceCodex429 && resp.StatusCode == http.StatusTooManyRequests && !upstream.AccountUsesAPIKey(token) {
+		guardConfirmed429 := false
+		// The Guard's only extra wire attempt is a serial confirmation request on
+		// the same leased account, egress, transport and identity. The first 429
+		// is durable evidence but is not itself a cooldown. A transport failure
+		// leaves that first signal intact and surfaces the original terminal rather
+		// than spinning or treating it as a second signal.
+		if codex429ConfirmationActive && resp.StatusCode == http.StatusTooManyRequests {
+			s.captureQuota(r.Context(), lease.Account.ID, "codex", model, resp.Header)
 			if s.confirmForceCodex429(r.Context(), lease.Account.ID) {
-				forceCodex429StormAttempted = true
-				initial429Status, initial429Header, initial429Body := resp.StatusCode, resp.Header.Clone(), append([]byte(nil), errorBody...)
-				if resp.Body != nil {
-					_ = resp.Body.Close()
-				}
-				resp, finalEgress, err = s.retryCodexForce429Storm(r.Context(), lease, func() upstream.Request {
-					return requestForToken(token)
-				})
-				if err != nil {
-					_ = s.settleBillingHold(r.Context(), holdID, "force_codex_429_retry_interrupted")
+				guardConfirmed429 = true
+				s.enqueueAudit(storage.AuditLogRow{AccountID: lease.Account.ID, AccountLabel: lease.Account.Label,
+					Action: "codex_429_confirmed", State: "confirmed", Reason: "upstream_explicit", Detail: "scope=global;attempt=2"})
+				s.installConfirmedCodex429Cooldown(r.Context(), lease.Account, resp.Header, errorBody)
+			} else if !codex429ConfirmationAttempted {
+				codex429ConfirmationAttempted = true
+				s.enqueueAudit(storage.AuditLogRow{AccountID: lease.Account.ID, AccountLabel: lease.Account.Label,
+					Action: "codex_429_first_signal", State: "pending_first_signal", Reason: "upstream_explicit", Detail: "scope=global;attempt=1"})
+				originalStatus, originalHeader := resp.StatusCode, resp.Header.Clone()
+				originalBody := append([]byte(nil), errorBody...)
+				_ = resp.Body.Close()
+				delay := codex429ConfirmationRetryDelay(originalHeader)
+				s.enqueueAudit(storage.AuditLogRow{AccountID: lease.Account.ID, AccountLabel: lease.Account.Label,
+					Action: "codex_429_confirmation_retry", State: "scheduled", Reason: "upstream_explicit", Detail: "ordinal=2;delay_ms=" + strconv.FormatInt(delay.Milliseconds(), 10)})
+				if err := waitForIgnoredRateLimitRetry(r.Context(), delay); err != nil {
+					_ = s.settleBillingHold(r.Context(), holdID, "codex_429_confirmation_interrupted")
 					if r.Context().Err() != nil {
 						return codexAttemptResult{Outcome: outcomeDone}
 					}
-					if errors.Is(err, errForceCodex429StormExpired) {
-						// The complete force window elapsed without a usable response.
-						// Exclude the original account before the next scheduler pass;
-						// unlike normal rate-limit handling, this transition does not
-						// sleep for Retry-After or a persisted cooldown.
-						if exclude != nil {
-							exclude[lease.Account.ID] = true
-						}
-						s.scheduler.RefreshAccountCache()
-						if movable {
-							if allowRetry {
-								return retry()
-							}
-							// Preserve one outer selection pass even when this account
-							// consumed the initial failover budget.
-							return codexAttemptResult{Outcome: outcomeRetry, WaitForCapacity: true}
-						}
-						// Stateful/native sessions cannot safely cross accounts with a
-						// live previous_response_id. Keep the original 429 private.
-						s.writeFilteredError(r.Context(), w, "codex", initial429Status, initial429Header, initial429Body, codexScrubber)
-						return codexAttemptResult{Outcome: outcomeDone}
-					}
-					writeError(w, http.StatusBadGateway, err)
+					s.writeFilteredError(r.Context(), w, "codex", originalStatus, originalHeader, originalBody, codexScrubber)
 					return codexAttemptResult{Outcome: outcomeDone}
 				}
-				if resp != nil && resp.StatusCode < http.StatusBadRequest {
+				resp, finalEgress, err = s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
+				if err != nil {
+					_ = s.settleBillingHold(r.Context(), holdID, "codex_429_confirmation_transport_error")
+					s.writeFilteredError(r.Context(), w, "codex", originalStatus, originalHeader, originalBody, codexScrubber)
+					return codexAttemptResult{Outcome: outcomeDone}
+				}
+				if resp.StatusCode < http.StatusBadRequest {
+					s.clearForceCodex429Confirmation(lease.Account.ID)
+					s.enqueueAudit(storage.AuditLogRow{AccountID: lease.Account.ID, AccountLabel: lease.Account.Label,
+						Action: "codex_429_streak_cleared", State: "normal_response", Reason: "upstream_non_429", Detail: "confirmation_attempt=2"})
 					goto codexSuccess
 				}
-				if resp != nil {
-					goto codexResponse
-				}
-				writeError(w, http.StatusBadGateway, errors.New("force codex 429 storm returned no response"))
-				return codexAttemptResult{Outcome: outcomeDone}
+				goto codexResponse
 			}
+		} else if codex429ConfirmationAttempted {
+			// The confirmation response was an explicit non-429 error. It must use
+			// the ordinary classifier, but can no longer borrow the first signal.
+			s.clearForceCodex429Confirmation(lease.Account.ID)
+			s.enqueueAudit(storage.AuditLogRow{AccountID: lease.Account.ID, AccountLabel: lease.Account.Label,
+				Action: "codex_429_streak_cleared", State: "non_429_error", Reason: "upstream_non_429", Detail: "confirmation_attempt=2"})
+		}
+		// A confirmed Guard event has consumed the only permitted extra upstream
+		// attempt. Surface the observed 429 after installing its monotonic cooldown;
+		// do not let unrelated version/auth/reset/failover branches create a third
+		// wire attempt on this logical request.
+		if guardConfirmed429 {
+			_ = s.settleBillingHold(r.Context(), holdID, "codex_429_confirmed")
+			s.writeFilteredError(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber)
+			return codexAttemptResult{Outcome: outcomeDone}
+		}
+		if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error"); ok {
+			return handled
 		}
 		// Goal's fixed machine terminal is the one signal that must leave the
 		// same-account override immediately. Otherwise an opted-in account loops in
@@ -2629,7 +2698,7 @@ codexResponse:
 		}
 		detection := cf.Detect(resp.StatusCode, resp.Header, errorBody)
 		v := ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
-		if isInvalidAgentIdentityTask(resp.StatusCode, errorBody, token) {
+		if !codex429ConfirmationAttempted && isInvalidAgentIdentityTask(resp.StatusCode, errorBody, token) {
 			oldTaskID := token.AgentTaskID
 			if recovered, recoverErr := s.ensureAgentIdentityTask(r.Context(), lease.Account, token, finalEgress, lease.Binding.CookieJarKey, oldTaskID); recoverErr == nil {
 				token = recovered
@@ -2653,7 +2722,7 @@ codexResponse:
 				log.Printf("agent identity task recovery %s: %v", lease.Account.ID, recoverErr)
 			}
 		}
-		if v.State == ban.AuthExpired && !cf.EdgeOnly(detection) && !upstream.AccountUsesAPIKey(token) && !isAgentIdentityToken(token) {
+		if !codex429ConfirmationAttempted && v.State == ban.AuthExpired && !cf.EdgeOnly(detection) && !upstream.AccountUsesAPIKey(token) && !isAgentIdentityToken(token) {
 			if refreshed, rerr := s.refreshCodexToken(r.Context(), token); rerr == nil && refreshed.Refreshed {
 				token = refreshed.Token
 				_ = resp.Body.Close()
@@ -2680,7 +2749,7 @@ codexResponse:
 				s.handleCodexRefreshFailure(r.Context(), lease.Account, refreshed, rerr, "gateway")
 			}
 		}
-		if codexClientVersion == "" && codexRequiresNewerVersion(errorBody) {
+		if !codex429ConfirmationAttempted && codexClientVersion == "" && codexRequiresNewerVersion(errorBody) {
 			codexClientVersion = s.cfg.ClientVersion
 			if !isChat && !isCompact && streamRequestWithMeta(body, forwardMeta) &&
 				(webSocketSession == nil || !webSocketSession.UseHTTPSFallback()) {
@@ -2716,7 +2785,7 @@ codexResponse:
 		distinctFailoverReady := allowRetry && movable &&
 			retryableForFailover(v, resp.StatusCode) &&
 			s.hasCodexFailoverCandidate(r.Context(), routeGroup, model, lease.Account.ID)
-		if !goalQuotaHeld && !goalQuotaTerminal && !distinctFailoverReady && !codexResetRetried && codexResetTriggerAllowed(resp.StatusCode, errorBody) &&
+		if !codex429ConfirmationAttempted && !goalQuotaHeld && !goalQuotaTerminal && !distinctFailoverReady && !codexResetRetried && codexResetTriggerAllowed(resp.StatusCode, errorBody) &&
 			!upstream.AccountUsesAPIKey(token) &&
 			!isAgentIdentityToken(token) &&
 			s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, resp.StatusCode, resp.Header, errorBody, "http_error") {
@@ -2775,7 +2844,7 @@ codexResponse:
 			v = ban.Verdict{State: ban.RegionBlocked, Reason: "cloudflare_edge"}
 		} else if ruleMatched {
 			v = s.applyRuleAccountAction(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody, decision)
-		} else {
+		} else if !guardConfirmed429 {
 			v = s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
 		}
 		// Downstream session/thread identifiers are lookup aliases only. If the
@@ -2893,7 +2962,7 @@ codexSuccess:
 	normalizeCodexStreamContentType(resp.Header, streamRequestWithMeta(body, forwardMeta))
 	goalQuotaGrace := codexGoalQuotaGraceFromContext(r.Context())
 	resetHeaderExhaustion := false
-	if !goalQuotaGrace && !codexResetRetried && !upstream.AccountUsesAPIKey(token) && !isAgentIdentityToken(token) && exhaustedCooldown(resp.Header, storage.Now()) > 0 {
+	if !codex429ConfirmationAttempted && !goalQuotaGrace && !codexResetRetried && !upstream.AccountUsesAPIKey(token) && !isAgentIdentityToken(token) && exhaustedCooldown(resp.Header, storage.Now()) > 0 {
 		resetHeaderExhaustion = s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, resp.StatusCode, resp.Header, nil, "success_header_exhaustion")
 	}
 	if !goalQuotaGrace && !resetHeaderExhaustion {
@@ -2920,7 +2989,7 @@ codexSuccess:
 			s.auditCodexGoalQuotaDecision(r.Context(), lease.Account.ID, "held", "non_authoritative_soft_quota_signal", http.StatusOK)
 		}
 		if cd := usageLimitCooldown(200, responseBody); cd > 0 && !goalSoftQuotaHeld {
-			if lease.Account.IgnoreRateLimitControls {
+			if !codex429ConfirmationAttempted && lease.Account.IgnoreRateLimitControls {
 				_ = resp.Body.Close()
 				resp, finalEgress, err = s.retryCodexSameAccountAfterRateLimit(r.Context(), lease, func() upstream.Request {
 					return requestForToken(token)
@@ -2940,7 +3009,7 @@ codexSuccess:
 			}
 			distinctFailoverReady := allowRetry && movable &&
 				s.hasCodexFailoverCandidate(r.Context(), routeGroup, model, lease.Account.ID)
-			if !distinctFailoverReady && !codexResetRetried && codexResetTriggerAllowed(200, responseBody) &&
+			if !codex429ConfirmationAttempted && !distinctFailoverReady && !codexResetRetried && codexResetTriggerAllowed(200, responseBody) &&
 				!isAgentIdentityToken(token) &&
 				s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, 200, resp.Header, responseBody, "soft_200_body") {
 				codexResetRetried = true
@@ -2989,7 +3058,7 @@ codexSuccess:
 		// instruction appended, then bill + serve the repaired answer (so usage reflects
 		// the final response). A failed re-ask falls through to the deterministic
 		// downgrade below.
-		if relTurn.Active && s.reliabilityRepairEnabled(r.Context()) {
+		if !codex429ConfirmationAttempted && relTurn.Active && s.reliabilityRepairEnabled(r.Context()) {
 			if findings := s.reliabilityFindings(r.Context(), responseBody, relTurn); len(findings) > 0 {
 				repairReq := requestForToken(token)
 				repairReq.SetBodyBytes(appendDeveloperTurn(body, s.reliabilityEnvelopeRole(r.Context()), reliability.RepairInstruction(findings)))
@@ -3008,9 +3077,6 @@ codexSuccess:
 		if responseJSON := codexSSEToResponseJSON(responseBody); len(responseJSON) > 0 {
 			responseBody = responseJSON
 		}
-		s.persistCodexStateBindings(r.Context(), r, body, affinity, responseBody, resp.Header, lease, finalEgress, model, isCompact)
-		s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
-		_ = s.settleBillingHold(r.Context(), holdID, "settled")
 		// A soft 200 "failed" response carrying limit/quota/switch-model state must
 		// not reach the downstream (envelope-only check; never inspects content).
 		if !strictNativeCPA && s.leakScrubEnabled(r.Context()) {
@@ -3032,6 +3098,9 @@ codexSuccess:
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(codexScrubber.ReplaceAll(chatBody))
+		s.persistCodexStateBindings(r.Context(), r, body, affinity, responseBody, resp.Header, lease, finalEgress, model, isCompact, true)
+		s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
+		_ = s.settleBillingHold(r.Context(), holdID, "settled")
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
 
@@ -3349,9 +3418,6 @@ codexSuccess:
 			if nativeRecorder.completedSuccessfully() && !codexPrewarm {
 				responseID, responseModel, _ := nativeRecorder.metadata()
 				if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
-					if mapping.rotateUpstreamSessionOnSafety && nativeRecorder.safetyBufferingDetected() {
-						mapping.noteSafetyBuffering()
-					}
 					turnState := nativeRecorder.responseTurnState()
 					var responseJSON []byte
 					if turnState == "" {
@@ -3406,11 +3472,13 @@ codexSuccess:
 				return nil
 			}
 			responseID, responseModel, _ := recorder.metadata()
+			// The completed frame has already been emitted by the caller. Persist the
+			// replay checkpoint before observing a rollover signal, so a missing or
+			// failed checkpoint can only suppress the following-turn intent.
+			checkpointRef := s.persistCodexGoalContinuity(r.Context(), r, body, recorder.ResponseJSON())
 			var mappingErr error
 			if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
-				if mapping.rotateUpstreamSessionOnSafety && recorder.safetyBufferingDetected() {
-					mapping.noteSafetyBuffering()
-				}
+				s.observeCodexTerminalRollover(r.Context(), mapping, lease, model, false, recorder.ResponseJSON(), checkpointRef)
 				turnState := recorder.responseTurnState()
 				if turnState == "" {
 					turnState = responseTurnState(upstreamHeader, recorder.ResponseJSON())
@@ -3425,17 +3493,12 @@ codexSuccess:
 				s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, committedEgress, "terminal_success", http.StatusOK)
 				s.persistCodexBindingAliases(r.Context(), affinity, responseID, responseModel, lease, committedEgress, model)
 			}
-			// A mapping-alias conflict must not discard the encrypted recovery
-			// checkpoint. In particular, downstream Responses WebSockets reach this
-			// native stream path, and losing a completed tool call here makes a later
-			// quota failover impossible to rebuild safely on another account.
-			if s.goalContinuityEnabled(r.Context()) {
-				s.persistCodexGoalContinuity(r.Context(), r, body, recorder.ResponseJSON())
-			}
 			return mappingErr
 		}
-		commitWriter := newTerminalCommitWriter(w, func() error {
-			return commitStreamMapping(streamRecorder, resp.Header, finalEgress)
+		commitWriter := newTerminalCommitWriterAfter(w, func() error { return nil }, func() {
+			if err := commitStreamMapping(streamRecorder, resp.Header, finalEgress); err != nil {
+				log.Printf("[CODEX-SESSION-MAPPING] post-terminal stream commit request_id=%s: %v", requestIDFromContext(r.Context()), err)
+			}
 		})
 		streamErr := s.streamSSE(streamCtx, commitWriter, recordingStream, codexScrubber, "codex", lease.Account.ID, affinity.Hash)
 		streamRecorder.finish()
@@ -3569,8 +3632,10 @@ codexSuccess:
 						s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, continuationEgress, "native_continue_headers", continuationResp.StatusCode)
 						continuationRecorder := s.newCodexStreamLedgerRecorder(r.Context())
 						defer continuationRecorder.Close()
-						continuationWriter := newTerminalCommitWriter(w, func() error {
-							return commitStreamMapping(continuationRecorder, continuationResp.Header, continuationEgress)
+						continuationWriter := newTerminalCommitWriterAfter(w, func() error { return nil }, func() {
+							if err := commitStreamMapping(continuationRecorder, continuationResp.Header, continuationEgress); err != nil {
+								log.Printf("[CODEX-SESSION-MAPPING] post-terminal continuation commit request_id=%s: %v", requestIDFromContext(r.Context()), err)
+							}
 						})
 						continuationStreamErr := s.streamSSE(streamCtx, continuationWriter, io.TeeReader(continuationResp.Body, continuationRecorder), codexScrubber, "codex", lease.Account.ID, affinity.Hash)
 						continuationRecorder.finish()
@@ -3860,9 +3925,7 @@ codexSuccess:
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 	}
-	s.persistCodexStateBindings(r.Context(), r, body, affinity, responseBody, resp.Header, lease, finalEgress, model, isCompact)
-	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
-	_ = s.settleBillingHold(r.Context(), holdID, "settled")
+	terminalResponseBody := append([]byte(nil), responseBody...)
 	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	// Output guard: deterministically downgrade a non-streaming Responses answer that
@@ -3883,10 +3946,16 @@ codexSuccess:
 		responseBody = filterRuleJSON(responseBody, rf)
 	}
 	_, _ = w.Write(codexScrubber.ReplaceAll(responseBody))
+	// The native terminal is already on the wire. Only now may its checkpoint,
+	// rollover intent, aliases, and billing metadata be persisted; none of these
+	// writes can alter visible response bytes or add an upstream attempt.
+	s.persistCodexStateBindings(r.Context(), r, body, affinity, terminalResponseBody, resp.Header, lease, finalEgress, model, isCompact, isChat)
+	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, terminalResponseBody)
+	_ = s.settleBillingHold(r.Context(), holdID, "settled")
 	return codexAttemptResult{Outcome: outcomeDone}
 }
 
-func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request, requestBody []byte, affinity routing.AffinityKey, responseBody []byte, responseHeader http.Header, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string, compact bool) {
+func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request, requestBody []byte, affinity routing.AffinityKey, responseBody []byte, responseHeader http.Header, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string, compact bool, isChatArg ...bool) {
 	// A prewarm frame never commits turn state: it only writes the upstream
 	// prefix cache and its response id must not become the conversation anchor.
 	if codexPrewarmFrameFromContext(ctx) {
@@ -3908,10 +3977,11 @@ func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request,
 		(!remoteCompactionV2 && response.Status != "" && !strings.EqualFold(response.Status, "completed")) {
 		return
 	}
+	// Durable replay must exist before an intent is allowed to become executable.
+	isChat := len(isChatArg) > 0 && isChatArg[0]
+	checkpointRef := s.persistCodexGoalContinuity(ctx, r, requestBody, responseBody)
 	if mapping := codexSessionMappingFromContext(ctx); mapping != nil && mapping.enabled {
-		if mapping.rotateUpstreamSessionOnSafety && codexResponseSafetyBuffered(responseBody) {
-			mapping.noteSafetyBuffering()
-		}
+		s.observeCodexTerminalRollover(ctx, mapping, lease, requestedModel, isChat, responseBody, checkpointRef)
 		if err := s.commitCodexSessionMapping(ctx, mapping, lease, egress, response.ID, responseTurnState(responseHeader, responseBody), compact); err != nil {
 			log.Printf("[CODEX-SESSION-MAPPING] terminal commit request_id=%s: %v", requestIDFromContext(ctx), err)
 			_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{Action: "codex_session_mapping_commit_failed", State: "retryable", Reason: codexMappingErrorCode(err), Detail: "terminal_metadata_only"})
@@ -3922,7 +3992,6 @@ func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request,
 		s.recordCodexUpstreamAttempt(ctx, mapping, lease, egress, "terminal_success", http.StatusOK)
 		s.persistCodexBindingAliases(ctx, affinity, response.ID, response.Model, lease, egress, requestedModel)
 	}
-	s.persistCodexGoalContinuity(ctx, r, requestBody, responseBody)
 }
 
 func codexRemoteCompactionV2Request(r *http.Request, requestBody []byte) bool {
@@ -3945,17 +4014,22 @@ func codexRemoteCompactionV2Request(r *http.Request, requestBody []byte) bool {
 // only for CPA-v2 sessions. The native upstream session remains the normal path;
 // this state is used exclusively to migrate a tree whose bound account or upstream
 // previous_response_id became unavailable.
-func (s *Server) persistCodexGoalContinuity(ctx context.Context, r *http.Request, requestBody, responseBody []byte) {
+func (s *Server) persistCodexGoalContinuity(ctx context.Context, r *http.Request, requestBody, responseBody []byte) string {
 	// The one recovery turn after a WebSocket-to-HTTPS transition temporarily
 	// disables native session mapping. It still needs the encrypted Goal chain
 	// advanced so a failed retry can be resumed without losing history.
 	if (!s.codexSessionMappingEnabled(ctx) && !codexResponsesWebSocketNeedsHTTPSRecovery(ctx)) || !s.goalContinuityEnabled(ctx) {
-		return
+		return ""
 	}
-	if _, err := s.persistGoalContinuity(ctx, r, "codex", requestBody, responseBody); err != nil {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), codexStateCommitTimeout)
+	defer cancel()
+	session, err := s.persistGoalContinuity(persistCtx, r, "codex", requestBody, responseBody)
+	if err != nil {
 		log.Printf("[GOAL-CONTINUITY] codex persistence degraded request_id=%s: %v", requestIDFromContext(ctx), err)
 		s.auditGoalPersistenceDegraded(ctx, "codex_terminal", err)
+		return ""
 	}
+	return strings.TrimSpace(session.CurrentCheckpoint)
 }
 
 func (s *Server) persistCodexBindingAliases(ctx context.Context, affinity routing.AffinityKey, responseID, actualModel string, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string) {
@@ -4423,6 +4497,7 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 	if diag.CachePrewarmAttempted && parsed.CacheReadTokens > 0 {
 		diag.CacheHitAfterPrewarm = true
 	}
+	diag = usageDiagnosticsWithFrozenClientIdentity(ctx, diag)
 	// Defer the insert off the request path. Usage rows are read only by the admin
 	// dashboards (never by request processing), so eventual recording is correct; the
 	// closure captures only the small parsed usage + identity, and uses a detached
@@ -4528,6 +4603,7 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 	if diag.CachePrewarmAttempted && parsed.CacheReadTokens > 0 {
 		diag.CacheHitAfterPrewarm = true
 	}
+	diag = usageDiagnosticsWithFrozenClientIdentity(ctx, diag)
 	s.enqueueUsage(storage.UsageRecordWrite{AccountID: accountID, RouteKeyHash: routeHash, APIKeyHash: keyHash, UserID: userID, Model: parsed.Model,
 		Prompt: parsed.PromptTokens, Completion: parsed.CompletionTokens, Total: parsed.TotalTokens, Cached: parsed.CachedTokens,
 		CacheRead: parsed.CacheReadTokens, CacheCreation: parsed.CacheCreationTokens, Raw: parsed.RawUsage, Diagnostics: diag})

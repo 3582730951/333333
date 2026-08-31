@@ -636,12 +636,20 @@ func goalInitialFingerprint(body []byte) string {
 }
 
 func bodyHasClientToolResult(body []byte) bool {
-	for _, marker := range [][]byte{
-		[]byte(`"function_call_output"`), []byte(`"local_shell_call_output"`), []byte(`"mcp_tool_call_output"`),
-		[]byte(`"custom_tool_call_output"`), []byte(`"tool_search_output"`), []byte(`"tool_result"`), []byte(`"tool_use_result"`),
-	} {
-		if bytes.Contains(body, marker) {
-			return true
+	root, err := decodeContextJSONMap(body)
+	if err != nil {
+		return false
+	}
+	for _, key := range []string{"input", "messages"} {
+		for _, raw := range appendItems(nil, root[key]) {
+			item, ok := raw.(map[string]interface{})
+			if !ok || isForceCodex429SyntheticMap(item) {
+				continue
+			}
+			switch strings.ToLower(strings.TrimSpace(streamString(item["type"]))) {
+			case "function_call_output", "local_shell_call_output", "mcp_tool_call_output", "custom_tool_call_output", "tool_search_output", "tool_result", "tool_use_result":
+				return true
+			}
 		}
 	}
 	return false
@@ -782,7 +790,7 @@ func goalCheckpointAndSegment(requestBody, segmentRequestBody, responseBody []by
 	// `input`, which made an otherwise valid Claude checkpoint unreplayable because
 	// /v1/messages requires `messages` and must retain its system/tool envelope.
 	base[historyKey] = []interface{}{}
-	history := segmentRequest[historyKey]
+	history := withoutForceCodex429SyntheticItems(segmentRequest[historyKey])
 	output := response["output"]
 	if output == nil {
 		// Claude's response content is preserved as a full opaque object in the

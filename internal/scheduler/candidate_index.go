@@ -322,9 +322,8 @@ func (s *Scheduler) evaluateIndexedCandidate(indexed indexedCandidate, evaluatio
 }
 
 // trialRateLimitExhausted mirrors storage's exhausted test. A rejected row is
-// normally the quota poller's hard verdict; only an explicit ForceCodex429
-// account may probe it. A zero-remaining row may be stale and is worth one probe
-// (see evaluateIndexedTrialCandidate).
+// normally the quota poller's hard verdict. A zero-remaining row may be stale
+// and is worth one probe (see evaluateIndexedTrialCandidate).
 func trialRateLimitExhausted(r storage.AccountRateLimit) bool {
 	switch strings.TrimSpace(r.LimiterType) {
 	case "requests":
@@ -356,14 +355,11 @@ func (s *Scheduler) evaluateIndexedTrialCandidate(indexed indexedCandidate, eval
 	}
 	candidateRoute := routeForProviderModel(evaluation.route, indexed.provider)
 	var cooldownUntil int64
-	// Rate-limit cooldown normally makes an account trial-eligible only when the
-	// limiter snapshot is not hard-rejected. ForceCodex429 is the explicit operator
-	// exception: it must be allowed to reach the same-account 429 state machine.
-	// Otherwise a zero-remaining row from an older poll may simply be stale and is
-	// worth exactly one probe, which the API layer converts into a cooldown clear.
+	// A zero-remaining row from an older poll may simply be stale and is worth
+	// exactly one probe, which the API layer converts into a cooldown clear.
 	if !account.IgnoreRateLimitControls {
 		for _, r := range evaluation.rateLimits[account.ID] {
-			if r.ResetAt <= evaluation.now || (strings.EqualFold(strings.TrimSpace(r.Status), "rejected") && !account.ForceCodex429) {
+			if r.ResetAt <= evaluation.now || strings.EqualFold(strings.TrimSpace(r.Status), "rejected") {
 				continue
 			}
 			if p := strings.TrimSpace(r.Provider); p != "" && p != indexed.provider {
@@ -450,7 +446,7 @@ func (s *Scheduler) tryCooldownTrial(ctx context.Context, route Route, index *ro
 	trials := make([]trialCandidate, 0, maxCooldownTrialAttempts)
 	for _, indexed := range index.candidates {
 		account := indexed.snapshot.Account
-		if cooldownTrialsRestrictedToOverrides(ctx) && !account.ForceCodex429 && !account.IgnoreRateLimitControls {
+		if cooldownTrialsRestrictedToOverrides(ctx) && !account.IgnoreRateLimitControls {
 			continue
 		}
 		if choice, until, ok := s.evaluateIndexedTrialCandidate(indexed, evaluation); ok {

@@ -19,6 +19,7 @@ export const adminRoutes = [
   { path: '/system', role: 'admin', navGroup: 'observability', titleKey: 'nav.system', descriptionKey: 'page.system.desc', lazyLoader: () => import('../pages/System.tsx'), prefetch: 'never' },
   { path: '/cf-events', role: 'admin', navGroup: 'observability', titleKey: 'nav.cf_events', descriptionKey: 'page.cf.desc', lazyLoader: () => import('../pages/CFEvents.tsx') },
   { path: '/audit', role: 'admin', navGroup: 'observability', titleKey: 'nav.audit', descriptionKey: 'page.audit.desc', lazyLoader: () => import('../pages/Audit.tsx') },
+  { path: '/codex-threads', role: 'admin', navGroup: 'observability', titleKey: 'nav.codex_threads', descriptionKey: 'page.codex_threads.desc', lazyLoader: () => import('../pages/CodexThreads.tsx'), prefetch: 'never' },
   { path: '/keys', role: 'admin', navGroup: 'security', titleKey: 'nav.keys', descriptionKey: 'page.keys.desc', lazyLoader: () => import('../pages/Keys.tsx'), prefetch: 'never' },
   { path: '/users', role: 'admin', navGroup: 'security', titleKey: 'nav.users', descriptionKey: 'page.users.desc', lazyLoader: () => import('../pages/Users.tsx') },
   { path: '/settings-v2', role: 'admin', navGroup: 'settings', titleKey: 'nav.settings', descriptionKey: 'page.settings.desc', lazyLoader: () => import('../pages/SettingsV2.tsx'), prefetch: 'never' },

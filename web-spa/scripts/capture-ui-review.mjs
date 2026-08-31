@@ -117,7 +117,11 @@ const fixtures = {
       email: 'primary.operator.with.long.email.alias@example-very-long-domain.test',
       provider: 'codex',
       group_name: 'cyber',
-      plan_type: 'pro',
+      plan_type: 'self_serve_business_prolite',
+      plan_presentation: {
+        plan_family: 'business', seat_type: 'business_premium',
+        plan_display_name: 'Team', seat_display_name: 'Premium (5×)', combined: 'Team (5×)',
+      },
       upstream_account_id: 'team-parent-fixture-001',
       status: 'active',
       usage: { requests: 987654, total_tokens: 987654321, cached_tokens: 456789123 },
@@ -644,6 +648,33 @@ async function handleAPI(req) {
     memory: { values: {} },
   }));
   if (p === '/admin/accounts/summary') return req.respond(json({ total: 3, active: 1, quarantined: 1, cooling: 0, recheck: 1, codex: 1, claude: 1, other: 1 }));
+  if (/^\/admin\/accounts\/[^/]+\/capacity$/.test(p)) return req.respond(json({
+    account_id: fixtures.accounts[0].id,
+    updated_at: now,
+    plan_presentation: fixtures.accounts[0].plan_presentation,
+    upstream_quota_windows: [{
+      account_id: fixtures.accounts[0].id, provider: 'codex', model: 'gpt-5.5', limiter_type: '7d', source: 'quota_metadata',
+      used_percent: 29, limit_tokens: 500000, remaining_tokens: 355000, reset_at: now + 604800, status: 'ok', updated_at: now - 90,
+    }],
+    last_30d_valuation: {
+      api_micro_usd_settled: 1250000, api_micro_usd_provisional: 250000,
+      chatgpt_milli_credits_settled: 2500, chatgpt_milli_credits_provisional: 400,
+      settled_events: 9, provisional_events: 2, unavailable_events: 0, updated_at: now - 90,
+    },
+    valuation_window: { from_at: now - 30 * 86400, to_at: now },
+    business_standard_5h_prior: { status: 'suppressed_for_premium_5x', method: 'premium_5x_no_five_hour_window', factor_milli: 1250, role: 'capacity_prior_not_entitlement', estimates: [] },
+    entitlement: {
+      plan_only: { plan_family: 'business', seat_type: 'unknown', confidence: 'low', flags_state: 'unknown', reason: 'plan_label_has_no_seat_evidence' },
+      current_evidence: {
+        id: 'ent_fixture', source_kind: 'quota_metadata', raw_plan_label: 'self_serve_business_prolite',
+        plan_family: 'business', seat_type: 'business_premium', confidence: 'high', usage_multiplier_milli: 5000,
+        no_five_hour_limit: true, observed_at: now - 90, expires_at: now + 86400, flags_state: 'known', freshness: 'fresh',
+      },
+      evidence: [], conflict: false, evidence_freshness: 'fresh',
+      premium_fixture_status: 'recognized_reviewed_5x_fixture_v1', premium_fixture_mapping_version: 'codex_quota_business_prolite_5x_no_5h_v1',
+    },
+    labels: { usd: 'API list-price equivalent; not an account cash balance', credits: 'ChatGPT Credits estimate only when subscription evidence is available' },
+  }));
   if (p === '/admin/accounts') return req.respond(json({ accounts: fixtures.accounts, rows: fixtures.accounts, total: fixtures.accounts.length }));
   if (p === '/admin/groups') return req.respond(json({ groups: [{ name: 'cyber', force_model: 'gpt-5.5', force_effort: 'high' }, { name: 'staging', force_model: '', force_effort: '' }] }));
   if (p === '/admin/user-groups') return req.respond(json([{ id: 'ug_fixture', name: 'Fixture users', targets: [{ kind: 'account_pool_group', id: 'cyber' }] }]));
@@ -1720,6 +1751,33 @@ async function assertPageContent(page, name, label) {
   }
 }
 
+// The account page screenshot alone never opens its drawer, so it used to
+// validate the capacity panel with an unrequested (and therefore empty) API
+// fixture. Open one real fixture drawer as a separate visual state and require
+// the actual capacity response before recording it.
+async function captureAccountDrawerCapacity(page, dir, label) {
+  const trigger = await page.waitForSelector('.pool-account-primary-id', { visible: true, timeout: 15000 });
+  const capacityResponse = page.waitForResponse((response) => {
+    const pathname = new URL(response.url()).pathname;
+    return /^\/admin\/accounts\/[^/]+\/capacity$/.test(pathname);
+  }, { timeout: 15000 });
+  await trigger.click();
+  const response = await capacityResponse;
+  if (!response.ok()) throw new Error(`${label} capacity fixture returned ${response.status()}`);
+  await page.waitForFunction(() => document.body.innerText.includes('A. 现在还能用多少')
+    && document.body.innerText.includes('该席位不提供 5 小时窗口'), { timeout: 15000 });
+  const file = path.join(dir, 'Accounts-capacity-drawer.png');
+  const files = await screenshotDocument(page, file);
+  const metrics = await pageMetrics(page);
+  assertNoTextOverlap(metrics, `${label}/capacity-drawer`);
+  log('account_capacity_drawer_fixture', {
+    file: path.relative(workspaceRoot, file),
+    files: files.map((item) => path.relative(workspaceRoot, item)),
+    status: response.status(),
+    metrics,
+  });
+}
+
 async function capturePage(browser, baseURL, role, theme, viewport, name, route) {
   const page = await preparePage(browser, baseURL, role, viewport, theme);
   const dir = path.join(screenshotRoot, role, theme, viewport.name);
@@ -1740,6 +1798,13 @@ async function capturePage(browser, baseURL, role, theme, viewport, name, route)
       assertNoTextOverlap(metrics, label);
     } catch (error) {
       issues.push(error.message);
+    }
+    if (name === 'Accounts' && role === 'admin' && theme === 'light' && viewport.name === '1280x720') {
+      try {
+        await captureAccountDrawerCapacity(page, dir, label);
+      } catch (error) {
+        issues.push(error.message);
+      }
     }
     log('screenshot', { role, theme, viewport: viewport.name, page: name, route, file: path.relative(workspaceRoot, file), files: files.map((item) => path.relative(workspaceRoot, item)), metrics });
     if (issues.length) throw new Error(issues.join(' | '));

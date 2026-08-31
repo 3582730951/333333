@@ -93,6 +93,8 @@ var (
 	ErrCodexSessionMappingAmbiguous     = errors.New("codex session mapping is ambiguous")
 	ErrCodexSessionEpochRetired         = errors.New("codex session context epoch retired")
 	ErrCodexSessionEpochConflict        = errors.New("codex session context epoch changed")
+	ErrCodexSessionRolloverNotPending   = errors.New("codex session rollover is not pending")
+	ErrCodexSessionRolloverInProgress   = errors.New("codex session rollover is already in progress")
 	ErrCodexInstructionSnapshotNotFound = errors.New("codex instruction snapshot not found")
 )
 
@@ -143,10 +145,22 @@ type CodexSessionBinding struct {
 	// toggle. The very next request for this binding detaches from the old chain
 	// (previous_response_id/turn-state stripped) and then clears the marker, so
 	// exactly one fresh turn starts under the new session id.
-	SafetyRotatedAt int64
-	CreatedAt       int64
-	UpdatedAt       int64
-	ExpiresAt       int64
+	SafetyRotatedAt                int64
+	PendingRolloverAt              int64
+	PendingRolloverCause           string
+	PendingRolloverDetectorVersion string
+	PendingRolloverCheckpointRef   string
+	PendingRolloverSourceEpoch     int64
+	PendingRolloverNonce           string
+	// PendingRolloverRequestFingerprint is populated only once a pending intent
+	// has been claimed for execution. It is an HMAC-derived request fingerprint,
+	// never a raw body or downstream identifier. Keeping it in the encrypted
+	// identity makes a crash-safe retry deterministic while preventing a later,
+	// different turn from silently consuming an in-progress rollover.
+	PendingRolloverRequestFingerprint string
+	CreatedAt                         int64
+	UpdatedAt                         int64
+	ExpiresAt                         int64
 }
 
 // CodexSessionCommit atomically creates/refreshes a mapping and attaches aliases
@@ -168,6 +182,21 @@ type CodexSessionCommit struct {
 	// DroppedHierarchyAliases receives the number skipped after a successful
 	// transaction. It is optional and used only for aggregate audit telemetry.
 	DroppedHierarchyAliases *int
+}
+
+// CodexSessionRolloverClaim is the durable, single-winner transition from a
+// terminal intent to a fresh upstream epoch. All IDs are internal upstream
+// identity values and are encrypted at rest; RequestFingerprint is a keyed
+// digest of the exact next downstream request, never its body.
+type CodexSessionRolloverClaim struct {
+	BindingID          string
+	ExpectedEpoch      int64
+	PendingNonce       string
+	RequestFingerprint string
+	RootSessionID      string
+	ThreadID           string
+	ParentThreadID     string
+	ForkedFromThreadID string
 }
 
 // CodexInstructionSnapshot is the tree-scoped, encrypted base-instructions
@@ -212,17 +241,24 @@ type CodexEgressRecentOutcome struct {
 }
 
 type codexSessionIdentityPayload struct {
-	InstallationID     string `json:"installation_id,omitempty"`
-	DeviceOSHint       string `json:"device_os_hint,omitempty"`
-	DeviceOSHintSet    bool   `json:"device_os_hint_set,omitempty"`
-	RootSessionID      string `json:"root_session_id"`
-	ThreadID           string `json:"thread_id"`
-	ParentThreadID     string `json:"parent_thread_id,omitempty"`
-	ForkedFromThreadID string `json:"forked_from_thread_id,omitempty"`
-	WindowGeneration   int64  `json:"window_generation"`
-	GoalModeActive     bool   `json:"goal_mode_active,omitempty"`
-	GoalTurnID         string `json:"goal_turn_id,omitempty"`
-	SafetyRotatedAt    int64  `json:"safety_rotated_at,omitempty"`
+	InstallationID                    string `json:"installation_id,omitempty"`
+	DeviceOSHint                      string `json:"device_os_hint,omitempty"`
+	DeviceOSHintSet                   bool   `json:"device_os_hint_set,omitempty"`
+	RootSessionID                     string `json:"root_session_id"`
+	ThreadID                          string `json:"thread_id"`
+	ParentThreadID                    string `json:"parent_thread_id,omitempty"`
+	ForkedFromThreadID                string `json:"forked_from_thread_id,omitempty"`
+	WindowGeneration                  int64  `json:"window_generation"`
+	GoalModeActive                    bool   `json:"goal_mode_active,omitempty"`
+	GoalTurnID                        string `json:"goal_turn_id,omitempty"`
+	SafetyRotatedAt                   int64  `json:"safety_rotated_at,omitempty"`
+	PendingRolloverAt                 int64  `json:"pending_rollover_at,omitempty"`
+	PendingRolloverCause              string `json:"pending_rollover_cause,omitempty"`
+	PendingRolloverDetectorVersion    string `json:"pending_rollover_detector_version,omitempty"`
+	PendingRolloverCheckpointRef      string `json:"pending_rollover_checkpoint_ref,omitempty"`
+	PendingRolloverSourceEpoch        int64  `json:"pending_rollover_source_epoch,omitempty"`
+	PendingRolloverNonce              string `json:"pending_rollover_nonce,omitempty"`
+	PendingRolloverRequestFingerprint string `json:"pending_rollover_request_fingerprint,omitempty"`
 }
 
 func normalizedCodexSessionAliases(in []CodexSessionAlias) []CodexSessionAlias {
@@ -278,6 +314,16 @@ func (s *Store) codexSessionNamespaceHash(namespace string) string {
 	return s.codexSessionAliasHash(namespace, "namespace", "")
 }
 
+// CodexRolloverRequestFingerprint produces a domain-separated, secret-keyed
+// digest suitable for the encrypted rollover claim. It deliberately accepts raw
+// bytes only transiently and exposes no reversible identifier.
+func (s *Store) CodexRolloverRequestFingerprint(body []byte) string {
+	mac := hmac.New(sha256.New, s.codexSessionMappingKey())
+	_, _ = mac.Write([]byte("codex-rollover-request/v1\x00"))
+	_, _ = mac.Write(body)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 func (s *Store) codexInstructionRevision(instructions string) string {
 	mac := hmac.New(sha256.New, s.codexSessionMappingKey())
 	_, _ = mac.Write([]byte("codex-instruction-snapshot-revision/v1\x00"))
@@ -329,17 +375,24 @@ const codexInstructionSnapshotColumns = `tree_id,encrypted_instructions,revision
 
 func (s *Store) sealCodexSessionIdentity(binding CodexSessionBinding) (string, error) {
 	payload, err := json.Marshal(codexSessionIdentityPayload{
-		InstallationID:     binding.InstallationID,
-		DeviceOSHint:       binding.DeviceOSHint,
-		DeviceOSHintSet:    binding.DeviceOSHintSet,
-		RootSessionID:      binding.RootSessionID,
-		ThreadID:           binding.ThreadID,
-		ParentThreadID:     binding.ParentThreadID,
-		ForkedFromThreadID: binding.ForkedFromThreadID,
-		WindowGeneration:   binding.WindowGeneration,
-		GoalModeActive:     binding.GoalModeActive,
-		GoalTurnID:         binding.GoalTurnID,
-		SafetyRotatedAt:    binding.SafetyRotatedAt,
+		InstallationID:                    binding.InstallationID,
+		DeviceOSHint:                      binding.DeviceOSHint,
+		DeviceOSHintSet:                   binding.DeviceOSHintSet,
+		RootSessionID:                     binding.RootSessionID,
+		ThreadID:                          binding.ThreadID,
+		ParentThreadID:                    binding.ParentThreadID,
+		ForkedFromThreadID:                binding.ForkedFromThreadID,
+		WindowGeneration:                  binding.WindowGeneration,
+		GoalModeActive:                    binding.GoalModeActive,
+		GoalTurnID:                        binding.GoalTurnID,
+		SafetyRotatedAt:                   binding.SafetyRotatedAt,
+		PendingRolloverAt:                 binding.PendingRolloverAt,
+		PendingRolloverCause:              binding.PendingRolloverCause,
+		PendingRolloverDetectorVersion:    binding.PendingRolloverDetectorVersion,
+		PendingRolloverCheckpointRef:      binding.PendingRolloverCheckpointRef,
+		PendingRolloverSourceEpoch:        binding.PendingRolloverSourceEpoch,
+		PendingRolloverNonce:              binding.PendingRolloverNonce,
+		PendingRolloverRequestFingerprint: binding.PendingRolloverRequestFingerprint,
 	})
 	if err != nil {
 		return "", err
@@ -367,6 +420,13 @@ func (s *Store) openCodexSessionIdentity(value string, binding *CodexSessionBind
 	binding.GoalModeActive = payload.GoalModeActive
 	binding.GoalTurnID = strings.TrimSpace(payload.GoalTurnID)
 	binding.SafetyRotatedAt = payload.SafetyRotatedAt
+	binding.PendingRolloverAt = payload.PendingRolloverAt
+	binding.PendingRolloverCause = strings.TrimSpace(payload.PendingRolloverCause)
+	binding.PendingRolloverDetectorVersion = strings.TrimSpace(payload.PendingRolloverDetectorVersion)
+	binding.PendingRolloverCheckpointRef = strings.TrimSpace(payload.PendingRolloverCheckpointRef)
+	binding.PendingRolloverSourceEpoch = payload.PendingRolloverSourceEpoch
+	binding.PendingRolloverNonce = strings.TrimSpace(payload.PendingRolloverNonce)
+	binding.PendingRolloverRequestFingerprint = strings.TrimSpace(payload.PendingRolloverRequestFingerprint)
 	if binding.RootSessionID == "" || binding.ThreadID == "" {
 		return errors.New("codex session mapping identity incomplete")
 	}
@@ -746,6 +806,82 @@ ON CONFLICT(alias_hash,binding_id) DO UPDATE SET updated_at=excluded.updated_at,
 	}
 	if commit.DroppedHierarchyAliases != nil {
 		*commit.DroppedHierarchyAliases = droppedHierarchyAliases
+	}
+	return binding, nil
+}
+
+// ClaimCodexSessionRollover atomically elects the one request allowed to consume
+// a pending rollover intent. A retry after a process crash is accepted only when
+// it carries the same keyed request fingerprint; every other request observes an
+// in-progress transition instead of replaying its body into the fresh epoch.
+//
+// The new identity is persisted at claim time so the replacement upstream turn is
+// idempotent across restart. Its aliases remain the stable downstream aliases of
+// the existing binding and are only advanced on the successful terminal commit.
+func (s *Store) ClaimCodexSessionRollover(ctx context.Context, claim CodexSessionRolloverClaim) (CodexSessionBinding, error) {
+	claim.BindingID = strings.TrimSpace(claim.BindingID)
+	claim.PendingNonce = strings.TrimSpace(claim.PendingNonce)
+	claim.RequestFingerprint = strings.TrimSpace(claim.RequestFingerprint)
+	claim.RootSessionID = strings.TrimSpace(claim.RootSessionID)
+	claim.ThreadID = strings.TrimSpace(claim.ThreadID)
+	if claim.BindingID == "" || claim.PendingNonce == "" || claim.RequestFingerprint == "" ||
+		claim.RootSessionID == "" || claim.ThreadID == "" {
+		return CodexSessionBinding{}, ErrCodexSessionRolloverNotPending
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return CodexSessionBinding{}, err
+	}
+	defer tx.Rollback()
+	row := tx.QueryRowContext(ctx, `SELECT `+codexSessionBindingColumns+` FROM codex_session_binding WHERE id=?`, claim.BindingID)
+	binding, err := scanCodexSessionBinding(s, row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CodexSessionBinding{}, ErrCodexSessionMappingNotFound
+	}
+	if err != nil {
+		return CodexSessionBinding{}, err
+	}
+	if binding.State != "active" {
+		return binding, ErrCodexSessionEpochRetired
+	}
+	// A claimed state is deliberately recoverable only by byte-identical retry.
+	// Do this check before SourceEpoch because a successful claim advances epoch.
+	if binding.SafetyRotatedAt != 0 {
+		if hmac.Equal([]byte(binding.PendingRolloverRequestFingerprint), []byte(claim.RequestFingerprint)) {
+			return binding, nil
+		}
+		return binding, ErrCodexSessionRolloverInProgress
+	}
+	if binding.Epoch != claim.ExpectedEpoch || binding.PendingRolloverSourceEpoch != claim.ExpectedEpoch ||
+		binding.PendingRolloverAt == 0 || binding.PendingRolloverNonce != claim.PendingNonce ||
+		strings.TrimSpace(binding.PendingRolloverCheckpointRef) == "" {
+		return binding, ErrCodexSessionRolloverNotPending
+	}
+	now := Now()
+	binding.RootSessionID = claim.RootSessionID
+	binding.ThreadID = claim.ThreadID
+	binding.ParentThreadID = strings.TrimSpace(claim.ParentThreadID)
+	binding.ForkedFromThreadID = strings.TrimSpace(claim.ForkedFromThreadID)
+	binding.Epoch++
+	binding.WindowGeneration++
+	binding.SafetyRotatedAt = now
+	binding.PendingRolloverRequestFingerprint = claim.RequestFingerprint
+	binding.UpdatedAt = now
+	encrypted, err := s.sealCodexSessionIdentity(binding)
+	if err != nil {
+		return CodexSessionBinding{}, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE codex_session_binding
+SET epoch=?,encrypted_identity=?,updated_at=?
+WHERE id=? AND epoch=? AND state='active'`, binding.Epoch, encrypted, binding.UpdatedAt, binding.ID, claim.ExpectedEpoch)
+	if err != nil {
+		return CodexSessionBinding{}, err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return CodexSessionBinding{}, ErrCodexSessionEpochConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return CodexSessionBinding{}, err
 	}
 	return binding, nil
 }

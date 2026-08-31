@@ -281,6 +281,11 @@ type UserGroup struct {
 	// account/primary egress when an upstream error occurs. It is opt-in and
 	// defaults to false so existing groups retain seamless failover behavior.
 	PinnedEgressNoFallback bool `json:"pinned_egress_no_fallback"`
+	// GPTSafetyBufferingSessionRolloverEnabled opts this policy group into the
+	// protocol-level safety_buffering rollover.  GPTTextRefusal... is deliberately
+	// independent: legacy safety rotation config must never enable text refusal.
+	GPTSafetyBufferingSessionRolloverEnabled bool `json:"gpt_safety_buffering_session_rollover_enabled"`
+	GPTTextRefusalSessionRolloverEnabled     bool `json:"gpt_text_refusal_session_rollover_enabled"`
 }
 
 const (
@@ -644,12 +649,10 @@ type Account struct {
 	// or quarantine. It never re-enables a disabled account or an unhealthy
 	// shared egress profile.
 	IgnoreRateLimitControls bool `json:"ignore_rate_limit_controls"`
-	// ForceCodex429 is an account-scoped opt-in for the "强制卡429" mode. For
-	// OpenAI OAuth Codex requests it injects a synthetic custom_tool_call pair
-	// into the upstream input history, and after two explicit 429s within the
-	// confirmation window keeps retrying on this same account instead of
-	// failing over to a fresh one. No effect for API-key accounts or chat-bridge
-	// entry points.
+	// ForceCodex429 is an account-scoped opt-in for Codex 429 Guard / 奸商模式.
+	// It is inert until the global runtime kill switch is enabled and only applies
+	// to eligible Codex OAuth or SetupToken credentials. It may append a synthetic
+	// checkpoint to an eligible request; it never overrides quota or cooldown.
 	ForceCodex429 bool `json:"force_codex_429"`
 	// RoutingWeight affects only fresh-account selection. Sticky/native sessions
 	// remain bound to their account. 100 is neutral; higher values receive a
@@ -1505,6 +1508,14 @@ func (s *Store) init(ctx context.Context, progress func(string), expandOnly bool
 	}
 	report("account_request_rate_schema")
 	if _, err := s.db.ExecContext(ctx, accountRequestRateSchemaSQL); err != nil {
+		return err
+	}
+	// The Codex 429 confirmation record is operational state, not request
+	// telemetry.  Create it during initialization as well as lazily from the
+	// public storage API so a rolling upgrade has one durable, cross-process
+	// source of truth before the first guarded response arrives.
+	report("codex_429_confirmation_schema")
+	if err := s.EnsureCodex429ConfirmationState(ctx); err != nil {
 		return err
 	}
 	report("admin_setup_schema")
@@ -2959,6 +2970,10 @@ ON CONFLICT(account_id) DO NOTHING`,
 		// replaced by the later terminal sample without counting a second logical
 		// request. Existing rows default to unsettled and remain visible in RPM.
 		`ALTER TABLE account_usage_rate_events ADD COLUMN settlement_state TEXT NOT NULL DEFAULT 'unsettled'`,
+		// Client-family diagnostics are additive and default fail-closed for rows
+		// written by older workers. Never infer a historical family from model names.
+		`ALTER TABLE account_usage_rate_events ADD COLUMN client_family TEXT NOT NULL DEFAULT 'unknown'`,
+		`ALTER TABLE account_usage_rate_events ADD COLUMN client_confidence TEXT NOT NULL DEFAULT 'low'`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_records_model_mismatch_created ON usage_records(model_mismatch, created_at)`,
 		`ALTER TABLE billing_holds ADD COLUMN usage_expected INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE billing_holds ADD COLUMN usage_recorded_at INTEGER NOT NULL DEFAULT 0`,
@@ -3275,6 +3290,8 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
 		`ALTER TABLE user_groups ADD COLUMN traffic_fallback_groups_json TEXT NOT NULL DEFAULT '{}'`,
 		`ALTER TABLE user_groups ADD COLUMN traffic_fallback_model_mappings_json TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE user_groups ADD COLUMN pinned_egress_no_fallback INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE user_groups ADD COLUMN gpt_safety_buffering_session_rollover_enabled INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE user_groups ADD COLUMN gpt_text_refusal_session_rollover_enabled INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE api_keys ADD COLUMN user_group_id TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_api_keys_user_group ON api_keys(user_group_id) WHERE user_group_id <> ''`,
 		// Antigravity explicit cache entries: tracks Gemini CachedContent resources
@@ -3704,14 +3721,14 @@ func (s *Store) DeleteGroup(ctx context.Context, name string) error {
 
 // ── UserGroup CRUD ──────────────────────────────────────────────────────────
 
-const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback`
+const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback, gpt_safety_buffering_session_rollover_enabled, gpt_text_refusal_session_rollover_enabled`
 
 func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
 	var g UserGroup
 	var apply, miEnabled, superEnabled, superResponseRewriteEnabled, superMemoryEnabled, superMonitorEnabled int
 	var filesJSON, profilesJSON, superSkillIDsJSON, superProfilesJSON, blockClaudeJSON, blockGPTJSON, fallbackGroupsJSON, fallbackMappingsJSON, routingJSON string
-	var pinnedNoFallback int
-	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &superEnabled, &superSkillIDsJSON, &superProfilesJSON, &superResponseRewriteEnabled, &superMemoryEnabled, &superMonitorEnabled, &g.ForceModel, &g.ForceEffort, &blockClaudeJSON, &blockGPTJSON, &fallbackGroupsJSON, &fallbackMappingsJSON, &routingJSON, &g.CreatedAt, &g.UpdatedAt, &pinnedNoFallback)
+	var pinnedNoFallback, safetyRollover, textRefusalRollover int
+	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &superEnabled, &superSkillIDsJSON, &superProfilesJSON, &superResponseRewriteEnabled, &superMemoryEnabled, &superMonitorEnabled, &g.ForceModel, &g.ForceEffort, &blockClaudeJSON, &blockGPTJSON, &fallbackGroupsJSON, &fallbackMappingsJSON, &routingJSON, &g.CreatedAt, &g.UpdatedAt, &pinnedNoFallback, &safetyRollover, &textRefusalRollover)
 	g.SystemPromptApplyToCompaction = apply != 0
 	g.ModelInstructionsEnabled = miEnabled != 0
 	g.ModelInstructionsFiles = decodeStringList(filesJSON)
@@ -3723,6 +3740,8 @@ func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
 	g.SuperInstructMemoryEnabled = superMemoryEnabled != 0
 	g.SuperInstructMonitorEnabled = superMonitorEnabled != 0
 	g.PinnedEgressNoFallback = pinnedNoFallback != 0
+	g.GPTSafetyBufferingSessionRolloverEnabled = safetyRollover != 0
+	g.GPTTextRefusalSessionRolloverEnabled = textRefusalRollover != 0
 	g.BlockClaudeTargetGroups = decodeStringList(blockClaudeJSON)
 	g.BlockGPTTargetGroups = decodeStringList(blockGPTJSON)
 	if err == nil {
@@ -3802,6 +3821,27 @@ func (s *Store) ListUserGroups(ctx context.Context) ([]UserGroup, error) {
 		}
 	}
 	return out, nil
+}
+
+// BackfillGPTSafetyBufferingSessionRollover preserves the legacy safety map for
+// one compatibility cycle. It is idempotent, touches only existing IDs, and never
+// grants the independent text-refusal flag.
+func (s *Store) BackfillGPTSafetyBufferingSessionRollover(ctx context.Context, groupIDs []string) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	for _, rawID := range groupIDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE user_groups
+SET gpt_safety_buffering_session_rollover_enabled=1, updated_at=?
+WHERE id=? AND gpt_safety_buffering_session_rollover_enabled=0`, Now(), id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // UserGroupRouteGeneration is a cheap, non-secret change token for a waiting
@@ -3885,9 +3925,9 @@ func (s *Store) CreateUserGroup(ctx context.Context, g UserGroup) error {
 	}
 	g.UpdatedAt = now
 	routingJSON := encodeModelRouting(g.ModelRouting)
-	_, err = s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback, gpt_safety_buffering_session_rollover_enabled, gpt_text_refusal_session_rollover_enabled) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO NOTHING`,
-		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), routingJSON, g.CreatedAt, g.UpdatedAt, boolInt(g.PinnedEgressNoFallback))
+		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), routingJSON, g.CreatedAt, g.UpdatedAt, boolInt(g.PinnedEgressNoFallback), boolInt(g.GPTSafetyBufferingSessionRolloverEnabled), boolInt(g.GPTTextRefusalSessionRolloverEnabled))
 	return err
 }
 
@@ -4399,8 +4439,8 @@ func (s *Store) CreateUserGroupDefinition(ctx context.Context, g UserGroup) erro
 		g.CreatedAt = now
 	}
 	g.UpdatedAt = now
-	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt, boolInt(g.PinnedEgressNoFallback)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback, gpt_safety_buffering_session_rollover_enabled, gpt_text_refusal_session_rollover_enabled) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt, boolInt(g.PinnedEgressNoFallback), boolInt(g.GPTSafetyBufferingSessionRolloverEnabled), boolInt(g.GPTTextRefusalSessionRolloverEnabled)); err != nil {
 		return err
 	}
 	if err := insertUserGroupTargets(ctx, tx, g, now); err != nil {
@@ -4422,8 +4462,8 @@ func (s *Store) ReplaceUserGroupDefinition(ctx context.Context, g UserGroup) err
 		return err
 	}
 	now := Now()
-	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, super_instruct_enabled=?, super_instruct_skill_ids=?, super_instruct_profiles=?, super_instruct_response_rewrite_enabled=?, super_instruct_memory_enabled=?, super_instruct_monitor_enabled=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, pinned_egress_no_fallback=?, updated_at=? WHERE id=?`,
-		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), boolInt(g.PinnedEgressNoFallback), now, g.ID)
+	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, super_instruct_enabled=?, super_instruct_skill_ids=?, super_instruct_profiles=?, super_instruct_response_rewrite_enabled=?, super_instruct_memory_enabled=?, super_instruct_monitor_enabled=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, pinned_egress_no_fallback=?, gpt_safety_buffering_session_rollover_enabled=?, gpt_text_refusal_session_rollover_enabled=?, updated_at=? WHERE id=?`,
+		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), boolInt(g.PinnedEgressNoFallback), boolInt(g.GPTSafetyBufferingSessionRolloverEnabled), boolInt(g.GPTTextRefusalSessionRolloverEnabled), now, g.ID)
 	if err != nil {
 		return err
 	}
@@ -8409,6 +8449,27 @@ func (s *Store) SetBindingCooldown(ctx context.Context, accountID string, until 
 	return err
 }
 
+// SetBindingCooldownIfLater advances an account cooldown without allowing a
+// delayed/out-of-order upstream response to shorten an already authoritative
+// deadline.  It intentionally does not set recheck_pending: a confirmed quota
+// or rate-limit signal is capacity evidence, not a liveness failure.
+func (s *Store) SetBindingCooldownIfLater(ctx context.Context, accountID string, until int64) (bool, error) {
+	if until <= 0 {
+		return false, errors.New("cooldown deadline must be positive")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE account_egress_bindings
+SET cooldown_until=?, updated_at=?
+WHERE account_id=? AND cooldown_until < ?`, until, Now(), accountID, until)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed > 0, nil
+}
+
 // BenchBindingForRecheck cools an account's binding AND marks it recheck-pending in
 // one write, so a single upstream error both rotates the pool off the account and
 // keeps it out of the candidate set until the background recheck loop verifies it is
@@ -9652,7 +9713,18 @@ type UsageDiagnostics struct {
 	// AgentClass is a server-derived request lineage classification. Supported
 	// values are root, subagent and unknown; it is never trusted as an event ID or
 	// authorization input.
-	AgentClass                        string
+	AgentClass string
+	// Client identity is a bounded, server-derived classification captured before
+	// any compatibility bridge or cloak rewrites the request. It is attribution
+	// metadata only: no raw UA, model string, session/thread id, or billing text is
+	// retained here.
+	ClientFamily                      string
+	ClientConfidence                  string
+	ClientConflict                    bool
+	ClassifierVersion                 string
+	InboundProtocol                   string
+	RequestedModelFamily              string
+	ResolvedProviderFamily            string
 	UsageProvider                     string
 	UsageSource                       string
 	CacheReadPresent                  bool
@@ -10060,8 +10132,8 @@ WHERE usage_records.estimated > 0 AND excluded.estimated = 0`,
 		// The rolling usage event is updated in the same transaction as the
 		// canonical usage row. A replay is a no-op, while a terminal real sample
 		// atomically replaces its earlier estimate without incrementing RPM.
-		if _, err = exec.ExecContext(ctx, `INSERT INTO account_usage_rate_events(event_id,account_id,occurred_at,input_tokens,cached_input_tokens,output_tokens,total_tokens,agent_class,settlement_state,estimated,updated_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?)
+		if _, err = exec.ExecContext(ctx, `INSERT INTO account_usage_rate_events(event_id,account_id,occurred_at,input_tokens,cached_input_tokens,output_tokens,total_tokens,agent_class,client_family,client_confidence,settlement_state,estimated,updated_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(event_id) DO UPDATE SET
  account_id=excluded.account_id,
  input_tokens=excluded.input_tokens,
@@ -10069,6 +10141,8 @@ ON CONFLICT(event_id) DO UPDATE SET
  output_tokens=excluded.output_tokens,
  total_tokens=excluded.total_tokens,
  agent_class=excluded.agent_class,
+	client_family=excluded.client_family,
+	client_confidence=excluded.client_confidence,
  settlement_state=excluded.settlement_state,
  estimated=excluded.estimated,
  updated_at=excluded.updated_at
@@ -10076,7 +10150,8 @@ ON CONFLICT(event_id) DO UPDATE SET
 WHERE (account_usage_rate_events.estimated>0 AND excluded.estimated=0) OR
       (account_usage_rate_events.settlement_state IN ('unsettled','partial','provisional') AND excluded.settlement_state<>'unsettled')`,
 			diag.UsageEventID, accountID, occurredAt, prompt, cachedInput, completion, totalForRate,
-			NormalizeAgentClass(diag.AgentClass), rateSettlement, boolInt(diag.Estimated), now); err != nil {
+			NormalizeAgentClass(diag.AgentClass), NormalizeClientFamily(diag.ClientFamily), NormalizeClientConfidence(diag.ClientConfidence),
+			rateSettlement, boolInt(diag.Estimated), now); err != nil {
 			return err
 		}
 		if err = s.writeNormalizedUsage(ctx, exec, write, diag, now); err != nil {

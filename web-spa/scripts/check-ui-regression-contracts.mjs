@@ -108,6 +108,27 @@ if (!/quota_summary\?\.reset_credits/.test(drawer) || !/formatResetCredits/.test
 if (!/available_count[\s\S]{0,160}`\$\{credits\.available_count\} 次`/.test(drawer)) {
   problems.push('AccountDrawer reset-credit formatter must preserve known 0 as "0 次" instead of unknown.');
 }
+const capacityModel = read('features/accounts/model/capacity.ts');
+if (/z\.record\(/.test(capacityModel)
+  || !/upstreamQuotaWindowSchema/.test(capacityModel)
+  || !/\['raw', 'raw_json', 'headers'/.test(capacityModel)
+  || !/usage_multiplier_milli:\s*optionalPositiveInteger/.test(capacityModel)) {
+  problems.push('Capacity response must use explicit finite typed schemas and reject raw quota JSON / invalid multiplier values.');
+}
+for (const layer of ['A. 现在还能用多少', 'B. 最近如何计价', 'C. 为什么系统这样判断']) {
+  if (!drawer.includes(layer)) problems.push(`AccountDrawer capacity panel must render the ${layer} information layer.`);
+}
+if (!/standardFiveHourPriorApplicable/.test(drawer)
+  || !/!premiumNoFiveHour/.test(drawer)
+  || !/currentEntitlementEvidence\?\.seat_type !== 'business_premium'/.test(drawer)) {
+  problems.push('Capacity Standard 5h prior must be gated by seat evidence, not only plan family.');
+}
+const reviewCapture = fs.readFileSync(path.join(root, 'scripts', 'capture-ui-review.mjs'), 'utf8');
+if (!/admin\\\/accounts\\\/\[\^\/\]\+\\\/capacity/.test(reviewCapture)
+  || !/captureAccountDrawerCapacity/.test(reviewCapture)
+  || !/该席位不提供 5 小时窗口/.test(reviewCapture)) {
+  problems.push('UI review must request a non-empty capacity fixture and capture the Premium no-5h drawer state.');
+}
 
 const providers = read('pages/Providers.jsx');
 if (!/CLAUDE_MODEL_TABLE\s*=\s*\[/.test(providers)

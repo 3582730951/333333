@@ -12,6 +12,8 @@ import {
   isProviderAPIKeyAccount, requiresPaidHealthTest,
 } from '../features/accounts/model/healthTest.ts';
 import { useAccountRequestRate } from '../features/accounts/live/accountRates.ts';
+import { parseCapacityResponse } from '../features/accounts/model/capacity.ts';
+import { formatPlanLabel } from '../features/accounts/model/planFormatter.ts';
 
 const Row = ({ k, v }) => (
   <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, padding: '5px 0', fontSize: 13 }}>
@@ -116,7 +118,7 @@ export default function AccountDrawer({
       profiles: Array.isArray(profiles) ? profiles : profiles?.profiles || profiles?.egress_profiles || [],
       groups: Array.isArray(groups) ? groups : groups?.groups || [],
       codexReauth,
-      capacity,
+      capacity: parseCapacityResponse(capacity),
     };
   }, [account]);
 
@@ -226,7 +228,7 @@ export default function AccountDrawer({
       const saved = await post(`/admin/accounts/${encodeURIComponent(account.id)}/force-codex-429`, {
         force_codex_429: enabled,
       });
-      Toast.success(enabled ? '此账号已开启强制卡429' : '此账号已关闭强制卡429');
+      Toast.success(enabled ? '此账号已开启 Codex 429 Guard（奸商模式）' : '此账号已关闭 Codex 429 Guard（奸商模式）');
       void onUpdated?.(account.id, saved);
     } catch (err) {
       setForceCodex429(previous);
@@ -356,6 +358,16 @@ export default function AccountDrawer({
   const standardFiveHourEstimate = Array.isArray(standardFiveHourPrior?.estimates)
     ? standardFiveHourPrior.estimates[0] || null
     : null;
+  const capacityPlanPresentation = capacity?.plan_presentation || account.plan_presentation || null;
+  const actualQuotaWindows = Array.isArray(capacity?.upstream_quota_windows) ? capacity.upstream_quota_windows : [];
+  const premiumNoFiveHour = capacityPlanPresentation?.seat_type === 'business_premium'
+    || (currentEntitlementEvidence?.seat_type === 'business_premium'
+      && currentEntitlementEvidence?.confidence === 'high'
+      && currentEntitlementEvidence?.no_five_hour_limit === true);
+  const standardFiveHourPriorApplicable = !premiumNoFiveHour
+    && currentEntitlementEvidence?.seat_type !== 'business_premium'
+    && capacityEntitlement.plan_only?.plan_family === 'business';
+  const hasActualFiveHourWindow = actualQuotaWindows.some((window) => String(window?.limiter_type || '').toLowerCase().includes('5h'));
 
   const formatCapacityUSD = (micro) => {
     const value = Number(micro);
@@ -364,6 +376,27 @@ export default function AccountDrawer({
   const formatCapacityCredits = (milli) => {
     const value = Number(milli);
     return Number.isFinite(value) && value >= 0 ? `${(value / 1000).toFixed(3)} Credits` : '不可用';
+  };
+  const capacityWindowLabel = (window, index) => {
+    const limiter = String(window?.limiter_type || '').toLowerCase();
+    if (limiter.includes('5h')) return '5 小时窗口';
+    if (limiter.includes('7d')) return '7 天窗口';
+    return window?.limiter_type ? `${window.limiter_type} 窗口` : `真实上游窗口 ${index + 1}`;
+  };
+  const capacityWindowValue = (window) => {
+    const parts = [];
+    const used = Number(window?.used_percent);
+    const remainingTokens = Number(window?.remaining_tokens);
+    const remainingRequests = Number(window?.remaining_requests);
+    const resetAt = Number(window?.reset_at);
+    const updatedAt = Number(window?.updated_at);
+    if (Number.isFinite(used) && used >= 0) parts.push(`${Math.round(used)}% 已用`);
+    if (Number.isFinite(remainingTokens) && remainingTokens >= 0) parts.push(`${fmtTokens(remainingTokens)} Token 剩余`);
+    if (Number.isFinite(remainingRequests) && remainingRequests >= 0) parts.push(`${fmtInt(remainingRequests)} 次请求剩余`);
+    if (resetAt > 0) parts.push(`${fmtRelative(resetAt)}重置`);
+    if (updatedAt > 0) parts.push(`${fmtRelative(updatedAt)}更新`);
+    if (window?.status && window.status !== 'ok') parts.push(`状态 ${window.status}`);
+    return parts.join(' · ') || '真实上游未提供可展示的额度数值';
   };
 
   return (
@@ -378,7 +411,7 @@ export default function AccountDrawer({
         <Row k="计费方式" v={account.billing_mode === 'pay_as_you_go' ? <Tag color="violet">按量计费</Tag> : '订阅'} />
         {providerAPIKey ? <Row k="API Key" v={account.api_key_present ? '已加密保存' : '未检测到'} /> : null}
         <Row k="分组" v={account.group_name || '默认'} />
-        <Row k="套餐" v={account.plan_type || '—'} />
+        <Row k="套餐" v={formatPlanLabel(account.plan_type, capacityPlanPresentation)} />
         <Row k="状态" v={statusTag ? statusTag(account) : account.status} />
         <Row k="调度例外" v={ignoreRateLimitControls ? <Tag color="orange" size="small">忽略 429 / 冷却 / 隔离</Tag> : '无'} />
         <Row k="隔离" v={(account.quarantine_until || 0) > Math.floor(Date.now() / 1000) ? (protectedProbeQuarantine ? '无限期' : fmtRelative(account.quarantine_until)) : '否'} />
@@ -462,32 +495,63 @@ export default function AccountDrawer({
       })() : null}
 
       <Panel title="容量与计价证据" style={{ marginBottom: 14 }}>
-        {capacity?.error ? <Typography.Text type="tertiary">容量诊断暂不可用：{capacity.error}</Typography.Text> : (
+        {capacity?.error ? <Typography.Text type="tertiary">容量诊断暂不可用：{capacity.error}。账号管理和额度操作不受影响。</Typography.Text> : !capacity && loading ? <Typography.Text type="tertiary">正在读取容量诊断…</Typography.Text> : (
           <>
-            <Row k="API 公价等价（近 30 天）" v={capacity?.last_30d_valuation?.api_micro_usd_settled != null ? formatCapacityUSD(capacity.last_30d_valuation.api_micro_usd_settled) : '不可用'} />
-            <Row k="ChatGPT Credits" v={capacity?.last_30d_valuation?.chatgpt_milli_credits_settled != null ? formatCapacityCredits(capacity.last_30d_valuation.chatgpt_milli_credits_settled) : '无订阅证据'} />
-            <Row k="套餐先验" v={capacityEntitlement.plan_only?.plan_family || 'unknown'} />
-            {capacityEntitlement.plan_only?.plan_family === 'business' ? (
-              <Row
-                k="Standard 5h 容量先验"
-                v={standardFiveHourEstimate
-                  ? `≈ ${formatCapacityUSD(standardFiveHourEstimate.limit_micro_usd)} · ${standardFiveHourEstimate.model_family}/${standardFiveHourEstimate.service_tier} · Plus×1.25`
-                  : '等待合格的 Plus 5h 实测样本'}
-              />
-            ) : null}
-            <Row k="席位证据" v={currentEntitlementEvidence ? <Tag size="small" color={currentEntitlementEvidence.confidence === 'high' ? 'green' : 'amber'}>{entitlementSeatLabel(currentEntitlementEvidence.seat_type)} · {currentEntitlementEvidence.confidence || 'unknown'}</Tag> : <Tag size="small">未确认</Tag>} />
-            {currentEntitlementEvidence?.usage_multiplier_milli != null ? <Row k="席位容量" v={`${Number(currentEntitlementEvidence.usage_multiplier_milli) / 1000}× Standard${currentEntitlementEvidence.no_five_hour_limit === true ? ' · 无 5 小时窗口' : ''}`} /> : null}
-            {capacityEntitlement.conflict ? <Typography.Text type="warning" as="p">检测到多来源权益冲突，当前显示按保守规则降级。</Typography.Text> : null}
-            {premiumFixtureState ? <Typography.Text type="tertiary" size="small" as="p">Premium/5x Team：<Tag size="small" color={premiumFixtureState.color}>{premiumFixtureState.label}</Tag></Typography.Text> : null}
-            {capacityEntitlement.plan_only?.plan_family === 'business' ? <Typography.Text type="tertiary" size="small" as="p">Plus×1.25 仅用于普通 Team 的容量参考，不参与 Premium 席位判定，也不覆盖上游真实窗口。</Typography.Text> : null}
-            {capacityEntitlement.premium_fixture_mapping_version ? <Row k="映射版本" v={<span className="pool-mono">{capacityEntitlement.premium_fixture_mapping_version}</span>} /> : null}
-            {capacityEstimates.length ? <div className="pool-capacity-estimates">{capacityEstimates.slice(0, 4).map((estimate) => (
-              <div className="pool-capacity-estimate" key={`${estimate.limiter_kind}:${estimate.model_family}:${estimate.service_tier}:${estimate.cycle_start}`}>
-                <div><b>{estimate.model_family || 'unknown'}</b><Tag size="small" color={estimate.service_tier === 'fast' ? 'violet' : 'blue'}>{estimate.service_tier || 'unknown'}</Tag><Tag size="small">置信度 {estimate.confidence || 'unavailable'}</Tag></div>
-                <div className="pool-muted">剩余 API 等价：{formatCapacityUSD(estimate.usd_equivalent_micro)} · Credits：{formatCapacityCredits(estimate.credits_remaining_milli)}</div>
-                <div className="pool-muted">样本 {estimate.sample_count ?? 0} · {estimate.method || '—'}</div>
-              </div>
-            ))}</div> : <Typography.Text type="tertiary" size="small">尚无满足置信度门槛的容量估算；需要额度窗口快照与已结算 Usage。</Typography.Text>}
+            <section aria-label="现在还能用多少">
+              <Typography.Text as="p"><b>A. 现在还能用多少</b> <span className="pool-muted">真实上游窗口，不是估算值</span></Typography.Text>
+              {actualQuotaWindows.length ? actualQuotaWindows.map((window, index) => (
+                <Row key={`${window.limiter_type || 'window'}:${window.model || ''}:${index}`} k={capacityWindowLabel(window, index)} v={capacityWindowValue(window)} />
+              )) : <Typography.Text type="tertiary" size="small">暂无真实上游窗口；可能尚未完成首次同步或上游未提供该维度。</Typography.Text>}
+              {premiumNoFiveHour && !hasActualFiveHourWindow ? <Row k="5 小时窗口" v={<Tag size="small" color="blue">该席位不提供 5 小时窗口</Tag>} /> : null}
+              {actualQuotaWindows.some((window) => String(window?.status || '').startsWith('error/')) ? <Typography.Text type="warning" size="small" as="p">部分真实窗口同步失败；仅显示最后可验证的数据。</Typography.Text> : null}
+              {capacityEntitlement.evidence_freshness === 'stale' ? <Typography.Text type="warning" size="small" as="p">权益证据已过期；本区域不会据此虚构窗口或额度。</Typography.Text> : null}
+            </section>
+
+            <hr style={{ border: 0, borderTop: '1px solid var(--pool-border)', margin: '14px 0' }} />
+
+            <section aria-label="最近如何计价">
+              <Typography.Text as="p"><b>B. 最近如何计价</b> <span className="pool-muted">估算与真实余额严格分开</span></Typography.Text>
+              <Row k="API 公价等价值（近 30 天）" v={capacity?.last_30d_valuation?.api_micro_usd_settled != null ? `${formatCapacityUSD(capacity.last_30d_valuation.api_micro_usd_settled)}（已结算）` : '不可用'} />
+              <Row k="API 公价等价值（暂估）" v={capacity?.last_30d_valuation?.api_micro_usd_provisional != null ? `${formatCapacityUSD(capacity.last_30d_valuation.api_micro_usd_provisional)}（未结算）` : '无未结算计价'} />
+              <Row k="ChatGPT Credits（已结算）" v={capacity?.last_30d_valuation?.chatgpt_milli_credits_settled != null ? formatCapacityCredits(capacity.last_30d_valuation.chatgpt_milli_credits_settled) : '无订阅证据'} />
+              <Row k="ChatGPT Credits（暂估）" v={capacity?.last_30d_valuation?.chatgpt_milli_credits_provisional != null ? formatCapacityCredits(capacity.last_30d_valuation.chatgpt_milli_credits_provisional) : '无未结算订阅证据'} />
+              <Row k="计价时间范围" v={capacity?.valuation_window?.from_at && capacity?.valuation_window?.to_at ? `${fmtDateTime(capacity.valuation_window.from_at)} 至 ${fmtDateTime(capacity.valuation_window.to_at)}` : '近 30 天范围不可用'} />
+              <Typography.Text type="tertiary" size="small" as="p">{capacity?.labels?.usd || 'API list-price equivalent; not an account cash balance'}。只有上游真实 pay-as-you-go balance 才可称为余额。</Typography.Text>
+              {capacityEstimates.length ? <div className="pool-capacity-estimates">{capacityEstimates.slice(0, 4).map((estimate) => (
+                <div className="pool-capacity-estimate" key={`${estimate.limiter_kind}:${estimate.model_family}:${estimate.service_tier}:${estimate.cycle_start}`}>
+                  <div><b>{estimate.model_family || 'unknown'}</b><Tag size="small" color={estimate.service_tier === 'fast' ? 'violet' : 'blue'}>{estimate.service_tier || 'unknown'}</Tag><Tag size="small">估算置信度 {estimate.confidence || 'unavailable'}</Tag></div>
+                  <div className="pool-muted">剩余 API 等价：{formatCapacityUSD(estimate.usd_equivalent_micro)} · Credits：{formatCapacityCredits(estimate.credits_remaining_milli)}</div>
+                  <div className="pool-muted">样本 {estimate.sample_count ?? 0} · {estimate.method || '—'}</div>
+                </div>
+              ))}</div> : <Typography.Text type="tertiary" size="small">尚无满足置信度门槛的容量估算；需要额度窗口快照与已结算 Usage。</Typography.Text>}
+            </section>
+
+            <hr style={{ border: 0, borderTop: '1px solid var(--pool-border)', margin: '14px 0' }} />
+
+            <section aria-label="为什么系统这样判断">
+              <Typography.Text as="p"><b>C. 为什么系统这样判断</b> <span className="pool-muted">证据与先验，不等同真实额度</span></Typography.Text>
+              <Row k="产品展示" v={formatPlanLabel(account.plan_type, capacityPlanPresentation)} />
+              <Row k="规范化套餐" v={capacityPlanPresentation?.plan_family || capacityEntitlement.plan_only?.plan_family || 'unknown'} />
+              <Row k="席位证据" v={currentEntitlementEvidence ? <Tag size="small" color={currentEntitlementEvidence.confidence === 'high' ? 'green' : 'amber'}>{entitlementSeatLabel(currentEntitlementEvidence.seat_type)} · {currentEntitlementEvidence.confidence || 'unknown'}</Tag> : <Tag size="small">未确认</Tag>} />
+              <Row k="证据新鲜度" v={capacityEntitlement.evidence_freshness || 'unknown'} />
+              {currentEntitlementEvidence?.usage_multiplier_milli != null ? <Row k="权益 multiplier" v={`${Number(currentEntitlementEvidence.usage_multiplier_milli) / 1000}×`} /> : null}
+              {currentEntitlementEvidence?.no_five_hour_limit != null ? <Row k="无 5 小时限制" v={currentEntitlementEvidence.no_five_hour_limit ? '是' : '否'} /> : null}
+              {currentEntitlementEvidence ? <Row k="证据来源" v={`${currentEntitlementEvidence.source_kind || 'unknown'} · ${currentEntitlementEvidence.observed_at ? fmtDateTime(currentEntitlementEvidence.observed_at) : '时间未知'}`} /> : null}
+              {currentEntitlementEvidence?.expires_at ? <Row k="证据有效至" v={fmtDateTime(currentEntitlementEvidence.expires_at)} /> : null}
+              {capacityEntitlement.conflict ? <Typography.Text type="warning" as="p">检测到多来源权益冲突，当前展示已按保守规则降级。</Typography.Text> : null}
+              {premiumFixtureState ? <Typography.Text type="tertiary" size="small" as="p">Premium/5× Team：<Tag size="small" color={premiumFixtureState.color}>{premiumFixtureState.label}</Tag></Typography.Text> : null}
+              {premiumNoFiveHour ? <Typography.Text type="tertiary" size="small" as="p">Plus×1.25 是 Standard Team 的 capacity prior；此 Premium 席位标记为 not applicable，未应用且不会覆盖真实上游窗口。</Typography.Text> : null}
+              {standardFiveHourPriorApplicable ? <Row k="Standard Team 5h capacity prior" v={standardFiveHourEstimate
+                ? `≈ ${formatCapacityUSD(standardFiveHourEstimate.limit_micro_usd)} · ${standardFiveHourEstimate.model_family}/${standardFiveHourEstimate.service_tier} · Plus×1.25（仅先验）`
+                : '等待合格的 Plus 5h 实测样本'} /> : null}
+              {standardFiveHourPriorApplicable ? <Typography.Text type="tertiary" size="small" as="p">Plus×1.25 仅用于普通 Team 的容量先验，不参与 Premium 席位判定，也不覆盖上游真实窗口。</Typography.Text> : null}
+              {capacityEntitlement.premium_fixture_mapping_version ? <Row k="映射版本" v={<span className="pool-mono">{capacityEntitlement.premium_fixture_mapping_version}</span>} /> : null}
+              <details style={{ marginTop: 8 }}>
+                <summary>查看原始证据字段</summary>
+                {currentEntitlementEvidence?.raw_plan_label ? <Row k="raw plan label" v={<span className="pool-mono">{currentEntitlementEvidence.raw_plan_label}</span>} /> : <Typography.Text type="tertiary" size="small">暂无原始套餐证据。</Typography.Text>}
+                {currentEntitlementEvidence?.flags_state ? <Row k="flags state" v={currentEntitlementEvidence.flags_state} /> : null}
+              </details>
+            </section>
           </>
         )}
       </Panel>
@@ -511,9 +575,9 @@ export default function AccountDrawer({
         </Typography.Text>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginTop: 14 }}>
           <div>
-            <div style={{ fontWeight: 600, fontSize: 13 }}>强制卡429</div>
+            <div style={{ fontWeight: 600, fontSize: 13 }}>Codex 429 Guard（奸商模式）</div>
             <Typography.Text size="small" type="tertiary">
-              仅限 Codex OAuth 账号。注入合成工具上下文，两次明确 429 后在原账号开启 100 并发直打（无冷却）最多 15 分钟；首个非 429 上游响应立即收敛，其间其他下游连接仍独立转发，超时才切换账号。
+              默认关闭，仅适用于 Codex OAuth / SetupToken（非 API key）。符合条件的请求会追加合成工具 checkpoint；不会并发轰炸、绕过 quota/cooldown 或承诺新连接复用旧 WebSocket；账号级设置影响所有使用该账号的用户组。
             </Typography.Text>
           </div>
           <Switch

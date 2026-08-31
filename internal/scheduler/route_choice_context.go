@@ -20,10 +20,10 @@ type cooldownTrialsRestrictedKey struct{}
 
 // WithCooldownTrialsRestrictedToOverrides prevents a non-final routing target
 // from using an ordinary cooled account as an intelligent-routing last-resort
-// probe. Accounts carrying the explicit ForceCodex429 or
-// IgnoreRateLimitControls operator overrides remain probe-eligible. The API
-// enables this only while another replay-safe, explicitly authorized target is
-// available; the final target retains the normal all-targets-exhausted behavior.
+// probe. Accounts carrying the explicit IgnoreRateLimitControls operator
+// override remain probe-eligible. The API enables this only while another
+// replay-safe, explicitly authorized target is available; the final target
+// retains the normal all-targets-exhausted behavior.
 func WithCooldownTrialsRestrictedToOverrides(ctx context.Context) context.Context {
 	return context.WithValue(ctx, cooldownTrialsRestrictedKey{}, true)
 }

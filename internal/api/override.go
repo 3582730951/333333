@@ -33,7 +33,11 @@ type downstreamPolicy struct {
 	UserID  string
 	Authed  bool
 	// UserGroupID, when set, means the key uses the two-layer group model.
-	UserGroupID            string
+	UserGroupID string
+	// PolicyUserGroupID is the immutable policy scope captured at authentication.
+	// Traffic fallback may rewrite UserGroupID for routing, but eligibility and
+	// feature toggles must continue to use this original group.
+	PolicyUserGroupID      string
 	PinnedEgressNoFallback bool
 	ModelOverrideSource    string
 }
@@ -222,6 +226,9 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 			}
 		}
 		pol.Authed = true
+		if strings.TrimSpace(pol.PolicyUserGroupID) == "" {
+			pol.PolicyUserGroupID = strings.TrimSpace(pol.UserGroupID)
+		}
 		return pol, true
 	}
 	pol := downstreamPolicy{Group: s.cfg.DefaultGroup, ProviderHint: "auto"}
@@ -263,6 +270,7 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 				pol.ProviderHint = normalizeProviderHintLoose(key.ProviderHint)
 				if strings.TrimSpace(key.UserGroupID) != "" {
 					pol.UserGroupID = key.UserGroupID
+					pol.PolicyUserGroupID = key.UserGroupID
 				}
 			}
 		} else if isPoolImportKeyPlain(plain) {
@@ -291,6 +299,9 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 				pol.ForceEffort = strings.TrimSpace(ug.ForceEffort)
 			}
 		}
+	}
+	if strings.TrimSpace(pol.PolicyUserGroupID) == "" {
+		pol.PolicyUserGroupID = strings.TrimSpace(pol.UserGroupID)
 	}
 	// A server-selected traffic fallback is applied after ordinary API-key and
 	// source-group policy resolution. It is therefore authoritative for the

@@ -25,6 +25,7 @@ type QuotaWindow struct {
 	ResetAt            int64   `json:"reset_at"`
 	Status             string  `json:"status,omitempty"`
 	UpdatedAt          int64   `json:"updated_at"`
+	State              string  `json:"state"`
 }
 
 type QuotaSummary struct {
@@ -36,11 +37,13 @@ type QuotaSummary struct {
 	ResetCredits *QuotaResetCredits `json:"reset_credits,omitempty"`
 	Estimate     *QuotaEstimate     `json:"estimate,omitempty"`
 
-	SyncReason string `json:"sync_reason"`
-	SyncedAt   int64  `json:"synced_at,omitempty"`
-	Stale      bool   `json:"stale,omitempty"`
-	Partial    bool   `json:"partial,omitempty"`
-	Supported  bool   `json:"supported"`
+	SyncReason        string `json:"sync_reason"`
+	SyncedAt          int64  `json:"synced_at,omitempty"`
+	Stale             bool   `json:"stale,omitempty"`
+	Partial           bool   `json:"partial,omitempty"`
+	Supported         bool   `json:"supported"`
+	LastSuccessAt     int64  `json:"last_success_at,omitempty"`
+	EvidenceFreshness string `json:"evidence_freshness,omitempty"`
 }
 
 // QuotaCredits is the account's extra paid balance beyond the plan's included
@@ -89,6 +92,14 @@ func BuildQuotaSummary(account storage.Account, token *storage.AccountToken, sna
 	}
 	if secondary != nil {
 		out.Secondary = secondary
+	}
+	for _, snap := range snapshots {
+		if isQuotaErrorMarker(snap) || strings.TrimSpace(snap.LimiterType) == codexStreamFeaturesLimiterType {
+			continue
+		}
+		if snap.UpdatedAt > out.LastSuccessAt {
+			out.LastSuccessAt = snap.UpdatedAt
+		}
 	}
 	if reset := selectQuotaResetCredits(snapshots); reset != nil {
 		out.ResetCredits = reset
@@ -360,6 +371,12 @@ func secondaryFromRaw(raw string, updatedAt, now int64) *QuotaWindow {
 		ResetAt:            resetAt,
 		Status:             detail.Secondary.Status,
 		UpdatedAt:          updatedAt,
+		State: func() string {
+			if updatedAt <= 0 || detail.Secondary.UsedPercent < 0 {
+				return "unknown"
+			}
+			return "known"
+		}(),
 	}
 }
 
@@ -375,7 +392,15 @@ func quotaWindowFromSnapshot(snap storage.AccountRateLimit) QuotaWindow {
 		ResetAt:           snap.ResetAt,
 		Status:            snap.Status,
 		UpdatedAt:         snap.UpdatedAt,
+		State:             quotaWindowSnapshotState(snap),
 	}
+}
+
+func quotaWindowSnapshotState(snap storage.AccountRateLimit) string {
+	if snap.UpdatedAt <= 0 || snap.UsedPercent < 0 {
+		return "unknown"
+	}
+	return "known"
 }
 
 func newerQuotaErrorMarker(snapshots []storage.AccountRateLimit, primary *storage.AccountRateLimit) *storage.AccountRateLimit {

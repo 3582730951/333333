@@ -11,6 +11,7 @@ import { get, post } from '../api.js';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import { fmtRelative } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
+import { formatPlanLabel, type PlanPresentation } from '../features/accounts/model/planFormatter.ts';
 
 const DataTable = ResourceTable as any;
 const MobileRow = MobileResourceCell as any;
@@ -74,6 +75,7 @@ interface TeamAccount {
   email?: string;
   upstream_account_id?: string;
   plan_type?: string;
+  plan_presentation?: PlanPresentation;
   status?: string;
 }
 
@@ -214,13 +216,13 @@ export default function TeamLifecycle() {
   const accountOptions = snapshot.accounts
     .filter((account) => account.status !== 'disabled')
     .map((account) => ({
-      label: `${account.label || account.email || account.id} · ${account.email || account.id}${account.plan_type ? ` · ${account.plan_type}` : ''}`,
+      label: `${account.label || account.email || account.id} · ${account.email || account.id}${account.plan_type || account.plan_presentation ? ` · ${formatPlanLabel(account.plan_type, account.plan_presentation)}` : ''}`,
       value: account.id,
     }));
   const parentAccountOptions = snapshot.accounts
     .filter((account) => account.status !== 'disabled' && Boolean(account.upstream_account_id))
     .map((account) => ({
-      label: `${account.label || account.email || account.id} · ${account.email || account.id}${account.plan_type ? ` · ${account.plan_type}` : ''}`,
+      label: `${account.label || account.email || account.id} · ${account.email || account.id}${account.plan_type || account.plan_presentation ? ` · ${formatPlanLabel(account.plan_type, account.plan_presentation)}` : ''}`,
       value: account.id,
     }));
 

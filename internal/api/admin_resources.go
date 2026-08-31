@@ -1340,12 +1340,12 @@ func (s *Server) adminQuota(w http.ResponseWriter, r *http.Request) {
 
 type quotaView struct {
 	storage.AccountRateLimit
-	Label              string       `json:"label"`
-	PlanType           string       `json:"plan_type,omitempty"`
-	OAuthRateLimitTier string       `json:"oauth_rate_limit_tier,omitempty"`
-	Secondary7d        *QuotaWindow `json:"secondary_7d,omitempty"`
-	Secondary7dUsed    float64      `json:"secondary_7d_used_pct"`
-	QuotaSummary       QuotaSummary `json:"quota_summary"`
+	Label              string                  `json:"label"`
+	PlanPresentation   accountPlanPresentation `json:"plan_presentation"`
+	OAuthRateLimitTier string                  `json:"oauth_rate_limit_tier,omitempty"`
+	Secondary7d        *QuotaWindow            `json:"secondary_7d,omitempty"`
+	Secondary7dUsed    float64                 `json:"secondary_7d_used_pct"`
+	QuotaSummary       QuotaSummary            `json:"quota_summary"`
 }
 
 func (s *Server) quotaViewsForAccounts(ctx context.Context, accounts []storage.Account) ([]quotaView, error) {
@@ -1356,15 +1356,18 @@ func (s *Server) quotaViewsForAccounts(ctx context.Context, accounts []storage.A
 	// These are independent WAL reads. Running them together shortens the quota
 	// page's cold path without adding upstream traffic or changing its snapshot.
 	var (
-		labels     map[string]string
-		tokensByID map[string]storage.AccountToken
-		snapsByID  map[string][]storage.AccountRateLimit
-		labelsErr  error
-		tokensErr  error
-		snapsErr   error
-		loads      sync.WaitGroup
+		labels               map[string]string
+		tokensByID           map[string]storage.AccountToken
+		snapsByID            map[string][]storage.AccountRateLimit
+		entitlements         map[string]*storage.AccountEntitlementEvidence
+		entitlementConflicts map[string]bool
+		labelsErr            error
+		tokensErr            error
+		snapsErr             error
+		entitlementsErr      error
+		loads                sync.WaitGroup
 	)
-	loads.Add(3)
+	loads.Add(4)
 	runLoad := func(name string, target *error, load func() error) {
 		go func() {
 			defer loads.Done()
@@ -1389,8 +1392,12 @@ func (s *Server) quotaViewsForAccounts(ctx context.Context, accounts []storage.A
 		snapsByID, err = s.store.ListAccountRateLimitsByAccountIDs(ctx, accountIDs)
 		return err
 	})
+	runLoad("quota-entitlement-load", &entitlementsErr, func() (err error) {
+		entitlements, entitlementConflicts, err = s.store.CurrentAccountEntitlementEvidenceByAccountIDs(ctx, accountIDs, storage.Now())
+		return err
+	})
 	loads.Wait()
-	for _, loadErr := range []error{labelsErr, tokensErr, snapsErr} {
+	for _, loadErr := range []error{labelsErr, tokensErr, snapsErr, entitlementsErr} {
 		if loadErr != nil {
 			return nil, loadErr
 		}
@@ -1409,7 +1416,7 @@ func (s *Server) quotaViewsForAccounts(ctx context.Context, accounts []storage.A
 		qv := quotaView{
 			AccountRateLimit: base,
 			Label:            labels[account.ID],
-			PlanType:         account.PlanType,
+			PlanPresentation: accountPlanPresentationFor(account.PlanType, entitlements[account.ID], entitlementConflicts[account.ID]),
 			QuotaSummary:     summary,
 			Secondary7d:      summary.Secondary,
 		}

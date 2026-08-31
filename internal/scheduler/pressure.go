@@ -43,9 +43,9 @@ type ProviderPressureSnapshot struct {
 // user-group negative-route cache. StructuralCandidates match group/provider/
 // model. EligibleCandidates can be selected immediately. CooldownBackoffCandidates
 // are blocked only by account quarantine, quota/binding cooldown, recheck, or an
-// egress cooldown. RateLimitOverrideCandidates carry an explicit operator choice
-// (ForceCodex429 for Codex, or IgnoreRateLimitControls) and therefore must never
-// be hidden behind an automatic fast-skip marker.
+// egress cooldown. RateLimitOverrideCandidates carry the explicit high-risk
+// IgnoreRateLimitControls operator choice and must never be hidden behind an
+// automatic fast-skip marker.
 type RouteAvailabilityProbe struct {
 	StructuralCandidates        int
 	EligibleCandidates          int
@@ -163,7 +163,7 @@ func (s *Scheduler) ProbeRouteAvailability(ctx context.Context, route Route) (Ro
 	evaluation := s.newCandidateEvaluationContext(ctx, route, selection)
 	for _, indexed := range index.candidates {
 		account := indexed.snapshot.Account
-		if account.IgnoreRateLimitControls || (indexed.provider == "codex" && account.ForceCodex429) {
+		if account.IgnoreRateLimitControls {
 			probe.RateLimitOverrideCandidates++
 		}
 		candidateCounters := NoAccountCounters{}

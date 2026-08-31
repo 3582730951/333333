@@ -1,8 +1,11 @@
+import type { PlanPresentation } from '../../accounts/model/planFormatter';
+
 export interface QuotaRow {
   account_id: string;
   label?: string;
   provider?: string;
   plan_type?: string;
+  plan_presentation?: PlanPresentation;
   model?: string;
   oauth_rate_limit_tier?: string;
   limiter_type?: string;

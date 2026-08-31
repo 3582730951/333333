@@ -50,6 +50,23 @@ CREATE INDEX IF NOT EXISTS idx_account_request_rate_class_account_bucket
 CREATE INDEX IF NOT EXISTS idx_account_request_rate_class_bucket_start
   ON account_request_rate_class_buckets(bucket_start);
 
+CREATE TABLE IF NOT EXISTS account_request_rate_client_buckets (
+  writer_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  bucket_start INTEGER NOT NULL,
+  claude_code_count BIGINT NOT NULL DEFAULT 0,
+  codex_cli_count BIGINT NOT NULL DEFAULT 0,
+  openai_sdk_count BIGINT NOT NULL DEFAULT 0,
+  other_count BIGINT NOT NULL DEFAULT 0,
+  unknown_count BIGINT NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(writer_id, account_id, bucket_start)
+);
+CREATE INDEX IF NOT EXISTS idx_account_request_rate_client_account_bucket
+  ON account_request_rate_client_buckets(account_id,bucket_start);
+CREATE INDEX IF NOT EXISTS idx_account_request_rate_client_bucket_start
+  ON account_request_rate_client_buckets(bucket_start);
+
 CREATE TABLE IF NOT EXISTS account_usage_rate_events (
   event_id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL,
@@ -59,6 +76,8 @@ CREATE TABLE IF NOT EXISTS account_usage_rate_events (
   output_tokens BIGINT NOT NULL DEFAULT 0,
   total_tokens BIGINT NOT NULL DEFAULT 0,
   agent_class TEXT NOT NULL DEFAULT 'unknown',
+  client_family TEXT NOT NULL DEFAULT 'unknown',
+  client_confidence TEXT NOT NULL DEFAULT 'low',
   settlement_state TEXT NOT NULL DEFAULT 'unsettled',
   estimated INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL
@@ -78,30 +97,45 @@ const (
 )
 
 type AccountRequestRateBucket struct {
-	WriterID      string
-	AccountID     string
-	BucketStart   int64
-	RequestCount  int64
-	RootCount     int64
-	SubagentCount int64
-	UnknownCount  int64
-	UpdatedAt     int64
+	WriterID           string
+	AccountID          string
+	BucketStart        int64
+	RequestCount       int64
+	RootCount          int64
+	SubagentCount      int64
+	UnknownCount       int64
+	ClaudeCodeCount    int64
+	CodexCLICount      int64
+	OpenAISDKCount     int64
+	OtherCount         int64
+	UnknownClientCount int64
+	UpdatedAt          int64
 }
 
 type AccountRequestRateAggregate struct {
-	AttemptRPM         int64
-	AttemptRootRPM     int64
-	AttemptSubagentRPM int64
-	AttemptUnknownRPM  int64
-	LogicalRPM         int64
-	RootRPM            int64
-	SubagentRPM        int64
-	UnknownRPM         int64
-	InputTPM           int64
-	CachedInputTPM     int64
-	OutputTPM          int64
-	TPM                int64
-	LatestUpdatedAt    int64
+	AttemptRPM              int64
+	AttemptRootRPM          int64
+	AttemptSubagentRPM      int64
+	AttemptUnknownRPM       int64
+	AttemptClaudeCodeRPM    int64
+	AttemptCodexCLIRPM      int64
+	AttemptOpenAISDKRPM     int64
+	AttemptOtherRPM         int64
+	AttemptUnknownClientRPM int64
+	LogicalRPM              int64
+	RootRPM                 int64
+	SubagentRPM             int64
+	UnknownRPM              int64
+	ClaudeCodeRPM           int64
+	CodexCLIRPM             int64
+	OpenAISDKRPM            int64
+	OtherRPM                int64
+	UnknownClientRPM        int64
+	InputTPM                int64
+	CachedInputTPM          int64
+	OutputTPM               int64
+	TPM                     int64
+	LatestUpdatedAt         int64
 }
 
 // AccountUsageRateEvent is the durable logical-arrival/settlement record used
@@ -109,12 +143,12 @@ type AccountRequestRateAggregate struct {
 // terminal usage updates the same event_id, so retries and duplicate terminal
 // frames cannot inflate logical RPM.
 type AccountUsageRateEvent struct {
-	EventID, AccountID                                        string
-	OccurredAt                                                int64
-	InputTokens, CachedInputTokens, OutputTokens, TotalTokens int64
-	AgentClass, SettlementState                               string
-	Estimated                                                 bool
-	UpdatedAt                                                 int64
+	EventID, AccountID                                          string
+	OccurredAt                                                  int64
+	InputTokens, CachedInputTokens, OutputTokens, TotalTokens   int64
+	AgentClass, ClientFamily, ClientConfidence, SettlementState string
+	Estimated                                                   bool
+	UpdatedAt                                                   int64
 }
 
 // RecordAccountRequestRateArrival inserts an idempotent logical request shell.
@@ -133,8 +167,8 @@ func (s *Store) RecordAccountRequestRateArrival(ctx context.Context, event Accou
 	if state == "" {
 		state = "unsettled"
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO account_usage_rate_events(event_id,account_id,occurred_at,input_tokens,cached_input_tokens,output_tokens,total_tokens,agent_class,settlement_state,estimated,updated_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(event_id) DO NOTHING`, event.EventID, event.AccountID, event.OccurredAt, 0, 0, 0, 0, NormalizeAgentClass(event.AgentClass), state, boolInt(event.Estimated), event.UpdatedAt)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO account_usage_rate_events(event_id,account_id,occurred_at,input_tokens,cached_input_tokens,output_tokens,total_tokens,agent_class,client_family,client_confidence,settlement_state,estimated,updated_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(event_id) DO NOTHING`, event.EventID, event.AccountID, event.OccurredAt, 0, 0, 0, 0, NormalizeAgentClass(event.AgentClass), NormalizeClientFamily(event.ClientFamily), NormalizeClientConfidence(event.ClientConfidence), state, boolInt(event.Estimated), event.UpdatedAt)
 	return err
 }
 
@@ -151,8 +185,8 @@ func (s *Store) SettleAccountRequestRateEvent(ctx context.Context, event Account
 	if event.UpdatedAt <= 0 {
 		event.UpdatedAt = Now()
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE account_usage_rate_events SET input_tokens=?,cached_input_tokens=?,output_tokens=?,total_tokens=?,agent_class=?,settlement_state=?,estimated=?,updated_at=?
-WHERE event_id=? AND (estimated>0 AND ?=0 OR settlement_state IN ('unsettled','partial','provisional'))`, event.InputTokens, event.CachedInputTokens, event.OutputTokens, event.TotalTokens, NormalizeAgentClass(event.AgentClass), state, boolInt(event.Estimated), event.UpdatedAt, event.EventID, boolInt(event.Estimated))
+	_, err := s.db.ExecContext(ctx, `UPDATE account_usage_rate_events SET input_tokens=?,cached_input_tokens=?,output_tokens=?,total_tokens=?,agent_class=?,client_family=?,client_confidence=?,settlement_state=?,estimated=?,updated_at=?
+WHERE event_id=? AND (estimated>0 AND ?=0 OR settlement_state IN ('unsettled','partial','provisional'))`, event.InputTokens, event.CachedInputTokens, event.OutputTokens, event.TotalTokens, NormalizeAgentClass(event.AgentClass), NormalizeClientFamily(event.ClientFamily), NormalizeClientConfidence(event.ClientConfidence), state, boolInt(event.Estimated), event.UpdatedAt, event.EventID, boolInt(event.Estimated))
 	return err
 }
 
@@ -161,22 +195,32 @@ type AccountRequestRate struct {
 	// clients keep seeing the historical request-attempt counter. New clients
 	// must use LogicalRPM for user-request accounting; retries/failover are exposed
 	// separately through AttemptRPM.
-	RPM                int64  `json:"rpm"`
-	LogicalRPM         int64  `json:"logical_rpm"`
-	AttemptRPM         int64  `json:"attempt_rpm"`
-	AttemptRootRPM     int64  `json:"attempt_root_rpm"`
-	AttemptSubagentRPM int64  `json:"attempt_subagent_rpm"`
-	AttemptUnknownRPM  int64  `json:"attempt_unknown_rpm"`
-	RootRPM            int64  `json:"root_rpm"`
-	SubagentRPM        int64  `json:"subagent_rpm"`
-	UnknownRPM         int64  `json:"unknown_rpm"`
-	TPM                int64  `json:"tpm"`
-	InputTPM           int64  `json:"input_tpm"`
-	CachedInputTPM     int64  `json:"cached_input_tpm"`
-	OutputTPM          int64  `json:"output_tpm"`
-	WindowSeconds      int64  `json:"window_seconds"`
-	SampledAt          int64  `json:"sampled_at"`
-	State              string `json:"state"`
+	RPM                     int64  `json:"rpm"`
+	LogicalRPM              int64  `json:"logical_rpm"`
+	AttemptRPM              int64  `json:"attempt_rpm"`
+	AttemptRootRPM          int64  `json:"attempt_root_rpm"`
+	AttemptSubagentRPM      int64  `json:"attempt_subagent_rpm"`
+	AttemptUnknownRPM       int64  `json:"attempt_unknown_rpm"`
+	AttemptClaudeCodeRPM    int64  `json:"attempt_claude_code_rpm"`
+	AttemptCodexCLIRPM      int64  `json:"attempt_codex_cli_rpm"`
+	AttemptOpenAISDKRPM     int64  `json:"attempt_openai_sdk_rpm"`
+	AttemptOtherRPM         int64  `json:"attempt_other_rpm"`
+	AttemptUnknownClientRPM int64  `json:"attempt_unknown_client_rpm"`
+	RootRPM                 int64  `json:"root_rpm"`
+	SubagentRPM             int64  `json:"subagent_rpm"`
+	UnknownRPM              int64  `json:"unknown_rpm"`
+	ClaudeCodeRPM           int64  `json:"claude_code_rpm"`
+	CodexCLIRPM             int64  `json:"codex_cli_rpm"`
+	OpenAISDKRPM            int64  `json:"openai_sdk_rpm"`
+	OtherRPM                int64  `json:"other_rpm"`
+	UnknownClientRPM        int64  `json:"unknown_client_rpm"`
+	TPM                     int64  `json:"tpm"`
+	InputTPM                int64  `json:"input_tpm"`
+	CachedInputTPM          int64  `json:"cached_input_tpm"`
+	OutputTPM               int64  `json:"output_tpm"`
+	WindowSeconds           int64  `json:"window_seconds"`
+	SampledAt               int64  `json:"sampled_at"`
+	State                   string `json:"state"`
 }
 
 const (
@@ -184,6 +228,40 @@ const (
 	AgentClassSubagent = "subagent"
 	AgentClassUnknown  = "unknown"
 )
+
+const (
+	ClientFamilyClaudeCode = "claude_code"
+	ClientFamilyCodexCLI   = "codex_cli"
+	ClientFamilyOpenAISDK  = "openai_sdk"
+	ClientFamilyOther      = "other"
+	ClientFamilyUnknown    = "unknown"
+)
+
+func NormalizeClientFamily(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case ClientFamilyClaudeCode:
+		return ClientFamilyClaudeCode
+	case ClientFamilyCodexCLI:
+		return ClientFamilyCodexCLI
+	case ClientFamilyOpenAISDK:
+		return ClientFamilyOpenAISDK
+	case ClientFamilyOther:
+		return ClientFamilyOther
+	default:
+		return ClientFamilyUnknown
+	}
+}
+
+func NormalizeClientConfidence(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "high":
+		return "high"
+	case "medium":
+		return "medium"
+	default:
+		return "low"
+	}
+}
 
 func NormalizeAgentClass(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
@@ -247,6 +325,19 @@ ON CONFLICT(writer_id,account_id,bucket_start) DO UPDATE SET
 		return err
 	}
 	defer classStmt.Close()
+	clientStmt, err := tx.PrepareContext(ctx, `INSERT INTO account_request_rate_client_buckets(writer_id,account_id,bucket_start,claude_code_count,codex_cli_count,openai_sdk_count,other_count,unknown_count,updated_at)
+VALUES(?,?,?,?,?,?,?,?,?)
+ON CONFLICT(writer_id,account_id,bucket_start) DO UPDATE SET
+ claude_code_count=CASE WHEN excluded.claude_code_count>account_request_rate_client_buckets.claude_code_count THEN excluded.claude_code_count ELSE account_request_rate_client_buckets.claude_code_count END,
+ codex_cli_count=CASE WHEN excluded.codex_cli_count>account_request_rate_client_buckets.codex_cli_count THEN excluded.codex_cli_count ELSE account_request_rate_client_buckets.codex_cli_count END,
+ openai_sdk_count=CASE WHEN excluded.openai_sdk_count>account_request_rate_client_buckets.openai_sdk_count THEN excluded.openai_sdk_count ELSE account_request_rate_client_buckets.openai_sdk_count END,
+ other_count=CASE WHEN excluded.other_count>account_request_rate_client_buckets.other_count THEN excluded.other_count ELSE account_request_rate_client_buckets.other_count END,
+ unknown_count=CASE WHEN excluded.unknown_count>account_request_rate_client_buckets.unknown_count THEN excluded.unknown_count ELSE account_request_rate_client_buckets.unknown_count END,
+ updated_at=CASE WHEN excluded.updated_at>account_request_rate_client_buckets.updated_at THEN excluded.updated_at ELSE account_request_rate_client_buckets.updated_at END`)
+	if err != nil {
+		return err
+	}
+	defer clientStmt.Close()
 	for _, bucket := range buckets {
 		if strings.TrimSpace(bucket.WriterID) == "" || strings.TrimSpace(bucket.AccountID) == "" || bucket.RequestCount < 0 {
 			continue
@@ -258,6 +349,12 @@ ON CONFLICT(writer_id,account_id,bucket_start) DO UPDATE SET
 			continue
 		}
 		if _, err = classStmt.ExecContext(ctx, bucket.WriterID, bucket.AccountID, bucket.BucketStart, bucket.RootCount, bucket.SubagentCount, bucket.UnknownCount, bucket.UpdatedAt); err != nil {
+			return err
+		}
+		if bucket.ClaudeCodeCount < 0 || bucket.CodexCLICount < 0 || bucket.OpenAISDKCount < 0 || bucket.OtherCount < 0 || bucket.UnknownClientCount < 0 {
+			continue
+		}
+		if _, err = clientStmt.ExecContext(ctx, bucket.WriterID, bucket.AccountID, bucket.BucketStart, bucket.ClaudeCodeCount, bucket.CodexCLICount, bucket.OpenAISDKCount, bucket.OtherCount, bucket.UnknownClientCount, bucket.UpdatedAt); err != nil {
 			return err
 		}
 	}
@@ -345,8 +442,40 @@ WHERE account_id IN (` + strings.Join(placeholders, ",") + `) AND bucket_start>=
 	if err := classRows.Err(); err != nil {
 		return nil, err
 	}
+	clientQuery := `SELECT account_id,claude_code_count,codex_cli_count,openai_sdk_count,other_count,unknown_count,updated_at
+FROM account_request_rate_client_buckets
+WHERE account_id IN (` + strings.Join(placeholders, ",") + `) AND bucket_start>=? AND bucket_start<=?
+`
+	clientRows, err := s.rdb.QueryContext(ctx, clientQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+	for clientRows.Next() {
+		var id string
+		var claudeCode, codexCLI, openAISDK, other, unknown, updatedAt int64
+		if err := clientRows.Scan(&id, &claudeCode, &codexCLI, &openAISDK, &other, &unknown, &updatedAt); err != nil {
+			clientRows.Close()
+			return nil, err
+		}
+		aggregate := result[id]
+		addRateCounter(&aggregate.AttemptClaudeCodeRPM, claudeCode)
+		addRateCounter(&aggregate.AttemptCodexCLIRPM, codexCLI)
+		addRateCounter(&aggregate.AttemptOpenAISDKRPM, openAISDK)
+		addRateCounter(&aggregate.AttemptOtherRPM, other)
+		addRateCounter(&aggregate.AttemptUnknownClientRPM, unknown)
+		if updatedAt > aggregate.LatestUpdatedAt {
+			aggregate.LatestUpdatedAt = updatedAt
+		}
+		result[id] = aggregate
+	}
+	if err := clientRows.Close(); err != nil {
+		return nil, err
+	}
+	if err := clientRows.Err(); err != nil {
+		return nil, err
+	}
 	// Usage events are selected row-by-row for the same overflow-safe reason.
-	usageQuery := `SELECT account_id,input_tokens,cached_input_tokens,output_tokens,total_tokens,agent_class,updated_at
+	usageQuery := `SELECT account_id,input_tokens,cached_input_tokens,output_tokens,total_tokens,agent_class,client_family,updated_at
 FROM account_usage_rate_events
 WHERE account_id IN (` + strings.Join(placeholders, ",") + `) AND occurred_at>=? AND occurred_at<=?
 `
@@ -357,8 +486,8 @@ WHERE account_id IN (` + strings.Join(placeholders, ",") + `) AND occurred_at>=?
 	for usageRows.Next() {
 		var id string
 		var input, cachedInput, output, total, updatedAt int64
-		var agentClass string
-		if err := usageRows.Scan(&id, &input, &cachedInput, &output, &total, &agentClass, &updatedAt); err != nil {
+		var agentClass, clientFamily string
+		if err := usageRows.Scan(&id, &input, &cachedInput, &output, &total, &agentClass, &clientFamily, &updatedAt); err != nil {
 			usageRows.Close()
 			return nil, err
 		}
@@ -371,6 +500,18 @@ WHERE account_id IN (` + strings.Join(placeholders, ",") + `) AND occurred_at>=?
 			addRateCounter(&aggregate.SubagentRPM, 1)
 		default:
 			addRateCounter(&aggregate.UnknownRPM, 1)
+		}
+		switch NormalizeClientFamily(clientFamily) {
+		case ClientFamilyClaudeCode:
+			addRateCounter(&aggregate.ClaudeCodeRPM, 1)
+		case ClientFamilyCodexCLI:
+			addRateCounter(&aggregate.CodexCLIRPM, 1)
+		case ClientFamilyOpenAISDK:
+			addRateCounter(&aggregate.OpenAISDKRPM, 1)
+		case ClientFamilyOther:
+			addRateCounter(&aggregate.OtherRPM, 1)
+		default:
+			addRateCounter(&aggregate.UnknownClientRPM, 1)
 		}
 		addRateCounter(&aggregate.InputTPM, input)
 		addRateCounter(&aggregate.CachedInputTPM, cachedInput)
@@ -390,6 +531,8 @@ WHERE account_id IN (` + strings.Join(placeholders, ",") + `) AND occurred_at>=?
 	for id, aggregate := range result {
 		reconcileRateClasses(aggregate.AttemptRPM, &aggregate.AttemptRootRPM, &aggregate.AttemptSubagentRPM, &aggregate.AttemptUnknownRPM)
 		reconcileRateClasses(aggregate.LogicalRPM, &aggregate.RootRPM, &aggregate.SubagentRPM, &aggregate.UnknownRPM)
+		reconcileRateClientFamilies(aggregate.AttemptRPM, &aggregate.AttemptClaudeCodeRPM, &aggregate.AttemptCodexCLIRPM, &aggregate.AttemptOpenAISDKRPM, &aggregate.AttemptOtherRPM, &aggregate.AttemptUnknownClientRPM)
+		reconcileRateClientFamilies(aggregate.LogicalRPM, &aggregate.ClaudeCodeRPM, &aggregate.CodexCLIRPM, &aggregate.OpenAISDKRPM, &aggregate.OtherRPM, &aggregate.UnknownClientRPM)
 		result[id] = aggregate
 	}
 	return result, nil
@@ -410,6 +553,9 @@ func (s *Store) CleanupAccountRequestRateBuckets(ctx context.Context, before int
 	if _, err = s.db.ExecContext(ctx, `DELETE FROM account_request_rate_class_buckets WHERE bucket_start<?`, before); err != nil {
 		return deleted, err
 	}
+	if _, err = s.db.ExecContext(ctx, `DELETE FROM account_request_rate_client_buckets WHERE bucket_start<?`, before); err != nil {
+		return deleted, err
+	}
 	if _, err = s.db.ExecContext(ctx, `DELETE FROM account_usage_rate_events WHERE occurred_at<?`, before); err != nil {
 		return deleted, err
 	}
@@ -422,14 +568,24 @@ type accountRateBucketKey struct {
 }
 
 type localAccountRateBucket struct {
-	count             int64
-	rootCount         int64
-	subagentCount     int64
-	unknownCount      int64
-	persisted         int64
-	persistedRoot     int64
-	persistedSubagent int64
-	persistedUnknown  int64
+	count                  int64
+	rootCount              int64
+	subagentCount          int64
+	unknownCount           int64
+	claudeCodeCount        int64
+	codexCLICount          int64
+	openAISDKCount         int64
+	otherCount             int64
+	unknownClientCount     int64
+	persisted              int64
+	persistedRoot          int64
+	persistedSubagent      int64
+	persistedUnknown       int64
+	persistedClaudeCode    int64
+	persistedCodexCLI      int64
+	persistedOpenAISDK     int64
+	persistedOther         int64
+	persistedUnknownClient int64
 }
 
 // AccountRateMeter is a process-local hot-path counter with one durable writer
@@ -476,6 +632,14 @@ func (m *AccountRateMeter) ObserveAttempt(accountID, provider, routeKind string,
 }
 
 func (m *AccountRateMeter) ObserveAttemptClass(accountID, provider, routeKind, agentClass string, observedAt time.Time) {
+	m.ObserveAttemptDimensions(accountID, provider, routeKind, agentClass, ClientFamilyUnknown, observedAt)
+}
+
+// ObserveAttemptDimensions records a transport attempt with frozen request
+// lineage and client-family attribution. The old ObserveAttempt/Class entry
+// points remain intentionally available for protocol adapters built before the
+// client dimension was introduced.
+func (m *AccountRateMeter) ObserveAttemptDimensions(accountID, provider, routeKind, agentClass, clientFamily string, observedAt time.Time) {
 	if m == nil {
 		return
 	}
@@ -502,6 +666,18 @@ func (m *AccountRateMeter) ObserveAttemptClass(accountID, provider, routeKind, a
 		bucket.subagentCount = saturatingRateIncrement(bucket.subagentCount)
 	default:
 		bucket.unknownCount = saturatingRateIncrement(bucket.unknownCount)
+	}
+	switch NormalizeClientFamily(clientFamily) {
+	case ClientFamilyClaudeCode:
+		bucket.claudeCodeCount = saturatingRateIncrement(bucket.claudeCodeCount)
+	case ClientFamilyCodexCLI:
+		bucket.codexCLICount = saturatingRateIncrement(bucket.codexCLICount)
+	case ClientFamilyOpenAISDK:
+		bucket.openAISDKCount = saturatingRateIncrement(bucket.openAISDKCount)
+	case ClientFamilyOther:
+		bucket.otherCount = saturatingRateIncrement(bucket.otherCount)
+	default:
+		bucket.unknownClientCount = saturatingRateIncrement(bucket.unknownClientCount)
 	}
 	m.mu.Unlock()
 }
@@ -563,6 +739,29 @@ func reconcileRateClasses(total int64, root, subagent, unknown *int64) {
 	*unknown = remaining
 }
 
+// reconcileRateClientFamilies applies the same forward-compatible partition
+// rule as lineage classes. Older workers have no client bucket, so unknown is
+// the deterministic remainder rather than silently shrinking attempt RPM.
+func reconcileRateClientFamilies(total int64, claudeCode, codexCLI, openAISDK, other, unknown *int64) {
+	if claudeCode == nil || codexCLI == nil || openAISDK == nil || other == nil || unknown == nil {
+		return
+	}
+	remaining := total
+	if remaining < 0 {
+		remaining = 0
+	}
+	for _, value := range []*int64{claudeCode, codexCLI, openAISDK, other} {
+		if *value < 0 {
+			*value = 0
+		}
+		if *value > remaining {
+			*value = remaining
+		}
+		remaining -= *value
+	}
+	*unknown = remaining
+}
+
 func (m *AccountRateMeter) Start(ctx context.Context) {
 	if m == nil || m.store == nil || ctx == nil {
 		return
@@ -618,21 +817,23 @@ func (m *AccountRateMeter) Flush(ctx context.Context) error {
 	m.mu.Lock()
 	keys := make([]accountRateBucketKey, 0, len(m.buckets))
 	buckets := make([]AccountRequestRateBucket, 0, len(m.buckets))
-	counts := make([][4]int64, 0, len(m.buckets))
+	counts := make([][9]int64, 0, len(m.buckets))
 	for key, local := range m.buckets {
 		if key.bucketStart < now-accountRequestRateRetentionSeconds {
 			delete(m.buckets, key)
 			continue
 		}
-		if local.count <= local.persisted && local.rootCount <= local.persistedRoot && local.subagentCount <= local.persistedSubagent && local.unknownCount <= local.persistedUnknown {
+		if local.count <= local.persisted && local.rootCount <= local.persistedRoot && local.subagentCount <= local.persistedSubagent && local.unknownCount <= local.persistedUnknown &&
+			local.claudeCodeCount <= local.persistedClaudeCode && local.codexCLICount <= local.persistedCodexCLI && local.openAISDKCount <= local.persistedOpenAISDK && local.otherCount <= local.persistedOther && local.unknownClientCount <= local.persistedUnknownClient {
 			continue
 		}
 		keys = append(keys, key)
-		counts = append(counts, [4]int64{local.count, local.rootCount, local.subagentCount, local.unknownCount})
+		counts = append(counts, [9]int64{local.count, local.rootCount, local.subagentCount, local.unknownCount, local.claudeCodeCount, local.codexCLICount, local.openAISDKCount, local.otherCount, local.unknownClientCount})
 		buckets = append(buckets, AccountRequestRateBucket{
 			WriterID: m.writerID, AccountID: key.accountID, BucketStart: key.bucketStart,
 			RequestCount: local.count, RootCount: local.rootCount, SubagentCount: local.subagentCount,
-			UnknownCount: local.unknownCount, UpdatedAt: now,
+			UnknownCount: local.unknownCount, ClaudeCodeCount: local.claudeCodeCount, CodexCLICount: local.codexCLICount,
+			OpenAISDKCount: local.openAISDKCount, OtherCount: local.otherCount, UnknownClientCount: local.unknownClientCount, UpdatedAt: now,
 		})
 	}
 	m.mu.Unlock()
@@ -654,6 +855,21 @@ func (m *AccountRateMeter) Flush(ctx context.Context) error {
 			}
 			if counts[index][3] > local.persistedUnknown {
 				local.persistedUnknown = counts[index][3]
+			}
+			if counts[index][4] > local.persistedClaudeCode {
+				local.persistedClaudeCode = counts[index][4]
+			}
+			if counts[index][5] > local.persistedCodexCLI {
+				local.persistedCodexCLI = counts[index][5]
+			}
+			if counts[index][6] > local.persistedOpenAISDK {
+				local.persistedOpenAISDK = counts[index][6]
+			}
+			if counts[index][7] > local.persistedOther {
+				local.persistedOther = counts[index][7]
+			}
+			if counts[index][8] > local.persistedUnknownClient {
+				local.persistedUnknownClient = counts[index][8]
 			}
 		}
 	}
@@ -732,12 +948,29 @@ func (m *AccountRateMeter) Rates(ctx context.Context, accountIDs []string, sampl
 		if delta := local.unknownCount - local.persistedUnknown; delta > 0 {
 			addRateCounter(&aggregate.AttemptUnknownRPM, delta)
 		}
+		if delta := local.claudeCodeCount - local.persistedClaudeCode; delta > 0 {
+			addRateCounter(&aggregate.AttemptClaudeCodeRPM, delta)
+		}
+		if delta := local.codexCLICount - local.persistedCodexCLI; delta > 0 {
+			addRateCounter(&aggregate.AttemptCodexCLIRPM, delta)
+		}
+		if delta := local.openAISDKCount - local.persistedOpenAISDK; delta > 0 {
+			addRateCounter(&aggregate.AttemptOpenAISDKRPM, delta)
+		}
+		if delta := local.otherCount - local.persistedOther; delta > 0 {
+			addRateCounter(&aggregate.AttemptOtherRPM, delta)
+		}
+		if delta := local.unknownClientCount - local.persistedUnknownClient; delta > 0 {
+			addRateCounter(&aggregate.AttemptUnknownClientRPM, delta)
+		}
 		aggregates[key.accountID] = aggregate
 	}
 	m.mu.Unlock()
 	for id, aggregate := range aggregates {
 		reconcileRateClasses(aggregate.AttemptRPM, &aggregate.AttemptRootRPM, &aggregate.AttemptSubagentRPM, &aggregate.AttemptUnknownRPM)
 		reconcileRateClasses(aggregate.LogicalRPM, &aggregate.RootRPM, &aggregate.SubagentRPM, &aggregate.UnknownRPM)
+		reconcileRateClientFamilies(aggregate.AttemptRPM, &aggregate.AttemptClaudeCodeRPM, &aggregate.AttemptCodexCLIRPM, &aggregate.AttemptOpenAISDKRPM, &aggregate.AttemptOtherRPM, &aggregate.AttemptUnknownClientRPM)
+		reconcileRateClientFamilies(aggregate.LogicalRPM, &aggregate.ClaudeCodeRPM, &aggregate.CodexCLIRPM, &aggregate.OpenAISDKRPM, &aggregate.OtherRPM, &aggregate.UnknownClientRPM)
 		aggregates[id] = aggregate
 	}
 	result := make(map[string]AccountRequestRate, len(ids))
@@ -745,7 +978,9 @@ func (m *AccountRateMeter) Rates(ctx context.Context, accountIDs []string, sampl
 		result[id] = AccountRequestRate{
 			RPM: aggregates[id].AttemptRPM, LogicalRPM: aggregates[id].LogicalRPM, AttemptRPM: aggregates[id].AttemptRPM,
 			AttemptRootRPM: aggregates[id].AttemptRootRPM, AttemptSubagentRPM: aggregates[id].AttemptSubagentRPM, AttemptUnknownRPM: aggregates[id].AttemptUnknownRPM,
+			AttemptClaudeCodeRPM: aggregates[id].AttemptClaudeCodeRPM, AttemptCodexCLIRPM: aggregates[id].AttemptCodexCLIRPM, AttemptOpenAISDKRPM: aggregates[id].AttemptOpenAISDKRPM, AttemptOtherRPM: aggregates[id].AttemptOtherRPM, AttemptUnknownClientRPM: aggregates[id].AttemptUnknownClientRPM,
 			RootRPM: aggregates[id].RootRPM, SubagentRPM: aggregates[id].SubagentRPM, UnknownRPM: aggregates[id].UnknownRPM,
+			ClaudeCodeRPM: aggregates[id].ClaudeCodeRPM, CodexCLIRPM: aggregates[id].CodexCLIRPM, OpenAISDKRPM: aggregates[id].OpenAISDKRPM, OtherRPM: aggregates[id].OtherRPM, UnknownClientRPM: aggregates[id].UnknownClientRPM,
 			TPM: aggregates[id].TPM, InputTPM: aggregates[id].InputTPM, CachedInputTPM: aggregates[id].CachedInputTPM, OutputTPM: aggregates[id].OutputTPM,
 			WindowSeconds: AccountRequestRateWindowSeconds,
 			SampledAt:     sampledAt, State: state,

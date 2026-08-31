@@ -27,6 +27,26 @@ type AccountEntitlementEvidence struct {
 	ObservedAt           int64                  `json:"observed_at"`
 	ExpiresAt            int64                  `json:"expires_at"`
 	PayloadRedacted      json.RawMessage        `json:"payload_redacted"`
+	FlagsState           string                 `json:"flags_state,omitempty"`
+	Freshness            string                 `json:"freshness,omitempty"`
+}
+
+// EntitlementEvidenceFreshness classifies an observation without inferring a
+// seat. Unknown means no observation exists; stale means observations exist but
+// all validity intervals have elapsed; fresh means at least one is still valid.
+func EntitlementEvidenceFreshness(rows []AccountEntitlementEvidence, at int64) string {
+	if at <= 0 {
+		at = Now()
+	}
+	if len(rows) == 0 {
+		return "unknown"
+	}
+	for _, row := range rows {
+		if row.ObservedAt > 0 && row.ExpiresAt > at {
+			return "fresh"
+		}
+	}
+	return "stale"
 }
 
 func entitlementSourcePriority(source string) int {
@@ -91,6 +111,21 @@ func validateEntitlementEvidence(evidence AccountEntitlementEvidence) error {
 	if flagsKnown && (evidence.UsageMultiplierMilli == nil || evidence.NoFiveHourLimit == nil) {
 		return fmt.Errorf("entitlement flags must be present or absent as a set")
 	}
+	if evidence.FlagsState == "" {
+		switch {
+		case evidence.UsageMultiplierMilli == nil && evidence.NoFiveHourLimit == nil:
+			evidence.FlagsState = "unknown"
+		case evidence.UsageMultiplierMilli == nil || evidence.NoFiveHourLimit == nil:
+			evidence.FlagsState = "unknown"
+		case *evidence.UsageMultiplierMilli == 5000 && *evidence.NoFiveHourLimit:
+			evidence.FlagsState = "known"
+		default:
+			evidence.FlagsState = "contradictory"
+		}
+	}
+	if evidence.FlagsState != "known" && evidence.FlagsState != "unknown" && evidence.FlagsState != "contradictory" {
+		return fmt.Errorf("entitlement flags state is invalid")
+	}
 	if evidence.SeatType == entitlement.SeatBusinessPremium {
 		if entitlementSourcePriority(evidence.SourceKind) < 2 || evidence.Confidence != "high" ||
 			evidence.UsageMultiplierMilli == nil || *evidence.UsageMultiplierMilli != 5000 ||
@@ -150,27 +185,101 @@ FROM account_entitlement_evidence WHERE account_id=? ORDER BY observed_at DESC,i
 	defer rows.Close()
 	result := []AccountEntitlementEvidence{}
 	for rows.Next() {
-		var item AccountEntitlementEvidence
-		var planFamily, seatType, payload string
-		var multiplier sql.NullInt64
-		var noFiveHour, flagsKnown int64
-		if err := rows.Scan(&item.ID, &item.AccountID, &item.SourceKind, &item.SourceFingerprint, &planFamily, &seatType,
-			&multiplier, &noFiveHour, &flagsKnown, &item.RawPlanLabel, &item.Confidence, &item.ObservedAt, &item.ExpiresAt, &payload); err != nil {
+		item, err := scanAccountEntitlementEvidence(rows.Scan)
+		if err != nil {
 			return nil, err
-		}
-		item.PlanFamily, item.SeatType = entitlement.PlanFamily(planFamily), entitlement.SeatType(seatType)
-		item.PayloadRedacted = json.RawMessage(payload)
-		if flagsKnown != 0 {
-			if !multiplier.Valid {
-				return nil, errors.New("entitlement evidence flags are corrupt")
-			}
-			item.UsageMultiplierMilli = nullableScanPointer(multiplier)
-			value := noFiveHour != 0
-			item.NoFiveHourLimit = &value
 		}
 		result = append(result, item)
 	}
 	return result, rows.Err()
+}
+
+// ListAccountEntitlementEvidenceByAccountIDs is the batched form used by the
+// account and quota admin views. It keeps presentation evidence on the same
+// snapshot path as account labels and quota rows instead of issuing one query
+// per card.
+func (s *Store) ListAccountEntitlementEvidenceByAccountIDs(ctx context.Context, accountIDs []string) (map[string][]AccountEntitlementEvidence, error) {
+	result := make(map[string][]AccountEntitlementEvidence, len(accountIDs))
+	ids := make([]string, 0, len(accountIDs))
+	for _, accountID := range accountIDs {
+		accountID = strings.TrimSpace(accountID)
+		if accountID == "" {
+			continue
+		}
+		if _, exists := result[accountID]; exists {
+			continue
+		}
+		result[accountID] = nil
+		ids = append(ids, accountID)
+	}
+	if len(ids) == 0 {
+		return result, nil
+	}
+	const batchSize = 500
+	for start := 0; start < len(ids); start += batchSize {
+		end := start + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		rows, err := s.rdb.QueryContext(ctx, `SELECT id,account_id,source_kind,source_fingerprint,plan_family,seat_type,usage_multiplier_milli,
+no_five_hour_limit,entitlement_flags_known,raw_plan_label,confidence,observed_at,expires_at,payload_redacted_json
+FROM account_entitlement_evidence WHERE account_id IN (`+sqlPlaceholders(end-start)+`) ORDER BY account_id,observed_at DESC,id`, stringArgs(ids[start:end])...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			item, scanErr := scanAccountEntitlementEvidence(rows.Scan)
+			if scanErr != nil {
+				_ = rows.Close()
+				return nil, scanErr
+			}
+			result[item.AccountID] = append(result[item.AccountID], item)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func scanAccountEntitlementEvidence(scan func(dest ...interface{}) error) (AccountEntitlementEvidence, error) {
+	var item AccountEntitlementEvidence
+	var planFamily, seatType, payload string
+	var multiplier sql.NullInt64
+	var noFiveHour, flagsKnown int64
+	if err := scan(&item.ID, &item.AccountID, &item.SourceKind, &item.SourceFingerprint, &planFamily, &seatType,
+		&multiplier, &noFiveHour, &flagsKnown, &item.RawPlanLabel, &item.Confidence, &item.ObservedAt, &item.ExpiresAt, &payload); err != nil {
+		return AccountEntitlementEvidence{}, err
+	}
+	item.PlanFamily, item.SeatType = entitlement.PlanFamily(planFamily), entitlement.SeatType(seatType)
+	item.PayloadRedacted = json.RawMessage(payload)
+	if item.ExpiresAt > Now() {
+		item.Freshness = "fresh"
+	} else {
+		item.Freshness = "stale"
+	}
+	if flagsKnown != 0 {
+		if multiplier.Valid {
+			item.FlagsState = "known"
+		} else {
+			item.FlagsState = "contradictory"
+		}
+	} else {
+		item.FlagsState = "unknown"
+	}
+	if flagsKnown != 0 {
+		if !multiplier.Valid {
+			return AccountEntitlementEvidence{}, errors.New("entitlement evidence flags are corrupt")
+		}
+		item.UsageMultiplierMilli = nullableScanPointer(multiplier)
+		value := noFiveHour != 0
+		item.NoFiveHourLimit = &value
+	}
+	return item, nil
 }
 
 func (s *Store) CurrentAccountEntitlementEvidence(ctx context.Context, accountID string, at int64) (*AccountEntitlementEvidence, bool, error) {
@@ -178,6 +287,30 @@ func (s *Store) CurrentAccountEntitlementEvidence(ctx context.Context, accountID
 	if err != nil {
 		return nil, false, err
 	}
+	return currentAccountEntitlementEvidence(rows, at)
+}
+
+// CurrentAccountEntitlementEvidenceByAccountIDs applies the exact same
+// precedence and conflict rules as the single-account lookup, while batching
+// the read for list endpoints.
+func (s *Store) CurrentAccountEntitlementEvidenceByAccountIDs(ctx context.Context, accountIDs []string, at int64) (map[string]*AccountEntitlementEvidence, map[string]bool, error) {
+	rowsByAccount, err := s.ListAccountEntitlementEvidenceByAccountIDs(ctx, accountIDs)
+	if err != nil {
+		return nil, nil, err
+	}
+	current := make(map[string]*AccountEntitlementEvidence, len(rowsByAccount))
+	conflicts := make(map[string]bool, len(rowsByAccount))
+	for accountID, rows := range rowsByAccount {
+		value, conflict, currentErr := currentAccountEntitlementEvidence(rows, at)
+		if currentErr != nil {
+			return nil, nil, currentErr
+		}
+		current[accountID], conflicts[accountID] = value, conflict
+	}
+	return current, conflicts, nil
+}
+
+func currentAccountEntitlementEvidence(rows []AccountEntitlementEvidence, at int64) (*AccountEntitlementEvidence, bool, error) {
 	if at <= 0 {
 		at = Now()
 	}

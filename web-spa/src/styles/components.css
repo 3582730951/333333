@@ -852,6 +852,17 @@
   table-layout: fixed;
 }
 
+/* Thread controls carry opaque handles plus two independent mutations. Keep their
+   intentionally dense desktop columns at a readable floor; narrower shells use the
+   table wrapper's horizontal scroll while the mobile resource rows remain single-column. */
+.pool-codex-threads-table {
+  --pool-table-fit-width: 1380px;
+}
+
+.pool-codex-threads-table .pool-mono {
+  white-space: nowrap;
+}
+
 .pool-table th,
 .pool-table td {
   min-width: 0;

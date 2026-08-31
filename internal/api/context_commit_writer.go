@@ -25,17 +25,28 @@ var (
 type terminalCommitWriter struct {
 	dst           http.ResponseWriter
 	commit        func() error
+	afterTerminal func()
 	buf           []byte
 	deferred      [][]byte
 	deferredBytes int
 	terminal      bool
 	once          sync.Once
+	afterOnce     sync.Once
 	commitErr     error
 	writeErr      error
 }
 
 func newTerminalCommitWriter(dst http.ResponseWriter, commit func() error) *terminalCommitWriter {
 	return &terminalCommitWriter{dst: dst, commit: commit}
+}
+
+// newTerminalCommitWriterAfter installs non-critical work that must happen only
+// after the completed frame was actually written to the downstream connection.
+// It is intentionally fire-and-forget from the stream's perspective: a durable
+// post-terminal intent may fail or be cancelled without changing already-visible
+// protocol bytes.
+func newTerminalCommitWriterAfter(dst http.ResponseWriter, commit func() error, afterTerminal func()) *terminalCommitWriter {
+	return &terminalCommitWriter{dst: dst, commit: commit, afterTerminal: afterTerminal}
 }
 
 func (w *terminalCommitWriter) Header() http.Header    { return w.dst.Header() }
@@ -185,6 +196,9 @@ func (w *terminalCommitWriter) writeFrame(frame []byte) error {
 	}
 	if _, err := w.dst.Write(frame); err != nil {
 		return err
+	}
+	if isCompleted && w.afterTerminal != nil {
+		w.afterOnce.Do(w.afterTerminal)
 	}
 	if isTerminal && len(w.deferred) > 0 {
 		for _, deferred := range w.deferred {

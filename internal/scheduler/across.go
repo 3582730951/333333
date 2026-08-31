@@ -253,7 +253,7 @@ func (s *Scheduler) tryAcrossCooldownTrials(ctx context.Context, trials []across
 		trials = trials[:maxCooldownTrialAttempts]
 	}
 	for _, trial := range trials {
-		if cooldownTrialsRestrictedToOverrides(ctx) && !trial.candidate.account.ForceCodex429 && !trial.candidate.account.IgnoreRateLimitControls {
+		if cooldownTrialsRestrictedToOverrides(ctx) && !trial.candidate.account.IgnoreRateLimitControls {
 			continue
 		}
 		lease, _, ok := s.tryLeaseAccountFromCandidate(ctx, trial.candidate, trial.route)

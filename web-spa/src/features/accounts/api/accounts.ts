@@ -56,6 +56,14 @@ export const accountRequestRateSchema = z.object({
   output_tpm: rate.output_tpm ?? 0,
 }));
 
+const planPresentationSchema = z.object({
+  plan_family: z.enum(['unknown', 'free', 'plus', 'pro', 'business', 'enterprise', 'edu', 'api']).catch('unknown'),
+  seat_type: z.enum(['unknown', 'personal', 'business_standard', 'business_premium', 'legacy_codex', 'enterprise_standard']).catch('unknown'),
+  plan_display_name: optionalString,
+  seat_display_name: optionalString,
+  combined: optionalString,
+}).passthrough();
+
 const accountSchema = z.object({
   id: z.preprocess((value) => typeof value === 'number' ? String(value) : value, z.string().min(1)),
   label: optionalString,
@@ -64,6 +72,7 @@ const accountSchema = z.object({
   status: optionalString,
   group_name: optionalString,
   plan_type: optionalString,
+  plan_presentation: planPresentationSchema.optional(),
   auth_method: optionalString,
   credential_mode: optionalString,
   billing_mode: optionalString,

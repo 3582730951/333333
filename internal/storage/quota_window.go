@@ -90,6 +90,26 @@ type QuotaWindowEstimateSummary struct {
 	FinalizedAt  int64
 }
 
+// LastSuccessfulQuotaAt returns the newest non-error quota observation for an
+// account. Error markers are intentionally excluded so a failed refresh cannot
+// masquerade as a successful sample or erase the last known-good timestamp.
+func (s *Store) LastSuccessfulQuotaAt(ctx context.Context, accountID string) (int64, error) {
+	if s == nil {
+		return 0, nil
+	}
+	var at sql.NullInt64
+	err := s.rdb.QueryRowContext(ctx, `SELECT MAX(updated_at) FROM account_rate_limits
+WHERE account_id=? AND limiter_type <> 'quota_poll_error' AND source <> 'quota_poll_error'
+AND status NOT LIKE 'error/%'`, strings.TrimSpace(accountID)).Scan(&at)
+	if err != nil {
+		return 0, err
+	}
+	if !at.Valid {
+		return 0, nil
+	}
+	return at.Int64, nil
+}
+
 // DeleteMisclassifiedLongFiveHourQuotaState removes only state produced by the
 // historical bug that stored a sole long (normally seven-day) Codex primary
 // window under the 5h bucket. Callers must first prove the reviewed Premium/5x

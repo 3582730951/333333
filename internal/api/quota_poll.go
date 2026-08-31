@@ -899,6 +899,9 @@ func (s *Server) recordQuotaPollError(ctx context.Context, acc storage.Account, 
 		"sync_reason": syncReason,
 		"error":       "",
 	}
+	if lastSuccess, lastErr := s.store.LastSuccessfulQuotaAt(ctx, acc.ID); lastErr == nil && lastSuccess > 0 {
+		detail["last_success_at"] = lastSuccess
+	}
 	if qerr.err != nil {
 		detail["error"] = qerr.err.Error()
 	} else if err != nil {

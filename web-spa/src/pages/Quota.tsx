@@ -14,6 +14,7 @@ import { fmtTokens, fmtRelative, fmtInt, middleEllipsis } from '../lib/format.js
 import { COLORS } from '../lib/chartTheme.js';
 import { t } from '../lib/i18n.js';
 import type { QuotaRow } from '../features/observability/model/types';
+import { formatPlanLabel } from '../features/accounts/model/planFormatter.ts';
 
 const DataTable = ResourceTable as any;
 const MobileRow = MobileResourceCell as any;
@@ -109,7 +110,7 @@ export default function Quota() {
   const exportCSV = () => {
     const ok = downloadCSV('quota.csv', toCSV(rows, [
       { title: 'account', get: (r: QuotaRow) => r.label || r.account_id }, { title: 'provider', get: (r: QuotaRow) => r.provider },
-      { title: 'plan_type', get: (r: QuotaRow) => r.plan_type }, { title: 'oauth_rate_limit_tier', get: (r: QuotaRow) => r.oauth_rate_limit_tier },
+      { title: 'plan', get: (r: QuotaRow) => formatPlanLabel(r.plan_type, r.plan_presentation) }, { title: 'oauth_rate_limit_tier', get: (r: QuotaRow) => r.oauth_rate_limit_tier },
       { title: '5h_used_pct', get: (r: QuotaRow) => r.quota_summary?.primary?.used_percent ?? r.used_percent },
       { title: '7d_used_pct', get: (r: QuotaRow) => r.quota_summary?.secondary?.used_percent ?? r.secondary_7d_used_pct },
       { title: 'remaining_tokens', get: (r: QuotaRow) => r.quota_summary?.primary?.remaining_tokens ?? r.remaining_tokens },
@@ -161,7 +162,7 @@ export default function Quota() {
         name: item.row.label || item.row.account_id || t('common.unnamed_account'),
         value: item.used,
         color: pctColor(item.used),
-        meta: item.row.provider ? `${item.row.provider}${item.row.plan_type ? ` · ${item.row.plan_type}` : ''}` : undefined,
+        meta: item.row.provider ? `${item.row.provider}${item.row.plan_type || item.row.plan_presentation ? ` · ${formatPlanLabel(item.row.plan_type, item.row.plan_presentation)}` : ''}` : undefined,
       }));
     return { critical, warning, healthy, average, remaining, remainingByProvider, stale, pressure, measured: withUsage.length };
   }, [rows]);
@@ -224,7 +225,7 @@ export default function Quota() {
       return <TextClamp strong title={name} ariaLabel={name}>{middleEllipsis(name, 15, 10)}</TextClamp>;
     } },
     { title: t('quota.provider'), dataIndex: 'provider', width: 96, render: (v: any) => v ? <Tag>{v}</Tag> : '—' },
-    { title: t('quota.plan'), dataIndex: 'plan_type', width: 110, render: (v: any) => v ? <Tag>{v}</Tag> : '—' },
+    { title: t('quota.plan'), dataIndex: 'plan_type', width: 140, render: (_v: any, r: QuotaRow) => r.plan_type || r.plan_presentation ? <Tag>{formatPlanLabel(r.plan_type, r.plan_presentation)}</Tag> : '—' },
     { title: 'OAuth Tier', dataIndex: 'oauth_rate_limit_tier', width: 140, render: (v: any) => v ? <span className="pool-mono">{v}</span> : '—' },
     { title: t('quota.window'), dataIndex: 'limiter_type', width: 150, render: (v: any) => v ? <span className="pool-mono">{v}</span> : '—' },
     { title: t('quota.usage_5h'), dataIndex: 'used_percent', width: 170, sorter: (a: QuotaRow, b: QuotaRow) => ((a.quota_summary?.primary?.used_percent ?? a.used_percent) || 0) - ((b.quota_summary?.primary?.used_percent ?? b.used_percent) || 0), defaultSortOrder: 'descend', render: (v: number, r: QuotaRow) => bar(r.quota_summary?.primary?.used_percent ?? v) },
@@ -394,7 +395,7 @@ export default function Quota() {
             <MobileRow
               title={row.label || row.account_id || t('common.unnamed_account')}
               subtitle={row.account_id}
-              badges={<><Tag>{row.provider || t('common.unknown')}</Tag>{row.plan_type ? <Tag>{row.plan_type}</Tag> : null}</>}
+              badges={<><Tag>{row.provider || t('common.unknown')}</Tag>{row.plan_type || row.plan_presentation ? <Tag>{formatPlanLabel(row.plan_type, row.plan_presentation)}</Tag> : null}</>}
               details={[
                 { label: t('quota.usage_5h'), value: primaryUsed == null ? t('common.unknown') : `${Math.round(primaryUsed)}%` },
                 { label: t('quota.usage_7d'), value: secondaryUsed == null ? t('common.unknown') : `${Math.round(secondaryUsed)}%` },

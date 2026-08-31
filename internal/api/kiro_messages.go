@@ -1426,6 +1426,7 @@ func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity rou
 	modelDiag := modelDiagnosticsFromCtx(r.Context())
 	diagnostics.BillingHoldID = holdIDFromCtx(r.Context())
 	diagnostics.RequestedModel, diagnostics.ResolvedModel, diagnostics.ModelOverrideSource = modelDiag.Requested, firstNonEmpty(modelDiag.Resolved, model), modelDiag.Source
+	diagnostics = usageDiagnosticsWithFrozenClientIdentity(r.Context(), diagnostics)
 	totalInput := data.InputTokens
 	if data.Metering.TotalInputTokens.Present {
 		totalInput = data.Metering.TotalInputTokens.Value
