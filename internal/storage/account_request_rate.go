@@ -104,6 +104,58 @@ type AccountRequestRateAggregate struct {
 	LatestUpdatedAt    int64
 }
 
+// AccountUsageRateEvent is the durable logical-arrival/settlement record used
+// by RPM and TPM views. A row is created at arrival with an "unsettled" state;
+// terminal usage updates the same event_id, so retries and duplicate terminal
+// frames cannot inflate logical RPM.
+type AccountUsageRateEvent struct {
+	EventID, AccountID                                        string
+	OccurredAt                                                int64
+	InputTokens, CachedInputTokens, OutputTokens, TotalTokens int64
+	AgentClass, SettlementState                               string
+	Estimated                                                 bool
+	UpdatedAt                                                 int64
+}
+
+// RecordAccountRequestRateArrival inserts an idempotent logical request shell.
+// It is safe to call before a billing hold or usage row exists.
+func (s *Store) RecordAccountRequestRateArrival(ctx context.Context, event AccountUsageRateEvent) error {
+	if s == nil || s.db == nil || strings.TrimSpace(event.EventID) == "" || strings.TrimSpace(event.AccountID) == "" {
+		return nil
+	}
+	if event.OccurredAt <= 0 {
+		event.OccurredAt = Now()
+	}
+	if event.UpdatedAt <= 0 {
+		event.UpdatedAt = event.OccurredAt
+	}
+	state := strings.TrimSpace(event.SettlementState)
+	if state == "" {
+		state = "unsettled"
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO account_usage_rate_events(event_id,account_id,occurred_at,input_tokens,cached_input_tokens,output_tokens,total_tokens,agent_class,settlement_state,estimated,updated_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(event_id) DO NOTHING`, event.EventID, event.AccountID, event.OccurredAt, 0, 0, 0, 0, NormalizeAgentClass(event.AgentClass), state, boolInt(event.Estimated), event.UpdatedAt)
+	return err
+}
+
+// SettleAccountRequestRateEvent updates an arrival shell in place. A duplicate
+// or older settlement is ignored; a real sample supersedes an estimate.
+func (s *Store) SettleAccountRequestRateEvent(ctx context.Context, event AccountUsageRateEvent) error {
+	if s == nil || s.db == nil || strings.TrimSpace(event.EventID) == "" {
+		return nil
+	}
+	state := strings.TrimSpace(event.SettlementState)
+	if state == "" {
+		state = "settled"
+	}
+	if event.UpdatedAt <= 0 {
+		event.UpdatedAt = Now()
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE account_usage_rate_events SET input_tokens=?,cached_input_tokens=?,output_tokens=?,total_tokens=?,agent_class=?,settlement_state=?,estimated=?,updated_at=?
+WHERE event_id=? AND (estimated>0 AND ?=0 OR settlement_state IN ('unsettled','partial','provisional'))`, event.InputTokens, event.CachedInputTokens, event.OutputTokens, event.TotalTokens, NormalizeAgentClass(event.AgentClass), state, boolInt(event.Estimated), event.UpdatedAt, event.EventID, boolInt(event.Estimated))
+	return err
+}
+
 type AccountRequestRate struct {
 	// RPM is the legacy wire field and remains an alias for AttemptRPM so older
 	// clients keep seeing the historical request-attempt counter. New clients

@@ -52,6 +52,16 @@ type BodyMeta struct {
 	CompactionTrigger  bool            `json:"compaction_trigger,omitempty"`
 	ClientToolResult   bool            `json:"client_tool_result,omitempty"`
 	ToolContext        bool            `json:"tool_context,omitempty"`
+	// Identity fields are optional compatibility metadata. They are populated
+	// when a client sends explicit body markers; HTTP/header classifiers may
+	// enrich them later without rescanning the body.
+	ClientFamily           string `json:"client_family,omitempty"`
+	AgentClass             string `json:"agent_class,omitempty"`
+	IdentityConfidence     string `json:"identity_confidence,omitempty"`
+	IdentityEvidenceBits   uint64 `json:"identity_evidence_bits,omitempty"`
+	IdentityConflict       bool   `json:"identity_conflict,omitempty"`
+	IdentityConflictReason string `json:"identity_conflict_reason,omitempty"`
+	RequestedModelFamily   string `json:"requested_model_family,omitempty"`
 	// PromptCacheBreakpoint marks the unsupported client-only cache control found
 	// anywhere below the request root. The Codex upstream sanitizer uses this bit
 	// to select its targeted materialized fallback without rescanning every large
@@ -78,7 +88,7 @@ var trackedJSONFields = map[string]struct{}{
 	"store": {}, "tool_choice": {}, "parallel_tool_calls": {}, "prompt_cache_retention": {}, "prompt_cache_options": {}, "client_metadata": {}, "generate": {}, "include": {},
 	"object": {}, "output": {}, "output_text": {}, "delta": {}, "item": {}, "usage": {}, "headers": {},
 	"window_id": {}, "parent_thread_id": {}, "forked_from_thread_id": {}, "turn_metadata": {}, "turn_state": {},
-	"compaction_trigger": {},
+	"compaction_trigger": {}, "client_family": {}, "client_type": {}, "agent_class": {}, "identity_confidence": {}, "originator": {},
 }
 
 // ScanJSON validates a replayable JSON body while retaining only bounded top-level metadata.
@@ -395,7 +405,7 @@ func (s *jsonMetaScanner) applyField(key string, value scannedValue) {
 		}
 	case "compaction_trigger":
 		s.meta.CompactionTrigger = value.kind == 't'
-	case "type", "id", "model", "status", "prompt_cache_key", "previous_response_id", "conversation_id", "session_id", "thread_id":
+	case "type", "id", "model", "status", "prompt_cache_key", "previous_response_id", "conversation_id", "session_id", "thread_id", "client_family", "client_type", "agent_class", "identity_confidence", "originator":
 		decoded, ok := decodeJSONString(value.raw)
 		if !ok {
 			return
@@ -420,6 +430,12 @@ func (s *jsonMetaScanner) applyField(key string, value scannedValue) {
 			s.meta.SessionID = decoded
 		case "thread_id":
 			s.meta.ThreadID = decoded
+		case "client_family", "client_type", "originator":
+			s.meta.ClientFamily = strings.ToLower(strings.TrimSpace(decoded))
+		case "agent_class":
+			s.meta.AgentClass = strings.ToLower(strings.TrimSpace(decoded))
+		case "identity_confidence":
+			s.meta.IdentityConfidence = strings.ToLower(strings.TrimSpace(decoded))
 		}
 	}
 }
