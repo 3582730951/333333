@@ -172,7 +172,11 @@ func FromRequest(r *http.Request) RequestClientIdentity {
 	if r.Header.Get("OpenAI-Beta") != "" || r.Header.Get("OpenAI-Organization") != "" {
 		add(ClientOpenAISDK, "openai_header", "client", "present", ConfidenceMedium)
 	}
+	if originator := r.Header.Get("Originator"); strings.Contains(strings.ToLower(originator), "codex") {
+		add(ClientCodexCLI, "originator_header", "client", "present", ConfidenceHigh)
+	}
 	if v := r.Header.Get("X-OpenAI-Subagent"); v != "" {
+		add(ClientCodexCLI, "x-openai-subagent", "client", "present", ConfidenceHigh)
 		add(ClientCodexCLI, "x-openai-subagent", "agent", v, ConfidenceHigh)
 	}
 	if v := r.Header.Get("X-Claude-Code-Is-Subagent"); v != "" {
@@ -307,6 +311,8 @@ func resolve(ev []Evidence) RequestClientIdentity {
 			out.EvidenceBits |= EvidenceAnthropicHeader
 		case "openai_header":
 			out.EvidenceBits |= EvidenceOpenAIHeader
+		case "originator_header":
+			out.EvidenceBits |= EvidenceBodyMarker
 		case "x-openai-subagent", "x-claude-code-is-subagent":
 			out.EvidenceBits |= EvidenceSubagentMarker
 		case "body_originator", "body_agent_class":
