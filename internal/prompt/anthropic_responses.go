@@ -428,8 +428,7 @@ func anthropicResponsesTools(value interface{}, names map[string]string) ([]inte
 		}
 		parameters := cleanAnthropicResponsesSchema(tool["input_schema"])
 		if schema, ok := parameters.(map[string]interface{}); ok && isClaudeCodeAgentToolSchema(originalName, schema) {
-			properties, _ := schema["properties"].(map[string]interface{})
-			delete(properties, "model")
+			removeClaudeCodeAgentModelOverride(schema)
 			inheritModelTools[originalName] = true
 		}
 		definition := map[string]interface{}{
@@ -459,14 +458,19 @@ func anthropicResponsesWebSearchToolNames(value interface{}) map[string]bool {
 	return names
 }
 
-// isClaudeCodeAgentToolSchema deliberately recognizes the built-in Agent tool
-// instead of every custom function that happens to use the same name. Claude Code's
-// optional model tier is unsafe across the Codex bridge: if Codex returns
-// model="haiku", the client starts the child request as claude-haiku-* and leaves the
-// Codex account pool. Omitting this optional property makes the child inherit the
-// already-selected GPT/Codex model while preserving every other Agent capability.
+// isClaudeCodeAgentToolSchema recognizes both historical Task and current Agent
+// built-ins. Claude Code has changed the name and the model enum over time, so tying
+// this safety boundary to one exact enum silently lets a child request escape the
+// selected Codex account pool. The shared structural fields distinguish the built-in
+// subagent launcher from ordinary functions named Agent or Task.
+//
+// Claude Code's optional model tier is unsafe across the Codex bridge: if Codex
+// returns model="haiku", the client starts the child request as claude-haiku-* and
+// leaves the Codex account pool. Omitting this optional property makes the child
+// inherit the already-selected GPT/Codex model while preserving every other Agent
+// capability.
 func isClaudeCodeAgentToolSchema(name string, schema map[string]interface{}) bool {
-	if name != "Agent" || stringOr(schema["type"], "") != "object" {
+	if (name != "Agent" && name != "Task") || !schemaTypeIncludesObject(schema["type"]) {
 		return false
 	}
 	properties, _ := schema["properties"].(map[string]interface{})
@@ -475,20 +479,62 @@ func isClaudeCodeAgentToolSchema(name string, schema map[string]interface{}) boo
 	}
 	for _, property := range []string{"description", "prompt", "subagent_type"} {
 		definition, _ := properties[property].(map[string]interface{})
-		if definition == nil || stringOr(definition["type"], "") != "string" {
+		if definition == nil || !schemaTypeIncludesString(definition["type"]) {
 			return false
 		}
 	}
 	model, _ := properties["model"].(map[string]interface{})
-	if model == nil || stringOr(model["type"], "") != "string" {
-		return false
+	return model != nil && schemaTypeIncludesString(model["type"])
+}
+
+func removeClaudeCodeAgentModelOverride(schema map[string]interface{}) {
+	properties, _ := schema["properties"].(map[string]interface{})
+	delete(properties, "model")
+	removeSchemaRequiredProperty(schema, "model")
+}
+
+func removeSchemaRequiredProperty(schema map[string]interface{}, property string) {
+	required, _ := schema["required"].([]interface{})
+	if len(required) == 0 {
+		return
 	}
-	values, _ := model["enum"].([]interface{})
-	tiers := make(map[string]bool, len(values))
+	clean := make([]interface{}, 0, len(required))
+	for _, value := range required {
+		if stringOr(value, "") != property {
+			clean = append(clean, value)
+		}
+	}
+	if len(clean) == 0 {
+		delete(schema, "required")
+		return
+	}
+	schema["required"] = clean
+}
+
+func schemaTypeIncludesObject(value interface{}) bool {
+	if stringOr(value, "") == "object" {
+		return true
+	}
+	values, _ := value.([]interface{})
 	for _, value := range values {
-		tiers[stringOr(value, "")] = true
+		if stringOr(value, "") == "object" {
+			return true
+		}
 	}
-	return tiers["sonnet"] && tiers["opus"] && tiers["haiku"]
+	return false
+}
+
+func schemaTypeIncludesString(value interface{}) bool {
+	if stringOr(value, "") == "string" {
+		return true
+	}
+	values, _ := value.([]interface{})
+	for _, value := range values {
+		if stringOr(value, "") == "string" {
+			return true
+		}
+	}
+	return false
 }
 
 func schemaHasRequiredStrings(schema map[string]interface{}, required ...string) bool {
@@ -533,10 +579,10 @@ func cleanAnthropicResponsesSchema(value interface{}) interface{} {
 	if root == nil {
 		root = map[string]interface{}{}
 	}
-	if stringOr(root["type"], "") == "" {
+	if _, present := root["type"]; !present {
 		root["type"] = "object"
 	}
-	if root["type"] == "object" {
+	if schemaTypeIncludesObject(root["type"]) {
 		if _, ok := root["properties"].(map[string]interface{}); !ok {
 			root["properties"] = map[string]interface{}{}
 		}
@@ -627,15 +673,17 @@ func anthropicResponsesToolNameMaps(value interface{}) (map[string]string, map[s
 	wireToOriginal := map[string]string{}
 	for _, original := range originals {
 		candidate := original
+		if strings.HasPrefix(candidate, "mcp__") && len(candidate) > codexToolNameLimit {
+			if index := strings.LastIndex(candidate, "__"); index > 0 {
+				candidate = "mcp__" + candidate[index+2:]
+			}
+		}
+		candidate = sanitizeChatToolName(candidate)
+		if candidate == "" {
+			candidate = "tool"
+		}
 		if len(candidate) > codexToolNameLimit {
-			if strings.HasPrefix(candidate, "mcp__") {
-				if index := strings.LastIndex(candidate, "__"); index > 0 {
-					candidate = "mcp__" + candidate[index+2:]
-				}
-			}
-			if len(candidate) > codexToolNameLimit {
-				candidate = candidate[:codexToolNameLimit]
-			}
+			candidate = candidate[:codexToolNameLimit]
 		}
 		base := candidate
 		for suffix := 1; used[candidate]; suffix++ {

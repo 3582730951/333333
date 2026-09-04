@@ -178,8 +178,13 @@ type Group struct {
 	// egressIDsConfigured distinguishes an explicitly saved [] from a legacy row
 	// whose egress_ids column has not been populated yet.
 	egressIDsConfigured bool
-	CreatedAt           int64 `json:"created_at"`
-	UpdatedAt           int64 `json:"updated_at"`
+	// User-group-only outlet policy is carried through request context after a
+	// user-group is resolved. Account-pool groups never persist these fields.
+	EgressRPMBalanceEnabled   bool     `json:"-"`
+	EgressRPMBalanceThreshold int64    `json:"-"`
+	EgressRPMBalanceEgressIDs []string `json:"-"`
+	CreatedAt                 int64    `json:"created_at"`
+	UpdatedAt                 int64    `json:"updated_at"`
 }
 
 const (
@@ -286,6 +291,26 @@ type UserGroup struct {
 	// independent: legacy safety rotation config must never enable text refusal.
 	GPTSafetyBufferingSessionRolloverEnabled bool `json:"gpt_safety_buffering_session_rollover_enabled"`
 	GPTTextRefusalSessionRolloverEnabled     bool `json:"gpt_text_refusal_session_rollover_enabled"`
+	// DynamicPoolBalanceEnabled enables soft, per-account logical-root RPM
+	// balancing for fresh requests in this user group. It deliberately defaults to
+	// false so old rows and clients retain the pre-feature route byte-for-byte.
+	DynamicPoolBalanceEnabled bool `json:"dynamic_pool_balance_enabled"`
+	// DynamicPoolBalanceRPMThreshold is the per-account threshold over the
+	// rolling 60 whole-second logical-root window. It is meaningful only when the
+	// corresponding switch is enabled and must be positive then.
+	DynamicPoolBalanceRPMThreshold int64 `json:"dynamic_pool_balance_rpm_threshold"`
+	// EgressRPMBalanceEnabled applies the rolling logical-request window to the
+	// ordered outlet list below. Outlet pressure includes all client agent classes;
+	// the policy itself is still limited to fresh, replay-safe routing. It is
+	// intentionally independent from account-pool balancing: operators may enable
+	// either policy or both.
+	EgressRPMBalanceEnabled bool `json:"egress_rpm_balance_enabled"`
+	// EgressRPMBalanceThreshold is reached (>=) before the next configured outlet
+	// is preferred. A disabled policy may retain a positive value for later use.
+	EgressRPMBalanceThreshold int64 `json:"egress_rpm_balance_threshold"`
+	// EgressRPMBalanceEgressIDs preserves operator order; missing/unhealthy exits
+	// are skipped at selection time without changing the saved policy.
+	EgressRPMBalanceEgressIDs []string `json:"egress_rpm_balance_egress_ids,omitempty"`
 }
 
 const (
@@ -1028,6 +1053,19 @@ type AccountRateLimit struct {
 	Raw               string  `json:"raw,omitempty"`      // JSON of the raw rate-limit headers, for the drawer
 	UpdatedAt         int64   `json:"updated_at"`
 }
+
+// AccountRateLimitSnapshotMaxAgeSeconds is the maximum age for which a known
+// quota observation is trusted by the scheduler. A stale exhaustion verdict is
+// fail-open: the account may be tried again while the background quota poller
+// obtains a fresh answer. Zero UpdatedAt is retained for legacy rows whose
+// producer predates the freshness field and is handled as "unknown age".
+const AccountRateLimitSnapshotMaxAgeSeconds int64 = 15 * 60
+
+// AccountRateLimitUnknownResetCooldownSeconds is the bounded retry interval for
+// a fresh authoritative exhausted observation that omits its reset time. The
+// account is benched briefly, then retried so an incomplete upstream response
+// cannot leave it permanently unavailable.
+const AccountRateLimitUnknownResetCooldownSeconds int64 = 60
 
 type CodexResetCreditConsumption struct {
 	AccountID       string `json:"account_id"`
@@ -2970,6 +3008,8 @@ ON CONFLICT(account_id) DO NOTHING`,
 		// replaced by the later terminal sample without counting a second logical
 		// request. Existing rows default to unsettled and remain visible in RPM.
 		`ALTER TABLE account_usage_rate_events ADD COLUMN settlement_state TEXT NOT NULL DEFAULT 'unsettled'`,
+		`ALTER TABLE account_usage_rate_events ADD COLUMN egress_id TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_account_usage_rate_egress_occurred ON account_usage_rate_events(egress_id,occurred_at)`,
 		// Client-family diagnostics are additive and default fail-closed for rows
 		// written by older workers. Never infer a historical family from model names.
 		`ALTER TABLE account_usage_rate_events ADD COLUMN client_family TEXT NOT NULL DEFAULT 'unknown'`,
@@ -3292,6 +3332,14 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
 		`ALTER TABLE user_groups ADD COLUMN pinned_egress_no_fallback INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE user_groups ADD COLUMN gpt_safety_buffering_session_rollover_enabled INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE user_groups ADD COLUMN gpt_text_refusal_session_rollover_enabled INTEGER NOT NULL DEFAULT 0`,
+		// Dynamic pool balancing is additive so the immutable PostgreSQL base-schema
+		// checksum remains stable. Zero defaults preserve disabled behavior for old
+		// rows during rolling upgrades.
+		`ALTER TABLE user_groups ADD COLUMN dynamic_pool_balance_enabled INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE user_groups ADD COLUMN dynamic_pool_balance_rpm_threshold INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE user_groups ADD COLUMN egress_rpm_balance_enabled INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE user_groups ADD COLUMN egress_rpm_balance_threshold INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE user_groups ADD COLUMN egress_rpm_balance_egress_ids TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE api_keys ADD COLUMN user_group_id TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_api_keys_user_group ON api_keys(user_group_id) WHERE user_group_id <> ''`,
 		// Antigravity explicit cache entries: tracks Gemini CachedContent resources
@@ -3721,14 +3769,17 @@ func (s *Store) DeleteGroup(ctx context.Context, name string) error {
 
 // ── UserGroup CRUD ──────────────────────────────────────────────────────────
 
-const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback, gpt_safety_buffering_session_rollover_enabled, gpt_text_refusal_session_rollover_enabled`
+const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback, gpt_safety_buffering_session_rollover_enabled, gpt_text_refusal_session_rollover_enabled, dynamic_pool_balance_enabled, dynamic_pool_balance_rpm_threshold, egress_rpm_balance_enabled, egress_rpm_balance_threshold, egress_rpm_balance_egress_ids`
 
 func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
 	var g UserGroup
 	var apply, miEnabled, superEnabled, superResponseRewriteEnabled, superMemoryEnabled, superMonitorEnabled int
 	var filesJSON, profilesJSON, superSkillIDsJSON, superProfilesJSON, blockClaudeJSON, blockGPTJSON, fallbackGroupsJSON, fallbackMappingsJSON, routingJSON string
-	var pinnedNoFallback, safetyRollover, textRefusalRollover int
-	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &superEnabled, &superSkillIDsJSON, &superProfilesJSON, &superResponseRewriteEnabled, &superMemoryEnabled, &superMonitorEnabled, &g.ForceModel, &g.ForceEffort, &blockClaudeJSON, &blockGPTJSON, &fallbackGroupsJSON, &fallbackMappingsJSON, &routingJSON, &g.CreatedAt, &g.UpdatedAt, &pinnedNoFallback, &safetyRollover, &textRefusalRollover)
+	var pinnedNoFallback, safetyRollover, textRefusalRollover, dynamicBalanceEnabled int
+	var dynamicBalanceThreshold, egressBalanceThreshold int64
+	var egressBalanceEnabled int
+	var egressBalanceIDsJSON string
+	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &superEnabled, &superSkillIDsJSON, &superProfilesJSON, &superResponseRewriteEnabled, &superMemoryEnabled, &superMonitorEnabled, &g.ForceModel, &g.ForceEffort, &blockClaudeJSON, &blockGPTJSON, &fallbackGroupsJSON, &fallbackMappingsJSON, &routingJSON, &g.CreatedAt, &g.UpdatedAt, &pinnedNoFallback, &safetyRollover, &textRefusalRollover, &dynamicBalanceEnabled, &dynamicBalanceThreshold, &egressBalanceEnabled, &egressBalanceThreshold, &egressBalanceIDsJSON)
 	g.SystemPromptApplyToCompaction = apply != 0
 	g.ModelInstructionsEnabled = miEnabled != 0
 	g.ModelInstructionsFiles = decodeStringList(filesJSON)
@@ -3742,6 +3793,11 @@ func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
 	g.PinnedEgressNoFallback = pinnedNoFallback != 0
 	g.GPTSafetyBufferingSessionRolloverEnabled = safetyRollover != 0
 	g.GPTTextRefusalSessionRolloverEnabled = textRefusalRollover != 0
+	g.DynamicPoolBalanceEnabled = dynamicBalanceEnabled != 0
+	g.DynamicPoolBalanceRPMThreshold = dynamicBalanceThreshold
+	g.EgressRPMBalanceEnabled = egressBalanceEnabled != 0
+	g.EgressRPMBalanceThreshold = egressBalanceThreshold
+	g.EgressRPMBalanceEgressIDs = decodeStringList(egressBalanceIDsJSON)
 	g.BlockClaudeTargetGroups = decodeStringList(blockClaudeJSON)
 	g.BlockGPTTargetGroups = decodeStringList(blockGPTJSON)
 	if err == nil {
@@ -3911,6 +3967,13 @@ func (s *Store) CreateUserGroup(ctx context.Context, g UserGroup) error {
 	if strings.TrimSpace(g.Name) == "" {
 		return errors.New("user group name required")
 	}
+	if err := validateDynamicPoolBalanceConfig(g); err != nil {
+		return err
+	}
+	if err := validateEgressRPMBalanceConfig(g); err != nil {
+		return err
+	}
+	g.EgressRPMBalanceEgressIDs = normalizeEgressRPMBalanceEgressIDs(g.EgressRPMBalanceEgressIDs)
 	if strings.TrimSpace(g.PromptMode) == "" {
 		g.PromptMode = "prepend"
 	}
@@ -3925,9 +3988,9 @@ func (s *Store) CreateUserGroup(ctx context.Context, g UserGroup) error {
 	}
 	g.UpdatedAt = now
 	routingJSON := encodeModelRouting(g.ModelRouting)
-	_, err = s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback, gpt_safety_buffering_session_rollover_enabled, gpt_text_refusal_session_rollover_enabled) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback, gpt_safety_buffering_session_rollover_enabled, gpt_text_refusal_session_rollover_enabled, dynamic_pool_balance_enabled, dynamic_pool_balance_rpm_threshold, egress_rpm_balance_enabled, egress_rpm_balance_threshold, egress_rpm_balance_egress_ids) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO NOTHING`,
-		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), routingJSON, g.CreatedAt, g.UpdatedAt, boolInt(g.PinnedEgressNoFallback), boolInt(g.GPTSafetyBufferingSessionRolloverEnabled), boolInt(g.GPTTextRefusalSessionRolloverEnabled))
+		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), routingJSON, g.CreatedAt, g.UpdatedAt, boolInt(g.PinnedEgressNoFallback), boolInt(g.GPTSafetyBufferingSessionRolloverEnabled), boolInt(g.GPTTextRefusalSessionRolloverEnabled), boolInt(g.DynamicPoolBalanceEnabled), g.DynamicPoolBalanceRPMThreshold, boolInt(g.EgressRPMBalanceEnabled), g.EgressRPMBalanceThreshold, encodeStringList(g.EgressRPMBalanceEgressIDs))
 	return err
 }
 
@@ -4322,6 +4385,56 @@ func uniqueStringsPreserveOrder(values []string) []string {
 	return out
 }
 
+// validateDynamicPoolBalanceConfig keeps the feature fail-closed at the storage
+// boundary. A disabled policy may retain a positive threshold for an operator's
+// next toggle, but a negative threshold is never meaningful; an enabled policy
+// must have an explicit positive trigger.
+func validateDynamicPoolBalanceConfig(g UserGroup) error {
+	if g.DynamicPoolBalanceRPMThreshold < 0 {
+		return errors.New("dynamic pool balance rpm threshold must be non-negative")
+	}
+	if g.DynamicPoolBalanceEnabled && g.DynamicPoolBalanceRPMThreshold <= 0 {
+		return errors.New("dynamic pool balance rpm threshold must be positive when enabled")
+	}
+	return nil
+}
+
+const maxEgressRPMBalanceEgresses = 32
+
+func normalizeEgressRPMBalanceEgressIDs(ids []string) []string {
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, raw := range ids {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func validateEgressRPMBalanceConfig(g UserGroup) error {
+	if g.EgressRPMBalanceThreshold < 0 {
+		return errors.New("egress rpm balance threshold must be non-negative")
+	}
+	normalizedIDs := normalizeEgressRPMBalanceEgressIDs(g.EgressRPMBalanceEgressIDs)
+	if len(normalizedIDs) > maxEgressRPMBalanceEgresses {
+		return fmt.Errorf("egress rpm balance supports at most %d egresses", maxEgressRPMBalanceEgresses)
+	}
+	if g.EgressRPMBalanceEnabled && g.EgressRPMBalanceThreshold <= 0 {
+		return errors.New("egress rpm balance threshold must be positive when enabled")
+	}
+	if g.EgressRPMBalanceEnabled && len(normalizedIDs) == 0 {
+		return errors.New("egress rpm balance requires at least one egress")
+	}
+	return nil
+}
+
 func (s *Store) normalizeUserGroupDefinition(ctx context.Context, tx *sql.Tx, g UserGroup) (UserGroup, error) {
 	g.ID = strings.TrimSpace(g.ID)
 	g.Name = strings.TrimSpace(g.Name)
@@ -4331,6 +4444,13 @@ func (s *Store) normalizeUserGroupDefinition(ctx context.Context, tx *sql.Tx, g 
 	if g.Name == "" {
 		return UserGroup{}, errors.New("user group name required")
 	}
+	if err := validateDynamicPoolBalanceConfig(g); err != nil {
+		return UserGroup{}, err
+	}
+	if err := validateEgressRPMBalanceConfig(g); err != nil {
+		return UserGroup{}, err
+	}
+	g.EgressRPMBalanceEgressIDs = normalizeEgressRPMBalanceEgressIDs(g.EgressRPMBalanceEgressIDs)
 	if strings.TrimSpace(g.PromptMode) == "" {
 		g.PromptMode = "prepend"
 	}
@@ -4439,8 +4559,8 @@ func (s *Store) CreateUserGroupDefinition(ctx context.Context, g UserGroup) erro
 		g.CreatedAt = now
 	}
 	g.UpdatedAt = now
-	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback, gpt_safety_buffering_session_rollover_enabled, gpt_text_refusal_session_rollover_enabled) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt, boolInt(g.PinnedEgressNoFallback), boolInt(g.GPTSafetyBufferingSessionRolloverEnabled), boolInt(g.GPTTextRefusalSessionRolloverEnabled)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, super_instruct_enabled, super_instruct_skill_ids, super_instruct_profiles, super_instruct_response_rewrite_enabled, super_instruct_memory_enabled, super_instruct_monitor_enabled, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at, pinned_egress_no_fallback, gpt_safety_buffering_session_rollover_enabled, gpt_text_refusal_session_rollover_enabled, dynamic_pool_balance_enabled, dynamic_pool_balance_rpm_threshold, egress_rpm_balance_enabled, egress_rpm_balance_threshold, egress_rpm_balance_egress_ids) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt, boolInt(g.PinnedEgressNoFallback), boolInt(g.GPTSafetyBufferingSessionRolloverEnabled), boolInt(g.GPTTextRefusalSessionRolloverEnabled), boolInt(g.DynamicPoolBalanceEnabled), g.DynamicPoolBalanceRPMThreshold, boolInt(g.EgressRPMBalanceEnabled), g.EgressRPMBalanceThreshold, encodeStringList(g.EgressRPMBalanceEgressIDs)); err != nil {
 		return err
 	}
 	if err := insertUserGroupTargets(ctx, tx, g, now); err != nil {
@@ -4462,8 +4582,8 @@ func (s *Store) ReplaceUserGroupDefinition(ctx context.Context, g UserGroup) err
 		return err
 	}
 	now := Now()
-	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, super_instruct_enabled=?, super_instruct_skill_ids=?, super_instruct_profiles=?, super_instruct_response_rewrite_enabled=?, super_instruct_memory_enabled=?, super_instruct_monitor_enabled=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, pinned_egress_no_fallback=?, gpt_safety_buffering_session_rollover_enabled=?, gpt_text_refusal_session_rollover_enabled=?, updated_at=? WHERE id=?`,
-		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), boolInt(g.PinnedEgressNoFallback), boolInt(g.GPTSafetyBufferingSessionRolloverEnabled), boolInt(g.GPTTextRefusalSessionRolloverEnabled), now, g.ID)
+	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, super_instruct_enabled=?, super_instruct_skill_ids=?, super_instruct_profiles=?, super_instruct_response_rewrite_enabled=?, super_instruct_memory_enabled=?, super_instruct_monitor_enabled=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, pinned_egress_no_fallback=?, gpt_safety_buffering_session_rollover_enabled=?, gpt_text_refusal_session_rollover_enabled=?, dynamic_pool_balance_enabled=?, dynamic_pool_balance_rpm_threshold=?, egress_rpm_balance_enabled=?, egress_rpm_balance_threshold=?, egress_rpm_balance_egress_ids=?, updated_at=? WHERE id=?`,
+		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), boolInt(g.PinnedEgressNoFallback), boolInt(g.GPTSafetyBufferingSessionRolloverEnabled), boolInt(g.GPTTextRefusalSessionRolloverEnabled), boolInt(g.DynamicPoolBalanceEnabled), g.DynamicPoolBalanceRPMThreshold, boolInt(g.EgressRPMBalanceEnabled), g.EgressRPMBalanceThreshold, encodeStringList(g.EgressRPMBalanceEgressIDs), now, g.ID)
 	if err != nil {
 		return err
 	}
@@ -4480,6 +4600,13 @@ func (s *Store) ReplaceUserGroupDefinition(ctx context.Context, g UserGroup) err
 }
 
 func (s *Store) UpdateUserGroup(ctx context.Context, g UserGroup) error {
+	if err := validateDynamicPoolBalanceConfig(g); err != nil {
+		return err
+	}
+	if err := validateEgressRPMBalanceConfig(g); err != nil {
+		return err
+	}
+	g.EgressRPMBalanceEgressIDs = normalizeEgressRPMBalanceEgressIDs(g.EgressRPMBalanceEgressIDs)
 	if strings.TrimSpace(g.PromptMode) == "" {
 		g.PromptMode = "prepend"
 	}
@@ -4493,8 +4620,8 @@ func (s *Store) UpdateUserGroup(ctx context.Context, g UserGroup) error {
 		return err
 	}
 	g.SuperInstructProfiles = superProfiles
-	_, err = s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, super_instruct_enabled=?, super_instruct_skill_ids=?, super_instruct_profiles=?, super_instruct_response_rewrite_enabled=?, super_instruct_memory_enabled=?, super_instruct_monitor_enabled=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, pinned_egress_no_fallback=?, updated_at=? WHERE id=?`,
-		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), boolInt(g.PinnedEgressNoFallback), Now(), g.ID)
+	_, err = s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, super_instruct_enabled=?, super_instruct_skill_ids=?, super_instruct_profiles=?, super_instruct_response_rewrite_enabled=?, super_instruct_memory_enabled=?, super_instruct_monitor_enabled=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, pinned_egress_no_fallback=?, gpt_safety_buffering_session_rollover_enabled=?, gpt_text_refusal_session_rollover_enabled=?, dynamic_pool_balance_enabled=?, dynamic_pool_balance_rpm_threshold=?, egress_rpm_balance_enabled=?, egress_rpm_balance_threshold=?, egress_rpm_balance_egress_ids=?, updated_at=? WHERE id=?`,
+		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), boolInt(g.SuperInstructEnabled), encodeStringList(g.SuperInstructSkillIDs), encodeSuperInstructProfiles(g.SuperInstructProfiles), boolInt(g.SuperInstructResponseRewriteEnabled), boolInt(g.SuperInstructMemoryEnabled), boolInt(g.SuperInstructMonitorEnabled), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), boolInt(g.PinnedEgressNoFallback), boolInt(g.GPTSafetyBufferingSessionRolloverEnabled), boolInt(g.GPTTextRefusalSessionRolloverEnabled), boolInt(g.DynamicPoolBalanceEnabled), g.DynamicPoolBalanceRPMThreshold, boolInt(g.EgressRPMBalanceEnabled), g.EgressRPMBalanceThreshold, encodeStringList(g.EgressRPMBalanceEgressIDs), Now(), g.ID)
 	return err
 }
 
@@ -6110,14 +6237,8 @@ func (s *Store) loadToken(ctx context.Context, accountID string, cache bool) (Ac
 	t.AgentRuntimeID = s.openToken(t.AgentRuntimeID)
 	t.AgentPrivateKey = s.openToken(t.AgentPrivateKey)
 	t.AgentTaskID = s.openToken(t.AgentTaskID)
-	opened := []string{t.AccessToken, t.RefreshToken, t.OpenAIAPIKey, t.IDTokenRaw,
-		t.AgentRuntimeID, t.AgentPrivateKey, t.AgentTaskID}
-	for i := range sealed {
-		if sealed[i] != "" && opened[i] == "" {
-			s.noteUndecryptableAccount(accountID)
-			break
-		}
-	}
+	s.noteUndecryptableFields(accountID, sealed, []string{t.AccessToken, t.RefreshToken,
+		t.OpenAIAPIKey, t.IDTokenRaw, t.AgentRuntimeID, t.AgentPrivateKey, t.AgentTaskID})
 	if err == nil && cache {
 		s.tokenCache.Store(accountID, t)
 	}
@@ -6152,6 +6273,8 @@ func (s *Store) ListTokensByAccountIDs(ctx context.Context, accountIDs []string)
 		if err := rows.Scan(&t.AccountID, &t.AuthMethod, &t.CredentialMode, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.AgentRuntimeID, &t.AgentPrivateKey, &t.AgentTaskID, &t.LastRefresh, &t.ExpiresAt, &t.Scopes, &t.OAuthRateLimitTier, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err
 		}
+		sealed := []string{t.AccessToken, t.RefreshToken, t.OpenAIAPIKey, t.IDTokenRaw,
+			t.AgentRuntimeID, t.AgentPrivateKey, t.AgentTaskID}
 		t.AccessToken = s.openToken(t.AccessToken)
 		t.RefreshToken = s.openToken(t.RefreshToken)
 		t.OpenAIAPIKey = s.openToken(t.OpenAIAPIKey)
@@ -6159,6 +6282,8 @@ func (s *Store) ListTokensByAccountIDs(ctx context.Context, accountIDs []string)
 		t.AgentRuntimeID = s.openToken(t.AgentRuntimeID)
 		t.AgentPrivateKey = s.openToken(t.AgentPrivateKey)
 		t.AgentTaskID = s.openToken(t.AgentTaskID)
+		s.noteUndecryptableFields(t.AccountID, sealed, []string{t.AccessToken, t.RefreshToken,
+			t.OpenAIAPIKey, t.IDTokenRaw, t.AgentRuntimeID, t.AgentPrivateKey, t.AgentTaskID})
 		out[t.AccountID] = t
 	}
 	return out, rows.Err()
@@ -6240,8 +6365,10 @@ func (s *Store) GetKiroCredentials(ctx context.Context, accountID string) (KiroC
 	var c KiroCredentials
 	err := s.rdb.QueryRowContext(ctx, `SELECT account_id, auth_method, client_id, client_secret, profile_arn, auth_region, api_region, machine_id, kiro_api_key, endpoint, credential_hash, created_at, updated_at FROM account_kiro_credentials WHERE account_id=?`, accountID).
 		Scan(&c.AccountID, &c.AuthMethod, &c.ClientID, &c.ClientSecret, &c.ProfileARN, &c.AuthRegion, &c.APIRegion, &c.MachineID, &c.KiroAPIKey, &c.Endpoint, &c.CredentialHash, &c.CreatedAt, &c.UpdatedAt)
+	sealed := []string{c.ClientSecret, c.KiroAPIKey}
 	c.ClientSecret = s.openToken(c.ClientSecret)
 	c.KiroAPIKey = s.openToken(c.KiroAPIKey)
+	s.noteUndecryptableFields(accountID, sealed, []string{c.ClientSecret, c.KiroAPIKey})
 	if err == nil {
 		s.kiroCache.Store(accountID, c)
 	}
@@ -6348,8 +6475,10 @@ func (s *Store) GetAntigravityCredentials(ctx context.Context, accountID string)
 	).Scan(&c.AccountID, &c.Email, &c.ProjectID, &c.AccessToken, &c.RefreshToken,
 		&c.ExpiresAt, &c.BaseURL, &c.UserAgent, &c.CreatedAt, &c.UpdatedAt)
 	if err == nil {
+		sealed := []string{c.AccessToken, c.RefreshToken}
 		c.AccessToken = s.openToken(c.AccessToken)
 		c.RefreshToken = s.openToken(c.RefreshToken)
+		s.noteUndecryptableFields(accountID, sealed, []string{c.AccessToken, c.RefreshToken})
 	}
 	return c, err
 }
@@ -6522,6 +6651,34 @@ func (s *Store) noteUndecryptableAccount(accountID string) {
 		// startup CryptoError gate cannot catch these — it runs before any account token
 		// is read.
 		log.Printf("[SECURITY] account %s has stored secrets that cannot be decrypted with the current key; it will present empty credentials until re-imported or re-authorized", accountID)
+	}
+}
+
+// UndecryptableAccountCount reports how many accounts have stored secrets that the
+// current key cannot open, without allocating the identity list. Callers on a
+// per-request path (a routing-failure audit row) want the number; only an operator
+// surface needs the names.
+func (s *Store) UndecryptableAccountCount() int {
+	s.undecryptableMu.Lock()
+	defer s.undecryptableMu.Unlock()
+	return len(s.undecryptable)
+}
+
+// noteUndecryptableFields attributes a decryption failure to accountID when any
+// field that was stored non-empty opened empty. sealed and opened must describe the
+// same fields in the same order.
+//
+// Every credential read that opens sealed columns must call this, not just the
+// single-account token path. The batch loaders are what the admin account list and
+// the routing diagnostics use, so a reader that skips attribution is precisely the
+// case where the operator is looking at the pool and the one fact that explains the
+// failure is the fact that was dropped.
+func (s *Store) noteUndecryptableFields(accountID string, sealed, opened []string) {
+	for i := range sealed {
+		if i < len(opened) && sealed[i] != "" && opened[i] == "" {
+			s.noteUndecryptableAccount(accountID)
+			return
+		}
 	}
 }
 
@@ -7906,6 +8063,32 @@ func (s *Store) DeleteEgressProfile(ctx context.Context, id string) error {
 		return err
 	}
 	_ = groupRows.Close()
+
+	// User-group RPM balancing keeps an ordered list of live outlet references.
+	// Treat every configured outlet as a deletion dependency so an operator cannot
+	// remove an exit that a policy is about to select.
+	userGroupRows, err := tx.QueryContext(ctx, `SELECT id, egress_rpm_balance_egress_ids FROM user_groups`)
+	if err != nil {
+		return err
+	}
+	for userGroupRows.Next() {
+		var groupID, idsJSON string
+		if err := userGroupRows.Scan(&groupID, &idsJSON); err != nil {
+			_ = userGroupRows.Close()
+			return err
+		}
+		for _, configuredID := range decodeStringList(idsJSON) {
+			if strings.TrimSpace(configuredID) == id {
+				references = append(references, "user_group_egress_balance:"+groupID)
+				break
+			}
+		}
+	}
+	if err := userGroupRows.Err(); err != nil {
+		_ = userGroupRows.Close()
+		return err
+	}
+	_ = userGroupRows.Close()
 
 	poolRows, err := tx.QueryContext(ctx, `SELECT pool_id FROM egress_pool_members WHERE egress_id = ?`, id)
 	if err != nil {
@@ -12120,7 +12303,7 @@ func AccountRateLimitCooldownUntilFromSnapshots(rows []AccountRateLimit, provide
 	model = strings.TrimSpace(model)
 	var earliest int64
 	for _, r := range rows {
-		if r.ResetAt <= now {
+		if r.UpdatedAt > 0 && now > r.UpdatedAt && now-r.UpdatedAt > AccountRateLimitSnapshotMaxAgeSeconds {
 			continue
 		}
 		rowProvider := strings.TrimSpace(r.Provider)
@@ -12131,14 +12314,61 @@ func AccountRateLimitCooldownUntilFromSnapshots(rows []AccountRateLimit, provide
 		if rowModel != "" && rowModel != model {
 			continue
 		}
-		if !accountRateLimitExhausted(r) {
-			continue
-		}
-		if earliest == 0 || r.ResetAt < earliest {
-			earliest = r.ResetAt
+		if resetAt, limited := AccountRateLimitEffectiveCooldownUntil(r, now); limited {
+			if earliest == 0 || resetAt < earliest {
+				earliest = resetAt
+			}
 		}
 	}
 	return earliest, earliest > 0
+}
+
+// AccountRateLimitEffectiveCooldownUntil returns the bounded cooldown represented
+// by one fresh exhausted observation. A current provider response may explicitly
+// report exhaustion without a reset (ResetAt=0, or ResetAt=now); that is still
+// authoritative evidence, but only receives a short recheck interval rather than
+// a permanent ban. Expired historical reset timestamps remain fail-open.
+func AccountRateLimitEffectiveCooldownUntil(r AccountRateLimit, now int64) (int64, bool) {
+	if !accountRateLimitExhausted(r) {
+		return 0, false
+	}
+	if r.UpdatedAt <= 0 || (now > r.UpdatedAt && now-r.UpdatedAt > AccountRateLimitSnapshotMaxAgeSeconds) {
+		return 0, false
+	}
+	if r.ResetAt > now {
+		return r.ResetAt, true
+	}
+	if r.UpdatedAt > 0 && (r.ResetAt == 0 || (r.ResetAt == now && r.UpdatedAt >= now)) {
+		unknownResetAuthoritative := rateLimitHasAuthoritativeZeroRemaining(r) || subscriptionQuotaLimiter(r.LimiterType)
+		if !unknownResetAuthoritative {
+			return 0, false
+		}
+		return now + AccountRateLimitUnknownResetCooldownSeconds, true
+	}
+	return 0, false
+}
+
+// rateLimitHasAuthoritativeZeroRemaining distinguishes an explicit exhausted
+// generic request/token limiter from the zero-valued placeholders older writers
+// used when a dimension was not reported. This keeps reset-less HTTP header
+// observations fail-closed without turning an incomplete row into a ban.
+func rateLimitHasAuthoritativeZeroRemaining(r AccountRateLimit) bool {
+	status := strings.ToLower(strings.TrimSpace(r.Status))
+	if status == "rejected" || status == "exhausted" {
+		return true
+	}
+	limiter := strings.TrimSpace(r.LimiterType)
+	if limiter == "" {
+		limiter = strings.TrimSpace(r.Source)
+	}
+	switch limiter {
+	case "requests":
+		return r.LimitRequests > 0 && r.RemainingRequests == 0
+	case "tokens", "input_tokens", "output_tokens", "unified":
+		return r.LimitTokens > 0 && r.RemainingTokens == 0
+	default:
+		return false
+	}
 }
 
 // AccountRateLimitCooldownUntil returns the reset time for an active exhausted
@@ -12147,8 +12377,12 @@ func AccountRateLimitCooldownUntilFromSnapshots(rows []AccountRateLimit, provide
 func (s *Store) AccountRateLimitCooldownUntil(ctx context.Context, accountID, provider, model string, now int64) (int64, bool, error) {
 	provider = strings.TrimSpace(provider)
 	model = strings.TrimSpace(model)
-	rows, err := s.rdb.QueryContext(ctx, `SELECT `+rateLimitCols+` FROM account_rate_limits WHERE account_id = ? AND reset_at > ? AND (? = '' OR provider = '' OR provider = ?) AND (model = '' OR model = ?) ORDER BY reset_at ASC`,
-		accountID, now, provider, provider, model)
+	// A reset deadline by itself is not enough to trust an old observation. Keep
+	// legacy rows with UpdatedAt=0 usable, but ignore a known observation older
+	// than the scheduler freshness window so an account is not benched forever
+	// after a stopped/degraded poller.
+	rows, err := s.rdb.QueryContext(ctx, `SELECT `+rateLimitCols+` FROM account_rate_limits WHERE account_id = ? AND (reset_at >= ? OR (reset_at = 0 AND updated_at > 0)) AND (updated_at = 0 OR updated_at >= ?) AND (? = '' OR provider = '' OR provider = ?) AND (model = '' OR model = ?) ORDER BY reset_at ASC`,
+		accountID, now, now-AccountRateLimitSnapshotMaxAgeSeconds, provider, provider, model)
 	if err != nil {
 		return 0, false, err
 	}
@@ -12158,8 +12392,8 @@ func (s *Store) AccountRateLimitCooldownUntil(ctx context.Context, accountID, pr
 		if err != nil {
 			return 0, false, err
 		}
-		if accountRateLimitExhausted(r) {
-			return r.ResetAt, true, nil
+		if resetAt, limited := AccountRateLimitEffectiveCooldownUntil(r, now); limited {
+			return resetAt, true, nil
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -12169,8 +12403,28 @@ func (s *Store) AccountRateLimitCooldownUntil(ctx context.Context, accountID, pr
 }
 
 func accountRateLimitExhausted(r AccountRateLimit) bool {
-	if strings.EqualFold(strings.TrimSpace(r.Status), "rejected") {
+	status := strings.ToLower(strings.TrimSpace(r.Status))
+	if status == "rejected" {
 		return true
+	}
+	if status == "exhausted" && subscriptionQuotaLimiter(r.LimiterType) {
+		return true
+	}
+	// The subscription-window producers (Codex / Claude OAuth / Kiro / Cursor)
+	// intentionally store token/request counts as -1 because the upstream only
+	// reports a percentage. In that schema a fresh 100% window is itself the
+	// authoritative exhausted signal; do not apply this fallback to arbitrary
+	// limiter names where 100% may describe only one of several dimensions.
+	if r.UsedPercent >= 100 && r.RemainingTokens < 0 && r.RemainingRequests < 0 {
+		if subscriptionQuotaLimiter(r.LimiterType) {
+			return true
+		}
+	}
+	// Subscription windows often omit token/request counts (and older fixtures
+	// default them to zero). Their percentage/status fields are authoritative;
+	// a zero placeholder must not turn an otherwise allowed window into a ban.
+	if subscriptionQuotaLimiter(r.LimiterType) {
+		return false
 	}
 	switch strings.TrimSpace(r.LimiterType) {
 	case "requests":
@@ -12179,6 +12433,23 @@ func accountRateLimitExhausted(r AccountRateLimit) bool {
 		return r.RemainingTokens == 0
 	}
 	return r.RemainingTokens == 0 || r.RemainingRequests == 0
+}
+
+func subscriptionQuotaLimiter(limiterType string) bool {
+	switch strings.TrimSpace(limiterType) {
+	case "5h_polled", "7d_polled", "5h_oauth_usage", "7d_oauth_usage", "kiro_usage", "cursor_monthly", "cursor_model_monthly":
+		return true
+	default:
+		return false
+	}
+}
+
+// AccountRateLimitIsExhausted exposes the same bounded exhaustion predicate to
+// background scheduling code without duplicating provider/limiter semantics.
+// Callers must still apply reset-time and freshness checks before treating the
+// result as an active cooldown.
+func AccountRateLimitIsExhausted(r AccountRateLimit) bool {
+	return accountRateLimitExhausted(r)
 }
 
 func scanCodexResetCreditConsumption(scan func(...interface{}) error) (CodexResetCreditConsumption, error) {

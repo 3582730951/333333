@@ -308,6 +308,10 @@ type Request struct {
 	// consume the same snapshot below. Nil keeps the legacy standalone-client
 	// fallback used by focused upstream tests and non-gateway callers.
 	CodexIdentity *CodexIdentitySnapshot
+	// PreserveCodexPromptCacheKey keeps an official Codex CLI UUID prompt cache
+	// key byte-identical on the ChatGPT wire. The gateway may still derive an
+	// internal cache/co-ordination key, but must not expose that key upstream.
+	PreserveCodexPromptCacheKey bool
 	// CodexExplicitCacheMode and CodexExplicitCacheCapable are set by the gateway
 	// after a persisted two-request capability probe for native API-key Responses.
 	// OAuth/ChatGPT Codex transports ignore these fields and strip public controls.
@@ -877,7 +881,9 @@ func (c *Client) Do(ctx context.Context, req Request) (resp *Response, err error
 			setRequestBody(&req, stripCodexResponsesMaxOutputTokensWithFields(req.bodyBytes, codexFields))
 			metadata := c.newCodexRequestMetadataWithResponsesLite(req, responsesLite)
 			req.codexMetadata = &metadata
-			setRequestBody(&req, normalizeCodexPromptCacheKeyForProfileWithFields(req.bodyBytes, codexFields, metadata))
+			if !req.PreserveCodexPromptCacheKey {
+				setRequestBody(&req, normalizeCodexPromptCacheKeyForProfileWithFields(req.bodyBytes, codexFields, metadata))
+			}
 			// ApiCompactionInput projects the same identity through headers; only
 			// normal Responses turns serialize client_metadata in the request body.
 			if !isCompact {
@@ -1843,9 +1849,19 @@ func (c *Client) postDirectThroughSidecarChain(ctx context.Context, spec Request
 var codexProtocolHeaders = map[string]bool{
 	"accept":       true,
 	"content-type": true,
-	// Claude Code requests bridged to Responses retain non-1M beta markers. The
-	// bridge strips the Anthropic-only context marker before this allowlist runs.
-	"anthropic-beta":                        true,
+	// NOTE: anthropic-beta is deliberately ABSENT. The Claude Code -> Responses
+	// bridge (handleMessagesViaCodex) strips only the Anthropic-only 1M context
+	// marker and leaves the client's remaining beta markers on the inbound header
+	// set, so allowlisting the name here forwarded e.g.
+	// "claude-code-20250219,prompt-caching-2024-07-31" all the way to
+	// chatgpt.com/backend-api/codex/responses, sitting next to
+	// Originator: codex_cli_rs and User-Agent: codex_cli_rs/<ver>. The real client
+	// never sends it: "anthropic" appears in no header construction anywhere in
+	// codex-rs (its default_headers sets originator + User-Agent only, see
+	// codex-rs/login/src/auth/default_client.rs:337), so the pair is an incoherent
+	// hybrid that identifies the sender as an Anthropic-protocol relay. The betas
+	// are Anthropic protocol negotiation and carry no meaning for the Responses
+	// API, so dropping them changes no model context, output, or reasoning effort.
 	"openai-beta":                           true,
 	"conversation_id":                       true,
 	"x-codex-turn-state":                    true,

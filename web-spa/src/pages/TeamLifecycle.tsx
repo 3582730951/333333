@@ -5,7 +5,6 @@ import { IconPlus, IconPulse, IconRefresh, IconStop, IconUndo, IconUserGroup } f
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import MobileResourceCell from '../components/MobileResourceCell.jsx';
-import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import { MetricRail, TextClamp, TinyMeter } from '../components/DisplayPrimitives.jsx';
 import { get, post } from '../api.js';
 import { showErrorToast } from '../components/ErrorToast.jsx';
@@ -18,7 +17,6 @@ const MobileRow = MobileResourceCell as any;
 const Clamp = TextClamp as any;
 const SummaryRail = MetricRail as any;
 const Meter = TinyMeter as any;
-const ErrorBanner = LoadErrorBanner as any;
 
 interface TeamWorkspace {
   id: string;
@@ -505,9 +503,10 @@ export default function TeamLifecycle() {
         ]}
       />
 
-      {error ? <ErrorBanner error={error} title={t('team_lifecycle.load_failed')} onRetry={load} /> : null}
-
       <DataTable
+        error={error}
+        errorTitle={t('team_lifecycle.load_failed')}
+        onRetry={load}
         loading={loading}
         lastRefresh={lastRefresh}
         dataSource={snapshot.workflows}

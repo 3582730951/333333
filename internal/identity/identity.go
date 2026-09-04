@@ -33,10 +33,18 @@ import (
 
 // Current official client versions. Kept here so a single edit updates the
 // fingerprint everywhere. These should track the real shipping clients.
-// Refreshed 2026-08-24 from the shipping Claude Code 2.1.236–2.1.241 binaries
-// and the official Codex CLI 0.150.1 source/release. Claude's shipping tuple
-// remains Node v26.3.0 with Stainless package 0.112.1 (2.1.226 shipped 0.94.0);
-// the per-version cli↔SDK pairing lives in config.claudeCLIFingerprints.
+// Refreshed 2026-09-04: Claude values remain from the shipping 2.1.236–2.1.241
+// binaries. Codex wire values were rechecked against the released rust-v0.152.1,
+// rust-v0.153.0, rust-v0.153.1, and rust-v0.153.2 tags. The default is the newest
+// confirmed stable 0.153.2; prerelease snapshots are not selected as a client
+// version. Trait decisions are traceable to that released line set: core/src/
+// session/mod.rs:1065-1084 plus features/src/lib.rs:1190-1198, :1620-1635,
+// :1656-1659 keep the default beta header at remote_compaction_v2; core/src/
+// responses_metadata.rs:38-39, :400-412 keeps code_mode_tool_names as a legacy
+// projection and parent_turn_id as the conditional parent field; core/src/client.rs:
+// 540-542, :1012-1027 retains the session-scoped prompt_cache_key; and core/src/
+// session/session.rs:607-625 with core/src/responses_metadata.rs:378-396, :520-524
+// adds window_number from the current window for 0.151.0+.
 const (
 	CodexCLIVersion  = config.DefaultClientVersion
 	ClaudeCLIVersion = "2.1.241"
@@ -50,7 +58,8 @@ const (
 	CodexOriginatorVSCode = "codex_vscode"
 	// CodexJA3 is the TLS ClientHello fingerprint (ja3 string) captured from the real
 	// Codex (Rust) binary against api.openai.com — ja3 hash 69d274b521896ab1d71737c4d804e22c
-	// (/tmp/pool-capture-20260710/manifest.json; current Codex source still uses stock
+	// (/tmp/pool-capture-20260710/manifest.json; the 2026-09-01 check against
+	// codex-rs 0.153.0-alpha.2 at commit 73919571 still finds stock
 	// reqwest/rustls without ClientHello customization).
 	// It is REFERENCE DATA, not a default or an alias target: verified against the Codex
 	// source (other_codex), the real client does NO JA3 spoofing — it builds a stock

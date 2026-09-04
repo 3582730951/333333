@@ -274,7 +274,7 @@ func cacheReportHasRows(report storage.CacheUsageReport) bool {
 }
 
 func cacheMetricHeader(prefix ...string) []string {
-	return append(prefix, "requests", "real_requests", "hit_requests", "request_hit_rate", "prompt_tokens", "cached_tokens", "hit_tokens", "cache_input_tokens", "cache_miss_tokens", "cache_creation_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "cache_creation_5m_share", "token_hit_rate", "cache_write_share", "eligible_cache_hit_rate", "actual_only_token_hit_rate", "estimated_requests", "estimated_rate", "cache_creation_reported_requests")
+	return append(prefix, "requests", "real_requests", "hit_requests", "request_hit_rate", "prompt_tokens", "cached_tokens", "hit_tokens", "cache_input_tokens", "cache_miss_tokens", "cache_creation_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "cache_creation_5m_share", "token_hit_rate", "cache_write_share", "eligible_cache_hit_rate", "real_token_hit_rate", "estimated_requests", "estimated_rate", "cache_creation_reported_requests")
 }
 
 func cacheMetricHeaderV2(prefix ...string) []string {

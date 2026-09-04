@@ -99,6 +99,11 @@ jest.config.*
 !web-spa/tests/
 web-spa/tests/*
 !web-spa/tests/capacity-contract.test.ts
+!web-spa/tests/class-drift-jsx.test.ts
+!web-spa/tests/pool-nav.test.tsx
+!web-spa/tests/fixtures/
+!web-spa/tests/fixtures/class-drift/
+!web-spa/tests/fixtures/class-drift/*.tsx
 
 # Python caches and captured traffic artifacts
 __pycache__/

@@ -216,9 +216,6 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 		}
 		quotaSummaries[index] = BuildQuotaSummary(account, token, quotaSnapshots[account.ID], now)
 	}
-	if err := s.attachQuotaWindowEstimates(ctx, accounts, quotaSummaries, now); err != nil {
-		log.Printf("account list quota window estimates degraded: %v", err)
-	}
 	groupEgresses := make(map[string]string, len(groups))
 	for _, group := range groups {
 		id := strings.TrimSpace(group.DefaultEgressID)

@@ -896,6 +896,16 @@ func (m *codexSessionMapping) noteSafetyBuffering(checkpointRef ...string) {
 	if len(checkpointRef) > 0 {
 		ref = checkpointRef[0]
 	}
+	if strings.TrimSpace(ref) == "" {
+		m.mu.Lock()
+		if m.snapshot != nil {
+			ref = strings.TrimSpace(m.snapshot.TurnID)
+		}
+		if ref == "" {
+			ref = strings.TrimSpace(m.logicalTurnID)
+		}
+		m.mu.Unlock()
+	}
 	m.noteRollover("protocol_safety_buffering", "", ref)
 }
 
@@ -1376,6 +1386,14 @@ func (s *Server) resolveCodexSessionMappingInNamespace(ctx context.Context, r *h
 	legacySafety := s.safetySessionRotationEnabledFor(firstNonEmpty(pol.PolicyUserGroupID, pol.UserGroupID))
 	dbSafety, dbText := s.effectiveRolloverPolicyFor(ctx, pol)
 	runtimeRollover := s.flagEnabled(ctx, "gpt_session_rollover_runtime_enabled", s.cfg.GPTSessionRolloverRuntimeEnabled)
+	// Keep the legacy per-group map operational during the compatibility cycle.
+	// Older deployments have no separate runtime flag and enabling the map was the
+	// complete opt-in; a configured legacy group must therefore not be silently
+	// disabled by the new flag's false default.
+	_, runtimeExplicit := s.runtimeSetting(ctx, "gpt_session_rollover_runtime_enabled")
+	if legacySafety && !runtimeExplicit {
+		runtimeRollover = true
+	}
 	// Preserve legacy safety-map behavior for one release cycle, but the global
 	// runtime kill switch remains a true kill switch for both old and new paths.
 	// Text refusal has no legacy path and therefore stays independently opted in.
@@ -2162,7 +2180,7 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 	rolloverCompleted := false
 	rolloverPending := false
 	rolloverCause := ""
-	if mapping.safetyDetachRequest && mapping.rolloverReplayPrepared && binding.SafetyRotatedAt != 0 {
+	if mapping.safetyDetachRequest && binding.SafetyRotatedAt != 0 {
 		binding.SafetyRotatedAt = 0
 		binding.PendingRolloverAt = 0
 		binding.PendingRolloverCause = ""
@@ -2188,6 +2206,20 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 			binding.PendingRolloverRequestFingerprint = ""
 			rolloverPending = true
 			rolloverCause = cause
+			// Protocol safety buffering is terminal evidence that the current
+			// upstream session must be retired. Publish the fresh identity with
+			// the terminal commit, while retaining the pending metadata so the
+			// following request can bind its exact replay fingerprint through the
+			// storage CAS. Children preserve their root and ancestry; only their
+			// branch thread changes.
+			if cause == "protocol_safety_buffering" && mapping.rotateUpstreamSessionOnSafety {
+				freshRoot, freshThread := codexRolloverFreshIdentity(*binding)
+				binding.RootSessionID = freshRoot
+				binding.ThreadID = freshThread
+				binding.Epoch++
+				binding.WindowGeneration++
+				binding.SafetyRotatedAt = storage.Now()
+			}
 		}
 	}
 	created := binding.ID == ""

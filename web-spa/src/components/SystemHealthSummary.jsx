@@ -62,7 +62,7 @@ function ModuleStatusLine({ modules = [] }) {
         <Typography.Text type="tertiary" size="small">{t('system.module_count').replace('{count}', fmtInt(modules.length))}</Typography.Text>
       </div>
       {recent ? (
-        <div className="pool-muted" style={{ fontSize: 12.5 }}>
+        <div className="pool-muted" style={{ fontSize: 'var(--pool-type-caption)' }}>
           <span className="pool-mono">{recent.name}</span>
           {' · '}
           <Tag size="small" color={moduleColor[recent.status] || 'grey'}>{recent.status ? t(`system.state.${recent.status}`, recent.status) : t('common.unknown')}</Tag>
@@ -119,21 +119,21 @@ export default function SystemHealthSummary({ system, variant = 'detail', action
           <Meter label={`${t('system.disk_usage')} (${disk.path || '/'})`} pct={disk.used_pct} color={meterColor(disk.used_pct || 0)} right={t('system.available').replace('{size}', fmtBytes(disk.free_bytes))} />
         </div>
         <div>
-          <div className="pool-muted" style={{ fontSize: 12.5, marginBottom: 6 }}>{t('system.status')}</div>
+          <div className="pool-muted" style={{ fontSize: 'var(--pool-type-caption)', marginBottom: 6 }}>{t('system.status')}</div>
           <ModuleStatusLine modules={modules} />
-          <div className="pool-muted" style={{ fontSize: 12, marginTop: 8 }}>
+          <div className="pool-muted" style={{ fontSize: 'var(--pool-type-caption)', marginTop: 8 }}>
             goroutine {fmtInt(go.goroutines)} · Go 内存 {fmtBytes(go.sys_bytes)}
           </div>
           <div style={{ marginTop: 12 }}>
-            <div className="pool-muted" style={{ fontSize: 12.5, marginBottom: 6 }}>{t('system.recent_events')}</div>
+            <div className="pool-muted" style={{ fontSize: 'var(--pool-type-caption)', marginBottom: 6 }}>{t('system.recent_events')}</div>
             <SupervisorEventLine events={events} />
           </div>
         </div>
         {compact ? (
           <div>
-            <div className="pool-muted" style={{ fontSize: 12.5, marginBottom: 6 }}>{t('system.registration_memory')}</div>
-            <div style={{ fontSize: 24, fontWeight: 700 }}>{fmtKB(reg.total_rss_kb)}</div>
-            <div className="pool-muted" style={{ fontSize: 12, marginTop: 4 }}>
+            <div className="pool-muted" style={{ fontSize: 'var(--pool-type-caption)', marginBottom: 6 }}>{t('system.registration_memory')}</div>
+            <div style={{ fontSize: 'var(--pool-type-title-2)', fontWeight: 700 }}>{fmtKB(reg.total_rss_kb)}</div>
+            <div className="pool-muted" style={{ fontSize: 'var(--pool-type-caption)', marginTop: 4 }}>
               node {reg.node || 0} · chrome {reg.chrome || 0} · Xvfb {reg.xvfb || 0}
             </div>
           </div>

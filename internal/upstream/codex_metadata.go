@@ -3,6 +3,7 @@ package upstream
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -34,10 +35,13 @@ type CodexIdentitySnapshot struct {
 	// DeviceOSHint is the root-elected OS profile used for every part of the
 	// virtual Codex device, including the User-Agent. It may intentionally be
 	// empty to select the host-default profile.
-	DeviceOSHint       string
-	SessionID          string
-	ThreadID           string
-	TurnID             string
+	DeviceOSHint string
+	SessionID    string
+	ThreadID     string
+	TurnID       string
+	// WindowGeneration is the durable CPA window ordinal. The state writer starts
+	// it at zero and advances it only after a successful compaction/rollover CAS;
+	// Codex 0.151.0+ serializes the same ordinal as turn-metadata window_number.
 	WindowGeneration   int64
 	ParentThreadID     string
 	ForkedFromThreadID string
@@ -53,12 +57,16 @@ func (s CodexIdentitySnapshot) WindowID() string {
 // compatibility headers and client_metadata so no transport exposes a different
 // session, thread, turn, or window identity.
 type codexRequestMetadata struct {
-	installationID     string
-	sessionID          string
-	threadID           string
-	turnID             string
-	parentTurnID       string
-	windowID           string
+	installationID string
+	sessionID      string
+	threadID       string
+	turnID         string
+	parentTurnID   string
+	windowID       string
+	// windowNumber is the persisted auto-compaction window ordinal. It is emitted
+	// only for profiles whose source schema includes window_number (0.151.0+).
+	windowNumber       uint64
+	windowNumberSet    bool
 	parentThreadID     string
 	forkedFromThreadID string
 	subagent           string
@@ -121,6 +129,10 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 				codexMetadataString(bodyMetadata, codexSubagentHeader),
 			),
 		}
+		if windowNumber, ok := codexWindowNumberFromGeneration(snapshot.WindowGeneration); ok {
+			metadata.windowNumber = windowNumber
+			metadata.windowNumberSet = true
+		}
 		if requestKind == "prewarm" {
 			metadata.turnID = ""
 		}
@@ -158,6 +170,7 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 	// two UUIDv7 values are intentionally identical (as is x-client-request-id).
 	sessionID := threadID
 	windowID := threadID + ":" + codexWindowOrdinal(rawWindowID)
+	windowNumber, windowNumberSet := codexWindowNumberFromID(rawWindowID)
 
 	requestKind := codexRequestKind(spec, incomingTurn)
 	startedAt := int64(0)
@@ -192,12 +205,14 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 	}
 
 	metadata := codexRequestMetadata{
-		installationID: id.MachineID,
-		sessionID:      sessionID,
-		threadID:       threadID,
-		turnID:         turnID,
-		windowID:       windowID,
-		parentThreadID: parentThreadID,
+		installationID:  id.MachineID,
+		sessionID:       sessionID,
+		threadID:        threadID,
+		turnID:          turnID,
+		windowID:        windowID,
+		windowNumber:    windowNumber,
+		windowNumberSet: windowNumberSet,
+		parentThreadID:  parentThreadID,
 		subagent: firstNonEmpty(
 			getHeaderFold(spec.Headers, codexSubagentHeader),
 			codexMetadataString(bodyMetadata, codexSubagentHeader),
@@ -297,6 +312,10 @@ func applyCodexClientMetadataWithFields(raw []byte, fields map[string]json.RawMe
 		"turn_id",
 		"parent_turn_id",
 		"window_id",
+		"window_number",
+		"forked_from_ordinal_exclusive",
+		"turn_trigger",
+		"history_ingest_requested",
 		"x-codex-window-id",
 		codexSubagentHeader,
 		"parent_thread_id",
@@ -383,6 +402,10 @@ func stripCodexTopLevelTransportCorrelatorsWithFields(raw []byte, fields map[str
 		"session_id",
 		"conversation_id",
 		"window_id",
+		"window_number",
+		"forked_from_ordinal_exclusive",
+		"turn_trigger",
+		"history_ingest_requested",
 		"parent_thread_id",
 		"parent_turn_id",
 		"forked_from_thread_id",
@@ -414,6 +437,10 @@ func buildCodexTurnMetadata(metadata codexRequestMetadata, incoming map[string]i
 		"thread_id",
 		"turn_id",
 		"window_id",
+		"window_number",
+		"forked_from_ordinal_exclusive",
+		"turn_trigger",
+		"history_ingest_requested",
 		"x-codex-window-id",
 		"x-codex-turn-metadata",
 		"x-codex-parent-thread-id",
@@ -433,6 +460,9 @@ func buildCodexTurnMetadata(metadata codexRequestMetadata, incoming map[string]i
 		turn["turn_id"] = metadata.turnID
 	}
 	turn["window_id"] = metadata.windowID
+	if metadata.profile.turnMetadataSchema.IncludesWindowNumber() && requestKind != "memory" && metadata.windowNumberSet {
+		turn["window_number"] = metadata.windowNumber
+	}
 	turn["request_kind"] = requestKind
 	if requestKind != "prewarm" && startedAt > 0 {
 		turn["turn_started_at_unix_ms"] = startedAt
@@ -705,4 +735,20 @@ func codexWindowOrdinal(windowID string) string {
 		return ordinal
 	}
 	return "0"
+}
+
+func codexWindowNumberFromGeneration(generation int64) (uint64, bool) {
+	if generation < 0 {
+		return 0, false
+	}
+	return uint64(generation), true
+}
+
+func codexWindowNumberFromID(windowID string) (uint64, bool) {
+	ordinal := strings.TrimSpace(codexWindowOrdinal(windowID))
+	number, err := strconv.ParseUint(ordinal, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return number, true
 }

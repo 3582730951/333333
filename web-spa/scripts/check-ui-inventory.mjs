@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 import parser from '@babel/parser';
 import traverseModule from '@babel/traverse';
 
+import { assertCanonicalRouteCoverage } from './lib/route-coverage.mjs';
+
 const traverse = traverseModule.default ?? traverseModule;
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const workspaceRoot = path.resolve(root, '..');
@@ -21,26 +23,50 @@ const expectedAdminRoutes = [
   '/',
   '/accounts',
   '/groups',
-  '/egress',
   '/providers',
+  '/models',
+  '/public-chat',
+  '/egress',
   '/upstream-error-rules',
   '/registration',
+  '/team-lifecycle',
+  '/email-pool',
+  '/email-pool/cloudflare',
   '/usage',
   '/quota',
   '/model-quality',
   '/system',
   '/cf-events',
   '/audit',
+  '/codex-threads',
   '/keys',
   '/users',
-  '/thinking',
-  '/moderation',
   '/settings-v2',
-  '/automation',
-  '/settings',
+  '/settings/ai/chatgpt',
+  '/settings/ai/claude',
+  '/settings/ai/kiro',
+  '/settings/ai/antigravity',
+  '/settings/ai/codex',
+  '/settings/ai/claude-code',
 ];
-const expectedPortalRoutes = ['/portal', '/portal/keys', '/portal/profile'];
+const expectedPortalRoutes = [
+  '/portal',
+  '/portal/keys',
+  '/portal/usage',
+  '/portal/quota',
+  '/portal/models',
+  '/portal/profile',
+  '/portal/sessions',
+];
 const expectedStorageKeys = ['pool_admin_token', 'pool_theme', 'pool_locale'];
+
+const routeCoverage = assertCanonicalRouteCoverage({
+  root,
+  gate: 'UI inventory',
+  admin: expectedAdminRoutes,
+  portal: expectedPortalRoutes,
+});
+if (!routeCoverage.ok) process.exit(1);
 
 function listFiles(dir, matcher) {
   const out = [];

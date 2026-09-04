@@ -1,0 +1,161 @@
+# Indexing and AI-training opt-out.
+#
+# WHAT THIS FILE DOES AND DOES NOT DO
+#
+# This file is authoritative only when it is served from the ROOT of a host you
+# control -- e.g. https://your-pool.example/robots.txt. Crawlers fetch robots.txt
+# from the site root and nowhere else.
+#
+# Sitting in a public GitHub repository, this file has NO technical effect on
+# github.com: GitHub serves its own /robots.txt and controls how the repository is
+# crawled. A robots.txt committed to a repo does not de-index that repo. The only
+# reliable way to keep a repository out of search indexes and scraping corpora is
+# to make the repository private. Treat the copy in this repo as a declaration of
+# intent, and deploy it at the root of any host that serves this software.
+#
+# The self-hosted console additionally sends, on every response:
+#   X-Robots-Tag: noindex, nofollow, noarchive, nosnippet, noimageindex, noai, noimageai
+# (see internal/console/console.go). That header is the stronger control: it travels
+# with each response, so it still applies to deep asset URLs fetched directly and to
+# non-HTML responses that are never parsed as a document.
+#
+# Everything below is advisory. Compliance is voluntary. A crawler that chooses to
+# ignore robots.txt is not prevented by it -- only by authentication and network
+# controls, which is what actually protects this deployment.
+
+# ---------------------------------------------------------------------------
+# Default: nothing on this host may be crawled.
+# ---------------------------------------------------------------------------
+User-agent: *
+Disallow: /
+
+# ---------------------------------------------------------------------------
+# AI / LLM training and retrieval crawlers, named explicitly.
+#
+# Named separately from the wildcard because several of these products document
+# that they honour their own token specifically, and because an explicit entry
+# survives a future relaxation of the wildcard rule above.
+# ---------------------------------------------------------------------------
+
+# OpenAI
+User-agent: GPTBot
+Disallow: /
+
+User-agent: OAI-SearchBot
+Disallow: /
+
+User-agent: ChatGPT-User
+Disallow: /
+
+# Anthropic
+User-agent: ClaudeBot
+Disallow: /
+
+User-agent: Claude-Web
+Disallow: /
+
+User-agent: Claude-User
+Disallow: /
+
+User-agent: Claude-SearchBot
+Disallow: /
+
+User-agent: anthropic-ai
+Disallow: /
+
+# Google (Google-Extended governs Gemini/Vertex training, separately from Googlebot)
+User-agent: Google-Extended
+Disallow: /
+
+# Common Crawl -- the upstream corpus for many downstream models
+User-agent: CCBot
+Disallow: /
+
+# Perplexity
+User-agent: PerplexityBot
+Disallow: /
+
+User-agent: Perplexity-User
+Disallow: /
+
+# Meta
+User-agent: FacebookBot
+Disallow: /
+
+User-agent: meta-externalagent
+Disallow: /
+
+User-agent: meta-externalfetcher
+Disallow: /
+
+# ByteDance
+User-agent: Bytespider
+Disallow: /
+
+# Amazon
+User-agent: Amazonbot
+Disallow: /
+
+# Apple
+User-agent: Applebot
+Disallow: /
+
+User-agent: Applebot-Extended
+Disallow: /
+
+# Microsoft / Bing
+User-agent: bingbot
+Disallow: /
+
+# Cohere
+User-agent: cohere-ai
+Disallow: /
+
+User-agent: cohere-training-data-crawler
+Disallow: /
+
+# Others regularly observed collecting training data
+User-agent: Diffbot
+Disallow: /
+
+User-agent: omgili
+Disallow: /
+
+User-agent: omgilibot
+Disallow: /
+
+User-agent: ImagesiftBot
+Disallow: /
+
+User-agent: Timpibot
+Disallow: /
+
+User-agent: YouBot
+Disallow: /
+
+User-agent: AI2Bot
+Disallow: /
+
+User-agent: Kangaroo Bot
+Disallow: /
+
+User-agent: PanguBot
+Disallow: /
+
+User-agent: Webzio-Extended
+Disallow: /
+
+User-agent: SemrushBot-OCOB
+Disallow: /
+
+User-agent: Scrapy
+Disallow: /
+
+# ---------------------------------------------------------------------------
+# Internet Archive.
+#
+# Left as a separate decision: archiving is not model training, and some operators
+# want it. Uncomment to opt out of the Wayback Machine as well.
+# ---------------------------------------------------------------------------
+# User-agent: ia_archiver
+# Disallow: /

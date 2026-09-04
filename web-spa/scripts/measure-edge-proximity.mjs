@@ -24,8 +24,11 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 
+import { assertCanonicalRouteCoverage } from './lib/route-coverage.mjs';
+
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const outDir = path.join(root, '.run', 'edge-proximity');
+const viteBin = path.join(root, 'node_modules', 'vite', 'bin', 'vite.js');
 
 const ADMIN_PAGES = [
   ['Dashboard', '/'], ['Accounts', '/accounts'], ['Groups', '/groups'], ['Providers', '/providers'],
@@ -33,13 +36,24 @@ const ADMIN_PAGES = [
   ['Registration', '/registration'], ['TeamLifecycle', '/team-lifecycle'], ['EmailPool', '/email-pool'],
   ['CloudflareMailbox', '/email-pool/cloudflare'], ['Usage', '/usage'], ['Quota', '/quota'],
   ['ModelQuality', '/model-quality'], ['System', '/system'], ['CFEvents', '/cf-events'],
-  ['Audit', '/audit'], ['Keys', '/keys'], ['Users', '/users'], ['Settings', '/settings-v2'],
+  ['Audit', '/audit'], ['CodexThreads', '/codex-threads'], ['Keys', '/keys'], ['Users', '/users'], ['Settings', '/settings-v2'],
   ['PublicChat', '/public-chat'],
+  ['AIChatGPT', '/settings/ai/chatgpt'], ['AIClaude', '/settings/ai/claude'],
+  ['AIKiro', '/settings/ai/kiro'], ['AIAntigravity', '/settings/ai/antigravity'],
+  ['AICodex', '/settings/ai/codex'], ['AIClaudeCode', '/settings/ai/claude-code'],
 ];
 const USER_PAGES = [
   ['PortalDashboard', '/portal'], ['PortalKeys', '/portal/keys'],
-  ['PortalModels', '/portal/models'], ['PortalProfile', '/portal/profile'],
+  ['PortalUsage', '/portal/usage'], ['PortalQuota', '/portal/quota'],
+  ['PortalModels', '/portal/models'], ['PortalProfile', '/portal/profile'], ['PortalSessions', '/portal/sessions'],
 ];
+const routeCoverage = assertCanonicalRouteCoverage({
+  root,
+  gate: 'Edge proximity',
+  admin: ADMIN_PAGES,
+  portal: USER_PAGES,
+});
+if (!routeCoverage.ok) process.exit(1);
 const VIEWPORTS = [
   { name: '1440x900', width: 1440, height: 900 },
   { name: '1280x720', width: 1280, height: 720 },
@@ -69,7 +83,7 @@ async function findPort(start) {
   throw new Error('no free port');
 }
 function startServer(port) {
-  return spawn('npx', ['vite', '--port', String(port), '--strictPort', '--host', '127.0.0.1'], {
+  return spawn(process.execPath, [viteBin, '--port', String(port), '--strictPort', '--host', '127.0.0.1'], {
     cwd: root, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, BROWSER: 'none' },
   });
 }
@@ -85,9 +99,14 @@ function waitForServer(child) {
   });
 }
 async function stopServer(child) {
-  if (!child || child.killed) return;
-  child.kill('SIGTERM');
-  await new Promise((resolve) => { child.once('exit', resolve); setTimeout(resolve, 4000); });
+  if (!child || child.exitCode !== null || child.signalCode) return;
+  await new Promise((resolve) => {
+    const force = setTimeout(() => {
+      if (child.exitCode === null && !child.signalCode) child.kill('SIGKILL');
+    }, 4000);
+    child.once('exit', () => { clearTimeout(force); resolve(); });
+    child.kill('SIGTERM');
+  });
 }
 
 const PROBE = () => {

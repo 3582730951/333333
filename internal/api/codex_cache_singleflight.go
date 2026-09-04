@@ -38,6 +38,13 @@ func (a *codexCacheFlightAdmission) Release(reason string) {
 }
 
 func (s *Server) enterCodexCacheSingleflight(ctx context.Context, enabled bool, accountID, model string, body []byte, metadata ...*bodysource.BodyMeta) *codexCacheFlightAdmission {
+	return s.enterCodexCacheSingleflightWithCoordinationKey(ctx, enabled, accountID, model, body, "", metadata...)
+}
+
+// enterCodexCacheSingleflightWithCoordinationKey keeps a gateway-derived cache
+// key private when an official Codex CLI request must preserve its first-party
+// prompt_cache_key on the wire.
+func (s *Server) enterCodexCacheSingleflightWithCoordinationKey(ctx context.Context, enabled bool, accountID, model string, body []byte, coordinationKey string, metadata ...*bodysource.BodyMeta) *codexCacheFlightAdmission {
 	admission := &codexCacheFlightAdmission{release: func(string) {}}
 	if !enabled {
 		return admission
@@ -46,7 +53,10 @@ func (s *Server) enterCodexCacheSingleflight(ctx context.Context, enabled bool, 
 	if len(metadata) > 0 {
 		meta = metadata[0]
 	}
-	promptCacheKey := strings.TrimSpace(promptCacheKeyWithMeta(body, meta))
+	promptCacheKey := strings.TrimSpace(coordinationKey)
+	if promptCacheKey == "" {
+		promptCacheKey = strings.TrimSpace(promptCacheKeyWithMeta(body, meta))
+	}
 	if promptCacheKey == "" {
 		return admission
 	}

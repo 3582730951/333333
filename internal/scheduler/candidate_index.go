@@ -271,7 +271,7 @@ func (s *Scheduler) evaluateIndexedCandidate(indexed indexedCandidate, evaluatio
 		return candidate{}, false
 	}
 	ignoreTelemetryCooldown := account.IgnoreRateLimitControls || (goalQuotaGrace && !binding.RecheckPending)
-	egress, ok := s.selectEgressWithCache(evaluation.ctx, binding, evaluation.now, ignoreTelemetryCooldown, &evaluation.requestEgress, evaluation.egressCacheMutex, &evaluation.egressCacheTime)
+	egress, ok := s.selectEgressForRoute(evaluation.ctx, binding, evaluation.route, evaluation.now, ignoreTelemetryCooldown, &evaluation.requestEgress, evaluation.egressCacheMutex, &evaluation.egressCacheTime)
 	if !ok {
 		if s.egressTemporarilyUnavailable(evaluation.ctx, binding, evaluation.now, ignoreTelemetryCooldown) {
 			counters.EgressCooldown++
@@ -284,6 +284,10 @@ func (s *Scheduler) evaluateIndexedCandidate(indexed indexedCandidate, evaluatio
 	if !ok {
 		counters.EgressUnavailable++
 		return candidate{}, false
+	}
+	if !strings.EqualFold(strings.TrimSpace(binding.BindingScope), storage.EgressBindingScopeAccount) && evaluation.route.RequiredEgressID == "" {
+		binding.PrimaryEgressID = egress.ID
+		binding.CookieJarKey = account.ID + ":" + egress.ID
 	}
 	egressLoad, sidecarLoad := s.currentEgressLoads(egress)
 	if concurrencyLimited(egress.MaxConcurrency, egressLoad) ||
@@ -321,9 +325,10 @@ func (s *Scheduler) evaluateIndexedCandidate(indexed indexedCandidate, evaluatio
 	return candidate{account: account, egress: egress, binding: binding, resolvedModel: indexed.resolvedModel, bootstrap: bootstrap, score: score}, true
 }
 
-// trialRateLimitExhausted mirrors storage's exhausted test. A rejected row is
-// normally the quota poller's hard verdict. A zero-remaining row may be stale
-// and is worth one probe (see evaluateIndexedTrialCandidate).
+// trialRateLimitExhausted is the numeric zero-remaining fallback for a trial.
+// Explicit rejected/exhausted statuses are handled as hard verdicts before this
+// helper: a zero-remaining row may instead be stale and is worth one probe (see
+// evaluateIndexedTrialCandidate).
 func trialRateLimitExhausted(r storage.AccountRateLimit) bool {
 	switch strings.TrimSpace(r.LimiterType) {
 	case "requests":
@@ -359,7 +364,11 @@ func (s *Scheduler) evaluateIndexedTrialCandidate(indexed indexedCandidate, eval
 	// exactly one probe, which the API layer converts into a cooldown clear.
 	if !account.IgnoreRateLimitControls {
 		for _, r := range evaluation.rateLimits[account.ID] {
-			if r.ResetAt <= evaluation.now || strings.EqualFold(strings.TrimSpace(r.Status), "rejected") {
+			status := strings.ToLower(strings.TrimSpace(r.Status))
+			if r.ResetAt <= evaluation.now || status == "rejected" || status == "exhausted" {
+				continue
+			}
+			if r.UpdatedAt > 0 && evaluation.now > r.UpdatedAt && evaluation.now-r.UpdatedAt > storage.AccountRateLimitSnapshotMaxAgeSeconds {
 				continue
 			}
 			if p := strings.TrimSpace(r.Provider); p != "" && p != indexed.provider {
@@ -394,13 +403,17 @@ func (s *Scheduler) evaluateIndexedTrialCandidate(indexed indexedCandidate, eval
 	// at capacity, token budget available. Only the cooldown gate is lifted;
 	// selectEgressWithCache still rejects an egress profile that is itself in
 	// cooldown, and the coordinator still enforces per-account concurrency/token.
-	egress, ok := s.selectEgressWithCache(evaluation.ctx, binding, evaluation.now, true, &evaluation.requestEgress, evaluation.egressCacheMutex, &evaluation.egressCacheTime)
+	egress, ok := s.selectEgressForRoute(evaluation.ctx, binding, evaluation.route, evaluation.now, true, &evaluation.requestEgress, evaluation.egressCacheMutex, &evaluation.egressCacheTime)
 	if !ok {
 		return candidate{}, 0, false
 	}
 	egress, ok = s.applyBoundSidecarWithCache(evaluation.ctx, binding, egress, evaluation.now, &evaluation.requestEgress, evaluation.egressCacheMutex)
 	if !ok {
 		return candidate{}, 0, false
+	}
+	if !strings.EqualFold(strings.TrimSpace(binding.BindingScope), storage.EgressBindingScopeAccount) && evaluation.route.RequiredEgressID == "" {
+		binding.PrimaryEgressID = egress.ID
+		binding.CookieJarKey = account.ID + ":" + egress.ID
 	}
 	egressLoad, sidecarLoad := s.currentEgressLoads(egress)
 	if concurrencyLimited(egress.MaxConcurrency, egressLoad) ||

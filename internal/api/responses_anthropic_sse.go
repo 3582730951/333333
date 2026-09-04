@@ -55,6 +55,13 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 }
 
 func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.ResponseWriter, body io.Reader, requestedModel string, toolNames map[string]string, inheritModelTools map[string]bool, scrubber *streamrewrite.Matcher, options bodysource.CaptureOptions) map[string]interface{} {
+	return responsesStreamToAnthropicSSEWithOptionsAndEstimate(ctx, w, body, requestedModel, toolNames, inheritModelTools, scrubber, options, 1)
+}
+
+// responsesStreamToAnthropicSSEWithOptionsAndEstimate starts an Anthropic stream
+// before Responses has terminal metering. The estimate is intentionally provisional:
+// response.completed remains authoritative and is repeated in message_delta.
+func responsesStreamToAnthropicSSEWithOptionsAndEstimate(ctx context.Context, w http.ResponseWriter, body io.Reader, requestedModel string, toolNames map[string]string, inheritModelTools map[string]bool, scrubber *streamrewrite.Matcher, options bodysource.CaptureOptions, estimatedInputTokens int64) map[string]interface{} {
 	flusher, _ := w.(http.Flusher)
 	emit := func(event string, payload map[string]interface{}) {
 		payload["type"] = event
@@ -86,6 +93,11 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 	webSearches := make([]*responsesAnthropicWebSearchStream, 0, 2)
 	webSearchRequests := 0
 	nextToolToFlush := 0
+	// Claude Code treats a completed tool_use block as executable immediately.
+	// Keep client-managed calls behind the native Responses terminal boundary so
+	// every call from one assistant turn is delivered as one complete batch.
+	// Otherwise a fast first result can race later calls from the same turn.
+	toolTurnFinalized := false
 	bridgePlan := prompt.NewResponsesToolBridgePlan()
 	var accumulationErr error
 	defer func() {
@@ -101,13 +113,20 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 		if started {
 			return
 		}
-		startUsage := map[string]interface{}{"input_tokens": int64(0), "output_tokens": int64(0)}
+		provisionalInputTokens := responsesProvisionalInputTokens(estimatedInputTokens)
+		startUsage := map[string]interface{}{"input_tokens": provisionalInputTokens, "output_tokens": int64(0)}
 		if usage != nil {
 			for key, value := range usage {
 				if key != "output_tokens" {
 					startUsage[key] = value
 				}
 			}
+		}
+		// Some Responses transports emit a created/in-progress usage skeleton with
+		// zero input tokens. It is not final metering, so keep the non-zero
+		// provisional value until response.completed supplies the authority.
+		if anthropicStreamUsageInt64(startUsage["input_tokens"]) <= 0 {
+			startUsage["input_tokens"] = provisionalInputTokens
 		}
 		emit("message_start", map[string]interface{}{"message": map[string]interface{}{
 			"id": messageID, "type": "message", "role": "assistant", "model": model,
@@ -252,6 +271,13 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 	}
 	var flushReadyTools func()
 	flushReadyTools = func() {
+		// response.output_item.done means an individual call is complete, not
+		// that the assistant turn is complete.  Do not let the Messages client
+		// execute a subset of a parallel tool turn while Responses is still
+		// emitting its remaining items.
+		if !toolTurnFinalized {
+			return
+		}
 		// A Responses reasoning item can span multiple frames. Keep every
 		// Anthropic content block strictly serial by waiting until all reasoning
 		// items observed so far have closed before opening a tool_use block.
@@ -628,7 +654,9 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 				}})
 				return
 			}
-			usage = prompt.ResponsesUsageToAnthropic(response["usage"])
+			if response["usage"] != nil {
+				usage = prompt.ResponsesUsageToAnthropic(response["usage"])
+			}
 			hydrateTerminalTools(response)
 			hydrateTerminalWebSearches(response)
 		}
@@ -645,6 +673,10 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 				state.closed = true
 			}
 		}
+		// All terminal output has now been hydrated and every reasoning block
+		// has been closed.  Releasing client tools here gives Claude Code one
+		// atomic, fully indexed tool_use turn.
+		toolTurnFinalized = true
 		for _, state := range tools {
 			if state.name == "" || state.id == "" {
 				// A terminal response that still cannot identify a pending call
@@ -675,7 +707,7 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 			}
 		}
 		if usage == nil {
-			usage = map[string]interface{}{"input_tokens": int64(0), "output_tokens": int64(0)}
+			usage = map[string]interface{}{"input_tokens": responsesProvisionalInputTokens(estimatedInputTokens), "output_tokens": int64(0)}
 		}
 		if webSearchRequests > 0 {
 			usage["server_tool_use"] = map[string]interface{}{"web_search_requests": webSearchRequests}
@@ -852,6 +884,13 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 		}})
 	}
 	return usage
+}
+
+func responsesProvisionalInputTokens(estimated int64) int64 {
+	if estimated > 0 {
+		return estimated
+	}
+	return 1
 }
 
 func responsesOutputItemText(item map[string]interface{}) string {

@@ -8,12 +8,14 @@ import (
 // Port of the calculate_money quota estimator (algorithm "total_cost_robust_v2",
 // github.com/Liao-zipeng/calculate_money). The pool's relay records real token
 // usage per account, and the quota poller snapshots upstream used_percent — so the
-// dollar value of a window cycle is inferred empirically: how much recorded cost a
-// measured percentage-point drop corresponds to. No plan list price is ever
-// consulted; the estimate is a ratio of observed cost to observed percentage
-// change, cross-checked by a robust Huber regression, with a confidence grade that
-// shrinks when the two disagree, when usage happened outside local accounting
-// (external intervals), or when the sample stream went stale.
+// internal API-list-price-equivalent capacity of a window cycle is inferred
+// empirically: how much recorded equivalent cost a measured percentage-point
+// drop corresponds to. It is never an account dollar balance and no plan list
+// price is projected into quota USD. The estimate is a ratio of observed cost
+// to observed percentage change, cross-checked by a robust Huber regression,
+// with a confidence grade that shrinks when the two disagree, when usage
+// happened outside local accounting (external intervals), or when the sample
+// stream went stale.
 //
 // The one deliberate divergence from the JS original: sample timestamps are unix
 // seconds, not milliseconds, and staleAfter is expressed in seconds. All numeric

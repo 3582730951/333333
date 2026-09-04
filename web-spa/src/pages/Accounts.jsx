@@ -19,6 +19,7 @@ import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
 import useResponsiveLayout from '../hooks/useResponsiveLayout.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
 import { fmtInt, fmtRelative, fmtTokens, fmtUSD, middleEllipsis } from '../lib/format.js';
+import { quotaWindowLabel } from '../lib/quotaWindows.js';
 import { accountQueryKeys, useAccountsPage } from '../features/accounts/queries/accounts.ts';
 import {
   downloadConfirmedAccountExport, fetchAccountArchive, fetchAccountsPage,
@@ -206,16 +207,6 @@ function quotaReasonLabel(reason) {
   return '额度状态待确认';
 }
 
-function quotaWindowLabel(window) {
-  const seconds = Number(window?.limit_window_seconds);
-  if (Number.isFinite(seconds) && seconds > 0) {
-    if (seconds % 86400 === 0) return `${seconds / 86400} 天窗口`;
-    if (seconds % 3600 === 0) return `${seconds / 3600} 小时窗口`;
-    if (seconds % 60 === 0) return `${seconds / 60} 分钟窗口`;
-  }
-  return window?.limiter_type ? `${window.limiter_type} 窗口` : '主额度窗口';
-}
-
 export function quotaPresentation(account) {
   const primary = account?.quota_summary?.primary || {};
   const percent = quotaPercent(account);
@@ -240,7 +231,13 @@ export function quotaPresentation(account) {
   // dollars and surface no numbers here — the truthful utilization is the
   // primary/secondary window percentages above, per the sub2api model.
   const estimate = account?.quota_summary?.estimate;
-  const estUSD = estimate && estimate.estimated && Number.isFinite(Number(estimate.remaining_usd)) && Number(estimate.remaining_usd) >= 0
+  // `estimated` and `method` are asserted together on purpose. Today the backend
+  // only ever sets estimated=true alongside payg_credits_balance
+  // (internal/api/quota_estimate.go), so this is not a behaviour change -- it is
+  // the guard that keeps a future estimating path from rendering as dollars a
+  // figure upstream never reported.
+  const estUSD = estimate && estimate.estimated && estimate.method === 'payg_credits_balance'
+    && Number.isFinite(Number(estimate.remaining_usd)) && Number(estimate.remaining_usd) >= 0
     ? {
         remaining: Number(estimate.remaining_usd),
         extra: Number(estimate.extra_usd) || 0,
@@ -923,6 +920,10 @@ export default function Accounts() {
     },
     { title: '操作', key: 'ops', width: 72, render: (_, r) => renderAccountActions(r) },
   ];
+  // ResourceTable keeps this compact fallback column alongside the richer mobile card renderer.
+  // That preserves a table-shaped accessible fallback if the renderer is ever intentionally
+  // removed, rather than making the mobile contract depend on a hidden desktop column set.
+  const mobileColumns = [columns[0]];
   const mobileAccountCell = (r, mobileMeta = {}) => {
     const route = routeSummary(r);
     const usage = accountUsage(r);
@@ -1093,6 +1094,7 @@ export default function Accounts() {
         density="account"
 		minScrollX={1410}
         rowHeight={72}
+        mobileColumns={mobileColumns}
         mobileRenderer={mobileAccountCell}
         mobileListLabel="账号列表"
         mobileScroll={false}

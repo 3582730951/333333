@@ -54,6 +54,7 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 		Compatibility      interface{}                 `json:"compatibility_manifest"`
 		PassiveHealth      interface{}                 `json:"passive_provider_health"`
 		DeploymentStorage  deploymentStorageStatus     `json:"deployment_storage"`
+		CredentialHealth   map[string]interface{}      `json:"credential_health"`
 	}{
 		Metrics:   sysmetrics.Collect(dataDir),
 		Admission: s.scheduler.AdmissionSnapshot(),
@@ -105,8 +106,34 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 			return s.passiveHealth.Snapshot()
 		}(),
 		DeploymentStorage: s.deploymentStorageStatus(),
+		CredentialHealth:  s.credentialHealthSnapshot(),
 	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+// credentialHealthSnapshot names the accounts whose stored secrets cannot be opened
+// with the current master key.
+//
+// The store discovers this lazily on every credential read and logs each account
+// once, but the list it accumulates had no reader. Neither existing gate can supply
+// it: the startup CryptoError check runs before any account token is read, and the
+// recurring deployment check only reports *that* decryption failed. So after a key
+// rotation — or a per-boot auto-generated key — the affected accounts still list as
+// configured while presenting empty credentials, and the operator saw routing
+// failures with no way to ask which accounts to re-authorize.
+//
+// Admin-gated on purpose: account IDs never belong in an unauthenticated surface.
+func (s *Server) credentialHealthSnapshot() map[string]interface{} {
+	if s == nil || s.store == nil {
+		return map[string]interface{}{"undecryptable_accounts": 0}
+	}
+	ids := s.store.UndecryptableAccountIDs()
+	out := map[string]interface{}{"undecryptable_accounts": len(ids)}
+	if len(ids) > 0 {
+		out["undecryptable_account_ids"] = ids
+		out["remediation"] = "these accounts' stored secrets cannot be opened with the current master key; re-import or re-authorize them"
+	}
+	return out
 }
 
 func (s *Server) bodyBudgetSnapshot() bodysource.BudgetSnapshot {

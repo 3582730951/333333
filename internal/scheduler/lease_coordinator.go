@@ -37,13 +37,16 @@ type LeaseRequest struct {
 }
 
 // LeaseCandidateRequest is one physical-account candidate in a same-tier
-// multi-target acquisition. AccountScore is used only after target pressure and
-// account active counts tie.
+// multi-target acquisition. BalancePriority is an optional soft overlay: +1 is
+// relief, -1 is above-threshold, and 0 preserves the historical ordering. It is
+// considered before target pressure/account load only when the scheduler has a
+// strict balancing decision; candidates are never filtered here.
 type LeaseCandidateRequest struct {
-	ChoiceKey    string
-	Request      LeaseRequest
-	AccountScore float64
-	Pending      int
+	ChoiceKey       string
+	Request         LeaseRequest
+	AccountScore    float64
+	Pending         int
+	BalancePriority int
 }
 
 type CoordinatedLeaseSelection struct {
@@ -158,6 +161,7 @@ func (c *localLeaseCoordinator) tryAcquireAcrossLocked(candidates []LeaseCandida
 		active   int
 		eligible int
 		pending  int
+		priority int
 	}
 	type membership struct {
 		target    *targetState
@@ -176,10 +180,13 @@ func (c *localLeaseCoordinator) tryAcquireAcrossLocked(candidates []LeaseCandida
 		choice := strings.TrimSpace(item.candidate.ChoiceKey)
 		state := targets[choice]
 		if state == nil {
-			state = &targetState{choice: choice, pending: item.candidate.Pending}
+			state = &targetState{choice: choice, pending: item.candidate.Pending, priority: item.candidate.BalancePriority}
 			targets[choice] = state
 		} else if item.candidate.Pending > state.pending {
 			state.pending = item.candidate.Pending
+		}
+		if item.candidate.BalancePriority > state.priority {
+			state.priority = item.candidate.BalancePriority
 		}
 		accountID := item.candidate.Request.AccountID
 		account := accounts[accountID]
@@ -192,7 +199,8 @@ func (c *localLeaseCoordinator) tryAcquireAcrossLocked(candidates []LeaseCandida
 			member = &membership{target: state, candidate: item}
 			account.byChoice[choice] = member
 			account.memberships = append(account.memberships, member)
-		} else if item.candidate.AccountScore < member.candidate.candidate.AccountScore {
+		} else if item.candidate.BalancePriority > member.candidate.candidate.BalancePriority ||
+			(item.candidate.BalancePriority == member.candidate.candidate.BalancePriority && item.candidate.AccountScore < member.candidate.candidate.AccountScore) {
 			member.candidate = item
 		}
 	}
@@ -210,10 +218,20 @@ func (c *localLeaseCoordinator) tryAcquireAcrossLocked(candidates []LeaseCandida
 	}
 	sort.Slice(orderedAccounts, func(i, j int) bool { return orderedAccounts[i].id < orderedAccounts[j].id })
 	c.rr++
+	for _, state := range orderedTargets {
+		// A target's priority must describe the memberships that remain after a
+		// shared physical account is assigned to exactly one target for this
+		// selection. Looking at every raw membership could prefer a target whose
+		// only relief account was rotated to a different target.
+		state.priority = 0
+	}
 	for index, account := range orderedAccounts {
 		membershipIndex := int((c.rr - 1 + uint64(index)) % uint64(len(account.memberships)))
 		account.selected = account.memberships[membershipIndex]
 		state := account.selected.target
+		if account.selected.candidate.candidate.BalancePriority > state.priority {
+			state.priority = account.selected.candidate.candidate.BalancePriority
+		}
 		state.eligible++
 		state.active += account.active
 		if account.active == 0 {
@@ -221,8 +239,29 @@ func (c *localLeaseCoordinator) tryAcquireAcrossLocked(candidates []LeaseCandida
 		}
 	}
 	bestTargets := make([]*targetState, 0, len(orderedTargets))
+	targetMaxPriority := -2
+	for _, state := range orderedTargets {
+		if state.eligible == 0 {
+			continue
+		}
+		if state.priority > targetMaxPriority {
+			targetMaxPriority = state.priority
+		}
+	}
+	if targetMaxPriority > 0 {
+		for _, state := range orderedTargets {
+			if state.eligible > 0 && state.priority == targetMaxPriority {
+				bestTargets = append(bestTargets, state)
+			}
+		}
+	} else {
+		targetMaxPriority = 0
+	}
 	maxIdle := -1
 	for _, state := range orderedTargets {
+		if targetMaxPriority > 0 && state.priority != targetMaxPriority {
+			continue
+		}
 		if state.eligible == 0 {
 			continue
 		}
@@ -237,6 +276,9 @@ func (c *localLeaseCoordinator) tryAcquireAcrossLocked(candidates []LeaseCandida
 	if maxIdle == 0 {
 		bestTargets = bestTargets[:0]
 		for _, state := range orderedTargets {
+			if targetMaxPriority > 0 && state.priority != targetMaxPriority {
+				continue
+			}
 			if state.eligible == 0 {
 				continue
 			}
@@ -265,19 +307,23 @@ func (c *localLeaseCoordinator) tryAcquireAcrossLocked(candidates []LeaseCandida
 	sort.SliceStable(choices, func(i, j int) bool {
 		leftAccount := accounts[choices[i].candidate.candidate.Request.AccountID]
 		rightAccount := accounts[choices[j].candidate.candidate.Request.AccountID]
+		left, right := choices[i].candidate.candidate, choices[j].candidate.candidate
+		if left.BalancePriority != right.BalancePriority {
+			return left.BalancePriority > right.BalancePriority
+		}
 		if leftAccount.active != rightAccount.active {
 			return leftAccount.active < rightAccount.active
 		}
-		left, right := choices[i].candidate.candidate, choices[j].candidate.candidate
 		if left.AccountScore != right.AccountScore {
 			return left.AccountScore < right.AccountScore
 		}
 		return left.Request.AccountID < right.Request.AccountID
 	})
 	minActive := accounts[choices[0].candidate.candidate.Request.AccountID].active
+	maxPriority := choices[0].candidate.candidate.BalancePriority
 	minScore := choices[0].candidate.candidate.AccountScore
 	tied := 0
-	for tied < len(choices) && accounts[choices[tied].candidate.candidate.Request.AccountID].active == minActive && choices[tied].candidate.candidate.AccountScore == minScore {
+	for tied < len(choices) && choices[tied].candidate.candidate.BalancePriority == maxPriority && accounts[choices[tied].candidate.candidate.Request.AccountID].active == minActive && choices[tied].candidate.candidate.AccountScore == minScore {
 		tied++
 	}
 	selected := choices[int((c.rr-1)%uint64(maxInt(tied, 1)))].candidate
@@ -382,22 +428,23 @@ local cleaned_resources = {}
 local saw_token_block = false
 
 for candidate_index = 1, candidate_count do
-  local candidate = {
+	local candidate = {
     index = candidate_index,
     choice = ARGV[position],
     account = ARGV[position + 1],
     requested = tonumber(ARGV[position + 2]),
     budget = tonumber(ARGV[position + 3]),
     compaction = ARGV[position + 4],
-    score = tonumber(ARGV[position + 5]) or 0,
-    pending = tonumber(ARGV[position + 6]) or 0,
-    ttl = tonumber(ARGV[position + 7]),
-    account_key = tonumber(ARGV[position + 8]),
-    tokens_key = tonumber(ARGV[position + 9]),
-    resources = {}
-  }
-  local resource_count = tonumber(ARGV[position + 10])
-  position = position + 11
+		score = tonumber(ARGV[position + 5]) or 0,
+		priority = tonumber(ARGV[position + 6]) or 0,
+		pending = tonumber(ARGV[position + 7]) or 0,
+		ttl = tonumber(ARGV[position + 8]),
+		account_key = tonumber(ARGV[position + 9]),
+		tokens_key = tonumber(ARGV[position + 10]),
+		resources = {}
+	}
+	local resource_count = tonumber(ARGV[position + 11])
+	position = position + 12
   for resource_index = 1, resource_count do
     candidate.resources[resource_index] = {key = tonumber(ARGV[position]), limit = tonumber(ARGV[position + 1])}
     position = position + 2
@@ -450,12 +497,13 @@ local account_by_id = {}
 for _, candidate in ipairs(candidates) do
   local target = target_by_choice[candidate.choice]
   if not target then
-    target = {choice = candidate.choice, pending = candidate.pending, eligible = 0, idle = 0, active = 0}
+		target = {choice = candidate.choice, pending = candidate.pending, priority = candidate.priority, eligible = 0, idle = 0, active = 0}
     target_by_choice[candidate.choice] = target
     table.insert(targets, target)
-  elseif candidate.pending > target.pending then
-    target.pending = candidate.pending
-  end
+	elseif candidate.pending > target.pending then
+		target.pending = candidate.pending
+	end
+	if candidate.priority > target.priority then target.priority = candidate.priority end
 
   local account = account_by_id[candidate.account]
   if not account then
@@ -468,27 +516,38 @@ for _, candidate in ipairs(candidates) do
     membership = {target = target, candidate = candidate}
     account.membership_by_choice[candidate.choice] = membership
     table.insert(account.memberships, membership)
-  elseif candidate.score < membership.candidate.score then
-    membership.candidate = candidate
+	elseif candidate.priority > membership.candidate.priority or (candidate.priority == membership.candidate.priority and candidate.score < membership.candidate.score) then
+		membership.candidate = candidate
   end
 end
 
 -- Count every physical account once globally, even when several choices refer
 -- to it.  Rotating the owner avoids a lexical-choice bias for shared accounts.
+for _, target in ipairs(targets) do
+  -- Recompute from the memberships actually owned for this selection. A raw
+  -- relief membership rotated away must not make its target win the priority
+  -- tier without a selectable relief account.
+  target.priority = 0
+end
 for account_index, account in ipairs(accounts) do
   local membership_index = ((rr + account_index - 2) % #account.memberships) + 1
   local membership = account.memberships[membership_index]
   account.selected_membership = membership
   local target = membership.target
+  if membership.candidate.priority > target.priority then target.priority = membership.candidate.priority end
   target.eligible = target.eligible + 1
   target.active = target.active + account.active
   if account.active == 0 then target.idle = target.idle + 1 end
 end
 
 local best_targets = {}
+local max_priority = 0
+for _, target in ipairs(targets) do
+  if target.eligible > 0 and target.priority > max_priority then max_priority = target.priority end
+end
 local max_idle = -1
 for _, target in ipairs(targets) do
-  if target.eligible > 0 then
+  if target.eligible > 0 and (max_priority == 0 or target.priority == max_priority) then
     if target.idle > max_idle then
       max_idle = target.idle
       best_targets = {target}
@@ -501,7 +560,7 @@ end
 if max_idle == 0 then
   best_targets = {}
   for _, target in ipairs(targets) do
-    if target.eligible > 0 then
+    if target.eligible > 0 and (max_priority == 0 or target.priority == max_priority) then
       if #best_targets == 0 then
         best_targets = {target}
       else
@@ -522,15 +581,18 @@ local selected_target = best_targets[((rr - 1) % #best_targets) + 1]
 local best_accounts = {}
 local min_active = nil
 local min_score = nil
+local max_account_priority = nil
 for _, account in ipairs(accounts) do
   local membership = account.selected_membership
   if membership.target == selected_target then
+    local priority = membership.candidate.priority
     local score = membership.candidate.score
-    if min_active == nil or account.active < min_active or (account.active == min_active and score < min_score) then
+    if max_account_priority == nil or priority > max_account_priority or (priority == max_account_priority and (min_active == nil or account.active < min_active or (account.active == min_active and score < min_score))) then
+      max_account_priority = priority
       min_active = account.active
       min_score = score
       best_accounts = {account}
-    elseif account.active == min_active and score == min_score then
+    elseif priority == max_account_priority and account.active == min_active and score == min_score then
       table.insert(best_accounts, account)
     end
   end
@@ -712,7 +774,7 @@ func (c *redisLeaseCoordinator) TryAcquireAcross(ctx context.Context, candidates
 		args = append(args,
 			strings.TrimSpace(candidate.ChoiceKey), request.AccountID, request.EstimatedTokens,
 			request.TokenBudget, boolIntString(request.Compaction), strconv.FormatFloat(score, 'g', 17, 64),
-			candidate.Pending, request.TTL.Milliseconds(), accountKey, tokensKey, len(request.Resources),
+			candidate.BalancePriority, candidate.Pending, request.TTL.Milliseconds(), accountKey, tokensKey, len(request.Resources),
 		)
 		for _, resource := range request.Resources {
 			args = append(args, addKey(c.prefix+"resource:"+leaseKeyPart(resource.ID)), resource.Limit)

@@ -28,7 +28,12 @@ const (
 	ContextShort = "short"
 	ContextLong  = "long"
 	ContextAll   = "all"
-	LongContext  = int64(272_000)
+	// LongContext follows OpenAI's documented long-context condition: requests
+	// estimated at strictly more than 272K prompt/input tokens use the long
+	// band. InputTotal is the upstream-reported aggregate input count; cached
+	// reads are already part of that count, while cache writes are a separate
+	// pricing component and must not be added again here.
+	LongContext = int64(272_000)
 )
 
 var ErrRateUnavailable = errors.New("an exact audited pricing rate is unavailable")
@@ -74,8 +79,12 @@ func apiRate(model, tier, band string, input, cached, cacheWrite, output int64, 
 }
 
 func apiRateWithoutCacheWrite(model, tier string, input, cached, output int64, source string) Rate {
+	return apiRateWithoutCacheWriteBand(model, tier, ContextShort, input, cached, output, source)
+}
+
+func apiRateWithoutCacheWriteBand(model, tier, band string, input, cached, output int64, source string) Rate {
 	return Rate{ProductSurface: SurfaceOpenAIAPI, Provider: "openai", Model: model, ServiceTier: tier,
-		ContextBand: ContextShort, UnitKind: UnitMicroUSD, InputRateUnits: input, CachedRateUnits: cached,
+		ContextBand: band, UnitKind: UnitMicroUSD, InputRateUnits: input, CachedRateUnits: cached,
 		OutputRateUnits: output, MultiplierMilli: DefaultMultiplier, SourceLineRef: source}
 }
 
@@ -125,6 +134,9 @@ func OfficialOpenAI20260829() Catalog {
 		creditRate("gpt-5.5", TierDefault, 125_000, 12_500, 750_000, DefaultMultiplier, credits),
 		creditRate("gpt-5.5", TierFast, 125_000, 12_500, 750_000, 2_500, credits+"; "+speed),
 		creditRate("gpt-5.4", TierDefault, 62_500, 6_250, 375_000, DefaultMultiplier, credits),
+		// The official Speed page explicitly gives GPT-5.4 Fast a 2x credit
+		// multiplier, while GPT-5.5 and GPT-5.6 use 2.5x (lines 806-808 in
+		// the reviewed 2026-08-29 source below).
 		creditRate("gpt-5.4", TierFast, 62_500, 6_250, 375_000, 2_000, credits+"; "+speed),
 	}
 	sort.Slice(rates, func(i, j int) bool {
@@ -140,6 +152,32 @@ func OfficialOpenAI20260829() Catalog {
 	}
 	catalog.SHA256 = CanonicalSHA256(catalog)
 	return catalog
+}
+
+// OfficialOpenAI20260831 is a later immutable snapshot. It preserves the
+// 2026-08-29 catalog byte-for-byte under its original ID and adds the audited
+// GPT-5.4 Standard long-context row published by OpenAI. GPT-5.4 Fast has no
+// long-context row because Fast mode excludes long-context requests.
+func OfficialOpenAI20260831() Catalog {
+	previous := OfficialOpenAI20260829()
+	rates := append([]Rate(nil), previous.Rates...)
+	rates = append(rates, apiRateWithoutCacheWriteBand(
+		"gpt-5.4", TierDefault, ContextLong,
+		5_000_000, 500_000, 22_500_000,
+		"developers.openai.com/api/docs/models/gpt-5.4 lines 826-859 (2026-08-31)",
+	))
+	sort.Slice(rates, func(i, j int) bool {
+		left := string(rates[i].ProductSurface) + "\x00" + rates[i].Model + "\x00" + rates[i].ServiceTier + "\x00" + rates[i].ContextBand
+		right := string(rates[j].ProductSurface) + "\x00" + rates[j].Model + "\x00" + rates[j].ServiceTier + "\x00" + rates[j].ContextBand
+		return left < right
+	})
+	previous.ID = "openai-official-2026-08-31-v3"
+	previous.EffectiveAt = 1788148800 // 2026-08-31 00:00 America/New_York
+	previous.FetchedAt = 1788148800
+	previous.SnapshotRef = "embedded:internal/pricing/catalog.go#OfficialOpenAI20260831"
+	previous.Rates = rates
+	previous.SHA256 = CanonicalSHA256(previous)
+	return previous
 }
 
 // CanonicalSHA256 fingerprints immutable pricing content. Lifecycle status and

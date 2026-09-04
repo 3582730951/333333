@@ -1309,7 +1309,7 @@ func (s *Server) adminQuota(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"rows": rows, "total": total, "page": page, "pageSize": pageSize,
+			"rows": quotaHTTPViews(rows, accounts), "total": total, "page": page, "pageSize": pageSize,
 		})
 		return
 	}
@@ -1335,7 +1335,7 @@ func (s *Server) adminQuota(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, rows)
+	writeJSON(w, http.StatusOK, quotaHTTPViews(rows, accounts))
 }
 
 type quotaView struct {
@@ -1346,6 +1346,26 @@ type quotaView struct {
 	Secondary7d        *QuotaWindow            `json:"secondary_7d,omitempty"`
 	Secondary7dUsed    float64                 `json:"secondary_7d_used_pct"`
 	QuotaSummary       QuotaSummary            `json:"quota_summary"`
+}
+
+// quotaHTTPView keeps the raw storage plan label out of the reusable quota view
+// (callers use the reviewed presentation), while retaining the legacy admin
+// endpoint's plan_type field for clients that need the upstream subscription id.
+type quotaHTTPView struct {
+	quotaView
+	PlanType string `json:"plan_type,omitempty"`
+}
+
+func quotaHTTPViews(rows []quotaView, accounts []storage.Account) []quotaHTTPView {
+	planByAccount := make(map[string]string, len(accounts))
+	for _, account := range accounts {
+		planByAccount[account.ID] = account.PlanType
+	}
+	out := make([]quotaHTTPView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, quotaHTTPView{quotaView: row, PlanType: planByAccount[row.AccountID]})
+	}
+	return out
 }
 
 func (s *Server) quotaViewsForAccounts(ctx context.Context, accounts []storage.Account) ([]quotaView, error) {
@@ -1411,7 +1431,6 @@ func (s *Server) quotaViewsForAccounts(ctx context.Context, accounts []storage.A
 		}
 		snaps := snapsByID[account.ID]
 		summary := BuildQuotaSummary(account, token, snaps, now)
-		s.attachQuotaWindowEstimate(ctx, account, &summary, now)
 		base := quotaBaseSnapshot(account, summary, snaps)
 		qv := quotaView{
 			AccountRateLimit: base,

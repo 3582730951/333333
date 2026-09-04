@@ -244,13 +244,21 @@ func (s *Server) claudeCacheTTL(ctx context.Context) string {
 // Server-state identifiers (previous_response_id, x-codex-turn-state) are left
 // untouched: they are strict-sticky and never cross accounts.
 func isolateCodexConversation(header http.Header, body []byte, id identity.Identity) []byte {
+	return isolateCodexConversationWithPromptCacheKey(header, body, id, false)
+}
+
+// isolateCodexConversationWithPromptCacheKey applies account-local correlation
+// namespaces while optionally preserving an official Codex CLI prompt_cache_key.
+// That field is first-party wire metadata; internal cache coordination uses a
+// separate key and must never leak its account namespace to ChatGPT.
+func isolateCodexConversationWithPromptCacheKey(header http.Header, body []byte, id identity.Identity, preservePromptCacheKey bool) []byte {
 	seed := identity.SessionSeed(id)
 	for _, h := range []string{"Conversation_id", "X-Codex-Window-Id", "X-Codex-Parent-Thread-Id", "X-Codex-Turn-Metadata"} {
 		if v := header.Get(h); v != "" {
 			header.Set(h, identity.DerivedUUID(seed, v))
 		}
 	}
-	if orig := routing.PromptCacheKey(body); orig != "" {
+	if orig := routing.PromptCacheKey(body); orig != "" && !preservePromptCacheKey {
 		ns := "cp_" + identity.DerivedKey(seed, orig)
 		if updated, err := sjson.SetBytes(body, "prompt_cache_key", ns); err == nil {
 			body = updated
@@ -607,6 +615,7 @@ func (s *Server) benchOnLimit(ctx context.Context, accountID string, status int,
 	if s.scheduler != nil {
 		s.scheduler.NotifyStateChanged()
 	}
+	s.wakeRouteAvailability()
 	return true
 }
 

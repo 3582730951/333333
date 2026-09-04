@@ -1947,20 +1947,23 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 	}
 	route := scheduler.Route{
-		Group:                    routeGroup,
-		NoEgressFallback:         pinnedNoFallback,
-		Provider:                 "codex",
-		Affinity:                 affinity,
-		Strict:                   strict,
-		ServerSideState:          !movable,
-		ImmutableAffinity:        pinnedNoFallback || !movable,
-		Movable:                  movable,
-		Model:                    model,
-		EstimatedTokens:          codexEstimatedTokensWithMeta(model, raw, replayMeta),
-		Compaction:               compactionRequestWithMeta(path, raw, replayMeta),
-		Exclude:                  exclude,
-		OnWait:                   onSchedulerWait,
-		SkipWait:                 userGroupFallbackProbe(r.Context()),
+		Group:             routeGroup,
+		NoEgressFallback:  pinnedNoFallback,
+		Provider:          "codex",
+		Affinity:          affinity,
+		Strict:            strict,
+		ServerSideState:   !movable,
+		ImmutableAffinity: pinnedNoFallback || !movable,
+		Movable:           movable,
+		Model:             model,
+		EstimatedTokens:   codexEstimatedTokensWithMeta(model, raw, replayMeta),
+		Compaction:        compactionRequestWithMeta(path, raw, replayMeta),
+		Exclude:           exclude,
+		OnWait:            onSchedulerWait,
+		// Once this request has already rejected an account, the next selection is
+		// a bounded failover probe. It must not wait behind that account's freshly
+		// recorded cooldown when no other candidate exists.
+		SkipWait:                 userGroupFallbackProbe(r.Context()) || len(exclude) > 0,
 		AllowCodexGoalQuotaGrace: codexGoalQuotaGraceFromContext(r.Context()),
 	}
 	route = codexMappingRequiredRoute(codexSessionMappingFromContext(r.Context()), route)
@@ -2049,6 +2052,11 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	if promptCacheKeyWithMeta(body, replayMeta) != "" {
 		promptCacheKeySource = "downstream"
 	}
+	// An official Codex CLI UUID is part of its first-party session contract.
+	// Preserve it all the way to ChatGPT; cache sharding and account isolation use
+	// a separate gateway-only coordination key below.
+	preserveOfficialCodexPromptCacheKey := isOfficialCodexCLIRequest(r) && looksLikeUUID(promptCacheKeyWithMeta(body, replayMeta))
+	officialCodexCoordinationKey := ""
 	retentionEffective := topLevelStringWithMeta(body, replayMeta, "prompt_cache_retention")
 	retentionSource := "unsupported_current_codex"
 	if retentionEffective != "" {
@@ -2141,10 +2149,20 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		analysis := analyzeOfficialCodexPromptCacheKey(r, body, model)
 		if analysis.ok {
 			codexShards = s.codexPromptCachePrefixShards(lease.Account.ID, model, analysis.stable, codexShards, time.Now())
-		}
-		if updated, normalized := normalizeOfficialCodexPromptCacheKeyFromAnalysis(r, body, model, analysis, codexShards); normalized {
-			body = updated
-			promptCacheKeySource = "official_codex_stable_prefix"
+			// This is intentionally never serialized into the upstream body. It
+			// retains the prefix coordination/sharding benefit while the official
+			// session UUID remains the wire prompt_cache_key.
+			officialCodexCoordinationKey = analysis.stable
+			if codexShards > 1 {
+				seed := officialCodexPromptCacheShardSeedFromRoot(r, analysis.root, analysis.existing)
+				officialCodexCoordinationKey = fmt.Sprintf("%s_s%02d", analysis.stable, codexPromptCacheShard(seed, codexShards))
+			}
+			if preserveOfficialCodexPromptCacheKey {
+				promptCacheKeySource = "official_codex_session_key"
+			} else if updated, normalized := normalizeOfficialCodexPromptCacheKeyFromAnalysis(r, body, model, analysis, codexShards); normalized {
+				body = updated
+				promptCacheKeySource = "official_codex_stable_prefix"
+			}
 		}
 	}
 	currentMeta := bodyMetaForView(replayMeta, sourceRaw, body)
@@ -2238,7 +2256,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	hdr := baseHeader.Clone()
 	if s.isolationEnabled(r.Context()) && !codexStrictCPAFromContext(r.Context()) {
 		id := s.virtualIdentity(r.Context(), lease.Account.ID, osHint)
-		body = isolateCodexConversation(hdr, body, id)
+		body = isolateCodexConversationWithPromptCacheKey(hdr, body, id, preserveOfficialCodexPromptCacheKey)
 	}
 
 	// Optional Codex sensitive-word scrub (off by default → raw fast path). Per
@@ -2252,11 +2270,15 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		body = scrub.Body
 		codexScrubber = scrub.Scrubber
 	}
+	coordinationPromptCacheKey := promptCacheKeyWithMeta(body, usageMeta)
+	if officialCodexCoordinationKey != "" {
+		coordinationPromptCacheKey = officialCodexCoordinationKey
+	}
 	logicalUsageDiag := codexRequestUsageDiagnostics(body, usageMeta, affinity, promptCacheKeySource, retentionEffective, retentionSource)
 	logicalUsageDiag.RequestedServiceTier = serviceTierFromRequestBody(raw)
 	logicalUsageDiag.ForwardedServiceTier = serviceTierFromRequestBody(body)
 	logicalUsageDiag.CacheControlInjected = autoCacheBreakpointInjected
-	cacheKeyObservation := s.observeCodexPromptCacheKey(lease.Account.ID, resolvedModel, promptCacheKeyWithMeta(body, usageMeta), codexCacheShardCount, time.Now())
+	cacheKeyObservation := s.observeCodexPromptCacheCoordinationKey(lease.Account.ID, resolvedModel, coordinationPromptCacheKey, codexCacheShardCount, time.Now())
 	defer cacheKeyObservation.Done()
 	if cacheKeyObservation.Shard < 0 {
 		cacheKeyObservation.Shard = codexCacheShardHint
@@ -2941,6 +2963,11 @@ codexResponse:
 				if allowRetry {
 					return retry()
 				}
+				if streamReq {
+					_ = s.settleBillingHold(r.Context(), holdID, "rate_limited_stream_terminal")
+					s.writeFilteredError(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber)
+					return codexAttemptResult{Outcome: outcomeDone}
+				}
 				return retryAfterCapacity()
 			}
 			if !allowRetry {
@@ -3039,6 +3066,11 @@ codexSuccess:
 			if movable {
 				if allowRetry {
 					return retry()
+				}
+				if streamReq {
+					_ = s.settleBillingHold(r.Context(), holdID, "rate_limited_stream_terminal")
+					s.writeFilteredError(r.Context(), w, "codex", resp.StatusCode, resp.Header, responseBody, codexScrubber)
+					return codexAttemptResult{Outcome: outcomeDone}
 				}
 				return retryAfterCapacity()
 			}
@@ -3381,6 +3413,11 @@ codexSuccess:
 						if allowRetry {
 							return retry()
 						}
+						if streamReq {
+							_ = s.settleBillingHold(r.Context(), holdID, "rate_limited_stream_terminal")
+							s.writeFilteredError(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber)
+							return codexAttemptResult{Outcome: outcomeDone}
+						}
 						return retryAfterCapacity()
 					}
 					if allowRetry && movable {
@@ -3467,15 +3504,16 @@ codexSuccess:
 			}
 			streamCtx = withResponseRuleFilter(streamCtx, rf)
 		}
-		commitStreamMapping := func(recorder *codexStreamLedgerRecorder, upstreamHeader http.Header, committedEgress storage.EgressProfile) error {
+		commitStreamMapping := func(recorder *codexStreamLedgerRecorder, upstreamHeader http.Header, committedEgress storage.EgressProfile, checkpointRef string) error {
 			if recorder == nil || !recorder.completedSuccessfully() || codexPrewarm {
 				return nil
 			}
 			responseID, responseModel, _ := recorder.metadata()
-			// The completed frame has already been emitted by the caller. Persist the
-			// replay checkpoint before observing a rollover signal, so a missing or
-			// failed checkpoint can only suppress the following-turn intent.
-			checkpointRef := s.persistCodexGoalContinuity(r.Context(), r, body, recorder.ResponseJSON())
+			// The replay checkpoint and CPA metadata are committed by
+			// terminalCommitWriter immediately before response.completed reaches the
+			// client. The checkpoint must exist before a rollover intent can become
+			// executable, and both records must be visible before an eager client can
+			// start its next turn.
 			var mappingErr error
 			if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
 				s.observeCodexTerminalRollover(r.Context(), mapping, lease, model, false, recorder.ResponseJSON(), checkpointRef)
@@ -3495,10 +3533,19 @@ codexSuccess:
 			}
 			return mappingErr
 		}
-		commitWriter := newTerminalCommitWriterAfter(w, func() error { return nil }, func() {
-			if err := commitStreamMapping(streamRecorder, resp.Header, finalEgress); err != nil {
-				log.Printf("[CODEX-SESSION-MAPPING] post-terminal stream commit request_id=%s: %v", requestIDFromContext(r.Context()), err)
+		persistCompletedGoalCheckpoint := func(recorder *codexStreamLedgerRecorder) string {
+			if recorder == nil || !recorder.completedSuccessfully() || codexPrewarm {
+				return ""
 			}
+			return s.persistCodexGoalContinuity(r.Context(), r, body, recorder.ResponseJSON())
+		}
+		commitWriter := newTerminalCommitWriter(w, func() error {
+			// streamRecorder has already observed the complete terminal frame via
+			// io.TeeReader. Commit before releasing that frame so an eager client
+			// cannot submit its tool_result into a checkpoint or CPA mapping
+			// visibility gap.
+			checkpointRef := persistCompletedGoalCheckpoint(streamRecorder)
+			return commitStreamMapping(streamRecorder, resp.Header, finalEgress, checkpointRef)
 		})
 		streamErr := s.streamSSE(streamCtx, commitWriter, recordingStream, codexScrubber, "codex", lease.Account.ID, affinity.Hash)
 		streamRecorder.finish()
@@ -3632,10 +3679,9 @@ codexSuccess:
 						s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, continuationEgress, "native_continue_headers", continuationResp.StatusCode)
 						continuationRecorder := s.newCodexStreamLedgerRecorder(r.Context())
 						defer continuationRecorder.Close()
-						continuationWriter := newTerminalCommitWriterAfter(w, func() error { return nil }, func() {
-							if err := commitStreamMapping(continuationRecorder, continuationResp.Header, continuationEgress); err != nil {
-								log.Printf("[CODEX-SESSION-MAPPING] post-terminal continuation commit request_id=%s: %v", requestIDFromContext(r.Context()), err)
-							}
+						continuationWriter := newTerminalCommitWriter(w, func() error {
+							checkpointRef := persistCompletedGoalCheckpoint(continuationRecorder)
+							return commitStreamMapping(continuationRecorder, continuationResp.Header, continuationEgress, checkpointRef)
 						})
 						continuationStreamErr := s.streamSSE(streamCtx, continuationWriter, io.TeeReader(continuationResp.Body, continuationRecorder), codexScrubber, "codex", lease.Account.ID, affinity.Hash)
 						continuationRecorder.finish()
@@ -3747,7 +3793,8 @@ codexSuccess:
 						_ = closeCodexStreamGracefully(scrubbedWriter, streamRecorder.partialItems(), streamRecorder.partialText(), responseID, responseModel)
 					} else if continuationRecorder != nil && continuationRecorder.completedSuccessfully() {
 						streamErr = nil
-						if err := commitStreamMapping(continuationRecorder, continuationHeader, finalEgress); err != nil {
+						continuationCheckpointRef := s.persistCodexGoalContinuity(r.Context(), r, body, continuationRecorder.ResponseJSON())
+						if err := commitStreamMapping(continuationRecorder, continuationHeader, finalEgress, continuationCheckpointRef); err != nil {
 							log.Printf("[GOAL-CONTINUITY] codex stateless continuation persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), err)
 						}
 						s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, continuationRecorder.ResponseJSON())
@@ -3900,6 +3947,11 @@ codexSuccess:
 		if movable {
 			if allowRetry {
 				return retry()
+			}
+			if streamReq {
+				_ = s.settleBillingHold(r.Context(), holdID, "rate_limited_stream_terminal")
+				s.writeFilteredError(r.Context(), w, "codex", resp.StatusCode, resp.Header, responseBody, codexScrubber)
+				return codexAttemptResult{Outcome: outcomeDone}
 			}
 			return retryAfterCapacity()
 		}
@@ -4060,6 +4112,7 @@ func (s *Server) doCodexUpstream(ctx context.Context, req upstream.Request) (*up
 	if s == nil || s.upstreamDo == nil {
 		return nil, fmt.Errorf("%w: client is unavailable", errInvalidUpstreamResponse)
 	}
+	ctx = contextWithRequestEgressID(ctx, req.Egress.ID)
 	s.ObserveAccountRequestAttempt(req.Account.ID, req.Provider, req.DownstreamPath, ctx)
 	resp, err := s.upstreamDo(ctx, req)
 	if err != nil {

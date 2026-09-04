@@ -20,6 +20,13 @@ START_SERVICE="${START_SERVICE:-1}"
 WITH_SIDECAR="${WITH_SIDECAR:-1}"
 WITH_WARP="${WITH_WARP:-0}"
 MIGRATE_USER_GROUPS="${MIGRATE_USER_GROUPS:-0}"
+# Cursor proxy is an optional, release-scoped Node module. Keep its source and
+# destination explicit: the server resolves this exact path beside its binary.
+WITH_CURSOR_PROXY="${WITH_CURSOR_PROXY:-1}"
+CURSOR_PROXY_SOURCE="${PROJECT_ROOT}/modules/cursor-proxy"
+CURSOR_PROXY_MODULE_RELATIVE="modules/cursor-proxy"
+CURSOR_PROXY_BINARY_RELATIVE="${CURSOR_PROXY_MODULE_RELATIVE}/node_modules/.bin/cursor-api-proxy"
+CURSOR_PROXY_INSTALL_STATUS="not attempted"
 # Node registration engine: installs Node.js + a headless
 # Chrome + Xvfb and the puppeteer-real-browser registrar so the pool can auto-register
 # accounts on a no-display cloud VPS. Default on; disable with --without-registration.
@@ -197,6 +204,8 @@ Options:
                             Default. Registration remains disabled until readiness and a
                             disposable per-method canary have succeeded.
   --without-registration    Do not install registration worker runtimes
+  --with-cursor-proxy       Install the pinned release-local Cursor proxy module (default)
+  --without-cursor-proxy    Do not install the optional Cursor proxy module
   --migrate-user-groups     Copy missing account-pool groups to same-named user groups on service start
   --no-migrate-user-groups  Keep account-pool groups separate (default)
   --with-warp               Provision the multi-exit WARP CF-fallback pool (wgcf + wireproxy)
@@ -238,7 +247,7 @@ Environment overrides:
   INSTALL_FREE_RESERVE_PERCENT, RELEASE_STORAGE_MAX_BYTES,
   CONSOLE_GENERATION_MAX_BYTES, BUILD_CACHE_MAX_BYTES,
   SKIP_OS_PACKAGES, GO_TARBALL_SHA256,
-  WITH_REGISTRATION, NODE_MIN_MAJOR, NODE_INSTALL_MAJOR, NODE_BIN, CHROME_BIN,
+  WITH_REGISTRATION, WITH_CURSOR_PROXY, NODE_MIN_MAJOR, NODE_INSTALL_MAJOR, NODE_BIN, CHROME_BIN,
   REGISTRAR_SOURCE, REGISTRAR_INSTALL, PY_REGISTRAR_SOURCE,
   CODEX_REAUTH_WORKER_SOURCE, CODEX_REAUTH_ADDR, CODEX_REAUTH_CONCURRENCY
 EOF
@@ -367,11 +376,13 @@ while [[ $# -gt 0 ]]; do
     --full)
       WITH_SIDECAR=1
       WITH_REGISTRATION=1
+      WITH_CURSOR_PROXY=1
       shift
       ;;
     --minimal)
       WITH_SIDECAR=0
       WITH_REGISTRATION=0
+      WITH_CURSOR_PROXY=0
       shift
       ;;
     --with-sidecar)
@@ -388,6 +399,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --without-registration)
       WITH_REGISTRATION=0
+      shift
+      ;;
+    --with-cursor-proxy)
+      WITH_CURSOR_PROXY=1
+      shift
+      ;;
+    --without-cursor-proxy)
+      WITH_CURSOR_PROXY=0
       shift
       ;;
     --migrate-user-groups)
@@ -1314,6 +1333,7 @@ ensure_absolute_paths() {
   require_absolute_path "REGISTRAR_SOURCE" "$REGISTRAR_SOURCE"
   require_absolute_path "REGISTRAR_INSTALL" "$REGISTRAR_INSTALL"
   require_absolute_path "PY_REGISTRAR_SOURCE" "$PY_REGISTRAR_SOURCE"
+  require_absolute_path "CURSOR_PROXY_SOURCE" "$CURSOR_PROXY_SOURCE"
   [[ "$BUILD_DIR" != "/" && "$APP_DIR" != "/" && "$DATA_DIR" != "/" ]] ||
     die "BUILD_DIR, APP_DIR, and DATA_DIR must not be the filesystem root"
 }
@@ -1336,12 +1356,23 @@ build_project() {
   export CGO_ENABLED=1
   mkdir -p "$BUILD_DIR"
 
+  # Releases are commonly uploaded as a GitHub archive or an additive copy,
+  # neither of which carries usable .git metadata. Go's automatic VCS stamping
+  # treats that as a hard build error on newer toolchains, even though the
+  # installer already records a best-effort commit id in release.json. Keep
+  # archive builds reproducible while retaining VCS diagnostics for a real
+  # checkout; callers can still add their own GOFLAGS when needed.
+  local buildvcs_flags=()
+  if ! git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    buildvcs_flags=(-buildvcs=false)
+  fi
+
   log "Downloading Go modules"
   "$GO_BIN" mod download
 
   if bool_enabled "$RUN_TESTS"; then
     log "Running go test ./..."
-    "$GO_BIN" test ./...
+    "$GO_BIN" test "${buildvcs_flags[@]}" ./...
   else
     warn "Skipping go test ./..."
   fi
@@ -1350,8 +1381,8 @@ build_project() {
   RELEASE_ID="${RELEASE_ID//[^A-Za-z0-9_.-]/-}"
   (( ${#RELEASE_ID} <= 48 )) || die "release id is too long (48 byte maximum): ${RELEASE_ID}"
   log "Building ${APP_NAME} release ${RELEASE_ID}"
-  "$GO_BIN" build -trimpath -ldflags="-s -w" -o "${BUILD_DIR}/${APP_NAME}" ./cmd/pool-server
-  "$GO_BIN" build -trimpath -ldflags="-s -w" -o "${BUILD_DIR}/${HANDOFF_NAME}" ./cmd/pool-handoff
+  "$GO_BIN" build "${buildvcs_flags[@]}" -trimpath -ldflags="-s -w" -o "${BUILD_DIR}/${APP_NAME}" ./cmd/pool-server
+  "$GO_BIN" build "${buildvcs_flags[@]}" -trimpath -ldflags="-s -w" -o "${BUILD_DIR}/${HANDOFF_NAME}" ./cmd/pool-handoff
 
   "${BUILD_DIR}/${APP_NAME}" --self-test >/dev/null
   "${BUILD_DIR}/${HANDOFF_NAME}" --self-test >/dev/null
@@ -1367,7 +1398,7 @@ build_project() {
       ext=".exe"
     fi
     CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
-      "$GO_BIN" build -trimpath -ldflags="-s -w" -o "${BUILD_DIR}/gateway-bin/gateway-${goos}-${goarch}${ext}" ./cmd/gateway
+      "$GO_BIN" build "${buildvcs_flags[@]}" -trimpath -ldflags="-s -w" -o "${BUILD_DIR}/gateway-bin/gateway-${goos}-${goarch}${ext}" ./cmd/gateway
   done
 }
 
@@ -3517,6 +3548,93 @@ install_nodejs() {
   log "Using Node $("$nb" --version 2>/dev/null): ${NODE_BIN}"
 }
 
+# ── Optional Cursor proxy module ───────────────────────────────────────────────
+# The Go server resolves this runtime from RELEASE_DIR/modules/cursor-proxy. Do
+# not install it globally: an immutable release must carry the exact npm-ci
+# closure selected by modules/cursor-proxy/package-lock.json.
+cursor_proxy_release_binary() {
+  printf '%s/%s\n' "${RELEASE_DIR%/}" "$CURSOR_PROXY_BINARY_RELATIVE"
+}
+
+install_cursor_proxy_module() {
+  if ! bool_enabled "$WITH_CURSOR_PROXY"; then
+    CURSOR_PROXY_INSTALL_STATUS="disabled"
+    return 0
+  fi
+
+  local source npm_bin release_install tmp binary
+  source="${CURSOR_PROXY_SOURCE%/}"
+  if [[ ! -f "$source/package.json" || ! -f "$source/package-lock.json" ]]; then
+    CURSOR_PROXY_INSTALL_STATUS="source files missing"
+    warn "Cursor proxy source is incomplete at ${source}; continuing without the optional Cursor module"
+    return 0
+  fi
+  if ! npm_bin="$(find_npm)"; then
+    CURSOR_PROXY_INSTALL_STATUS="npm unavailable"
+    warn "npm is unavailable; continuing without the optional Cursor proxy module"
+    return 0
+  fi
+
+  release_install="${RELEASE_DIR%/}/${CURSOR_PROXY_MODULE_RELATIVE}"
+  tmp="${release_install}.tmp"
+  binary="${tmp}/node_modules/.bin/cursor-api-proxy"
+  log "Installing pinned Cursor proxy module to ${release_install}"
+  if ! run_root rm -rf -- "$tmp" || \
+      ! run_root install -d -m 0750 "$tmp" || \
+      ! run_root install -m 0644 "$source/package.json" "$tmp/package.json" || \
+      ! run_root install -m 0644 "$source/package-lock.json" "$tmp/package-lock.json"; then
+    CURSOR_PROXY_INSTALL_STATUS="release staging failed"
+    warn "could not stage the optional Cursor proxy module; continuing without Cursor support"
+    return 0
+  fi
+
+  # npm ci rejects lock/package drift and never resolves a newer dependency range.
+  if ! run_root env HOME="$DATA_DIR" "$npm_bin" --prefix "$tmp" ci --omit=dev --no-audit --no-fund; then
+    CURSOR_PROXY_INSTALL_STATUS="npm ci failed"
+    run_root rm -rf -- "$tmp" || warn "could not remove failed Cursor proxy staging tree ${tmp}"
+    warn "pinned Cursor proxy npm ci failed; continuing without Cursor support"
+    return 0
+  fi
+  if ! run_root test -x "$binary"; then
+    CURSOR_PROXY_INSTALL_STATUS="npm ci produced no executable"
+    run_root rm -rf -- "$tmp" || warn "could not remove invalid Cursor proxy staging tree ${tmp}"
+    warn "pinned Cursor proxy install produced no executable; continuing without Cursor support"
+    return 0
+  fi
+  # Secure the staging tree before its same-filesystem move into the immutable
+  # release. A permission failure must not leave a runnable-looking partial
+  # module at the path the server resolves.
+  if ! run_root chown -R "root:${SERVICE_GROUP}" "$tmp" || \
+      ! run_root chmod -R u=rwX,g=rX,o= "$tmp" || \
+      ! run_root rm -rf -- "$release_install" || \
+      ! run_root mv "$tmp" "$release_install"; then
+    CURSOR_PROXY_INSTALL_STATUS="release finalization failed"
+    run_root rm -rf -- "$tmp" || warn "could not remove unfinished Cursor proxy staging tree ${tmp}"
+    warn "could not finalize the optional Cursor proxy module; continuing without Cursor support"
+    return 0
+  fi
+  CURSOR_PROXY_INSTALL_STATUS="ready"
+}
+
+verify_cursor_proxy_module() {
+  local binary
+  if ! bool_enabled "$WITH_CURSOR_PROXY"; then
+    CURSOR_PROXY_INSTALL_STATUS="disabled"
+    log "Cursor proxy module: disabled"
+    return 0
+  fi
+  binary="$(cursor_proxy_release_binary)"
+  if [[ "$CURSOR_PROXY_INSTALL_STATUS" == "ready" ]] && run_root test -x "$binary"; then
+    log "Cursor proxy module ready at ${binary} (pinned npm ci release artifact)"
+    return 0
+  fi
+  CURSOR_PROXY_INSTALL_STATUS="unavailable"
+  warn "Cursor proxy module self-check failed for release ${RELEASE_ID}: expected executable ${binary}"
+  warn "The gateway remains available, but Cursor support is disabled. Restore Node/npm and registry access, then rerun from this project checkout: sudo ./install.sh --with-cursor-proxy"
+  warn "The repair uses the pinned modules/cursor-proxy/package-lock.json via npm ci; do not run npm install -g cursor-api-proxy."
+  return 0
+}
+
 find_chrome() {
   local c
   if [[ -n "${CHROME_BIN:-}" && -x "${CHROME_BIN:-}" ]]; then
@@ -3811,12 +3929,17 @@ frontend_url_hint() {
 }
 
 print_summary() {
-  local sidecar_summary migration_summary warp_summary super_instruct_summary frontend_url manual_admin_env admin_token_summary admin_setup_summary reauth_manual
+  local sidecar_summary cursor_proxy_summary migration_summary warp_summary super_instruct_summary frontend_url manual_admin_env admin_token_summary admin_setup_summary reauth_manual
   if bool_enabled "$WITH_SIDECAR"; then
     sidecar_summary="${SERVICE_NAME}-sidecar.service (${SIDECAR_ADDR})"
   else
     sidecar_summary="disabled"
   fi
+  case "$CURSOR_PROXY_INSTALL_STATUS" in
+    ready) cursor_proxy_summary="ready in this release" ;;
+    disabled) cursor_proxy_summary="disabled" ;;
+    *) cursor_proxy_summary="unavailable (${CURSOR_PROXY_INSTALL_STATUS}; see installer WARN)" ;;
+  esac
   local registration_summary
   if bool_enabled "$WITH_REGISTRATION"; then
     registration_summary="node engine @ ${REGISTRAR_INSTALL}; OAuth reauth @ $(codex_reauth_base_url) (node=${NODE_BIN:-?}, chrome=${CHROME_BIN:-?})"
@@ -3873,6 +3996,7 @@ Frontend:      ${frontend_url}
 Handoff svc:  ${HANDOFF_SERVICE_NAME}.service
 Compat svc:   ${SERVICE_NAME}.service
 Sidecar:       ${sidecar_summary}
+Cursor proxy:  ${cursor_proxy_summary}
 Super-Instruct: ${super_instruct_summary}
 Registration:  ${registration_summary}
 Group migration: ${migration_summary}
@@ -3934,6 +4058,7 @@ main() {
   provision_admin_setup
   install_sidecar
   install_nodejs
+  install_cursor_proxy_module
   install_chrome
   install_node_registrar
   install_python_registrar
@@ -3941,6 +4066,7 @@ main() {
   enforce_deployment_budget poststage
   printf '%s\n' "$RELEASE_ID" | run_root tee "${RELEASE_DIR%/}/.staged-ok" >/dev/null
   install_systemd_unit
+  verify_cursor_proxy_module
   open_firewall_port
   run_root rm -rf -- "$BUILD_DIR"
   collect_deployment_storage status

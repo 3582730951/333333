@@ -49,6 +49,10 @@ func (s *Server) adminUserGroups(w http.ResponseWriter, r *http.Request) {
 			writePoolCodeError(w, http.StatusUnprocessableEntity, "invalid_model_instruction_policy", err.Error())
 			return
 		}
+		if err := s.validateUserGroupEgressRPMBalance(r, req); err != nil {
+			writePoolCodeError(w, http.StatusUnprocessableEntity, "invalid_egress_rpm_balance", err.Error())
+			return
+		}
 		if err := s.validateUserGroupSuperInstructConfig(r, &req); err != nil {
 			writePoolCodeError(w, http.StatusUnprocessableEntity, "invalid_super_instruct_policy", err.Error())
 			return
@@ -140,6 +144,10 @@ func (s *Server) adminUserGroupsItem(w http.ResponseWriter, r *http.Request, id 
 			writePoolCodeError(w, http.StatusUnprocessableEntity, "invalid_model_instruction_policy", err.Error())
 			return
 		}
+		if err := s.validateUserGroupEgressRPMBalance(r, req); err != nil {
+			writePoolCodeError(w, http.StatusUnprocessableEntity, "invalid_egress_rpm_balance", err.Error())
+			return
+		}
 		if err := s.validateUserGroupSuperInstructConfig(r, &req); err != nil {
 			writePoolCodeError(w, http.StatusUnprocessableEntity, "invalid_super_instruct_policy", err.Error())
 			return
@@ -171,6 +179,19 @@ func (s *Server) adminUserGroupsItem(w http.ResponseWriter, r *http.Request, id 
 	default:
 		methodNotAllowed(w)
 	}
+}
+
+func (s *Server) validateUserGroupEgressRPMBalance(r *http.Request, group storage.UserGroup) error {
+	if !group.EgressRPMBalanceEnabled {
+		return nil
+	}
+	if group.EgressRPMBalanceThreshold <= 0 {
+		return errors.New("egress rpm balance threshold must be positive when enabled")
+	}
+	if len(normalizeNonEmptyStrings(group.EgressRPMBalanceEgressIDs)) == 0 {
+		return errors.New("egress rpm balance requires at least one egress")
+	}
+	return s.validateOrderedEgressIDs(r, group.EgressRPMBalanceEgressIDs)
 }
 
 // adminUserGroupTargets handles GET/POST /admin/user-groups/{id}/targets.

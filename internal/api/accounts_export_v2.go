@@ -421,13 +421,13 @@ func (s *Server) handleStrictAccountExport(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err = s.validateStrictExportNonce(r, req); err != nil {
-		s.auditStrictAccountExport(req, "denied", err.Error(), 0, len(req.AccountIDs))
+		s.auditStrictAccountExport(r, req, "denied", err.Error(), 0, len(req.AccountIDs))
 		writeError(w, http.StatusForbidden, err)
 		return
 	}
 	nonceDigest := sha256.Sum256([]byte(req.ConfirmationNonce))
 	if err = s.store.ConsumeAccountExportConfirmation(r.Context(), hex.EncodeToString(nonceDigest[:]), time.Now().Unix()); err != nil {
-		s.auditStrictAccountExport(req, "denied", "confirmation_reused_or_expired", 0, len(req.AccountIDs))
+		s.auditStrictAccountExport(r, req, "denied", "confirmation_reused_or_expired", 0, len(req.AccountIDs))
 		writeError(w, http.StatusForbidden, errors.New("confirmation_nonce is invalid, expired, or already used"))
 		return
 	}
@@ -448,7 +448,7 @@ func (s *Server) handleStrictAccountExport(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	if len(skipped) > 0 && req.IncompatiblePolicy == "fail_all" {
-		s.auditStrictAccountExport(req, "denied", "incompatible_accounts", 0, len(skipped))
+		s.auditStrictAccountExport(r, req, "denied", "incompatible_accounts", 0, len(skipped))
 		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]interface{}{"error": "one or more accounts are incompatible", "items": items})
 		return
@@ -458,11 +458,11 @@ func (s *Server) handleStrictAccountExport(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err = s.writeStrictAccountExport(w, r.Context(), req, compatible, skipped); err != nil {
-		s.auditStrictAccountExport(req, "failed", err.Error(), 0, len(skipped))
+		s.auditStrictAccountExport(r, req, "failed", err.Error(), 0, len(skipped))
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.auditStrictAccountExport(req, "success", "confirmed", len(compatible), len(skipped))
+	s.auditStrictAccountExport(r, req, "success", "confirmed", len(compatible), len(skipped))
 }
 
 type strictRenderedFile struct {
@@ -682,11 +682,16 @@ func sub2APIProxyFromEgress(profile storage.EgressProfile) (sub2APIDataProxy, er
 		Host: parsed.Hostname(), Port: port, Username: username, Password: password, Status: status}, nil
 }
 
-func (s *Server) auditStrictAccountExport(req strictAccountExportRequest, state, reason string, exported, skipped int) {
+// auditStrictAccountExport records the confirmed export path. The actor is the same
+// value already bound into the confirmation nonce's HMAC, so a row that omitted it
+// left the audit trail unable to answer "who" about a decision the nonce had already
+// attributed.
+func (s *Server) auditStrictAccountExport(r *http.Request, req strictAccountExportRequest, state, reason string, exported, skipped int) {
 	ids := append([]string(nil), req.AccountIDs...)
 	sort.Strings(ids)
 	digest := sha256.Sum256([]byte(strings.Join(ids, "\x00")))
 	s.enqueueAudit(storage.AuditLogRow{Action: "account_credentials_export", State: state, Reason: reason,
-		Detail: fmt.Sprintf("format=%s accounts_hash=%s requested=%d exported=%d skipped=%d include_proxies=%t", req.Format,
+		Detail: fmt.Sprintf("actor=%s method=%s format=%s accounts_hash=%s requested=%d exported=%d skipped=%d include_proxies=%t",
+			strictExportActor(s, r), http.MethodPost, req.Format,
 			hex.EncodeToString(digest[:8]), len(ids), exported, skipped, req.IncludeProxies), CreatedAt: storage.Now()})
 }

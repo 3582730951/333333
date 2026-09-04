@@ -26,6 +26,7 @@ import (
 	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
+	"codex-account-pool/internal/upstream"
 	"github.com/tidwall/gjson"
 )
 
@@ -640,15 +641,35 @@ func bodyHasClientToolResult(body []byte) bool {
 	if err != nil {
 		return false
 	}
+	isResult := func(item map[string]interface{}) bool {
+		if item == nil || isForceCodex429SyntheticMap(item) {
+			return false
+		}
+		switch strings.ToLower(strings.TrimSpace(streamString(item["type"]))) {
+		case "function_call_output", "local_shell_call_output", "mcp_tool_call_output", "custom_tool_call_output", "tool_search_output", "tool_result", "tool_use_result":
+			return true
+		default:
+			return false
+		}
+	}
 	for _, key := range []string{"input", "messages"} {
 		for _, raw := range appendItems(nil, root[key]) {
 			item, ok := raw.(map[string]interface{})
-			if !ok || isForceCodex429SyntheticMap(item) {
+			if !ok {
 				continue
 			}
-			switch strings.ToLower(strings.TrimSpace(streamString(item["type"]))) {
-			case "function_call_output", "local_shell_call_output", "mcp_tool_call_output", "custom_tool_call_output", "tool_search_output", "tool_result", "tool_use_result":
+			if isResult(item) {
 				return true
+			}
+			// Claude/Messages puts tool_result inside the user's content array,
+			// rather than making it a top-level history item. The old scan missed
+			// that shape and returned the 409 before replay pairing could inspect
+			// a complete (including parallel) result batch.
+			for _, rawBlock := range appendItems(nil, item["content"]) {
+				block, ok := rawBlock.(map[string]interface{})
+				if ok && isResult(block) {
+					return true
+				}
 			}
 		}
 	}
@@ -940,11 +961,15 @@ func goalCompactionSignature(raw interface{}) (string, bool) {
 	return "compaction\x00" + encrypted, true
 }
 
-func mergeCodexGoalReplayInput(durableRaw, currentRaw interface{}) []interface{} {
+func mergeCodexGoalReplayInput(durableRaw, currentRaw interface{}, currentLiteValues ...bool) []interface{} {
 	durablePrefix, durableHistory := removeCodexLiteReplayPrefixes(appendItems(nil, durableRaw))
 	currentPrefix, currentHistory := splitLeadingCodexLiteReplayPrefix(appendItems(nil, currentRaw))
+	currentLite := len(currentLiteValues) > 0 && currentLiteValues[0]
 	prefix := currentPrefix
-	if len(prefix) == 0 {
+	if len(prefix) == 0 && currentLite {
+		// Responses-Lite continuation frames may omit the native prefix because it
+		// already belongs to the warm connection. A classic request must not inherit
+		// that prefix from a prior Lite checkpoint during a profile/model migration.
 		prefix = durablePrefix
 	}
 
@@ -1051,18 +1076,25 @@ func codexRemoteCompactionReplacement(durableReplay, incrementalBody, responseBo
 	return storage.CodexRemoteCompactionV2Replacement(logicalInput, response["output"])
 }
 
-func codexCompactionReplacementPrefix(durableReplay, logicalBody []byte) []interface{} {
-	for _, body := range [][]byte{logicalBody, durableReplay} {
-		root, err := decodeContextJSONMap(body)
-		if err != nil {
-			continue
-		}
-		prefix, _ := removeCodexLiteReplayPrefixes(appendItems(nil, root["input"]))
-		if len(prefix) > 0 {
+func codexCompactionReplacementPrefix(durableReplay, logicalBody []byte, currentLite bool) []interface{} {
+	if prefix := codexLiteReplayPrefixFromBody(logicalBody); len(prefix) > 0 {
+		return prefix
+	}
+	if currentLite {
+		if prefix := codexLiteReplayPrefixFromBody(durableReplay); len(prefix) > 0 {
 			return prefix
 		}
 	}
 	return nil
+}
+
+func codexLiteReplayPrefixFromBody(body []byte) []interface{} {
+	root, err := decodeContextJSONMap(body)
+	if err != nil {
+		return nil
+	}
+	prefix, _ := removeCodexLiteReplayPrefixes(appendItems(nil, root["input"]))
+	return prefix
 }
 
 // goalResponseFromSSE retains a protocol stream as encrypted structured segment data
@@ -1288,7 +1320,7 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 		semantics.CodexCompactionEvaluated = true
 		semantics.ReplacementHistory, _ = codexRemoteCompactionReplacement(durableReplay, logicalRequestBody, responseBody, replaceInput)
 		if len(semantics.ReplacementHistory) > 0 {
-			semantics.ReplacementPrefix = codexCompactionReplacementPrefix(durableReplay, logicalRequestBody)
+			semantics.ReplacementPrefix = codexCompactionReplacementPrefix(durableReplay, logicalRequestBody, upstream.CodexRequestUsesResponsesLite(logicalRequestBody))
 		}
 	} else if family == storage.GoalFamilyMessages {
 		// Every Messages-family provider serializes the same Claude Code native
@@ -1601,7 +1633,7 @@ func (s *Server) goalReplayBody(ctx context.Context, r *http.Request, protocol s
 		// Responses Lite metadata during an account migration. Start from a fresh
 		// envelope so fields intentionally omitted now cannot leak from an old
 		// checkpoint.
-		mergedInput := mergeCodexGoalReplayInput(replayed[historyKey], cur[historyKey])
+		mergedInput := mergeCodexGoalReplayInput(replayed[historyKey], cur[historyKey], upstream.CodexRequestUsesResponsesLite(current))
 		currentEnvelope := make(map[string]interface{}, len(cur)+1)
 		for key, value := range cur {
 			switch key {
@@ -1627,10 +1659,11 @@ func (s *Server) goalReplayBody(ctx context.Context, r *http.Request, protocol s
 	delete(replayed, "previous_response_id")
 	delete(replayed, "turn_state")
 	// Sessions written before custom_tool_call was added to the awaiting-state
-	// detector may still say ready.  Validate the reconstructed, chronological
-	// history as the last line of defence so those older checkpoint chains cannot be
-	// sent upstream without the tool result that completes the call.
-	if protocol == "codex" && hasPendingClientToolCall(replayed[historyKey]) {
+	// detector may still say ready. Validate the reconstructed, chronological
+	// history as the last line of defence so neither Responses nor Messages
+	// checkpoint chains can be sent upstream without every client tool result
+	// that completes the turn.
+	if hasPendingClientToolCall(replayed[historyKey]) {
 		return goalResumeResult{Kind: goalResumeRequiresToolResult, Session: session, Reason: "the reconstructed history contains a client tool call without its result"}
 	}
 	body, err := json.Marshal(replayed)

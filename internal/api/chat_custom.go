@@ -1151,9 +1151,17 @@ func (s *Server) handleResponsesViaAnthropicMessagesCustom(w http.ResponseWriter
 		writePoolCodeError(w, http.StatusUnprocessableEntity, "protocol_conversion_failed", err.Error())
 		return
 	}
-	if len(bridge.CompatibilityLosses) > 0 {
-		writePoolCodeError(w, http.StatusUnprocessableEntity, "unsupported_protocol_field", "Responses fields cannot be converted safely: "+strings.Join(bridge.CompatibilityLosses, ", "))
+	if blocking := intolerableResponsesClaudeLosses(bridge.CompatibilityLosses); len(blocking) > 0 {
+		writePoolCodeError(w, http.StatusUnprocessableEntity, "unsupported_protocol_field", "Responses fields cannot be converted safely: "+strings.Join(blocking, ", "))
 		return
+	}
+	r = withResponsesCompatibilityLosses(r, bridge.CompatibilityLosses)
+	stream := isStreamRequest(raw)
+	if stream {
+		declareResponsesCompatibilityTrailer(w)
+		defer setResponsesCompatibilityTrailer(w, bridge.CompatibilityLosses)
+	} else {
+		setResponsesCompatibilityHeader(w, bridge.CompatibilityLosses)
 	}
 	body, err := prompt.ChatCompletionToAnthropic(bridge.Body)
 	if err != nil {
@@ -1167,7 +1175,6 @@ func (s *Server) handleResponsesViaAnthropicMessagesCustom(w http.ResponseWriter
 	}
 	defer cc.lease.Release()
 	defer cc.resp.Body.Close()
-	stream := isStreamRequest(raw)
 	if stream && isEventStream(cc.resp.Header) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -1342,7 +1349,11 @@ func (s *Server) handleMessagesViaResponsesCustom(w http.ResponseWriter, r *http
 		// this provider happens to speak upstream, so the capture sits after the
 		// conversion and belongs to the Messages family.
 		goalOut, finishGoal := s.captureCustomMessagesGoalStream(r.Context(), r, raw, rw)
-		responsesStreamToAnthropicSSE(goalOut, io.TeeReader(cc.resp.Body, uscan), model, converted.ToolNames, converted.InheritModelTools, cc.scrubber)
+		responsesStreamToAnthropicSSEWithOptionsAndEstimate(
+			r.Context(), goalOut, io.TeeReader(cc.resp.Body, uscan), model,
+			converted.ToolNames, converted.InheritModelTools, cc.scrubber, bodysource.CaptureOptions{},
+			countCodexInputTokens(converted.Body),
+		)
 		s.settleStreamUsage(r, cc, uscan)
 		finishGoal(false)
 		return
@@ -1650,6 +1661,11 @@ func validateResponsesToAnthropicRequest(raw []byte) error {
 		"temperature": true, "top_p": true, "max_output_tokens": true,
 		"max_tokens": true, "max_completion_tokens": true, "parallel_tool_calls": true,
 		"tools": true, "tool_choice": true,
+		// These are optional Responses envelope/cache controls. The Anthropic
+		// adapter cannot forward them verbatim, but the bridge emits an explicit
+		// compatibility signal and retains all prompt/tool content.
+		"client_metadata": true, "include": true, "prompt_cache_key": true,
+		"reasoning": true, "store": true, "text": true,
 	})
 	return err
 }

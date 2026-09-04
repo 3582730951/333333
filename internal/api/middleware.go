@@ -266,6 +266,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			raw, err = readLimited(r.Body, bodyCaptureConfig.MaxBodyBytes)
 			if err == nil {
 				requestBody = bodysource.Bytes(raw)
+				// Keep attribution behavior stable during the one-release legacy
+				// body-pipeline rollback. The body is already bounded and retained
+				// in memory here, so a best-effort metadata scan can recover native
+				// Claude Code lineage without changing legacy validation semantics.
+				if requestNeedsBodyMeta(r) {
+					if scanned, scanErr := bodysource.ScanJSON(r.Context(), requestBody, s.identitySecretCached); scanErr == nil {
+						bodyMeta = scanned
+					}
+				}
 			}
 		} else if requestNeedsBodyMeta(r) {
 			requestBody, bodyMeta, err = captureJSONRequestBody(r.Context(), r.Body, bodyCaptureConfig, s.requestBodyBudget, s.identitySecretCached, r.ContentLength)

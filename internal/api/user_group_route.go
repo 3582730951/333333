@@ -208,15 +208,20 @@ func blockedUserGroupTarget(group storage.UserGroup, target storage.TargetRef, m
 }
 
 type userGroupRoutePlan struct {
-	UserGroupID  string
-	AffinityKey  string
-	BindingModel string
-	Candidates   []storage.TargetRef
-	Tiers        [][]storage.TargetRef
-	Affinity     routing.AffinityKey
-	Persist      bool
-	Bound        bool
-	BoundTarget  storage.TargetRef
+	UserGroupID                    string
+	AffinityKey                    string
+	BindingModel                   string
+	Candidates                     []storage.TargetRef
+	Tiers                          [][]storage.TargetRef
+	Affinity                       routing.AffinityKey
+	Persist                        bool
+	Bound                          bool
+	BoundTarget                    storage.TargetRef
+	DynamicPoolBalanceEnabled      bool
+	DynamicPoolBalanceRPMThreshold int64
+	EgressRPMBalanceEnabled        bool
+	EgressRPMBalanceThreshold      int64
+	EgressRPMBalanceEgressIDs      []string
 	// PolicyTransfer is set when an existing model-scoped binding now points at
 	// an account-pool target blocked by the user-group policy. The next eligible
 	// target atomically takes over that binding instead of returning a rejection.
@@ -326,12 +331,17 @@ func resolveUserGroupRouteCandidates(ctx context.Context, store *storage.Store, 
 	orderedTiers := orderUserGroupTierSlices(tiers, seed)
 	ordered := flattenUserGroupTiers(orderedTiers)
 	plan := userGroupRoutePlan{
-		UserGroupID: group.ID,
-		AffinityKey: affinityKeyObj.Hash,
-		Candidates:  ordered,
-		Tiers:       orderedTiers,
-		Affinity:    affinityKeyObj,
-		Persist:     routing.IsTrueConversationAffinity(affinityKeyObj),
+		UserGroupID:                    group.ID,
+		AffinityKey:                    affinityKeyObj.Hash,
+		Candidates:                     ordered,
+		Tiers:                          orderedTiers,
+		Affinity:                       affinityKeyObj,
+		Persist:                        routing.IsTrueConversationAffinity(affinityKeyObj),
+		DynamicPoolBalanceEnabled:      group.DynamicPoolBalanceEnabled,
+		DynamicPoolBalanceRPMThreshold: group.DynamicPoolBalanceRPMThreshold,
+		EgressRPMBalanceEnabled:        group.EgressRPMBalanceEnabled,
+		EgressRPMBalanceThreshold:      group.EgressRPMBalanceThreshold,
+		EgressRPMBalanceEgressIDs:      append([]string(nil), group.EgressRPMBalanceEgressIDs...),
 	}
 
 	// A root/session binding is shared by the main CLI and its child agents. Only
@@ -793,6 +803,35 @@ retryUserGroupRoute:
 				}
 			}
 			candidateContext, choiceState = scheduler.WithRouteChoices(candidateContext, choices, claim)
+			// Dynamic balancing is deliberately attached only to a fresh, replay-safe
+			// root request and one compatible account-pool tier. The frozen agent class
+			// is independent of the eventual model/protocol bridge; traffic-fallback
+			// re-entry and durable bindings never opt in.
+			policyScope := strings.TrimSpace(pol.PolicyUserGroupID)
+			dynamicEligible := !pol.PinnedEgressNoFallback && (plan.DynamicPoolBalanceEnabled && plan.DynamicPoolBalanceRPMThreshold > 0 || plan.EgressRPMBalanceEnabled && plan.EgressRPMBalanceThreshold > 0 && len(plan.EgressRPMBalanceEgressIDs) > 0) &&
+				!plan.Bound && !plan.PolicyTransfer
+			if dynamicEligible && policyScope != "" && policyScope != strings.TrimSpace(pol.UserGroupID) {
+				dynamicEligible = false
+			}
+			if dynamicEligible {
+				if _, fallbackExecution := trafficFallbackExecutionFromContext(r.Context()); fallbackExecution {
+					dynamicEligible = false
+				}
+			}
+			if dynamicEligible && accountAgentClassFromContext(r.Context()) == storage.AgentClassRoot && s.scheduler != nil {
+				lifecycleCtx := s.runtimeTaskCtx
+				if lifecycleCtx == nil {
+					lifecycleCtx = context.Background()
+				}
+				s.scheduler.StartDynamicPoolBalance(lifecycleCtx)
+				candidateContext = scheduler.WithDynamicPoolBalance(candidateContext, scheduler.DynamicPoolBalancePolicy{
+					Enabled: true, RPMThreshold: plan.DynamicPoolBalanceRPMThreshold, UserGroupID: plan.UserGroupID,
+					AgentClass: storage.AgentClassRoot, Fresh: true, Bound: false, OnlyAccountPoolTier: true,
+					EventID: usageEventIDFromContext(r.Context()), EgressRPMBalanceEnabled: plan.EgressRPMBalanceEnabled,
+					EgressRPMBalanceThreshold: plan.EgressRPMBalanceThreshold, EgressRPMBalanceEgressIDs: plan.EgressRPMBalanceEgressIDs,
+				})
+				candidateContext = scheduler.WithDynamicPoolBalanceEventID(candidateContext, usageEventIDFromContext(r.Context()))
+			}
 		}
 		if !pol.PinnedEgressNoFallback && replaySafe && (moreUnits || len(unit.Targets) > 1) {
 			candidateContext = withUserGroupFallbackProbe(candidateContext)

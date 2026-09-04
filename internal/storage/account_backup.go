@@ -47,9 +47,9 @@ func forEachAccountBackupIDBatch(accountIDs []string, fn func([]string) error) e
 }
 
 // AccountGroupMembership is the durable many-group membership attached to an
-// account. Group definitions are intentionally not part of an account backup;
-// group_name values remain usable even when the destination has not configured a
-// matching policy yet.
+// account. Full group definitions remain outside the historical account-backup
+// contract; the optional UserGroupPolicies field below carries only the new
+// dynamic-balance policy needed to avoid silently losing that setting.
 type AccountGroupMembership struct {
 	AccountID string `json:"account_id"`
 	GroupName string `json:"group_name"`
@@ -63,6 +63,23 @@ type AccountModelCatalogStatus struct {
 	AccountID     string `json:"account_id"`
 	Authoritative bool   `json:"authoritative"`
 	LastProbeAt   int64  `json:"last_probe_at"`
+}
+
+// UserGroupPolicyBackup carries the user-group fields whose semantics are
+// independent of a single account. Account archives include only policies that
+// reference an exported account's pool group; this keeps the historical archive
+// boundary while ensuring a restored account does not silently lose the dynamic
+// balance switch/threshold. Targets are retained for a destination that does not
+// yet have the definition, although existing definitions are updated in place.
+type UserGroupPolicyBackup struct {
+	ID                             string      `json:"id"`
+	Name                           string      `json:"name"`
+	DynamicPoolBalanceEnabled      bool        `json:"dynamic_pool_balance_enabled"`
+	DynamicPoolBalanceRPMThreshold int64       `json:"dynamic_pool_balance_rpm_threshold"`
+	EgressRPMBalanceEnabled        bool        `json:"egress_rpm_balance_enabled,omitempty"`
+	EgressRPMBalanceThreshold      int64       `json:"egress_rpm_balance_threshold,omitempty"`
+	EgressRPMBalanceEgressIDs      []string    `json:"egress_rpm_balance_egress_ids,omitempty"`
+	Targets                        []TargetRef `json:"targets,omitempty"`
 }
 
 // AccountBackup contains the complete durable account configuration,
@@ -84,6 +101,7 @@ type AccountBackup struct {
 	ModelCatalogStatus     *AccountModelCatalogStatus
 	CodexReauthConfig      *AccountCodexReauthConfig
 	GroupMemberships       []AccountGroupMembership
+	UserGroupPolicies      []UserGroupPolicyBackup
 }
 
 func accountBackupCustomProviderID(provider string) string {
@@ -422,6 +440,62 @@ func (s *Store) accountBackupEgressProfilesByIDs(ctx context.Context, egressIDs 
 	return out, err
 }
 
+func userGroupPolicyBackupsForAccounts(groups []UserGroup, accounts []Account, memberships map[string][]AccountGroupMembership) map[string][]UserGroupPolicyBackup {
+	out := make(map[string][]UserGroupPolicyBackup, len(accounts))
+	for _, account := range accounts {
+		accountID := strings.TrimSpace(account.ID)
+		if accountID == "" {
+			continue
+		}
+		pools := make(map[string]struct{})
+		if pool := strings.TrimSpace(account.GroupName); pool != "" {
+			pools[pool] = struct{}{}
+		}
+		// An account may serve several account-pool groups. The primary
+		// accounts.group_name is only one of those memberships; policy export must
+		// retain a UserGroup that references any additional membership as well.
+		for _, membership := range memberships[accountID] {
+			if pool := strings.TrimSpace(membership.GroupName); pool != "" {
+				pools[pool] = struct{}{}
+			}
+		}
+		if len(pools) == 0 {
+			continue
+		}
+		for _, group := range groups {
+			// Keep archives produced for groups that never opted into the feature
+			// byte-for-byte compatible with the old document. A disabled policy with a
+			// retained positive threshold is still meaningful and is therefore kept.
+			if !group.DynamicPoolBalanceEnabled && group.DynamicPoolBalanceRPMThreshold == 0 && !group.EgressRPMBalanceEnabled && group.EgressRPMBalanceThreshold == 0 {
+				continue
+			}
+			matches := false
+			for _, target := range group.Targets {
+				if target.Kind == TargetKindAccountPoolGroup {
+					if _, serves := pools[strings.TrimSpace(target.ID)]; serves {
+						matches = true
+						break
+					}
+				}
+			}
+			if !matches {
+				continue
+			}
+			policy := UserGroupPolicyBackup{
+				ID: group.ID, Name: group.Name,
+				DynamicPoolBalanceEnabled:      group.DynamicPoolBalanceEnabled,
+				DynamicPoolBalanceRPMThreshold: group.DynamicPoolBalanceRPMThreshold,
+				EgressRPMBalanceEnabled:        group.EgressRPMBalanceEnabled, EgressRPMBalanceThreshold: group.EgressRPMBalanceThreshold,
+				EgressRPMBalanceEgressIDs: append([]string(nil), group.EgressRPMBalanceEgressIDs...),
+				Targets:                   append([]TargetRef(nil), group.Targets...),
+			}
+			out[accountID] = append(out[accountID], policy)
+		}
+		sort.Slice(out[accountID], func(i, j int) bool { return out[accountID][i].ID < out[accountID][j].ID })
+	}
+	return out
+}
+
 // ExportAccountBackups batch-loads complete account backup records without an
 // N+1 credential query. The supplied account order is retained.
 func (s *Store) ExportAccountBackups(ctx context.Context, accounts []Account) ([]AccountBackup, error) {
@@ -501,6 +575,14 @@ func (s *Store) ExportAccountBackups(ctx context.Context, accounts []Account) ([
 	if err != nil {
 		return nil, err
 	}
+	// UserGroup definitions are a shared policy boundary. Capture only definitions
+	// that actually point at one of the exported accounts' pool groups; repeated
+	// account entries are deduplicated during restore.
+	userGroups, err := s.ListUserGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	userGroupPolicies := userGroupPolicyBackupsForAccounts(userGroups, accounts, memberships)
 	customProviderIDs := make([]string, 0)
 	for _, account := range accounts {
 		if providerID := accountBackupCustomProviderID(account.Provider); providerID != "" {
@@ -533,6 +615,10 @@ func (s *Store) ExportAccountBackups(ctx context.Context, accounts []Account) ([
 			dependencies.CustomProvider = &provider
 		}
 		ids := accountBackupReferencedEgressIDs(dependencies)
+		for _, policy := range userGroupPolicies[account.ID] {
+			ids = append(ids, policy.EgressRPMBalanceEgressIDs...)
+		}
+		ids = normalizeOrderedIDs(ids)
 		accountEgressIDs[account.ID] = ids
 		allEgressIDs = append(allEgressIDs, ids...)
 	}
@@ -555,11 +641,12 @@ func (s *Store) ExportAccountBackups(ctx context.Context, accounts []Account) ([
 			return nil, fmt.Errorf("account %q has no authentication row", account.ID)
 		}
 		backup := AccountBackup{
-			Account:          account,
-			Token:            token,
-			Capabilities:     capabilities[account.ID],
-			InjectedCookies:  injectedCookies[account.ID],
-			GroupMemberships: memberships[account.ID],
+			Account:           account,
+			Token:             token,
+			Capabilities:      capabilities[account.ID],
+			InjectedCookies:   injectedCookies[account.ID],
+			GroupMemberships:  memberships[account.ID],
+			UserGroupPolicies: userGroupPolicies[account.ID],
 		}
 		if providerID := accountBackupCustomProviderID(account.Provider); providerID != "" {
 			item := customProviders[providerID]
@@ -861,6 +948,77 @@ ON CONFLICT(id) DO UPDATE SET
 	return err
 }
 
+func restoreAccountBackupUserGroupPolicyTx(ctx context.Context, tx *sql.Tx, policy UserGroupPolicyBackup, now int64) error {
+	policy.ID = strings.TrimSpace(policy.ID)
+	policy.Name = strings.TrimSpace(policy.Name)
+	if policy.ID == "" || policy.Name == "" {
+		return errors.New("user-group policy backup requires id and name")
+	}
+	if policy.DynamicPoolBalanceRPMThreshold < 0 || (policy.DynamicPoolBalanceEnabled && policy.DynamicPoolBalanceRPMThreshold <= 0) {
+		return fmt.Errorf("user-group policy %q has invalid dynamic pool balance threshold", policy.ID)
+	}
+	if policy.EgressRPMBalanceThreshold < 0 || (policy.EgressRPMBalanceEnabled && policy.EgressRPMBalanceThreshold <= 0) {
+		return fmt.Errorf("user-group policy %q has invalid egress rpm balance threshold", policy.ID)
+	}
+	var exists int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM user_groups WHERE id=?`, policy.ID).Scan(&exists)
+	if err == nil {
+		_, err = tx.ExecContext(ctx, `UPDATE user_groups SET dynamic_pool_balance_enabled=?, dynamic_pool_balance_rpm_threshold=?, egress_rpm_balance_enabled=?, egress_rpm_balance_threshold=?, egress_rpm_balance_egress_ids=?, updated_at=? WHERE id=?`, boolInt(policy.DynamicPoolBalanceEnabled), policy.DynamicPoolBalanceRPMThreshold, boolInt(policy.EgressRPMBalanceEnabled), policy.EgressRPMBalanceThreshold, encodeStringList(policy.EgressRPMBalanceEgressIDs), now, policy.ID)
+		return err
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	// An archive may be restored into a deployment where the shared definition
+	// was removed. Recreate a minimal definition with the original targets so the
+	// dynamic fields do not disappear; all non-balance policy fields intentionally
+	// retain their zero/default values rather than being guessed.
+	if len(policy.Targets) == 0 {
+		return fmt.Errorf("user-group policy %q is absent and has no targets", policy.ID)
+	}
+	normalized, err := normalizeTargetRefs(policy.Targets)
+	if err != nil {
+		return err
+	}
+	for _, target := range normalized {
+		switch target.Kind {
+		case TargetKindAccountPoolGroup:
+			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM groups WHERE name=?`, target.ID).Scan(&exists); err != nil {
+				return fmt.Errorf("restore user-group policy %q target %q: %w", policy.ID, target.ID, err)
+			}
+		case TargetKindModelProvider:
+			if target.ID == "codex" || target.ID == "claude" || target.ID == "kiro" || target.ID == "antigravity" {
+				continue
+			}
+			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM custom_providers WHERE id=?`, target.ID).Scan(&exists); err != nil {
+				return fmt.Errorf("restore user-group policy %q provider %q: %w", policy.ID, target.ID, err)
+			}
+		default:
+			return fmt.Errorf("restore user-group policy %q has unsupported target kind %q", policy.ID, target.Kind)
+		}
+	}
+	for _, egressID := range normalizeOrderedIDs(policy.EgressRPMBalanceEgressIDs) {
+		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM egress_profiles WHERE id=?`, egressID).Scan(&exists); err != nil {
+			return fmt.Errorf("restore user-group policy %q egress %q: %w", policy.ID, egressID, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id,name,system_prompt,prompt_mode,system_prompt_apply_to_compaction,model_instructions_enabled,model_instructions_files,model_instruction_profiles,super_instruct_enabled,super_instruct_skill_ids,super_instruct_profiles,super_instruct_response_rewrite_enabled,super_instruct_memory_enabled,super_instruct_monitor_enabled,force_model,force_effort,block_claude_target_groups,block_gpt_target_groups,traffic_fallback_groups_json,traffic_fallback_model_mappings_json,model_routing_json,created_at,updated_at,pinned_egress_no_fallback,gpt_safety_buffering_session_rollover_enabled,gpt_text_refusal_session_rollover_enabled,dynamic_pool_balance_enabled,dynamic_pool_balance_rpm_threshold,egress_rpm_balance_enabled,egress_rpm_balance_threshold,egress_rpm_balance_egress_ids)
+VALUES(?,?, '', 'prepend', 1, 0, '[]', '{}', 0, '[]', '{}', 0, 0, 0, '', '', '[]', '[]', '{}', '[]', '[]', ?, ?, 0, 0, 0, ?, ?, ?, ?, ?)`,
+		policy.ID, policy.Name, now, now, boolInt(policy.DynamicPoolBalanceEnabled), policy.DynamicPoolBalanceRPMThreshold, boolInt(policy.EgressRPMBalanceEnabled), policy.EgressRPMBalanceThreshold, encodeStringList(policy.EgressRPMBalanceEgressIDs)); err != nil {
+		return err
+	}
+	for _, target := range normalized {
+		legacy, err := legacyTargetFromRef(policy.ID, target, now)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO user_group_targets(user_group_id,target_type,target_ref,affinity_weight,created_at) VALUES(?,?,?,?,?)`, legacy.UserGroupID, legacy.TargetType, legacy.TargetRef, legacy.AffinityWeight, legacy.CreatedAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // RestoreAccountBackups atomically and completely replaces the durable
 // configuration of every included account. Accounts not present in backups are
 // untouched. A validation or database failure leaves every account unchanged.
@@ -885,6 +1043,26 @@ func (s *Store) RestoreAccountBackups(ctx context.Context, backups []AccountBack
 	if err != nil {
 		return err
 	}
+	policiesByID := make(map[string]UserGroupPolicyBackup)
+	policyFingerprints := make(map[string]string)
+	for _, backup := range backups {
+		for _, policy := range backup.UserGroupPolicies {
+			id := strings.TrimSpace(policy.ID)
+			if id == "" {
+				return errors.New("user-group policy backup has no id")
+			}
+			raw, marshalErr := json.Marshal(policy)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			fingerprint := string(raw)
+			if previous, duplicate := policyFingerprints[id]; duplicate && previous != fingerprint {
+				return fmt.Errorf("conflicting user-group policy definitions for id %q", id)
+			}
+			policyFingerprints[id] = fingerprint
+			policiesByID[id] = policy
+		}
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -905,6 +1083,16 @@ func (s *Store) RestoreAccountBackups(ctx context.Context, backups []AccountBack
 	for i := range backups {
 		if err := s.restoreAccountBackupTx(ctx, tx, backups[i]); err != nil {
 			return fmt.Errorf("restore account %q: %w", backups[i].Account.ID, err)
+		}
+	}
+	policyIDs := make([]string, 0, len(policiesByID))
+	for id := range policiesByID {
+		policyIDs = append(policyIDs, id)
+	}
+	sort.Strings(policyIDs)
+	for _, id := range policyIDs {
+		if err := restoreAccountBackupUserGroupPolicyTx(ctx, tx, policiesByID[id], now); err != nil {
+			return fmt.Errorf("restore user-group policy %q: %w", id, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {

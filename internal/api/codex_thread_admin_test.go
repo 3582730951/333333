@@ -9,48 +9,11 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"codex-account-pool/internal/storage"
 )
-
-const codexThreadAdminTestToken = "codex-thread-admin-test-token"
-
-func enableCodexThreadAdmin(t *testing.T, h *testHarness) {
-	t.Helper()
-	h.app.cfg.AdminToken = codexThreadAdminTestToken
-	hasAdmin, err := h.store.HasAdminUser(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hasAdmin {
-		return
-	}
-	passwordHash, err := hashPassword("codex-thread-admin-test-password")
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := storage.Now()
-	_, err = h.store.ClaimAdminWithRecoveryCredential(context.Background(), storage.User{
-		ID: "codex-thread-admin", Email: "codex-thread-admin@example.test", Name: "Codex thread admin", PasswordHash: passwordHash,
-	}, storage.UserSession{
-		TokenHash: hashAPIKey("codex-thread-admin-session"), CreatedAt: now, ExpiresAt: now + 3600,
-	}, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
 
 func codexThreadAdminRequest(t *testing.T, h *testHarness, method, path string) (*http.Response, []byte) {
 	t.Helper()
-	req, err := http.NewRequest(method, h.pool.URL+path, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+codexThreadAdminTestToken)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := doAdminRequest(t, h, method, path, nil)
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	return resp, body
@@ -102,7 +65,7 @@ func (s *codexThreadRuntimeStub) SubscribeThreadStatus(_ context.Context, _ stri
 
 func TestCodexThreadAdminUsesOpaqueHandlesAndConfirmsExactInterrupt(t *testing.T) {
 	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
-	enableCodexThreadAdmin(t, h)
+	enableAdmin(t, h)
 	runtime := newCodexThreadRuntimeStub(Thread{
 		ID: "thread-raw-secret", ActiveTurnID: "turn-raw-secret", Model: "gpt-5.6", ModelProvider: "openai",
 		Source: "cli", Status: "active", WaitingReason: "waitingOnApproval", CWD: "/private/workspace/project-secret",

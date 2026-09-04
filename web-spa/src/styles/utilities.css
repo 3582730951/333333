@@ -15,7 +15,7 @@
 
 .pool-grid {
   display: grid;
-  gap: 14px;
+  gap: var(--pool-space-3);
 }
 
 .pool-grid-2 {
@@ -64,7 +64,7 @@
   width: 1px;
   height: 1px;
   padding: 0;
-  margin: -1px;
+  margin: -1px; /* optical: sr-only clip box, not spacing rhythm */
   overflow: hidden;
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;

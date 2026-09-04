@@ -5,16 +5,30 @@
 // expecting behaviour. Neither shows up in a typecheck, a unit test, or a screenshot that
 // happens not to exercise the case. This finds them by comparing what the components emit
 // against what the stylesheets define.
-import { readFileSync, writeFileSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
-const root = path.resolve(import.meta.dirname, '..');
-const list = (pattern, dir) => execSync(`grep -rl "" --include=${pattern} ${dir}`, { cwd: root, encoding: 'utf8' })
-  .trim().split('\n').filter(Boolean);
+import { OWNED_PREFIXES, collectOwnedClassesFromJsx } from './lib/class-drift-jsx.mjs';
 
-const styleFiles = list('*.css', 'src/styles');
-const codeFiles = [...list('*.jsx', 'src'), ...list('*.tsx', 'src')];
+const root = path.resolve(import.meta.dirname, '..');
+const list = (dir, matcher) => {
+  const found = [];
+  const walk = (relative) => {
+    for (const entry of readdirSync(path.join(root, relative), { withFileTypes: true })) {
+      const child = path.join(relative, entry.name);
+      if (entry.isDirectory()) walk(child);
+      else if (matcher(entry.name)) found.push(child);
+    }
+  };
+  walk(dir);
+  return found;
+};
+
+const styleFiles = list('src/styles', (name) => name.endsWith('.css'));
+const codeFiles = [
+  ...list('src', (name) => name.endsWith('.jsx')),
+  ...list('src', (name) => name.endsWith('.tsx')),
+];
 
 // The prefixes this app owns. `pool-` was the only one checked for a long time, which left whole
 // families unwatched: `upstream-rule-main` and `public-chat-admin-page` were both emitted with no
@@ -26,8 +40,6 @@ const codeFiles = [...list('*.jsx', 'src'), ...list('*.tsx', 'src')];
 // Prefix-scoped rather than "every class we emit": the Semi Design components bring their own
 // `semi-*` classes whose rules live in node_modules, and matching those would report the entire
 // vendor surface as drift.
-const OWNED_PREFIXES = ['pool-', 'upstream-rule', 'upstream-rules', 'public-chat'];
-const owned = (name) => OWNED_PREFIXES.some((p) => name.startsWith(p));
 const CLASS_RE = new RegExp(`\\.((?:${OWNED_PREFIXES.join('|')})[a-z0-9_-]*)`, 'g');
 
 // Comments are stripped before anything is read as a selector. A comment that discusses a class by
@@ -46,6 +58,7 @@ const readVars = new Set([...css.matchAll(/var\(\s*(--pool-[a-z0-9-]+)/g)].map((
 
 const usedClasses = new Map();
 const setVars = new Map();
+const indeterminateClasses = [];
 const note = (map, key, file) => {
   if (!map.has(key)) map.set(key, new Set());
   map.get(key).add(file);
@@ -53,32 +66,12 @@ const note = (map, key, file) => {
 
 for (const file of codeFiles) {
   const src = readFileSync(path.join(root, file), 'utf8');
-  // className="..." / className={`...`} / plain 'pool-x' strings in class position.
-  for (const m of src.matchAll(/className\s*=\s*(?:"([^"]*)"|\{`([^`]*)`\}|\{'([^']*)'\})/g)) {
-    const raw = m[1] ?? m[2] ?? m[3] ?? '';
-    // Interpolations produce names no static reader can know; skip the hole, keep the rest.
-    // A fragment left dangling on its separator (`pool-delta--${tone}` -> `pool-delta--`)
-    // is the hole, not a name, so it is dropped rather than reported as missing.
-    for (const cls of raw.replace(/\$\{[^}]*\}/g, ' ').split(/\s+/)) {
-      if (owned(cls) && !/[-_]$/.test(cls)) note(usedClasses, cls, file);
-    }
-    // The erase above drops the hole's contents too, and a hole is where a state class most
-    // often lives: `${collapsed ? 'pool-sider-collapsed' : 'pool-sider-expanded'}` emits two
-    // real names that no rule need exist for. The ternary sweep below only recovers `--`
-    // modifier names, so plain state classes were invisible to this gate -- four unstyled ones
-    // sat in App.tsx behind exactly this blind spot. Mine the string literals out of each hole.
-    for (const hole of raw.matchAll(/\$\{([^}]*)\}/g)) {
-      for (const lit of hole[1].matchAll(/'([^']*)'|"([^"]*)"/g)) {
-        for (const cls of (lit[1] ?? lit[2] ?? '').split(/\s+/)) {
-          if (owned(cls) && !/[-_]$/.test(cls)) note(usedClasses, cls, file);
-        }
-      }
-    }
-  }
-  // Classes assembled in arrays or ternaries, e.g. `cond ? 'pool-x--on' : ''`.
-  for (const m of src.matchAll(/'([a-z][a-z0-9_-]*--[a-z0-9_-]+)'/g)) {
-    if (owned(m[1])) note(usedClasses, m[1], file);
-  }
+  // JSX AST traversal covers direct strings, templates (including literal template holes),
+  // conditional/logical values, arrays, and clsx-style arguments. Unlike the old source regex,
+  // a naked `className={condition ? 'pool-a' : 'pool-b'}` reaches this path too.
+  const usage = collectOwnedClassesFromJsx(src, { file });
+  for (const cls of usage.classes) note(usedClasses, cls, file);
+  indeterminateClasses.push(...usage.indeterminate);
   for (const m of src.matchAll(/'(--pool-[a-z0-9-]+)'\s*:/g)) note(setVars, m[1], file);
 }
 
@@ -136,6 +129,10 @@ if (deadVars.length) {
 
 console.log(`class drift: ${usedClasses.size} emitted, ${definedClasses.size} defined in ${styleFiles.length} stylesheets`);
 console.log(`custom properties: ${setVars.size} set from components, ${definedVars.size} declared, ${readVars.size} read`);
+console.log(`不可静态判定的 className 表达式: ${indeterminateClasses.length}`);
+for (const item of indeterminateClasses) {
+  console.log(`  ${item.file}:${item.line}:${item.column} ${item.expression} — ${item.reason}`);
+}
 if (unreadDefined.length) {
   // Not a failure: a token can be declared as part of a palette and only consumed later.
   console.log(`note: ${unreadDefined.length} declared custom propert(y|ies) are never read via var()`);

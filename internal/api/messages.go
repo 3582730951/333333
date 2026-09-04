@@ -406,7 +406,11 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		EstimatedTokens:       virtual.EstimateTokensJSON(raw),
 		Exclude:               exclude,
 		OnWait:                schedulerWaitCallback(r.Context()),
-		SkipWait:              userGroupFallbackProbe(r.Context()),
+		// A retry already has an excluded account. Probe the remaining pool
+		// immediately instead of entering the unbounded scheduler wait behind a
+		// cooldown that belongs only to the account we just rejected; if no other
+		// account is ready, return the Anthropic error envelope promptly.
+		SkipWait: userGroupFallbackProbe(r.Context()) || len(exclude) > 0,
 	}
 	lease, err := s.scheduler.Select(r.Context(), route)
 	virtualContext1M := false

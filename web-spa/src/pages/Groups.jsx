@@ -202,6 +202,11 @@ function blankUserGroup() {
     pinned_egress_no_fallback: false,
 	 gpt_safety_buffering_session_rollover_enabled: false,
 	 gpt_text_refusal_session_rollover_enabled: false,
+    dynamic_pool_balance_enabled: false,
+    dynamic_pool_balance_rpm_threshold: 0,
+    egress_rpm_balance_enabled: false,
+    egress_rpm_balance_threshold: 0,
+    egress_rpm_balance_egress_ids: [],
     target_keys: [],
     model_routing: [],
   };
@@ -250,6 +255,11 @@ function userGroupDraft(row) {
     pinned_egress_no_fallback: Boolean(row.pinned_egress_no_fallback),
 	 gpt_safety_buffering_session_rollover_enabled: Boolean(row.gpt_safety_buffering_session_rollover_enabled),
 	 gpt_text_refusal_session_rollover_enabled: Boolean(row.gpt_text_refusal_session_rollover_enabled),
+    dynamic_pool_balance_enabled: Boolean(row.dynamic_pool_balance_enabled),
+    dynamic_pool_balance_rpm_threshold: Math.max(0, Math.trunc(Number(row.dynamic_pool_balance_rpm_threshold) || 0)),
+    egress_rpm_balance_enabled: Boolean(row.egress_rpm_balance_enabled),
+    egress_rpm_balance_threshold: Math.max(0, Math.trunc(Number(row.egress_rpm_balance_threshold) || 0)),
+    egress_rpm_balance_egress_ids: uniqueStrings(row.egress_rpm_balance_egress_ids),
     model_routing: (row.model_routing || []).map((rule) => ({
       model: rule.model || '',
       tiers: (rule.tiers || []).map((tier) => (tier || []).map(targetKey)),
@@ -319,6 +329,13 @@ function normalizedUserGroupPayload(draft, providers = []) {
     pinned_egress_no_fallback: Boolean(draft.pinned_egress_no_fallback),
 	 gpt_safety_buffering_session_rollover_enabled: Boolean(draft.gpt_safety_buffering_session_rollover_enabled),
 	 gpt_text_refusal_session_rollover_enabled: Boolean(draft.gpt_text_refusal_session_rollover_enabled),
+    dynamic_pool_balance_enabled: Boolean(draft.dynamic_pool_balance_enabled),
+    // Preserve a disabled threshold so an operator can pause the policy without
+    // losing its chosen value; the server validates it whenever enabled.
+    dynamic_pool_balance_rpm_threshold: Math.max(0, Math.trunc(Number(draft.dynamic_pool_balance_rpm_threshold) || 0)),
+    egress_rpm_balance_enabled: Boolean(draft.egress_rpm_balance_enabled),
+    egress_rpm_balance_threshold: Math.max(0, Math.trunc(Number(draft.egress_rpm_balance_threshold) || 0)),
+    egress_rpm_balance_egress_ids: uniqueStrings(draft.egress_rpm_balance_egress_ids),
     targets,
     model_routing: (draft.model_routing || []).filter((rule) => String(rule.model || '').trim()).map((rule) => {
       const mentioned = new Set();
@@ -336,6 +353,21 @@ function formatTime(value) {
   const timestamp = Number(value) || 0;
   if (!timestamp) return '尚无记录';
   return new Date(timestamp * 1000).toLocaleString();
+}
+
+function dynamicBalanceIssue(draft) {
+  if (!draft?.dynamic_pool_balance_enabled) return '';
+  const threshold = Number(draft.dynamic_pool_balance_rpm_threshold);
+  if (!Number.isInteger(threshold) || threshold <= 0) return '启用动态均衡时，请填写大于 0 的整数 RPM 阈值。';
+  return '';
+}
+
+function egressBalanceIssue(draft) {
+  if (!draft?.egress_rpm_balance_enabled) return '';
+  const threshold = Number(draft.egress_rpm_balance_threshold);
+  if (!Number.isInteger(threshold) || threshold <= 0) return '启用网络出口 RPM 均衡时，请填写大于 0 的整数阈值。';
+  if (uniqueStrings(draft.egress_rpm_balance_egress_ids).length === 0) return '启用网络出口 RPM 均衡时，请至少选择一个出口。';
+  return '';
 }
 
 function AccountGroupEditor({ editor, profiles, saving, onCancel, onSave }) {
@@ -738,6 +770,7 @@ function UserGroupEditor({
   superSkillsLoading,
   superSkillsError,
   models,
+  egresses,
   modelsError,
   catalogLoading,
   catalogError,
@@ -760,6 +793,8 @@ function UserGroupEditor({
     .map((group) => ({ id: group.id, label: group.name || group.id }));
   const payload = normalizedUserGroupPayload(draft, providers);
   const fallbackIssues = fallbackConfigurationIssues(draft);
+  const dynamicBalanceError = dynamicBalanceIssue(draft);
+  const egressBalanceError = egressBalanceIssue(draft);
 
   const setTargets = (targetKeys) => setDraft((current) => {
     const selected = new Set(targetKeys);
@@ -868,6 +903,50 @@ function UserGroupEditor({
             />
           </div>
         </div>
+      </Card>
+      <Card title="账号池内动态均衡" className="pool-card">
+        <Banner
+          type="info"
+          title="按账号的主 CLI Root RPM 分流"
+          description="达到阈值后，新建的主 CLI 请求优先进入同一用户分组内较低负载的账号；当前池全部过载时才比较同层的其他账号池分组。"
+        />
+        <div className="pool-user-group-grid">
+          <label className="pool-inline-switch">
+            <Switch
+              checked={Boolean(draft.dynamic_pool_balance_enabled)}
+              onChange={(dynamic_pool_balance_enabled) => setDraft((current) => ({ ...current, dynamic_pool_balance_enabled }))}
+              aria-label="启用账号池内动态均衡"
+            />
+            <span>{draft.dynamic_pool_balance_enabled ? '已启用' : '默认关闭'}</span>
+          </label>
+          <Form.InputNumber
+            label="触发阈值（逻辑 Root RPM）"
+            help="统计最近 60 个整秒窗口；只影响新建的主 CLI 请求。"
+            value={draft.dynamic_pool_balance_rpm_threshold || ''}
+            onChange={(dynamic_pool_balance_rpm_threshold) => setDraft((current) => ({
+              ...current,
+              dynamic_pool_balance_rpm_threshold: Number(dynamic_pool_balance_rpm_threshold) || 0,
+            }))}
+            min={1}
+            max={1000000}
+            step={1}
+            disabled={!draft.dynamic_pool_balance_enabled}
+            aria-label="动态均衡触发阈值"
+          />
+        </div>
+        <div className="pool-field__help">
+          子 agent、已固定会话、流量兜底和快照过期时不会介入；负载无法确定时自动保持原调度顺序。
+        </div>
+        {dynamicBalanceError ? <div className="pool-fallback-validation" role="alert"><strong>{dynamicBalanceError}</strong></div> : null}
+      </Card>
+      <Card title="用户分组 RPM 均衡（网络出口）" className="pool-card">
+        <Banner type="info" title="按最近 60 秒请求数顺序切换出口" description="达到阈值后，新的主 CLI 请求会跳到下一个健康出口；账号级固定出口、已有会话和流量兜底不会被改写。" />
+        <div className="pool-user-group-grid">
+          <label className="pool-inline-switch"><Switch checked={Boolean(draft.egress_rpm_balance_enabled)} onChange={(value) => setDraft((current) => ({ ...current, egress_rpm_balance_enabled: value }))} /><span>{draft.egress_rpm_balance_enabled ? '已启用' : '默认关闭'}</span></label>
+          <Form.InputNumber label="出口 RPM 阈值" value={draft.egress_rpm_balance_threshold || ''} min={1} max={1000000} step={1} disabled={!draft.egress_rpm_balance_enabled} onChange={(value) => setDraft((current) => ({ ...current, egress_rpm_balance_threshold: Number(value) || 0 }))} />
+        </div>
+        <Form.Select label="参与出口（按顺序）" multiple value={draft.egress_rpm_balance_egress_ids} optionList={(egresses || []).map((e) => ({ label: e.name || e.id, value: e.id }))} disabled={!draft.egress_rpm_balance_enabled} onChange={(value) => setDraft((current) => ({ ...current, egress_rpm_balance_egress_ids: value }))} />
+        {egressBalanceError ? <div className="pool-fallback-validation" role="alert"><strong>{egressBalanceError}</strong></div> : null}
       </Card>
       <Card title="流量兜底" className="pool-card pool-traffic-fallback-card">
         <Banner
@@ -1032,7 +1111,7 @@ function UserGroupEditor({
       </Card>
       <div className="pool-modal-actions">
         <Button onClick={onCancel} disabled={saving}>取消</Button>
-        <Button theme="solid" loading={saving} disabled={!payload.name || payload.targets.length === 0 || fallbackIssues.length > 0} onClick={() => onSave(payload)}>保存用户分组</Button>
+        <Button theme="solid" loading={saving} disabled={!payload.name || payload.targets.length === 0 || fallbackIssues.length > 0 || Boolean(dynamicBalanceError) || Boolean(egressBalanceError)} onClick={() => onSave(payload)}>保存用户分组</Button>
       </div>
     </div>
   );
@@ -1055,7 +1134,7 @@ export default function Groups() {
   const userGroupsResource = useUserGroupsData();
   const instructionsResource = useGroupInstructionsData(needsUserEditorCatalog || instructionLibraryOpen);
   const superSkillsResource = useGroupSuperSkillsData(needsUserEditorCatalog);
-  const egressesResource = useGroupEgressesData(needsAccountEditorCatalog);
+  const egressesResource = useGroupEgressesData(needsAccountEditorCatalog || needsUserEditorCatalog);
   const providersResource = useGroupProvidersData(needsUserEditorCatalog);
   const modelsResource = useGroupModelsData(needsUserEditorCatalog);
   const data = {
@@ -1082,8 +1161,9 @@ export default function Groups() {
       instructionsResource.reload(),
       superSkillsResource.reload(),
       modelsResource.reload(),
+      egressesResource.reload(),
     ]);
-  }, [groupsResource.reload, providersResource.reload, instructionsResource.reload, superSkillsResource.reload, modelsResource.reload]);
+  }, [groupsResource.reload, providersResource.reload, instructionsResource.reload, superSkillsResource.reload, modelsResource.reload, egressesResource.reload]);
   const openUserGroupEditor = useCallback((editor) => {
     setUserEditor(editor);
   }, []);
@@ -1262,6 +1342,8 @@ export default function Groups() {
         FALLBACK_FAMILIES.reduce((count, { key }) => count + (row.traffic_fallback_groups?.[key]?.length || 0), 0)
           ? `流量兜底 ${FALLBACK_FAMILIES.reduce((count, { key }) => count + (row.traffic_fallback_groups?.[key]?.length || 0), 0)} 组`
           : '',
+        row.dynamic_pool_balance_enabled ? `动态均衡 ${row.dynamic_pool_balance_rpm_threshold || '未设阈值'} RPM` : '',
+        row.egress_rpm_balance_enabled ? `出口均衡 ${row.egress_rpm_balance_threshold || '未设阈值'} RPM` : '',
       ].filter(Boolean)} max={3} />,
     },
     {
@@ -1371,6 +1453,7 @@ export default function Groups() {
             superSkillsLoading={superSkillsResource.loading}
             superSkillsError={superSkillsResource.error}
             models={data.models}
+            egresses={data.egresses}
             modelsError={modelsResource.error}
             catalogLoading={targetCatalogLoading}
             catalogError={targetCatalogError}
@@ -1397,6 +1480,7 @@ export default function Groups() {
 
 export {
   blankUserGroup,
+  dynamicBalanceIssue,
   fallbackConfigurationIssues,
   modelFamily,
   modelsByFamily,

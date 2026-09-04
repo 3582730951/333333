@@ -232,7 +232,7 @@ func resolveCursorProxyBinary(configured string) (string, error) {
 		}
 		reasons = append(reasons, fmt.Sprintf("%s %s (%v)", candidate.source, candidate.path, err))
 	}
-	return "", fmt.Errorf("Cursor proxy module is not installed; tried %s", strings.Join(reasons, "; "))
+	return "", fmt.Errorf("Cursor proxy module is not installed; tried %s. Repair the pinned release-local module by rerunning `sudo ./install.sh --with-cursor-proxy` from the project checkout (it uses modules/cursor-proxy/package-lock.json via npm ci; do not use npm install -g cursor-api-proxy)", strings.Join(reasons, "; "))
 }
 
 func usableCursorProxyBinary(path string) (string, error) {

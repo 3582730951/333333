@@ -255,8 +255,14 @@ func (s *Server) writePublicNoAccountError(ctx context.Context, w http.ResponseW
 			Action: "routing_unavailable",
 			State:  "unavailable",
 			Reason: reason,
-			Detail: fmt.Sprintf("group_hash=%s allowed_providers=%s requested_model=%s normalized_model=%s kiro_accounts=%d status=%d counters=%s detail=%s",
-				shortHash(group), strings.Join(allowedProviders, ","), model, normalizedModel, s.activeKiroAccountsInGroup(ctx, group), status, counterJSON, bodySnippet([]byte(detail), 600)),
+			// undecryptable_credentials is the cause the scheduler counters cannot
+			// express. An account whose stored secret will not open still counts as
+			// active and is still selected, so a key rotation reads here as a plain
+			// selection failure with every counter at zero. Carrying the number keeps
+			// the 503's real cause queryable from the audit trail; the names stay on
+			// the admin-gated surface.
+			Detail: fmt.Sprintf("group_hash=%s allowed_providers=%s requested_model=%s normalized_model=%s kiro_accounts=%d status=%d undecryptable_credentials=%d counters=%s detail=%s",
+				shortHash(group), strings.Join(allowedProviders, ","), model, normalizedModel, s.activeKiroAccountsInGroup(ctx, group), status, s.store.UndecryptableAccountCount(), counterJSON, bodySnippet([]byte(detail), 600)),
 		})
 	} else {
 		s.routingAuditSuppressed.Add(1)

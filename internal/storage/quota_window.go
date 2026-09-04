@@ -9,11 +9,11 @@ import (
 )
 
 // Quota window estimation follows the calculate_money scheme (sub2api ecosystem):
-// each quota poll snapshots the account's used_percent together with the USD cost
-// the relay recorded inside that same window cycle. The ratio of cost change to
-// percentage change over a cycle infers the window's total dollar value without
-// ever consulting a plan list price. Raw samples are pruned once a cycle is
-// finalized; only the best-quality summary per cycle is kept.
+// each quota poll snapshots the account's used_percent together with the
+// versioned API-list-price-equivalent cost the relay recorded inside that same
+// window cycle. This is an internal empirical ratio, never an account USD
+// balance. Raw samples are pruned once a cycle is finalized; only the
+// best-quality summary per cycle is kept.
 //
 // quotaWindowSchemaSQL is additive and driver-neutral: sqlite executes it in
 // Store.init, postgres folds it into the checksummed base migration.
@@ -53,7 +53,9 @@ CREATE TABLE IF NOT EXISTS quota_window_estimates(
 `
 
 // QuotaWindowSample is one poll-time snapshot of a window cycle: the upstream
-// used_percent together with the relay's recorded USD cost inside that cycle.
+// used_percent together with the relay's recorded API-list-price-equivalent
+// cost inside that cycle. CostUSD is a legacy storage field name; it is not
+// exposed as an account cash balance.
 type QuotaWindowSample struct {
 	AccountID   string
 	WindowKind  string

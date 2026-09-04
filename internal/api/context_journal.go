@@ -61,7 +61,7 @@ func (s *Server) journalReplayBody(ctx context.Context, current []byte) ([]byte,
 	if _, ok := rebuilt["model"]; !ok {
 		rebuilt["model"] = base["model"]
 	}
-	rebuilt["input"] = mergeCodexGoalReplayInput(base["input"], cur["input"])
+	rebuilt["input"] = mergeCodexGoalReplayInput(base["input"], cur["input"], upstream.CodexRequestUsesResponsesLite(current))
 	out, e := json.Marshal(rebuilt)
 	return out, e == nil
 }
@@ -117,7 +117,7 @@ func (s *Server) persistContextJournalFallback(ctx context.Context, requestBody,
 				// the old envelope here would silently resurrect a prior model,
 				// instruction, tool set, reasoning effort, or future option on the
 				// following turn.
-				req["input"] = mergeCodexGoalReplayInput(base["input"], req["input"])
+				req["input"] = mergeCodexGoalReplayInput(base["input"], req["input"], upstream.CodexRequestUsesResponsesLite(requestBody))
 			}
 			// Keep the chain's live tail warm as the conversation advances.
 			s.touchContextJournal(ctx, prev)
@@ -411,10 +411,12 @@ func toolCallPairKind(t string) string {
 	}
 }
 
-// hasPendingClientToolCall reports whether a stateless Responses history carries a
-// client-managed tool call without its matching result.  A replay must never forward
-// such a history: the upstream correctly rejects it with e.g. "No tool output found
-// for custom tool call ...", while executing the call again would be unsafe.
+// hasPendingClientToolCall reports whether a replay history carries a client-managed
+// tool call without its matching result. It accepts both native Responses input and
+// Anthropic Messages content blocks because a Messages request can be rebuilt before
+// it is converted to Responses. A replay must never forward such a history: the
+// upstream correctly rejects it with e.g. "No tool output found for custom tool call
+// ...", while executing the call again would be unsafe.
 //
 // Server-executed tool search calls are excluded because their result is owned by the
 // Responses service rather than the downstream client.  Pairing is intentionally
@@ -422,6 +424,28 @@ func toolCallPairKind(t string) string {
 // call look complete.
 func hasPendingClientToolCall(input interface{}) bool {
 	pending := map[string]struct{}{}
+	add := func(kind, callID string) {
+		if callID != "" {
+			pending[kind+"\x00"+callID] = struct{}{}
+		}
+	}
+	remove := func(kind, callID string) {
+		if callID != "" {
+			delete(pending, kind+"\x00"+callID)
+		}
+	}
+	processAnthropicBlock := func(item map[string]interface{}) bool {
+		switch strings.ToLower(strings.TrimSpace(streamString(item["type"]))) {
+		case "tool_use", "mcp_tool_use":
+			add("anthropic", streamString(item["id"]))
+			return true
+		case "tool_result", "tool_use_result":
+			remove("anthropic", streamString(item["tool_use_id"]))
+			return true
+		default:
+			return false
+		}
+	}
 	for _, raw := range appendItems(nil, input) {
 		item, ok := raw.(map[string]interface{})
 		if !ok {
@@ -431,14 +455,24 @@ func hasPendingClientToolCall(input interface{}) bool {
 			continue
 		}
 		if kind := clientToolCallPairKind(item); kind != "" {
-			if callID := streamString(item["call_id"]); callID != "" {
-				pending[kind+"\x00"+callID] = struct{}{}
-			}
+			add(kind, streamString(item["call_id"]))
 			continue
 		}
 		if kind := toolOutputPairKind(item); kind != "" && kind != "tool_search_server" {
-			if callID := streamString(item["call_id"]); callID != "" {
-				delete(pending, kind+"\x00"+callID)
+			remove(kind, streamString(item["call_id"]))
+			continue
+		}
+		if processAnthropicBlock(item) {
+			continue
+		}
+		// Anthropic tool calls/results are content blocks inside a role message,
+		// whereas Responses items are already flat. Preserve block order so a
+		// result that precedes its call remains invalid just like the Responses
+		// pairing rules above.
+		for _, rawBlock := range appendItems(nil, item["content"]) {
+			block, ok := rawBlock.(map[string]interface{})
+			if ok {
+				processAnthropicBlock(block)
 			}
 		}
 	}

@@ -205,11 +205,11 @@ export default function CodexThreads() {
 
       <div className="pool-toolbar" style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 14 }}>
         <label>
-          <span className="pool-muted" style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>来源</span>
+          <span className="pool-muted" style={{ display: 'block', fontSize: 'var(--pool-type-caption)', marginBottom: 4 }}>来源</span>
           <Select value={source} onChange={(value: string) => setSource(value)} optionList={[{ label: '全部来源', value: '' }, { label: 'CLI', value: 'cli' }, { label: 'User', value: 'user' }, { label: 'Rollout', value: 'rollout' }, { label: 'Imported', value: 'imported' }]} style={{ width: 150 }} />
         </label>
         <label style={{ minWidth: 230, flex: '1 1 260px' }}>
-          <span className="pool-muted" style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>安全搜索</span>
+          <span className="pool-muted" style={{ display: 'block', fontSize: 'var(--pool-type-caption)', marginBottom: 4 }}>安全搜索</span>
           <input className="pool-input" value={searchTerm} maxLength={256} placeholder="按 app-server 元数据搜索" onChange={(event) => setSearchTerm(event.target.value)} />
         </label>
       </div>

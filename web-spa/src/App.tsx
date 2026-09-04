@@ -29,8 +29,8 @@ import {
 } from './app/frontendPerformance';
 
 const { Header, Sider, Content } = Layout;
-const SIDEBAR_EXPANDED_WIDTH = 248;
-const SIDEBAR_COLLAPSED_WIDTH = 68;
+const SIDEBAR_EXPANDED_WIDTH = 'var(--pool-nav-sidebar-expanded)';
+const SIDEBAR_COLLAPSED_WIDTH = 'var(--pool-nav-sidebar-collapsed)';
 
 const adminPages = new Map<string, LazyExoticComponent<ComponentType<any>>>(adminRoutes.map((route) => [route.path, lazy(route.lazyLoader)]));
 const portalPages = new Map<string, LazyExoticComponent<ComponentType<any>>>(portalRoutes.map((route) => [route.path, lazy(route.lazyLoader)]));
@@ -519,9 +519,10 @@ export default function App() {
   }, [auth.authed, isAdmin, mobileOpen, responsive.isMobile, shellViewIdentity]);
   const ident = auth.user?.email || auth.user?.name || (isAdmin ? 'admin' : 'user');
   const identInitial = String(ident).trim().charAt(0).toUpperCase();
+  const navStorageScope = String(ident);
   const commandShortcut = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘K' : 'Ctrl K';
   const navCollapsed = isAdmin && !responsive.isMobile ? collapsed : false;
-  const sidebarWidth = !isAdmin ? 0 : responsive.isMobile ? SIDEBAR_EXPANDED_WIDTH : navCollapsed ? SIDEBAR_COLLAPSED_WIDTH : SIDEBAR_EXPANDED_WIDTH;
+  const sidebarWidth = !isAdmin ? '0px' : responsive.isMobile ? SIDEBAR_EXPANDED_WIDTH : navCollapsed ? SIDEBAR_COLLAPSED_WIDTH : SIDEBAR_EXPANDED_WIDTH;
   const navigateFromShell = (target: string) => {
     if (target === `${location.pathname}${location.search}` || target === location.pathname) return;
     if (aiSettingsDirty && !window.confirm(t('ai_settings.leave_description'))) return;
@@ -604,7 +605,7 @@ export default function App() {
         {/* The login screen returns above the shell, so it was the one surface with no
             depth field -- the first thing anyone sees, and the flattest. It carries no
             live sample: there is no session yet to have a pulse. */}
-        <Suspense fallback={null}><AtmosphereLayer /></Suspense>
+        <Suspense fallback={null}><AtmosphereLayer pathname={location.pathname} /></Suspense>
         <Suspense fallback={<BootScreen portal={location.pathname.startsWith('/portal')} />}>
           <CommittedView identity="auth:login" title={t('auth.login_title')} onCommit={handleViewCommit}>
             <LoginPage onSuccess={auth.refresh} />
@@ -614,7 +615,7 @@ export default function App() {
     );
   }
 
-  const layoutStyle = { '--pool-sidebar-width': `${sidebarWidth}px` } as CSSProperties;
+  const layoutStyle = { '--pool-sidebar-width': sidebarWidth } as CSSProperties;
   const accountMenu = (
     <div className="pool-account-menu-wrap" ref={accountMenuRef}>
       <Button ref={accountMenuButtonRef} className="pool-account-menu-button" theme="borderless" aria-label={t('app.account_menu')} aria-haspopup="menu" aria-controls="pool-account-menu" aria-expanded={accountMenuOpen} onClick={() => setAccountMenuOpen((value) => !value)} onKeyDown={(event: React.KeyboardEvent) => {
@@ -655,7 +656,7 @@ export default function App() {
       >
         {t('app.skip_to_content')}
       </a>
-      <Suspense fallback={null}><AtmosphereLayer subscribe={ambient.subscribe} /></Suspense>
+      <Suspense fallback={null}><AtmosphereLayer subscribe={ambient.subscribe} pathname={location.pathname} /></Suspense>
       {isAdmin && responsive.isMobile && mobileOpen ? <div className="pool-shell-drawer-overlay" aria-hidden="true" onClick={closeMobileMenu} /> : null}
       {isAdmin ? <Sider
         id={responsive.isMobile ? 'pool-mobile-navigation' : 'pool-desktop-navigation'}
@@ -675,13 +676,14 @@ export default function App() {
           selectedKeys={[currentNavKey]}
           items={navigation}
           isCollapsed={navCollapsed}
+          storageScope={navStorageScope}
           onClick={({ itemKey, group }: { itemKey: string; group?: boolean }) => {
             if (group && navCollapsed && !responsive.isMobile) { setCollapsed(false); return; }
             if (itemKey?.startsWith('/')) navigateFromShell(itemKey);
           }}
           onIntent={({ itemKey }: { itemKey: string }) => prefetchRouteIntent(itemKey)}
           className="pool-nav-scroll"
-          key={`${locale}:${currentNavKey}:${navCollapsed}`}
+          key={`${locale}:${currentNavKey}:${navCollapsed}:${navStorageScope}`}
         />
         {!responsive.isMobile ? (
           <div className="pool-sidebar-collapse"><Button theme="borderless" icon={<IconList />} onClick={() => setCollapsed((value) => !value)} aria-label={navCollapsed ? t('app.expand_sidebar') : t('app.collapse_sidebar')}>{!navCollapsed ? t('app.collapse_sidebar') : null}</Button></div>

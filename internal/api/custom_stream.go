@@ -995,9 +995,13 @@ func chatStreamToAnthropicSSEWithOptions(ctx context.Context, w http.ResponseWri
 	delta := map[string]interface{}{"stop_reason": prompt.FinishToStopReason(finish, hasTools), "stop_sequence": nil}
 	msgDelta := map[string]interface{}{"delta": delta}
 	if usage != nil {
+		anthropicUsage := prompt.ChatUsageToAnthropic(usage)
 		msgUsage := map[string]interface{}{"output_tokens": usage["completion_tokens"]}
-		if cached := prompt.ChatUsageToAnthropic(usage)["cache_read_input_tokens"]; cached != nil {
+		if cached := anthropicUsage["cache_read_input_tokens"]; cached != nil {
 			msgUsage["cache_read_input_tokens"] = cached
+		}
+		if missed := anthropicUsage["prompt_cache_miss_tokens"]; missed != nil {
+			msgUsage["prompt_cache_miss_tokens"] = missed
 		}
 		msgDelta["usage"] = msgUsage
 	}

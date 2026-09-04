@@ -124,6 +124,7 @@ type accountBackupDocumentV1 struct {
 	ModelCatalogStatus     *storage.AccountModelCatalogStatus     `json:"model_catalog_status,omitempty"`
 	CodexReauthConfig      *storage.AccountCodexReauthConfig      `json:"codex_reauth_config,omitempty"`
 	GroupMemberships       []storage.AccountGroupMembership       `json:"group_memberships,omitempty"`
+	UserGroupPolicies      []storage.UserGroupPolicyBackup        `json:"user_group_policies,omitempty"`
 }
 
 func backupDocumentFromStorage(backup storage.AccountBackup, exportedAt int64) accountBackupDocumentV1 {
@@ -142,6 +143,7 @@ func backupDocumentFromStorage(backup storage.AccountBackup, exportedAt int64) a
 		ModelCatalogStatus: backup.ModelCatalogStatus,
 		CodexReauthConfig:  backup.CodexReauthConfig,
 		GroupMemberships:   backup.GroupMemberships,
+		UserGroupPolicies:  backup.UserGroupPolicies,
 	}
 	if item := backup.KiroCredentials; item != nil {
 		document.KiroCredentials = &accountBackupKiroCredentialsV1{
@@ -197,6 +199,7 @@ func (document accountBackupDocumentV1) storageBackup() storage.AccountBackup {
 		ModelCatalogStatus: document.ModelCatalogStatus,
 		CodexReauthConfig:  document.CodexReauthConfig,
 		GroupMemberships:   document.GroupMemberships,
+		UserGroupPolicies:  document.UserGroupPolicies,
 	}
 	if item := document.KiroCredentials; item != nil {
 		backup.KiroCredentials = &storage.KiroCredentials{
@@ -430,6 +433,11 @@ func (s *Server) writeAccountsBackupDownload(w http.ResponseWriter, r *http.Requ
 			}
 			for _, cookie := range backup.InjectedCookies {
 				addEgress(cookie.EgressID)
+			}
+			for _, policy := range backup.UserGroupPolicies {
+				for _, id := range policy.EgressRPMBalanceEgressIDs {
+					addEgress(id)
+				}
 			}
 			if provider := backup.CustomProvider; provider != nil {
 				for _, id := range provider.EgressIDs {

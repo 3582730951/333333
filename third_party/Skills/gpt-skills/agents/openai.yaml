@@ -1,0 +1,6 @@
+interface:
+  display_name: "Elegant Engineering"
+  short_description: "Minimal, direct, validated engineering guidance"
+
+policy:
+  allow_implicit_invocation: true

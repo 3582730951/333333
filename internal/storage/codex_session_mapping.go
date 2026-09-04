@@ -847,6 +847,24 @@ func (s *Store) ClaimCodexSessionRollover(ctx context.Context, claim CodexSessio
 	// A claimed state is deliberately recoverable only by byte-identical retry.
 	// Do this check before SourceEpoch because a successful claim advances epoch.
 	if binding.SafetyRotatedAt != 0 {
+		// Safety protocol terminals publish the replacement identity together
+		// with their durable intent. The first following request only records
+		// its exact replay fingerprint; it must not mint a second identity.
+		if strings.TrimSpace(binding.PendingRolloverRequestFingerprint) == "" {
+			binding.PendingRolloverRequestFingerprint = claim.RequestFingerprint
+			binding.UpdatedAt = Now()
+			encrypted, sealErr := s.sealCodexSessionIdentity(binding)
+			if sealErr != nil {
+				return CodexSessionBinding{}, sealErr
+			}
+			if _, updateErr := tx.ExecContext(ctx, `UPDATE codex_session_binding SET encrypted_identity=?,updated_at=? WHERE id=? AND state='active'`, encrypted, binding.UpdatedAt, binding.ID); updateErr != nil {
+				return CodexSessionBinding{}, updateErr
+			}
+			if commitErr := tx.Commit(); commitErr != nil {
+				return CodexSessionBinding{}, commitErr
+			}
+			return binding, nil
+		}
 		if hmac.Equal([]byte(binding.PendingRolloverRequestFingerprint), []byte(claim.RequestFingerprint)) {
 			return binding, nil
 		}

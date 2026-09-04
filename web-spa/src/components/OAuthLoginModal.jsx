@@ -464,7 +464,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         <Divider margin="16px 0" />
 
         <div style={{ marginBottom: 12 }}>
-          <Text type="tertiary" style={{ fontSize: 13 }}>
+          <Text type="tertiary" style={{ fontSize: 'var(--pool-type-label)' }}>
             Web session 无 Refresh Token 时会按 Codex 的 chatgptAuthTokens 模式导入；占位 id_token 只承载账号元数据，实际认证始终使用 accessToken：
           </Text>
         </div>
@@ -479,7 +479,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
             padding: 12,
             borderRadius: 6,
             border: '1px solid var(--pool-border)',
-            fontSize: 13,
+            fontSize: 'var(--pool-type-label)',
             fontFamily: 'monospace',
             resize: 'vertical',
             background: 'var(--pool-bg-surface)',
@@ -729,7 +729,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
                   该 Key 属于上游 Platform / Console，与下游 cap_* Key 完全分离。系统先免费读取模型列表；认证成功后仅发送一次固定提示“Reply exactly OK”的最小推理。若推理失败，账号会保留但无限期隔离。
                 </Text>
               </div>
-              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13, cursor: 'pointer' }}>
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 'var(--pool-type-label)', cursor: 'pointer' }}>
                 <input
                   type="checkbox"
                   checked={confirmProviderCost}
@@ -799,7 +799,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
             >
               <Text strong>授权链接</Text>
               {countdown > 0 && (
-                <Text type="tertiary" style={{ fontSize: 12 }}>
+                <Text type="tertiary" style={{ fontSize: 'var(--pool-type-caption)' }}>
                   有效期: {Math.floor(countdown / 60)}:{String(countdown % 60).padStart(2, '0')}
                 </Text>
               )}
@@ -819,7 +819,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
                 style={{
                   flex: 1,
                   fontFamily: 'monospace',
-                  fontSize: 12,
+                  fontSize: 'var(--pool-type-caption)',
                 }}
               />
               <Tooltip content={copied ? '已复制' : '复制链接'}>
@@ -852,7 +852,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
               marginBottom: 16,
             }}
           >
-            <Text type="tertiary" style={{ fontSize: 13, lineHeight: 1.6 }}>
+            <Text type="tertiary" style={{ fontSize: 'var(--pool-type-label)', lineHeight: 1.6 }}>
               <strong>操作步骤：</strong>
               <br />
               1. 点击"打开"或复制链接到浏览器

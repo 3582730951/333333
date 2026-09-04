@@ -169,7 +169,7 @@
 
 .pool-portal-hero__eyebrow {
   color: var(--pool-text-3);
-  font-size: 12.5px;
+  font-size: var(--pool-type-caption);
   font-weight: 600;
   letter-spacing: 0.02em;
   line-height: var(--pool-leading-tight);
@@ -186,7 +186,7 @@
 
 .pool-portal-hero__figure strong {
   color: var(--pool-text);
-  font-size: clamp(34px, 4.4vw, 46px);
+  font-size: clamp(var(--pool-type-title-1), 4.4vw, var(--pool-type-display));
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.035em;
@@ -211,7 +211,7 @@
   display: flex;
   min-width: 0;
   flex-direction: column;
-  gap: 3px;
+  gap: 3px; /* optical: dt/dd hero fact reads as one figure */
 }
 
 .pool-portal-hero__facts dt {
@@ -223,7 +223,7 @@
 .pool-portal-hero__facts dd {
   margin: 0;
   color: var(--pool-text);
-  font-size: 19px;
+  font-size: var(--pool-type-title-3);
   font-weight: 650;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.018em;
@@ -261,7 +261,7 @@
 .pool-portal-hero__split > div {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 3px; /* optical: label over value in a split cell; one block */
 }
 
 .pool-portal-hero__split span {
@@ -272,7 +272,7 @@
 
 .pool-portal-hero__split b {
   color: var(--pool-text);
-  font-size: 20px;
+  font-size: var(--pool-type-title-3);
   font-weight: 650;
   font-variant-numeric: tabular-nums;
   line-height: var(--pool-leading-tight);
@@ -317,7 +317,7 @@
 .pool-portal-usage__model,
 .pool-portal-token-grid {
   display: grid;
-  gap: 3px;
+  gap: 3px; /* optical: model name over its token line; one entry */
 }
 
 .pool-portal-usage__model small,
@@ -365,7 +365,7 @@
 
 .pool-portal-quota-card strong {
   color: var(--pool-text);
-  font-size: clamp(26px, 3vw, 38px);
+  font-size: clamp(var(--pool-type-title-2), 3vw, var(--pool-type-title-1));
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.03em;
 }
@@ -379,7 +379,7 @@
 
 .pool-portal-definition-list > div {
   display: grid;
-  gap: 4px;
+  gap: var(--pool-space-1);
   padding-bottom: var(--pool-space-3);
   border-bottom: 1px solid var(--pool-border-subtle);
 }
@@ -421,7 +421,7 @@
   display: flex;
   gap: var(--pool-space-2);
   align-items: center;
-  margin-bottom: 4px;
+  margin-bottom: var(--pool-space-1);
 }
 
 .pool-portal-session b {
@@ -508,7 +508,7 @@
   }
 }
 
-@media (max-width: 519px) {
+@media (max-width: 520px) {
   .pool-portal-bento {
     grid-template-columns: minmax(0, 1fr);
   }

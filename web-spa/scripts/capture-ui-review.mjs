@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 
 import puppeteer from 'puppeteer';
 
+import { assertCanonicalRouteCoverage } from './lib/route-coverage.mjs';
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const workspaceRoot = path.resolve(root, '..');
 const distRoot = path.join(workspaceRoot, 'internal', 'console', 'dist');
@@ -21,10 +23,20 @@ const recordOnly = process.env.UI_REVIEW_RECORD_ONLY === '1';
 const skipStates = process.env.UI_REVIEW_SKIP_STATES === '1';
 const staticMode = process.env.UI_REVIEW_STATIC === '1';
 
+// Widths, not devices, are what the stylesheets switch on. The five original entries left
+// 391-767px unrendered end to end, which meant every sub-767 breakpoint in src/styles -- 390,
+// 420, 460, 480, 519, 520, 540, 560, 620, 640, 700, 720 -- could be moved, merged or deleted and
+// produce a byte-identical screenshot set. A change that cannot be photographed reads as safe.
+// 744 sits in the widest compact band (721-767, above every sub-767 tier and below the
+// max-width:767 boundary) and 414 sits between the 390 and 420 tiers, so the two of them put a
+// render inside the previously untouched span. Both are also real devices (iPad Mini portrait,
+// iPhone 11/XR) rather than synthetic widths, which keeps the screenshots worth reviewing.
 const viewports = [
   { name: '1440x900', width: 1440, height: 900 },
   { name: '1280x720', width: 1280, height: 720 },
   { name: '820x1180', width: 820, height: 1180 },
+  { name: '744x1133', width: 744, height: 1133 },
+  { name: '414x896', width: 414, height: 896, mobile: true },
   { name: '390x844', width: 390, height: 844, mobile: true },
   { name: '360x800', width: 360, height: 800, mobile: true },
 ];
@@ -48,6 +60,7 @@ const adminPages = [
   ['System', '/system'],
   ['CFEvents', '/cf-events'],
   ['Audit', '/audit'],
+  ['CodexThreads', '/codex-threads'],
   ['Keys', '/keys'],
   ['Users', '/users'],
   ['Settings', '/settings-v2'],
@@ -61,9 +74,20 @@ const adminPages = [
 const userPages = [
   ['PortalDashboard', '/portal'],
   ['PortalKeys', '/portal/keys'],
+  ['PortalUsage', '/portal/usage'],
+  ['PortalQuota', '/portal/quota'],
   ['PortalModels', '/portal/models'],
   ['PortalProfile', '/portal/profile'],
+  ['PortalSessions', '/portal/sessions'],
 ];
+
+const routeCoverage = assertCanonicalRouteCoverage({
+  root,
+  gate: 'UI review capture',
+  admin: adminPages,
+  portal: userPages,
+});
+if (!routeCoverage.ok) process.exit(1);
 
 function requested(envName) {
   return String(process.env[envName] || '').split(',').map((item) => item.trim()).filter(Boolean);
@@ -677,7 +701,12 @@ async function handleAPI(req) {
   }));
   if (p === '/admin/accounts') return req.respond(json({ accounts: fixtures.accounts, rows: fixtures.accounts, total: fixtures.accounts.length }));
   if (p === '/admin/groups') return req.respond(json({ groups: [{ name: 'cyber', force_model: 'gpt-5.5', force_effort: 'high' }, { name: 'staging', force_model: '', force_effort: '' }] }));
-  if (p === '/admin/user-groups') return req.respond(json([{ id: 'ug_fixture', name: 'Fixture users', targets: [{ kind: 'account_pool_group', id: 'cyber' }] }]));
+  if (p === '/admin/user-groups') return req.respond(json([{
+    id: 'ug_fixture', name: 'Fixture users',
+    targets: [{ kind: 'account_pool_group', id: 'cyber' }],
+    dynamic_pool_balance_enabled: true,
+    dynamic_pool_balance_rpm_threshold: 10,
+  }]));
   if (p === '/admin/api-keys') return req.respond(json({ keys: fixtures.apiKeys }));
   if (p === '/admin/users') return req.respond(json({ users: fixtures.users }));
   if (p === '/admin/providers') return req.respond(json({ providers: [{ id: 'openai', name: 'OpenAI', base_url: 'https://api.openai.com/v1', enabled: true, auto_discover_models: true, models: ['gpt-5.5', 'gpt-5.4'] }] }));
@@ -1719,6 +1748,7 @@ async function assertPageContent(page, name, label) {
     System: ['系统监控', '资源与运行时', '磁盘空间守卫', '模块状态分布', '近 24 小时事件节奏'],
     CFEvents: ['Cloudflare 事件'],
     Audit: ['审计日志'],
+    CodexThreads: ['Codex Threads', '独立的 app-server 线程控制面'],
     Keys: ['API Keys'],
     Users: ['用户管理'],
     AIChatGPT: ['AI 设置'],
@@ -1729,8 +1759,11 @@ async function assertPageContent(page, name, label) {
     AIClaudeCode: ['AI 设置'],
     PortalDashboard: ['我的用量', '总 Token', '按模型用量'],
     PortalKeys: ['我的 API Key', '复制 Key'],
+    PortalUsage: ['请求与计量明细', '筛选'],
+    PortalQuota: ['额度与计费口径', '计算依据'],
     PortalModels: ['可用模型'],
     PortalProfile: ['我的资料', 'user@example.test'],
+    PortalSessions: ['登录会话', '活跃会话'],
   };
   const required = requirements[name];
   if (!required) return;

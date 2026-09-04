@@ -141,34 +141,39 @@ func nullableInt64(value *int64) interface{} {
 }
 
 func (s *Store) ensureBuiltinPricingCatalog(ctx context.Context) error {
-	catalog := pricing.OfficialOpenAI20260829()
+	catalogs := []pricing.Catalog{
+		pricing.OfficialOpenAI20260829(),
+		pricing.OfficialOpenAI20260831(),
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var existingSHA string
-	err = tx.QueryRowContext(ctx, `SELECT sha256 FROM pricing_catalog_versions WHERE id=?`, catalog.ID).Scan(&existingSHA)
-	if err == nil && existingSHA != catalog.SHA256 {
-		return fmt.Errorf("immutable pricing catalog %s checksum mismatch", catalog.ID)
-	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	if errors.Is(err, sql.ErrNoRows) {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO pricing_catalog_versions(id,catalog_kind,source_url,effective_at,expires_at,fetched_at,currency,sha256,status,raw_snapshot_ref)
-VALUES(?,?,?,?,?,?,?,?,?,?)`, catalog.ID, catalog.CatalogKind, catalog.SourceURL, catalog.EffectiveAt, catalog.ExpiresAt, catalog.FetchedAt,
-			catalog.Currency, catalog.SHA256, catalog.Status, catalog.SnapshotRef); err != nil {
+	for _, catalog := range catalogs {
+		var existingSHA string
+		err = tx.QueryRowContext(ctx, `SELECT sha256 FROM pricing_catalog_versions WHERE id=?`, catalog.ID).Scan(&existingSHA)
+		if err == nil && existingSHA != catalog.SHA256 {
+			return fmt.Errorf("immutable pricing catalog %s checksum mismatch", catalog.ID)
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-	}
-	for _, rate := range catalog.Rates {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO pricing_rates(catalog_id,product_surface,provider,model_pattern,service_tier,context_band,unit_kind,
+		if errors.Is(err, sql.ErrNoRows) {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO pricing_catalog_versions(id,catalog_kind,source_url,effective_at,expires_at,fetched_at,currency,sha256,status,raw_snapshot_ref)
+VALUES(?,?,?,?,?,?,?,?,?,?)`, catalog.ID, catalog.CatalogKind, catalog.SourceURL, catalog.EffectiveAt, catalog.ExpiresAt, catalog.FetchedAt,
+				catalog.Currency, catalog.SHA256, catalog.Status, catalog.SnapshotRef); err != nil {
+				return err
+			}
+		}
+		for _, rate := range catalog.Rates {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO pricing_rates(catalog_id,product_surface,provider,model_pattern,service_tier,context_band,unit_kind,
 input_rate_units,cached_read_rate_units,cache_write_rate_units,output_rate_units,per_request_rate_units,multiplier_milli,source_line_ref)
 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, catalog.ID, string(rate.ProductSurface), rate.Provider, rate.Model,
-			rate.ServiceTier, rate.ContextBand, string(rate.UnitKind), rate.InputRateUnits, rate.CachedRateUnits,
-			nullableInt64(rate.CacheWriteRate), rate.OutputRateUnits, rate.PerRequestUnits, rate.MultiplierMilli, rate.SourceLineRef); err != nil {
-			return err
+				rate.ServiceTier, rate.ContextBand, string(rate.UnitKind), rate.InputRateUnits, rate.CachedRateUnits,
+				nullableInt64(rate.CacheWriteRate), rate.OutputRateUnits, rate.PerRequestUnits, rate.MultiplierMilli, rate.SourceLineRef); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
@@ -241,6 +246,11 @@ func (s *Store) writeNormalizedUsage(ctx context.Context, exec sqlExecContext, w
 	settlement := normalized.SettlementState
 	if tier.Settlement == "unsettled" && settlement != "integrity_error" {
 		settlement = "unsettled"
+	} else if tier.Settlement == "provisional" && settlement == "settled" {
+		// A complete token payload does not make the charge final when the
+		// upstream omitted service_tier. Preserve the conservative Fast/default
+		// decision as provisional until an observed tier can settle it.
+		settlement = "provisional"
 	}
 	settledAt := interface{}(nil)
 	if settlement == "settled" && tier.Settlement == "final" {

@@ -13,59 +13,13 @@ import (
 	"codex-account-pool/internal/storage"
 )
 
-const forceCodex429AdminToken = "force-codex-429-test-admin"
-
-func enableForceCodex429Admin(t *testing.T, h *testHarness) {
-	t.Helper()
-	h.app.cfg.AdminToken = forceCodex429AdminToken
-	hasAdmin, err := h.store.HasAdminUser(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hasAdmin {
-		return
-	}
-	passwordHash, err := hashPassword("force-codex-429-admin-password")
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := storage.Now()
-	_, err = h.store.ClaimAdminWithRecoveryCredential(context.Background(), storage.User{
-		ID: "force-codex-429-admin", Email: "force-codex-429-admin@example.test", Name: "Force test admin", PasswordHash: passwordHash,
-	}, storage.UserSession{
-		TokenHash: hashAPIKey("force-codex-429-session"), CreatedAt: now, ExpiresAt: now + 3600,
-	}, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
 func forceCodex429AdminReq(t *testing.T, h *testHarness, method, path, body string) (int, []byte) {
 	t.Helper()
-	var input io.Reader
-	if body != "" {
-		input = strings.NewReader(body)
-	}
-	req, err := http.NewRequest(method, h.pool.URL+path, input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+forceCodex429AdminToken)
-	if body != "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, raw
+	return adminJSONReq(t, h, method, path, body)
 }
 
 func importForceCodex429Account(t *testing.T, h *testHarness, label, upstreamAccountID, accessToken string) string {
 	t.Helper()
-	enableForceCodex429Admin(t, h)
 	payload := map[string]interface{}{
 		"label": label,
 		"auth_json": map[string]interface{}{
@@ -139,7 +93,7 @@ func TestAdminAccountForceCodex429AreIndividual(t *testing.T) {
 
 func TestAdminAccountForceCodex429RejectsIneligibleAccounts(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
-	enableForceCodex429Admin(t, h)
+	enableAdmin(t, h)
 	ctx := context.Background()
 	cases := []struct {
 		name    string
@@ -176,7 +130,7 @@ func TestAdminAccountForceCodex429RejectsIneligibleAccounts(t *testing.T) {
 
 func TestAdminAccountForceCodex429AllowsOpenAIOAuth(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
-	enableForceCodex429Admin(t, h)
+	enableAdmin(t, h)
 	account := storage.Account{ID: "force-openai", Label: "force-openai", GroupName: "cyber", Provider: "openai", Status: "active"}
 	if err := h.store.UpsertAccount(context.Background(), account, storage.AccountToken{AuthMethod: "oauth", AccessToken: "openai-oauth", RefreshToken: "openai-refresh"}); err != nil {
 		t.Fatal(err)

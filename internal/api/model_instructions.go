@@ -179,6 +179,9 @@ func userGroupPolicyAsAccountGroup(group storage.UserGroup) storage.Group {
 		SuperInstructMonitorEnabled:         group.SuperInstructMonitorEnabled,
 		ForceModel:                          group.ForceModel,
 		ForceEffort:                         group.ForceEffort,
+		EgressRPMBalanceEnabled:             group.EgressRPMBalanceEnabled,
+		EgressRPMBalanceThreshold:           group.EgressRPMBalanceThreshold,
+		EgressRPMBalanceEgressIDs:           append([]string(nil), group.EgressRPMBalanceEgressIDs...),
 	}
 }
 

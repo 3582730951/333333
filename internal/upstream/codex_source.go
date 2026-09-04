@@ -217,7 +217,7 @@ func normalizeCodexSource(client *Client, spec *Request, upstreamBaseURL string,
 		}
 		metadata := client.newCodexRequestMetadataWithResponsesLite(*spec, responsesLite)
 		spec.codexMetadata = &metadata
-		if looksLikeCodexGeneratedUUID(meta.PromptCacheKey) {
+		if !spec.PreserveCodexPromptCacheKey && looksLikeCodexGeneratedUUID(meta.PromptCacheKey) {
 			promptCacheKey := metadata.threadID
 			if metadata.profile.promptCacheKeyBySession {
 				promptCacheKey = metadata.sessionID
@@ -247,7 +247,7 @@ func normalizeCodexSource(client *Client, spec *Request, upstreamBaseURL string,
 			patches = append(patches, bodysource.JSONFieldPatch{Name: "generate", Delete: true})
 		}
 	}
-	for _, name := range []string{"thread_id", "session_id", "conversation_id", "window_id", "parent_thread_id", "parent_turn_id", "forked_from_thread_id", "turn_metadata", "turn_state", "client_version"} {
+	for _, name := range []string{"thread_id", "session_id", "conversation_id", "window_id", "window_number", "forked_from_ordinal_exclusive", "turn_trigger", "history_ingest_requested", "parent_thread_id", "parent_turn_id", "forked_from_thread_id", "turn_metadata", "turn_state", "client_version"} {
 		if _, present := meta.Fields[name]; present {
 			patches = append(patches, bodysource.JSONFieldPatch{Name: name, Delete: true})
 		}
@@ -380,7 +380,7 @@ func codexClientMetadataSourceValue(spec Request, metadata codexRequestMetadata)
 		out = bytes.TrimSpace(raw)
 	}
 	var err error
-	for _, key := range []string{"installation_id", codexInstallationIDMetadataKey, "session_id", "thread_id", "turn_id", "parent_turn_id", "window_id", "x-codex-window-id", codexSubagentHeader, "parent_thread_id", "x-codex-parent-thread-id", "forked_from_thread_id", "x-codex-turn-metadata", "x-codex-turn-state", codexWSResponsesLiteMetadata, codexWSRequestStartMetadata} {
+	for _, key := range []string{"installation_id", codexInstallationIDMetadataKey, "session_id", "thread_id", "turn_id", "parent_turn_id", "window_id", "window_number", "forked_from_ordinal_exclusive", "turn_trigger", "history_ingest_requested", "x-codex-window-id", codexSubagentHeader, "parent_thread_id", "x-codex-parent-thread-id", "forked_from_thread_id", "x-codex-turn-metadata", "x-codex-turn-state", codexWSResponsesLiteMetadata, codexWSRequestStartMetadata} {
 		out, err = sjson.DeleteBytes(out, key)
 		if err != nil {
 			return nil, false, nil

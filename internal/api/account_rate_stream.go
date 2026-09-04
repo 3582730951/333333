@@ -36,6 +36,19 @@ type accountRateSubscription struct {
 	updates chan accountRateFrame
 }
 
+type requestEgressIDContextKey struct{}
+
+func contextWithRequestEgressID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, requestEgressIDContextKey{}, strings.TrimSpace(id))
+}
+func requestEgressIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(requestEgressIDContextKey{}).(string)
+	return strings.TrimSpace(v)
+}
+
 func accountRateValuesEqual(left, right storage.AccountRequestRate) bool {
 	left.SampledAt, right.SampledAt = 0, 0
 	return left == right
@@ -227,13 +240,18 @@ func (s *Server) ObserveAccountRequestAttempt(accountID, provider, routeKind str
 	if s.store != nil && eventID != "" && strings.TrimSpace(accountID) != "" {
 		arrivalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 		err := s.store.RecordAccountRequestRateArrival(arrivalCtx, storage.AccountUsageRateEvent{
-			EventID: eventID, AccountID: accountID, AgentClass: class,
+			EventID: eventID, AccountID: accountID, EgressID: requestEgressIDFromContext(ctx), AgentClass: class,
 			ClientFamily: clientFamily, ClientConfidence: string(identity.Confidence),
 			SettlementState: "unsettled",
 		})
 		cancel()
 		if err != nil {
 			log.Printf("account rate arrival degraded account=%s: %v", accountID, err)
+		} else if s.scheduler != nil && s.store.DB() != nil {
+			// Convert the provisional selection overlay to a confirmed logical
+			// arrival only after the idempotent durable insert succeeds. Retries
+			// carry the same event id and therefore do not create another overlay.
+			s.scheduler.ConfirmDynamicPoolBalanceArrival(ctx, accountID, requestEgressIDFromContext(ctx))
 		}
 	}
 }
@@ -301,6 +319,7 @@ func requestAccountAgentClass(r *http.Request) string {
 // protocols that use upstream.Request. Probes, OAuth and background quota work keep
 // calling the raw client and are therefore deliberately excluded from RPM.
 func (s *Server) doAccountUpstreamAttempt(ctx context.Context, req upstream.Request) (*upstream.Response, error) {
+	ctx = contextWithRequestEgressID(ctx, req.Egress.ID)
 	s.ObserveAccountRequestAttempt(req.Account.ID, req.Provider, req.DownstreamPath, ctx)
 	return s.upstream.Do(ctx, req)
 }

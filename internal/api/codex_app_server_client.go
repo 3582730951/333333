@@ -88,7 +88,7 @@ type JSONRPCCodexRuntime struct {
 	sequence        atomic.Uint64
 }
 
-func (c *JSONRPCCodexRuntime) call(ctx context.Context, method string, params any, out any) error {
+func (c *JSONRPCCodexRuntime) callAppServer(ctx context.Context, method string, params any, out any) error {
 	if strings.TrimSpace(c.URL) == "" {
 		return errors.New("codex app-server URL is empty")
 	}
@@ -111,7 +111,7 @@ func (c *JSONRPCCodexRuntime) call(ctx context.Context, method string, params an
 	}
 	client := c.Client
 	if client == nil {
-		client = http.DefaultClient
+		client = apiExternalHTTPClient
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -142,13 +142,13 @@ func (c *JSONRPCCodexRuntime) call(ctx context.Context, method string, params an
 
 func (c *JSONRPCCodexRuntime) ListThreads(ctx context.Context, _ string, p ThreadListParams) (ThreadListResponse, error) {
 	var result ThreadListResponse
-	err := c.call(ctx, "thread/list", p, &result)
+	err := c.callAppServer(ctx, "thread/list", p, &result)
 	return result, err
 }
 
 func (c *JSONRPCCodexRuntime) ReadThread(ctx context.Context, _ string, threadID string, includeTurns bool) (Thread, error) {
 	var result Thread
-	err := c.call(ctx, "thread/read", map[string]any{
+	err := c.callAppServer(ctx, "thread/read", map[string]any{
 		"thread_id": threadID, "include_turns": includeTurns,
 	}, &result)
 	return result, err
@@ -156,12 +156,12 @@ func (c *JSONRPCCodexRuntime) ReadThread(ctx context.Context, _ string, threadID
 
 func (c *JSONRPCCodexRuntime) ResumeThread(ctx context.Context, _ string, p ThreadResumeParams) (Thread, error) {
 	var result Thread
-	err := c.call(ctx, "thread/resume", map[string]any{"thread_id": p.ThreadID}, &result)
+	err := c.callAppServer(ctx, "thread/resume", map[string]any{"thread_id": p.ThreadID}, &result)
 	return result, err
 }
 
 func (c *JSONRPCCodexRuntime) InterruptTurn(ctx context.Context, _ string, threadID, turnID string) error {
-	return c.call(ctx, "turn/interrupt", map[string]any{"thread_id": threadID, "turn_id": turnID}, nil)
+	return c.callAppServer(ctx, "turn/interrupt", map[string]any{"thread_id": threadID, "turn_id": turnID}, nil)
 }
 
 func (c *JSONRPCCodexRuntime) SubscribeThreadStatus(ctx context.Context, runtimeID string) (<-chan ThreadStatusChanged, error) {

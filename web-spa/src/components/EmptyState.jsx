@@ -13,12 +13,15 @@ export default function EmptyState({
   // Use appropriate icon based on type, or custom icon
   const getIcon = () => {
     if (customIcon) return customIcon;
+    // No fontSize here: these are lucide SVGs whose geometry is path coordinates in a
+    // 0 0 24 24 viewBox, and `.pool-icon` sets width/height: 16px, which beats the
+    // presentational width/height attributes. A font-size on the <svg> styles nothing.
     switch (type) {
-      case 'accounts': return <IconPlus style={{ fontSize: 32 }} />;
-      case 'keys': return <IconKey style={{ fontSize: 32 }} />;
-      case 'settings': return <IconSetting style={{ fontSize: 32 }} />;
-      case 'refresh': return <IconRefresh style={{ fontSize: 32 }} />;
-      default: return <IconInbox style={{ fontSize: 32 }} />;
+      case 'accounts': return <IconPlus />;
+      case 'keys': return <IconKey />;
+      case 'settings': return <IconSetting />;
+      case 'refresh': return <IconRefresh />;
+      default: return <IconInbox />;
     }
   };
 

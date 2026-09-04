@@ -6,6 +6,9 @@ import { fileURLToPath } from 'node:url';
 
 import puppeteer from 'puppeteer';
 
+import { installMocks as installReviewMocks } from './capture-ui-review.mjs';
+import { assertCanonicalRouteCoverage } from './lib/route-coverage.mjs';
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const workspaceRoot = path.resolve(root, '..');
 const screenshotDir = path.join(workspaceRoot, '.run', 'screenshots');
@@ -13,6 +16,56 @@ const port = Number(process.env.VISUAL_SMOKE_PORT || 5191);
 const baseURL = `http://127.0.0.1:${port}/console`;
 const serverReadyPattern = /Local:\s+http:\/\/127\.0\.0\.1:/;
 const viteBin = path.join(root, 'node_modules', 'vite', 'bin', 'vite.js');
+
+// Every route gets the inexpensive desktop smoke below. The focused cases retain the deeper
+// mobile/table contracts that originally justified this script. This is an explicit layered
+// policy: 35 route renders protect coverage; five focused captures protect dense interactions.
+const adminRouteCases = [
+  ['Dashboard', '/'],
+  ['Accounts', '/accounts'],
+  ['Groups', '/groups'],
+  ['Providers', '/providers'],
+  ['Models', '/models'],
+  ['PublicChat', '/public-chat'],
+  ['Egress', '/egress'],
+  ['UpstreamErrors', '/upstream-error-rules'],
+  ['Registration', '/registration'],
+  ['TeamLifecycle', '/team-lifecycle'],
+  ['EmailPool', '/email-pool'],
+  ['CloudflareMailbox', '/email-pool/cloudflare'],
+  ['Usage', '/usage'],
+  ['Quota', '/quota'],
+  ['ModelQuality', '/model-quality'],
+  ['System', '/system'],
+  ['CFEvents', '/cf-events'],
+  ['Audit', '/audit'],
+  ['CodexThreads', '/codex-threads'],
+  ['Keys', '/keys'],
+  ['Users', '/users'],
+  ['Settings', '/settings-v2'],
+  ['AIChatGPT', '/settings/ai/chatgpt'],
+  ['AIClaude', '/settings/ai/claude'],
+  ['AIKiro', '/settings/ai/kiro'],
+  ['AIAntigravity', '/settings/ai/antigravity'],
+  ['AICodex', '/settings/ai/codex'],
+  ['AIClaudeCode', '/settings/ai/claude-code'],
+];
+const portalRouteCases = [
+  ['PortalDashboard', '/portal'],
+  ['PortalKeys', '/portal/keys'],
+  ['PortalUsage', '/portal/usage'],
+  ['PortalQuota', '/portal/quota'],
+  ['PortalModels', '/portal/models'],
+  ['PortalProfile', '/portal/profile'],
+  ['PortalSessions', '/portal/sessions'],
+];
+const routeCoverage = assertCanonicalRouteCoverage({
+  root,
+  gate: 'Visual smoke',
+  admin: adminRouteCases,
+  portal: portalRouteCases,
+});
+if (!routeCoverage.ok) process.exit(1);
 
 const apiKeyRows = [
   {
@@ -277,6 +330,19 @@ async function installMocks(page) {
   });
 }
 
+async function waitForRouteReady(page) {
+  await page.waitForFunction(() => {
+    const content = document.querySelector('.pool-route-content[data-page-ready="true"]');
+    const heading = content?.querySelector('h1, .pool-page-title');
+    return Boolean(content && heading && heading.getBoundingClientRect().height > 1);
+  }, { timeout: 45000 });
+  // Do not make network-idle a navigation precondition. Some routes legitimately open streams;
+  // a best-effort settle after the route-ready contract keeps a background request from hanging
+  // all 35 cases while still giving charts and lazy chunks a moment to paint.
+  await page.waitForNetworkIdle({ idleTime: 250, timeout: 5000 }).catch(() => {});
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+}
+
 async function runCase(browser, testCase) {
   const page = await browser.newPage();
   const badResponses = [];
@@ -294,14 +360,25 @@ async function runCase(browser, testCase) {
   if (testCase.reducedMotion) {
     await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
   }
-  await installMocks(page);
+  // The focused cases retain their compact, purpose-built fixture. Canonical route coverage uses
+  // the richer UI-review fixture so every lazy page gets the same broad API surface; mixing those
+  // datasets would turn a focused mobile geometry assertion into a test of fixture row count.
+  if (testCase.fixture === 'focused') await installMocks(page);
+  else await installReviewMocks(page);
+  const role = testCase.role || 'admin';
+  const expires = Math.floor(Date.now() / 1000) + 86400;
+  await page.setCookie(
+    { url: baseURL, name: 'cp_session', value: `${role}-fixture`, path: '/', expires },
+    { url: baseURL, name: 'cp_csrf', value: `${role}-csrf`, path: '/', expires },
+  );
   for (let attempt = 0; attempt < 3; attempt += 1) {
     badResponses.length = 0;
     if (attempt === 0) {
-      await page.goto(`${baseURL}${testCase.route}`, { waitUntil: 'networkidle0', timeout: 60000 });
+      await page.goto(`${baseURL}${testCase.route}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
     } else {
-      await page.reload({ waitUntil: 'networkidle0', timeout: 60000 });
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
     }
+    await waitForRouteReady(page);
     const optimizerRace = badResponses.length > 0 && badResponses.every(
       ({ status, url }) => status === 504 && url.includes('/node_modules/.vite/deps/'),
     );
@@ -328,6 +405,8 @@ async function runCase(browser, testCase) {
     const mobileLists = [...document.querySelectorAll('.pool-mobile-list[role="list"]')];
     const mobileListItems = [...document.querySelectorAll('.pool-mobile-list[role="list"] > [role="listitem"]')];
     return {
+      routeReady: Boolean(document.querySelector('.pool-route-content[data-page-ready="true"]')),
+      hasPageHeading: Boolean(document.querySelector('.pool-route-content h1, .pool-route-content .pool-page-title')),
       documentWidth: document.documentElement.scrollWidth,
       noPageOverflow: document.documentElement.scrollWidth <= viewport.width + 1,
       topbarOverlap: !!(topTitle && topActions && topTitle.right > topActions.left - 1 && topTitle.bottom > topActions.top && topTitle.top < topActions.bottom),
@@ -364,11 +443,13 @@ async function runCase(browser, testCase) {
     requiredLabels: testCase.requiredLabels || [],
   });
   await page.close();
-  return { name: testCase.name, badResponses, metrics, screenshot: testCase.screenshot };
+  return { name: testCase.name, focused: Boolean(testCase.focused), badResponses, metrics, screenshot: testCase.screenshot };
 }
 
 function assertCase(result) {
   const failures = [];
+  if (!result.metrics.routeReady) failures.push('route never reached data-page-ready=true');
+  if (!result.metrics.hasPageHeading) failures.push('route rendered without a page heading');
   if (result.badResponses.length > 0) {
     failures.push(`has failed resources: ${JSON.stringify(result.badResponses)}`);
   }
@@ -377,10 +458,10 @@ function assertCase(result) {
   if (!result.metrics.shellStartsAtTop) {
     failures.push('shell header or main column is displaced from the top of the page');
   }
-  if (result.metrics.documentHeight > result.metrics.viewportHeight * 1.9) {
+  if (result.focused && result.metrics.documentHeight > result.metrics.viewportHeight * 1.9) {
     failures.push(`document is ${result.metrics.documentHeight}px tall for a ${result.metrics.viewportHeight}px viewport`);
   }
-  if (!result.metrics.siderHidden) failures.push('mobile sidebar is visible while closed');
+  if (result.focused && !result.metrics.siderHidden) failures.push('mobile sidebar is visible while closed');
   if (result.name === 'desktop-keys' && !result.metrics.hasDesktopColumns) failures.push('desktop table columns are missing');
   if (result.name.startsWith('mobile-') && !result.metrics.hasExpectedMobileHeader) failures.push('mobile table is not using the expected single-column layout');
   if (result.name.startsWith('mobile-') && !result.metrics.hasExpectedMobileCards) failures.push('mobile card list is missing');
@@ -398,11 +479,24 @@ async function main() {
     const browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-dev-shm-usage'] });
     try {
       const results = [];
-      for (const testCase of [
-        { name: 'desktop-keys', route: '/keys', width: 1440, height: 900, reducedMotion: false, screenshot: path.join(screenshotDir, 'accept-desktop-keys.png') },
+      const routeSmokeCases = [
+        ...adminRouteCases.map(([name, route]) => ({
+          name: `route-admin-${name}`, route, role: 'admin', width: 1440, height: 900,
+          screenshot: path.join(screenshotDir, `route-admin-${name}.png`),
+        })),
+        ...portalRouteCases.map(([name, route]) => ({
+          name: `route-portal-${name}`, route, role: 'user', width: 1440, height: 900,
+          screenshot: path.join(screenshotDir, `route-portal-${name}.png`),
+        })),
+      ];
+      const focusedCases = [
+        { name: 'desktop-keys', route: '/keys', role: 'admin', fixture: 'focused', focused: true, width: 1440, height: 900, reducedMotion: false, screenshot: path.join(screenshotDir, 'accept-desktop-keys.png') },
         {
           name: 'mobile-keys',
           route: '/keys',
+          role: 'admin',
+          fixture: 'focused',
+          focused: true,
           width: 390,
           height: 844,
           reducedMotion: true,
@@ -414,6 +508,9 @@ async function main() {
         {
           name: 'mobile-accounts',
           route: '/accounts',
+          role: 'admin',
+          fixture: 'focused',
+          focused: true,
           width: 390,
           height: 844,
           reducedMotion: true,
@@ -425,6 +522,9 @@ async function main() {
         {
           name: 'mobile-providers',
           route: '/providers',
+          role: 'admin',
+          fixture: 'focused',
+          focused: true,
           width: 390,
           height: 844,
           reducedMotion: true,
@@ -436,6 +536,9 @@ async function main() {
         {
           name: 'mobile-users',
           route: '/users',
+          role: 'admin',
+          fixture: 'focused',
+          focused: true,
           width: 390,
           height: 844,
           reducedMotion: true,
@@ -444,7 +547,9 @@ async function main() {
           requiredLabels: ['用户操作'],
           screenshot: path.join(screenshotDir, 'accept-mobile-users.png'),
         },
-      ]) {
+      ];
+      console.log(`Visual smoke strategy: ${routeSmokeCases.length}/35 canonical routes get desktop render/response/geometry checks; ${focusedCases.length} focused cases add mobile/table checks.`);
+      for (const testCase of [...routeSmokeCases, ...focusedCases]) {
         results.push(await runCase(browser, testCase));
       }
       const failures = results.flatMap((result) => assertCase(result).map((failure) => `${result.name}: ${failure}`));

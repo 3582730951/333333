@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"codex-account-pool/internal/identity"
+	"codex-account-pool/internal/storage"
 )
 
 // GatewayIdentityResponse 返回给本地网关的完整虚拟身份
@@ -163,6 +164,15 @@ func (s *Server) allowGatewayIdentityKey(w http.ResponseWriter, r *http.Request,
 	}
 	if !key.Enabled {
 		writeError(w, http.StatusUnauthorized, errors.New("api key disabled"))
+		return false
+	}
+	// A revoked key was already refused here, but an expired one was not, so the two
+	// halves of the same lifecycle disagreed: the inference path rejects an expired key
+	// and this one accepted it. Nothing is taken away from a working key — an expired
+	// key cannot obtain inference anyway, so honouring its expiry costs no functioning
+	// request and closes the disagreement.
+	if key.ExpiresAt > 0 && key.ExpiresAt <= storage.Now() {
+		writeError(w, http.StatusUnauthorized, errors.New("api key expired"))
 		return false
 	}
 	return true

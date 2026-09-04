@@ -62,6 +62,13 @@ type BodyMeta struct {
 	IdentityConflict       bool   `json:"identity_conflict,omitempty"`
 	IdentityConflictReason string `json:"identity_conflict_reason,omitempty"`
 	RequestedModelFamily   string `json:"requested_model_family,omitempty"`
+	// ClaudeCodeBilling is set only after the scanner validates the canonical
+	// first system text block emitted by Claude Code.  The marker is deliberately
+	// not exported: it is a bounded classification hint, not durable request
+	// metadata.  ClaudeCodeAgentClass is either root, subagent, or empty when a
+	// malformed lineage marker made the class unsafe to infer.
+	ClaudeCodeBilling    bool   `json:"-"`
+	ClaudeCodeAgentClass string `json:"-"`
 	// PromptCacheBreakpoint marks the unsupported client-only cache control found
 	// anywhere below the request root. The Codex upstream sanitizer uses this bit
 	// to select its targeted materialized fallback without rescanning every large
@@ -87,7 +94,7 @@ var trackedJSONFields = map[string]struct{}{
 	"instructions": {}, "system": {}, "tools": {}, "input": {}, "messages": {}, "max_output_tokens": {}, "max_tokens": {}, "reasoning": {}, "thinking": {},
 	"store": {}, "tool_choice": {}, "parallel_tool_calls": {}, "prompt_cache_retention": {}, "prompt_cache_options": {}, "client_metadata": {}, "generate": {}, "include": {},
 	"object": {}, "output": {}, "output_text": {}, "delta": {}, "item": {}, "usage": {}, "headers": {},
-	"window_id": {}, "parent_thread_id": {}, "forked_from_thread_id": {}, "turn_metadata": {}, "turn_state": {},
+	"window_id": {}, "window_number": {}, "forked_from_ordinal_exclusive": {}, "turn_trigger": {}, "history_ingest_requested": {}, "parent_thread_id": {}, "forked_from_thread_id": {}, "turn_metadata": {}, "turn_state": {},
 	"compaction_trigger": {}, "client_family": {}, "client_type": {}, "agent_class": {}, "identity_confidence": {}, "originator": {},
 }
 
@@ -300,6 +307,8 @@ func (s *jsonMetaScanner) scanTopObject() error {
 			} else {
 				value, err = s.scanValue(1, tracked)
 			}
+		} else if key == "system" {
+			value, err = s.scanSystemValue(1, tracked)
 		} else {
 			value, err = s.scanValue(1, tracked)
 		}
@@ -348,6 +357,198 @@ func (s *jsonMetaScanner) scanTopObject() error {
 		default:
 			return s.syntax("expected ',' or '}'")
 		}
+	}
+}
+
+// scanSystemValue recognizes only the exact structural location in which
+// Claude Code places its billing block: the first top-level system text block.
+// Looking for the text globally would let an ordinary user prompt alter an
+// attribution dimension, so non-system strings intentionally do not participate.
+func (s *jsonMetaScanner) scanSystemValue(depth int, capture bool) (scannedValue, error) {
+	b, err := s.peek()
+	if err != nil {
+		return scannedValue{}, s.syntax("unexpected end of system value")
+	}
+	switch b {
+	case '"':
+		value, valueErr := s.scanValue(depth, capture)
+		if text, ok := decodeJSONString(value.raw); ok {
+			s.observeClaudeCodeBillingText(text)
+		}
+		return value, valueErr
+	case '[':
+		return scannedValue{kind: '['}, s.scanSystemArray(depth + 1)
+	case '{':
+		return scannedValue{kind: '{'}, s.scanSystemBlockObject(depth+1, true)
+	default:
+		return s.scanValue(depth, capture)
+	}
+}
+
+func (s *jsonMetaScanner) scanSystemArray(depth int) error {
+	if depth > maxJSONDepth {
+		return ErrJSONDepth
+	}
+	if err := s.expect('['); err != nil {
+		return err
+	}
+	if err := s.skipSpace(); err != nil {
+		return err
+	}
+	if ok, err := s.consumeIf(']'); ok || err != nil {
+		return err
+	}
+	first := true
+	for {
+		next, err := s.peek()
+		if err != nil {
+			return err
+		}
+		if next == '{' {
+			if err := s.scanSystemBlockObject(depth+1, first); err != nil {
+				return err
+			}
+		} else if _, err := s.scanValue(depth, false); err != nil {
+			return err
+		}
+		first = false
+		if err := s.skipSpace(); err != nil {
+			return err
+		}
+		if ok, err := s.consumeIf(']'); ok || err != nil {
+			return err
+		}
+		if err := s.expect(','); err != nil {
+			return err
+		}
+		if err := s.skipSpace(); err != nil {
+			return err
+		}
+	}
+}
+
+func (s *jsonMetaScanner) scanSystemBlockObject(depth int, first bool) error {
+	if depth > maxJSONDepth {
+		return ErrJSONDepth
+	}
+	if err := s.expect('{'); err != nil {
+		return err
+	}
+	if err := s.skipSpace(); err != nil {
+		return err
+	}
+	if ok, err := s.consumeIf('}'); ok || err != nil {
+		return err
+	}
+	blockType, blockText := "", ""
+	for {
+		keyValue, err := s.scanString(256)
+		if err != nil {
+			return err
+		}
+		key, _ := decodeJSONString(keyValue.raw)
+		if key == "prompt_cache_breakpoint" {
+			s.meta.PromptCacheBreakpoint = true
+		}
+		if key == "status" {
+			s.goalStatusKey = true
+		}
+		if key == "encrypted_content" {
+			s.meta.EncryptedContentKey = true
+		}
+		if err = s.skipSpace(); err != nil {
+			return err
+		}
+		if err = s.expect(':'); err != nil {
+			return err
+		}
+		if err = s.skipSpace(); err != nil {
+			return err
+		}
+		value, err := s.scanValue(depth, key == "type" || key == "name" || key == "text")
+		if err != nil {
+			return err
+		}
+		if decoded, ok := decodeJSONString(value.raw); ok {
+			switch key {
+			case "type":
+				blockType = decoded
+				s.applySemanticType(decoded)
+			case "text":
+				blockText = decoded
+			case "name":
+				if decoded == "create_goal" || decoded == "update_goal" {
+					s.meta.GoalSignalQualified = true
+				}
+			}
+		}
+		if err = s.skipSpace(); err != nil {
+			return err
+		}
+		if ok, err := s.consumeIf('}'); ok || err != nil {
+			if first && strings.EqualFold(strings.TrimSpace(blockType), "text") {
+				s.observeClaudeCodeBillingText(blockText)
+			}
+			return err
+		}
+		if err = s.expect(','); err != nil {
+			return err
+		}
+		if err = s.skipSpace(); err != nil {
+			return err
+		}
+	}
+}
+
+// observeClaudeCodeBillingText accepts the protocol-native billing text only
+// when it has the durable fields used by the official CLI.  A missing
+// cc_is_subagent is the main Claude Code conversation; malformed or conflicting
+// values deliberately leave the agent class unset rather than guessing.
+func (s *jsonMetaScanner) observeClaudeCodeBillingText(text string) {
+	const prefix = "x-anthropic-billing-header:"
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(strings.ToLower(text), prefix) {
+		return
+	}
+	hasVersion, hasEntrypoint := false, false
+	agentClass := "root"
+	invalidAgentClass := false
+	for _, field := range strings.Split(text[len(prefix):], ";") {
+		key, value, found := strings.Cut(strings.TrimSpace(field), "=")
+		if !found {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "cc_version":
+			hasVersion = strings.TrimSpace(value) != ""
+		case "cc_entrypoint":
+			switch strings.ToLower(strings.TrimSpace(value)) {
+			case "cli", "sdk-cli":
+				hasEntrypoint = true
+			}
+		case "cc_is_subagent":
+			switch strings.ToLower(strings.TrimSpace(value)) {
+			case "true", "1", "yes", "subagent", "sub-agent":
+				if agentClass == "root" && !invalidAgentClass {
+					agentClass = "subagent"
+				} else if agentClass != "subagent" {
+					invalidAgentClass = true
+				}
+			case "false", "0", "no", "root", "main":
+				if agentClass == "subagent" {
+					invalidAgentClass = true
+				}
+			default:
+				invalidAgentClass = true
+			}
+		}
+	}
+	if !hasVersion || !hasEntrypoint {
+		return
+	}
+	s.meta.ClaudeCodeBilling = true
+	if !invalidAgentClass {
+		s.meta.ClaudeCodeAgentClass = agentClass
 	}
 }
 

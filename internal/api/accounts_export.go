@@ -56,6 +56,36 @@ type cliProxyCodexDocument struct {
 // complete portable backup, CLIProxyAPI Codex credentials, or the official
 // Codex auth.json format. Compatibility credential formats are deliberately
 // generated one account per file; multiple accounts are returned as a ZIP.
+// auditAccountCredentialExport records one bulk credential-export access under the
+// same action the confirmed POST path uses, so both land in a single queryable
+// stream.
+//
+// The GET path emits exactly the same plaintext access tokens, refresh tokens and
+// API keys as the confirmed POST path — in JSON, CSV, a bare token list, the
+// upstream-compatible formats, and the full portable archive — but it wrote no audit
+// row at all. Two doors to the same secrets where only one is recorded means the
+// after-the-fact question "who pulled the pool's credentials, and when" was
+// answerable only for whoever used the door that asks for confirmation.
+//
+// Only the account-ID digest is recorded, never the IDs themselves and never any
+// credential material.
+func (s *Server) auditAccountCredentialExport(r *http.Request, format, state, reason string, requested, exported int) {
+	ids := requestedAccountBackupIDs(r)
+	sort.Strings(ids)
+	digest := sha256.Sum256([]byte(strings.Join(ids, "\x00")))
+	scope := "selection"
+	if len(ids) == 0 {
+		scope = "entire_pool"
+	}
+	s.enqueueAudit(storage.AuditLogRow{
+		Action: "account_credentials_export", State: state, Reason: reason,
+		Detail: fmt.Sprintf("actor=%s method=%s format=%s scope=%s accounts_hash=%s requested=%d exported=%d",
+			strictExportActor(s, r), r.Method, format, scope,
+			hex.EncodeToString(digest[:8]), requested, exported),
+		CreatedAt: storage.Now(),
+	})
+}
+
 func (s *Server) adminAccountsExport(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
 		return
@@ -72,19 +102,27 @@ func (s *Server) adminAccountsExport(w http.ResponseWriter, r *http.Request) {
 	if format == "" {
 		format = "json"
 	}
+	// Audited before emission, not after: the response body streams, so a row written
+	// only on clean completion would lose exactly the truncated export an
+	// investigation cares about.
+	requestedIDs := len(requestedAccountBackupIDs(r))
 	if format == "backup" || format == "archive" || format == "portable" {
+		s.auditAccountCredentialExport(r, format, "success", "unconfirmed_download", requestedIDs, requestedIDs)
 		s.writeAccountsBackupDownload(w, r)
 		return
 	}
 	records, explicitSelection, err := s.accountExportRecords(r)
 	if err != nil {
+		s.auditAccountCredentialExport(r, format, "failed", "load_records", requestedIDs, 0)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if len(records) == 0 {
+		s.auditAccountCredentialExport(r, format, "denied", "empty_pool", requestedIDs, 0)
 		writeError(w, http.StatusNotFound, errors.New("account pool is empty"))
 		return
 	}
+	s.auditAccountCredentialExport(r, format, "success", "unconfirmed_download", requestedIDs, len(records))
 
 	switch format {
 	case "cliproxyapi", "cliproxy", "cli-proxy-api":

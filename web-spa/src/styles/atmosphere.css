@@ -326,11 +326,11 @@
 }
 
 .pool-admin-shell:not(.pool-sidebar-is-collapsed) .pool-nav-section {
-  margin-top: var(--pool-space-6);
+  margin-top: var(--pool-nav-group-gap);
 }
 
 .pool-admin-shell:not(.pool-sidebar-is-collapsed) .pool-nav-group-label {
-  padding-left: var(--pool-space-3);
+  padding-left: var(--pool-nav-guide-inset);
   color: var(--pool-text-3);
   opacity: 0.72;
 }
@@ -340,8 +340,8 @@
    so it reads as a bracket rather than a border. */
 .pool-admin-shell:not(.pool-sidebar-is-collapsed) .pool-nav-children {
   position: relative;
-  margin-left: var(--pool-space-4);
-  padding-left: var(--pool-space-3);
+  margin-left: var(--pool-nav-child-inset);
+  padding-left: var(--pool-nav-guide-inset);
 }
 
 .pool-admin-shell:not(.pool-sidebar-is-collapsed) .pool-nav-children::before {
@@ -354,32 +354,36 @@
 
 /* The active row owns the guide line where it crosses it, which is what makes the
    selection read as "here, inside this section" rather than as a floating pill. */
-.pool-admin-shell:not(.pool-sidebar-is-collapsed) .pool-nav-item[aria-current='page'] {
-  box-shadow: inset 2px 0 0 var(--pool-accent);
+.pool-admin-shell .pool-nav-item[aria-current='page'] {
+  box-shadow: inset var(--pool-nav-active-indicator-width) 0 0 var(--pool-accent);
 }
 
-/* -------------------------------------------------------------------- layout */
-
-/*
- * Bento grid. Dense auto-flow so a short tile backfills the hole a tall one
- * leaves, which is what gives the arrangement its deliberate, non-uniform rhythm
- * without any of the tiles being hand-placed.
- */
-.pool-bento {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
-  grid-auto-flow: dense;
-  gap: var(--pool-space-4);
+.pool-nav-group-label {
+  min-height: var(--pool-nav-group-trigger-size);
+  font-size: var(--pool-nav-group-font-size);
+  font-weight: var(--pool-nav-group-font-weight);
+  letter-spacing: var(--pool-nav-group-letter-spacing);
 }
 
-.pool-bento__wide { grid-column: span 2; }
-.pool-bento__tall { grid-row: span 2; }
+.pool-nav-item {
+  min-height: var(--pool-nav-row-height);
+}
 
-/* A single-column viewport cannot honour a 2-column span, and letting it try is
-   exactly how a grid child pushes the document wider than the viewport. */
-@media (max-width: 720px) {
-  .pool-bento__wide { grid-column: auto; }
-  .pool-bento__tall { grid-row: auto; }
+.pool-nav-children[hidden] {
+  display: none;
+}
+
+.pool-sidebar-is-collapsed .pool-nav-group-label,
+.pool-sidebar-is-collapsed .pool-nav-item {
+  width: var(--pool-nav-group-trigger-size);
+}
+
+.pool-sidebar-is-collapsed .pool-nav-group-label {
+  min-height: var(--pool-nav-group-trigger-size);
+}
+
+.pool-sidebar-is-collapsed .pool-nav-item {
+  min-height: var(--pool-nav-row-height);
 }
 
 /* ------------------------------------------------------- narrative and motion */

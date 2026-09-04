@@ -119,6 +119,18 @@ func HandlerWithOptions(options Options) http.Handler {
 	buildSignature := releaseManifestSignature(manifest)
 	fileServer := http.StripPrefix("/console/", http.FileServer(http.FS(sub)))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The console is an operations surface, not public content. X-Robots-Tag is
+		// set before any branch below -- including the build-error and asset paths --
+		// so no response can escape without it. This is the authoritative opt-out:
+		// unlike robots.txt it travels with the response itself, so a crawler that
+		// reached a deep asset URL directly still sees it, and unlike the <meta> tag
+		// it also covers non-HTML responses (JSON, JS, source maps) that never get
+		// parsed as a document.
+		//
+		// noai / noimageai are not registered with any standards body; they are
+		// included because several crawlers have adopted them and an unrecognized
+		// token is ignored rather than invalidating the header.
+		w.Header().Set("X-Robots-Tag", "noindex, nofollow, noarchive, nosnippet, noimageindex, noai, noimageai")
 		if ixErr != nil {
 			serveConsoleBuildError(w)
 			return

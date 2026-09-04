@@ -5,9 +5,13 @@ import {
 import { reportClientError } from './AppErrorBoundary.jsx';
 import { readDocumentElementCustomProperties } from '../lib/browserDocument.js';
 import {
-  addDocumentListener, addWindowListener, isDocumentVisible,
+  addDocumentListener, addWindowListener, cancelBrowserAnimationFrame,
+  isDocumentVisible, requestBrowserAnimationFrame,
 } from '../lib/browserLifecycle.js';
 import { consoleBootstrap } from '../app/bootstrap';
+import { startAuroraEnhancement } from '../engine/bootstrap.js';
+import { effectsForRoute } from '../engine/routeEffects.js';
+import { createEffectInputDriver } from '../engine/effectInputs.js';
 
 type AmbientVisualSample = {
   energy?: number;
@@ -18,6 +22,34 @@ type Subscribe = (listener: (sample: AmbientVisualSample) => void) => () => void
 type VisualQuality = 'auto' | 'high' | 'balanced' | 'low' | 'still' | 'off';
 
 const VISUAL_QUALITY_KEY = 'pool.visual_quality';
+
+// The two vocabularies are not the same set: the atmosphere has 'balanced' and
+// two non-rendering states, the engine has three rendering levels. 'still' and
+// 'off' map to no engine at all rather than to a slow one.
+const ENGINE_QUALITY: Partial<Record<Exclude<VisualQuality, 'auto'>, 'high' | 'medium' | 'low'>> = {
+  high: 'high',
+  balanced: 'medium',
+  low: 'low',
+};
+
+// `startAuroraEnhancement` returns one of two shapes. A refused capability probe
+// or a failed dynamic import yields the small inactive session, which has only
+// `dispose`; treating the two as one type is how a "just call stop()" cleanup
+// turns into a TypeError on exactly the low-end machines the fallback exists for.
+type EngineSession = {
+  active: boolean;
+  reason?: string;
+  dispose: () => void;
+  start?: () => void;
+  stop?: () => void;
+  loadEffect?: (id: string, parameters?: Record<string, unknown>) => Promise<boolean>;
+  unloadEffect?: (id: string) => boolean;
+  syncPaletteFromDocument?: (element: Element) => Promise<boolean>;
+  syncSize?: () => void;
+};
+type ActiveEngineSession = EngineSession & Required<Pick<
+  EngineSession, 'start' | 'stop' | 'loadEffect' | 'unloadEffect' | 'syncPaletteFromDocument' | 'syncSize'
+>>;
 
 const PALETTE_TOKENS = [
   '--pool-atmo-void', '--pool-atmo-near', '--pool-atmo-far', '--pool-atmo-glow',
@@ -85,8 +117,24 @@ export function resolveVisualQuality(preference: VisualQuality): Exclude<VisualQ
  * the canvas either never appears or renders a single still frame, and the CSS
  * layer underneath carries the design on its own.
  */
-export default function AtmosphereLayer({ subscribe }: { subscribe?: Subscribe }) {
+export default function AtmosphereLayer({ subscribe, pathname }: { subscribe?: Subscribe; pathname?: string }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const layerRef = useRef<HTMLDivElement | null>(null);
+  // The engine starts asynchronously and outlives individual route renders, so
+  // it is held in a ref rather than state: a re-render must not restart it.
+  const sessionRef = useRef<EngineSession | null>(null);
+  const activeEffectsRef = useRef<string[]>([]);
+  const routeRef = useRef<string>(pathname || '/');
+  const inputDriverRef = useRef<ReturnType<typeof createEffectInputDriver>>(null);
+  const experienceEnabledRef = useRef(true);
+  // Single narrowing point: callers get the full surface or nothing at all.
+  const activeSession = (): ActiveEngineSession | null => {
+    const session = sessionRef.current;
+    // `active` alone is the host's claim; the typeof check is the one that
+    // actually protects the call sites, so it is what the narrowing rests on.
+    if (!session || !session.active || typeof session.start !== 'function') return null;
+    return session as ActiveEngineSession;
+  };
   // Drives `data-webgl`, which tells the stylesheet whether the CSS field is doing
   // the work or merely sitting under an opaque canvas.
   const [live, setLive] = useState(false);
@@ -151,6 +199,7 @@ export default function AtmosphereLayer({ subscribe }: { subscribe?: Subscribe }
       const rect = canvas.getBoundingClientRect();
       atmosphere.resize(rect.width, rect.height, window.devicePixelRatio || 1);
       if (still) atmosphere.renderStill();
+      activeSession()?.syncSize();
     };
 
     atmosphere.setPalette(readPalette());
@@ -163,6 +212,9 @@ export default function AtmosphereLayer({ subscribe }: { subscribe?: Subscribe }
       if (disposed) return;
       atmosphere.setPalette(readPalette());
       if (still) atmosphere.renderStill();
+      // P3 §7.3: every effect reads --pool-atmo-*, so a theme swap has to reach
+      // the engine too or the effects keep painting the previous theme's colours.
+      void activeSession()?.syncPaletteFromDocument(document.documentElement);
     });
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
@@ -189,6 +241,10 @@ export default function AtmosphereLayer({ subscribe }: { subscribe?: Subscribe }
         const w = window.innerWidth || 1;
         const h = window.innerHeight || 1;
         atmosphere.setPointer((event.clientX / w) * 2 - 1, (event.clientY / h) * 2 - 1);
+        // The atmosphere takes NDC; effect uniforms are declared in 0..1 UV with
+        // GL's bottom-left origin, so the vertical axis is flipped here rather
+        // than inside each shader.
+        inputDriverRef.current?.setPointer(event.clientX / w, 1 - event.clientY / h);
         const now = performance.now();
         const elapsed = Math.max(16, now - previousPointer.at);
         const distance = Math.hypot(event.clientX - previousPointer.x, event.clientY - previousPointer.y);
@@ -203,6 +259,7 @@ export default function AtmosphereLayer({ subscribe }: { subscribe?: Subscribe }
         const elapsed = Math.max(16, now - previousScroll.at);
         const velocity = Math.min(1, Math.abs(window.scrollY - previousScroll.y) / elapsed / 1.2);
         atmosphere.setScroll((window.scrollY / max) * 2 - 1, velocity);
+        inputDriverRef.current?.setScroll(velocity, window.scrollY < 0 ? -window.scrollY / max : 0);
         previousScroll = { y: window.scrollY, at: now };
       }, { passive: true });
 
@@ -214,7 +271,13 @@ export default function AtmosphereLayer({ subscribe }: { subscribe?: Subscribe }
         atmosphere.setFocus(x, y);
         atmosphere.setActivity(0.42);
       });
-      removePointerActivity = addDocumentListener('pointerdown', () => atmosphere.setActivity(0.72), { passive: true });
+      removePointerActivity = addDocumentListener('pointerdown', (event: PointerEvent) => {
+        atmosphere.setActivity(0.72);
+        inputDriverRef.current?.press(
+          event.clientX / Math.max(1, window.innerWidth),
+          1 - event.clientY / Math.max(1, window.innerHeight),
+        );
+      }, { passive: true });
       removeActivity = addWindowListener('pool-rpm-activity', (event: CustomEvent<number>) => {
         atmosphere.setActivity(Number(event.detail) || 0);
       });
@@ -223,8 +286,13 @@ export default function AtmosphereLayer({ subscribe }: { subscribe?: Subscribe }
       // none. Stop the loop outright rather than relying on the browser to throttle.
       removeVisibility = addDocumentListener('visibilitychange', () => {
         if (disposed) return;
-        if (isDocumentVisible()) atmosphere.start();
-        else atmosphere.stop();
+        if (isDocumentVisible()) {
+          atmosphere.start();
+          activeSession()?.start();
+        } else {
+          atmosphere.stop();
+          activeSession()?.stop();
+        }
       });
 
       if (isDocumentVisible()) atmosphere.start();
@@ -245,6 +313,55 @@ export default function AtmosphereLayer({ subscribe }: { subscribe?: Subscribe }
           }
         }
         if (still && sample?.ui_experience_v2 !== false) atmosphere.renderStill();
+      });
+    }
+
+    // ── P6 engine wiring ───────────────────────────────────────────────────
+    // This component stays the ONE owner of `createAtmosphere` (P3 §7.1): the
+    // host is handed the existing controller as an `external` adapter and never
+    // builds a second background field. `startAuroraEnhancement` runs its own
+    // capability probe and returns an inactive session on refusal, so the CSS
+    // gradient plus this canvas remain the whole picture on machines that
+    // cannot take more.
+    const engineQualityLevel = ENGINE_QUALITY[resolvedQuality];
+    if (engineQualityLevel && layerRef.current) {
+      void startAuroraEnhancement({
+        effectLayer: layerRef.current,
+        fallbackRoot: layerRef.current,
+        quality: engineQualityLevel,
+        atmosphere: { mode: 'external', controller: atmosphere },
+        effects: effectsForRoute(routeRef.current),
+        onDiagnostic: (message: string) => reportClientError(new Error(message), {
+          source: 'aurora.engine',
+          componentStack: 'AtmosphereLayer',
+        }),
+      }).then((session: EngineSession) => {
+        // The effect may have been torn down while the dynamic import was in
+        // flight; disposing here rather than storing it prevents a leaked GL
+        // context that no cleanup path can still reach.
+        if (disposed) { session.dispose(); return; }
+        sessionRef.current = session;
+        // An inactive session is still stored above so the cleanup below can
+        // dispose it, but it exposes nothing else to drive.
+        const live = activeSession();
+        if (!live) return;
+        activeEffectsRef.current = effectsForRoute(routeRef.current).map((entry) => entry.id);
+        // Without this the interaction slot renders its default uniforms forever:
+        // admitted, drawn, and completely unresponsive to the pointer.
+        inputDriverRef.current = createEffectInputDriver({
+          session: live,
+          requestFrame: requestBrowserAnimationFrame,
+          cancelFrame: cancelBrowserAnimationFrame,
+          now: () => performance.now(),
+        });
+        inputDriverRef.current?.setLoadedEffects(activeEffectsRef.current);
+        void live.syncPaletteFromDocument(document.documentElement);
+        if (still || !experienceEnabledRef.current || !isDocumentVisible()) live.stop();
+      }).catch((error: unknown) => {
+        reportClientError(error instanceof Error ? error : new Error(String(error)), {
+          source: 'aurora.engine.start',
+          componentStack: 'AtmosphereLayer',
+        });
       });
     }
 
@@ -274,13 +391,55 @@ export default function AtmosphereLayer({ subscribe }: { subscribe?: Subscribe }
       canvas.removeEventListener('webglcontextrestored', onContextRestored);
       // Releases the GL program and the drawing buffer. Without this a hot reload
       // that remounts the shell repeatedly walks into the live-context ceiling and
-      // every later mount silently gets no context at all.
+      // every later mount silently gets no context at all. The engine owns a
+      // second context on its own canvas and has exactly the same problem.
+      inputDriverRef.current?.dispose();
+      inputDriverRef.current = null;
+      sessionRef.current?.dispose();
+      sessionRef.current = null;
+      activeEffectsRef.current = [];
       atmosphere.dispose();
     };
   }, [contextGeneration, resolvedQuality, subscribe]);
 
+  // `ui_experience_v2` arrives on the live ambient sample and can flip at any
+  // time. Toggling it through the effect's dependency list would tear down and
+  // rebuild two GL contexts on every flip; the atmosphere has always handled it
+  // imperatively via setEnabled(), and the engine is handled the same way here.
+  useEffect(() => {
+    experienceEnabledRef.current = experienceEnabled;
+    const session = activeSession();
+    if (!session) return;
+    if (experienceEnabled && isDocumentVisible()) session.start();
+    else session.stop();
+  }, [experienceEnabled]);
+
+  // Route changes swap the effect set in place. Restarting the host instead
+  // would rebuild the GL context on every navigation, which is both the slow
+  // path and the one that eventually exhausts the browser's context budget.
+  useEffect(() => {
+    const nextRoute = pathname || '/';
+    routeRef.current = nextRoute;
+    const session = activeSession();
+    if (!session) return;
+    const next = effectsForRoute(nextRoute);
+    const nextIds = next.map((entry) => entry.id);
+    const previousIds = activeEffectsRef.current;
+    if (previousIds.length === nextIds.length && previousIds.every((id, index) => id === nextIds[index])) return;
+    for (const id of previousIds) {
+      if (!nextIds.includes(id)) session.unloadEffect(id);
+    }
+    activeEffectsRef.current = nextIds;
+    inputDriverRef.current?.setLoadedEffects(nextIds);
+    for (const entry of next) {
+      if (previousIds.includes(entry.id)) continue;
+      void session.loadEffect(entry.id, entry.parameters);
+    }
+  }, [pathname]);
+
   return (
     <div
+      ref={layerRef}
       className="pool-atmosphere"
       data-webgl={live && experienceEnabled ? 'true' : 'false'}
       data-quality={effectiveQuality}

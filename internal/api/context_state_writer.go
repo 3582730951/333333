@@ -11,7 +11,6 @@ import (
 const (
 	codexStateCommitQueueDepth = 4096
 	codexStateCommitBatchMax   = 256
-	codexStateCommitBatchWait  = 20 * time.Millisecond
 	codexStateCommitTimeout    = 30 * time.Second
 )
 
@@ -34,8 +33,26 @@ func (s *Server) startCodexStateWriter() {
 		for first := range s.codexStateCommits {
 			batch := make([]codexStateCommitRequest, 1, codexStateCommitBatchMax)
 			batch[0] = first
-			timer := time.NewTimer(codexStateCommitBatchWait)
 			closed := false
+			// Group-commit only what is ALREADY queued; never wait for arrivals.
+			//
+			// This writer used to wait codexStateCommitBatchWait for batch-mates. That
+			// was free when the CPA commit ran after the terminal SSE frame had been
+			// released. It is no longer: the commit now completes before
+			// response.completed reaches the client, so every waiter is holding its own
+			// terminal frame, and the wait is added directly to client latency.
+			//
+			// The amortization no longer pays for itself. One binding transaction
+			// measures ~50us, so a full 256-request batch saves at most ~13ms of server
+			// time while charging up to 20ms of latency to each of its 256 members.
+			// Draining without waiting keeps the batching that actually matters --
+			// under real load the queue is non-empty because requests accumulate while
+			// the previous batch commits, so batches still form -- and removes the
+			// artificial delay when this is the only in-flight turn.
+			//
+			// Ordering is unchanged: the transaction still completes before the terminal
+			// frame is written, so this only moves the transaction's start earlier. It
+			// never defers a commit past the frame.
 		collect:
 			for len(batch) < codexStateCommitBatchMax {
 				select {
@@ -45,14 +62,8 @@ func (s *Server) startCodexStateWriter() {
 						break collect
 					}
 					batch = append(batch, next)
-				case <-timer.C:
-					break collect
-				}
-			}
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
 				default:
+					break collect
 				}
 			}
 			s.persistCodexStateCommitBatch(batch)

@@ -143,7 +143,7 @@ type AccountRequestRateAggregate struct {
 // terminal usage updates the same event_id, so retries and duplicate terminal
 // frames cannot inflate logical RPM.
 type AccountUsageRateEvent struct {
-	EventID, AccountID                                          string
+	EventID, AccountID, EgressID                                string
 	OccurredAt                                                  int64
 	InputTokens, CachedInputTokens, OutputTokens, TotalTokens   int64
 	AgentClass, ClientFamily, ClientConfidence, SettlementState string
@@ -167,8 +167,8 @@ func (s *Store) RecordAccountRequestRateArrival(ctx context.Context, event Accou
 	if state == "" {
 		state = "unsettled"
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO account_usage_rate_events(event_id,account_id,occurred_at,input_tokens,cached_input_tokens,output_tokens,total_tokens,agent_class,client_family,client_confidence,settlement_state,estimated,updated_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(event_id) DO NOTHING`, event.EventID, event.AccountID, event.OccurredAt, 0, 0, 0, 0, NormalizeAgentClass(event.AgentClass), NormalizeClientFamily(event.ClientFamily), NormalizeClientConfidence(event.ClientConfidence), state, boolInt(event.Estimated), event.UpdatedAt)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO account_usage_rate_events(event_id,account_id,egress_id,occurred_at,input_tokens,cached_input_tokens,output_tokens,total_tokens,agent_class,client_family,client_confidence,settlement_state,estimated,updated_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(event_id) DO NOTHING`, event.EventID, event.AccountID, strings.TrimSpace(event.EgressID), event.OccurredAt, 0, 0, 0, 0, NormalizeAgentClass(event.AgentClass), NormalizeClientFamily(event.ClientFamily), NormalizeClientConfidence(event.ClientConfidence), state, boolInt(event.Estimated), event.UpdatedAt)
 	return err
 }
 
@@ -534,6 +534,97 @@ WHERE account_id IN (` + strings.Join(placeholders, ",") + `) AND occurred_at>=?
 		reconcileRateClientFamilies(aggregate.AttemptRPM, &aggregate.AttemptClaudeCodeRPM, &aggregate.AttemptCodexCLIRPM, &aggregate.AttemptOpenAISDKRPM, &aggregate.AttemptOtherRPM, &aggregate.AttemptUnknownClientRPM)
 		reconcileRateClientFamilies(aggregate.LogicalRPM, &aggregate.ClaudeCodeRPM, &aggregate.CodexCLIRPM, &aggregate.OpenAISDKRPM, &aggregate.OtherRPM, &aggregate.UnknownClientRPM)
 		result[id] = aggregate
+	}
+	return result, nil
+}
+
+// AccountRootRate is the minimal logical-arrival view consumed by the dynamic
+// pool balancer. It intentionally excludes attempt buckets: retries and target
+// failover belong to transport diagnostics, not to the root-request threshold.
+type AccountRootRate struct {
+	RootRPM    int64
+	UnknownRPM int64
+}
+
+// EgressRootRateSnapshot returns logical request RPM by selected outlet. The
+// historical name is retained for API compatibility with the account balancer;
+// outlet pressure includes root and subagent requests because both consume the
+// same network exit capacity.
+func (s *Store) EgressRootRateSnapshot(ctx context.Context, sampledAt int64) (map[string]int64, error) {
+	if s == nil || s.rdb == nil {
+		return nil, errors.New("egress root rate snapshot store is unavailable")
+	}
+	if sampledAt <= 0 {
+		sampledAt = Now()
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT egress_id FROM account_usage_rate_events WHERE egress_id<>'' AND occurred_at>=? AND occurred_at<=?`, sampledAt-(AccountRequestRateWindowSeconds-1), sampledAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		count := out[id]
+		addRateCounter(&count, 1)
+		out[id] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, rows.Close()
+}
+
+// AccountRootRateSnapshot reads the shared durable logical-arrival table for one
+// rolling 60-whole-second window. This method is for the scheduler's background
+// refresher; callers on a request/selection path must publish and read an atomic
+// snapshot instead of invoking it synchronously.
+func (s *Store) AccountRootRateSnapshot(ctx context.Context, sampledAt int64) (map[string]AccountRootRate, error) {
+	if s == nil || s.rdb == nil {
+		return nil, errors.New("account root rate snapshot store is unavailable")
+	}
+	if sampledAt <= 0 {
+		sampledAt = Now()
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, agent_class
+FROM account_usage_rate_events
+WHERE occurred_at >= ? AND occurred_at <= ?`, sampledAt-(AccountRequestRateWindowSeconds-1), sampledAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[string]AccountRootRate)
+	for rows.Next() {
+		var accountID, class string
+		if err := rows.Scan(&accountID, &class); err != nil {
+			return nil, err
+		}
+		accountID = strings.TrimSpace(accountID)
+		if accountID == "" {
+			continue
+		}
+		rate := result[accountID]
+		switch NormalizeAgentClass(class) {
+		case AgentClassRoot:
+			addRateCounter(&rate.RootRPM, 1)
+		case AgentClassUnknown:
+			addRateCounter(&rate.UnknownRPM, 1)
+		}
+		result[accountID] = rate
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
 	}
 	return result, nil
 }

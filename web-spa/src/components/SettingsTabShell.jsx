@@ -77,7 +77,7 @@ function SavedDiffPanel({ diffs, onUndo, undoLoading = false, onClose }) {
       type="success"
       title={`${t('settings.saved_prefix')} ${diffs.length} ${t('settings.saved_changes_suffix')}`}
       description={
-        <div style={{ maxHeight: 120, overflow: 'auto', fontSize: 12, fontFamily: 'monospace', lineHeight: 1.6 }}>
+        <div style={{ maxHeight: 120, overflow: 'auto', fontSize: 'var(--pool-type-caption)', fontFamily: 'monospace', lineHeight: 1.6 }}>
           {diffs.map((d, i) => (
             <div key={i}>
               [{d.section}] <b>{d.key}</b>: {formatSavedDiffValue(d.key, d.old_value)} → {formatSavedDiffValue(d.key, d.new_value)}

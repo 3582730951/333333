@@ -19,6 +19,7 @@ type codexProtocolProfile struct {
 	codeModeToolNames       bool
 	parentTurnID            bool
 	promptCacheKeyBySession bool
+	turnMetadataSchema      config.CodexTurnMetadataSchema
 }
 
 func codexProtocolProfileForVersion(version string) codexProtocolProfile {
@@ -31,6 +32,7 @@ func codexProtocolProfileForVersion(version string) codexProtocolProfile {
 			codeModeToolNames:       fingerprint.CodeModeToolNames,
 			parentTurnID:            fingerprint.ParentTurnID,
 			promptCacheKeyBySession: fingerprint.PromptCacheKeyBySession,
+			turnMetadataSchema:      fingerprint.TurnMetadataSchema,
 		}
 	}
 	// Explicit operator/model pins outside the built-in window remain supported.
@@ -43,6 +45,12 @@ func codexProtocolProfileForVersion(version string) codexProtocolProfile {
 		codeModeToolNames:       codexVersionAtLeast(version, "0.146.0"),
 		parentTurnID:            codexVersionAtLeast(version, "0.147.0"),
 		promptCacheKeyBySession: codexVersionAtLeast(version, "0.145.0"),
+		turnMetadataSchema: func() config.CodexTurnMetadataSchema {
+			if codexVersionAtLeast(version, "0.151.0") {
+				return config.CodexTurnMetadataSchemaWindowNumber
+			}
+			return config.CodexTurnMetadataSchemaLegacy
+		}(),
 	}
 }
 

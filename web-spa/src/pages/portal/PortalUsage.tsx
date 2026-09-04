@@ -1,12 +1,14 @@
 import { useMemo, useState } from 'react';
-import { Button, DataTable, Form, Tag } from '../../components/pool/index.jsx';
+import { Button, Form, Tag } from '../../components/pool/index.jsx';
 import { IconRefresh } from '../../components/pool/icons.jsx';
-import LoadErrorBanner from '../../components/LoadErrorBanner.jsx';
 import PageHeader, { Panel } from '../../components/PageHeader.jsx';
+import ResourceTable from '../../components/ResourceTable.jsx';
 import { fmtDateTime, fmtTokens, fmtUSD } from '../../lib/format.js';
 import { t } from '../../lib/i18n.js';
 import { usePortalUsageEventsData } from '../../features/portal/queries/details';
 import type { PortalUsageEvent, PortalValuation } from '../../features/portal/model/details';
+
+const DataTable = ResourceTable as any;
 
 function nullableTokens(value: number | null) {
   return value == null ? '—' : fmtTokens(value);
@@ -28,7 +30,7 @@ export default function PortalUsage() {
   const [cursor, setCursor] = useState('');
   const [history, setHistory] = useState<string[]>([]);
   const filters = useMemo(() => ({ model, service_tier: tier, cursor, limit: 50 }), [cursor, model, tier]);
-  const { data, loading, refreshing, error, reload } = usePortalUsageEventsData(filters);
+  const { data, loading, refreshing, error, lastRefresh, reload } = usePortalUsageEventsData(filters);
   const rows = data?.items || [];
 
   const columns = [
@@ -81,7 +83,6 @@ export default function PortalUsage() {
     <div className="pool-portal-page">
       <PageHeader title={t('portal_details.usage_title')} subtitle={t('portal_details.usage_subtitle')}
         actions={<Button icon={<IconRefresh />} onClick={reload} loading={refreshing}>{t('common.refresh')}</Button>} />
-      <LoadErrorBanner error={error} onRetry={reload} title={t('portal_details.load_failed')} />
       <Panel title={t('portal_details.filters')}>
         <div className="pool-portal-filters">
           <Form.Input value={modelDraft} onChange={(value: string) => setModelDraft(value)} placeholder={t('portal_details.model_filter')} onEnterPress={applyFilters} />
@@ -92,8 +93,10 @@ export default function PortalUsage() {
         </div>
       </Panel>
       <Panel title={t('portal_details.requests')}>
-        <DataTable<PortalUsageEvent> dataSource={rows} columns={columns} rowKey="usage_event_id" loading={loading}
-          pagination={false} scroll={{ x: 980 }} aria-label={t('portal_details.requests')} />
+        <DataTable error={error} errorTitle={t('portal_details.load_failed')} onRetry={reload}
+          lastRefresh={lastRefresh} dataSource={rows} columns={columns} rowKey="usage_event_id" loading={loading}
+          pagination={false} scroll={{ x: 980 }} aria-label={t('portal_details.requests')}
+          emptyTitle={t('portal_details.no_items')} />
         <div className="pool-portal-pagination" aria-live="polite">
           <Button disabled={!history.length || loading} onClick={() => {
             setHistory((current) => { const next = current.slice(); setCursor(next.pop() || ''); return next; });

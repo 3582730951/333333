@@ -7,10 +7,10 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 7px;
-  padding: 0 12px;
+  gap: var(--pool-space-2);
+  padding: 0 var(--pool-space-3);
   cursor: pointer;
-  transition: background-color 140ms ease, border-color 140ms ease, transform 120ms ease;
+  transition: background-color var(--pool-motion-fast) var(--pool-ease-standard), border-color var(--pool-motion-fast) var(--pool-ease-standard), transform var(--pool-motion-instant) var(--pool-ease-standard);
   white-space: nowrap;
 }
 
@@ -31,6 +31,39 @@
   color: var(--pool-text-disabled);
   opacity: 1;
   transform: none;
+}
+
+/* Every async control exposes the same semantic flag, regardless of whether its
+   implementation is Button, Switch, or a dialog action. Keep the affordance
+   visible even though the native control is disabled while the request settles. */
+.pool-button[aria-busy='true'] {
+  cursor: progress;
+  opacity: 0.78;
+}
+
+.pool-button[aria-busy='true'] .pool-button__label {
+  opacity: 0.86;
+}
+
+.pool-switch[aria-busy='true'] {
+  cursor: progress;
+  opacity: 0.78;
+}
+
+/* P0 Top10 #7. The two rules above are per-component, so any control that is not
+   a Button or a Switch announces aria-busy to assistive technology and shows
+   nothing at all -- the semantic flag and the visual state disagree. This is the
+   shared contract: anything that says it is busy looks busy. The named rules
+   above still win where they are more specific, so no existing surface changes.
+   [aria-busy] on a live region means "content is updating", not "control is
+   pending", so the region roles are excluded rather than dimmed. */
+[aria-busy='true']:not([role='status']):not([role='alert']):not([role='log']):not([aria-live]) {
+  cursor: progress;
+}
+
+[aria-busy='true']:not([role='status']):not([role='alert']):not([role='log']):not([aria-live])
+  > :where(.pool-button__label, .pool-field__control, .pool-card__body) {
+  opacity: 0.86;
 }
 
 .pool-button--primary {
@@ -71,13 +104,13 @@
 
 .pool-button--small {
   min-height: 28px;
-  padding: 0 9px;
-  font-size: 12px;
+  padding: 0 var(--pool-space-2);
+  font-size: var(--pool-type-caption);
 }
 
 .pool-button--large {
   min-height: 38px;
-  padding: 0 16px;
+  padding: 0 var(--pool-space-4);
 }
 
 .pool-button--block {
@@ -103,7 +136,7 @@
   border: 2px solid var(--pool-border-strong);
   border-top-color: var(--pool-accent);
   border-radius: 999px;
-  animation: pool-spin 800ms linear infinite;
+  animation: pool-spin 800ms var(--pool-ease-linear) infinite;
   display: inline-block;
 }
 
@@ -133,7 +166,7 @@
 .pool-card,
 .pool-panel,
 .pool-chart-card {
-  padding: 16px;
+  padding: var(--pool-space-4);
 }
 
 .pool-chart-card .head {
@@ -141,22 +174,22 @@
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
+  gap: var(--pool-space-3);
+  margin-bottom: var(--pool-space-3);
 }
 
 .pool-chart-card .t,
 .pool-section-title {
   color: var(--pool-text);
-  font-size: 14px;
+  font-size: var(--pool-type-body);
   font-weight: 650;
   letter-spacing: 0;
 }
 
 .pool-chart-card .s {
-  margin-top: 3px;
+  margin-top: 3px; /* optical: 3px baseline gap under a chart card title; a 4px step detaches the caption from its heading */
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: 1.45;
 }
 
@@ -164,8 +197,8 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
+  gap: var(--pool-space-3);
+  margin-bottom: var(--pool-space-3);
 }
 
 .pool-card-body {
@@ -175,7 +208,7 @@
 .pool-stat,
 .pool-data-card,
 .pool-metric-card {
-  padding: 14px;
+  padding: var(--pool-space-3);
 }
 
 .pool-stat {
@@ -183,7 +216,7 @@
   min-height: 92px;
   display: grid;
   align-content: space-between;
-  gap: 8px;
+  gap: var(--pool-space-2);
   overflow: hidden;
 }
 
@@ -197,13 +230,13 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: var(--pool-space-2);
   min-width: 0;
 }
 
 .pool-stat .label {
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   font-weight: 600;
 }
 
@@ -218,7 +251,7 @@
 
 .pool-stat .value {
   color: var(--pool-text);
-  font-size: 24px;
+  font-size: var(--pool-type-title-2);
   font-weight: 720;
   line-height: 1.08;
   overflow-wrap: anywhere;
@@ -226,7 +259,7 @@
 
 .pool-stat .sub {
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: 1.4;
 }
 
@@ -234,14 +267,14 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  margin: 0 0 18px;
-  padding: 10px 12px;
+  gap: var(--pool-space-3);
+  margin: 0 0 var(--pool-space-4);
+  padding: var(--pool-space-2) var(--pool-space-3);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-sm);
   background: var(--pool-bg-surface);
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: 1.45;
 }
 
@@ -249,7 +282,7 @@
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 8px 14px;
+  gap: var(--pool-space-2) var(--pool-space-3);
   flex-wrap: wrap;
 }
 
@@ -262,13 +295,13 @@
 .pool-audit-export-group {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--pool-space-2);
   flex-wrap: wrap;
   max-width: 100%;
 }
 
 .pool-audit-export-group {
-  padding: 3px;
+  padding: 3px; /* optical: 3px inset frames the export control group as one hairline-bordered unit */
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-sm);
   background: var(--pool-bg-surface-2);
@@ -280,7 +313,7 @@
 }
 
 .pool-confirm-copy p {
-  margin: 0 0 8px;
+  margin: 0 0 var(--pool-space-2);
 }
 
 .pool-confirm-copy p:last-child {
@@ -288,15 +321,15 @@
 }
 
 .pool-profile-section {
-  margin-top: 16px;
-  padding-top: 16px;
+  margin-top: var(--pool-space-4);
+  padding-top: var(--pool-space-4);
   border-top: 1px solid var(--pool-border);
 }
 
 .pool-profile-section__title {
-  margin-bottom: 12px;
+  margin-bottom: var(--pool-space-3);
   color: var(--pool-text);
-  font-size: 15px;
+  font-size: var(--pool-type-body);
   font-weight: 650;
   line-height: 1.35;
 }
@@ -315,7 +348,7 @@
 .pool-stat-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .pool-grid.cols-2 {
@@ -344,30 +377,30 @@
   border-radius: var(--pool-radius-md);
   background: var(--pool-bg-surface);
   box-shadow: var(--pool-shadow-sm);
-  padding: 16px;
+  padding: var(--pool-space-4);
 }
 .pool-cache-breakdown__legend {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 10px;
+  gap: var(--pool-space-2);
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 .pool-cache-breakdown {
   display: grid;
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .pool-cache-breakdown__head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .pool-cache-breakdown__head b {
-  font-size: 28px;
+  font-size: var(--pool-type-title-1);
   line-height: 1;
   color: var(--pool-success);
 }
@@ -428,13 +461,13 @@
   z-index: 4;
   min-width: 190px;
   display: grid;
-  gap: 3px;
-  padding: 8px 10px;
+  gap: 3px; /* optical: 3px row gap inside the cache-model tooltip; 4px would grow the floating panel past its anchor */
+  padding: var(--pool-space-2);
   border: 1px solid var(--pool-chart-tooltip-border);
   border-radius: 8px;
   background: var(--pool-chart-tooltip-bg);
   box-shadow: var(--pool-shadow);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-cache-breakdown__dot {
@@ -442,7 +475,7 @@
   height: 8px;
   display: inline-block;
   border-radius: 50%;
-  margin-right: 6px;
+  margin-right: var(--pool-space-1);
 }
 
 .pool-cache-breakdown__dot--cached {
@@ -460,23 +493,23 @@
 .pool-model-toggle-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--pool-space-2);
   min-height: 28px;
-  margin: 0 0 10px;
+  margin: 0 0 var(--pool-space-2);
 }
 
 .pool-model-toggle {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--pool-space-1);
   min-height: 26px;
   max-width: 180px;
-  padding: 4px 8px;
+  padding: var(--pool-space-1) var(--pool-space-2);
   border: 1px solid var(--pool-border);
   border-radius: 6px;
   background: var(--pool-bg-surface);
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   cursor: pointer;
 }
 
@@ -502,13 +535,13 @@
 .pool-input-wrap {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--pool-space-2);
   min-height: 34px;
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-sm);
   background: var(--pool-bg-surface-2);
   color: var(--pool-text);
-  padding: 0 10px;
+  padding: 0 var(--pool-space-2);
 }
 
 .pool-input-wrap:focus-within {
@@ -526,7 +559,7 @@
   background: var(--pool-bg-surface-2);
   color: var(--pool-text);
   min-height: 34px;
-  padding: 0 10px;
+  padding: 0 var(--pool-space-2);
 }
 
 .pool-input-wrap .pool-input {
@@ -555,7 +588,7 @@
 
 .pool-textarea {
   min-height: 90px;
-  padding: 9px 10px;
+  padding: var(--pool-space-2);
   resize: vertical;
 }
 
@@ -574,8 +607,8 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 5px 9px;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-1) var(--pool-space-2);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-sm);
   background: var(--pool-bg-surface-2);
@@ -595,19 +628,19 @@
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 5px;
+  gap: var(--pool-space-1);
 }
 
 .pool-multi-select__tag {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: var(--pool-space-1);
   min-height: 25px;
-  padding: 2px 7px;
+  padding: 2px var(--pool-space-2); /* optical: 2px vertical inset on a 25px-tall removable tag; 4px would exceed the pill height */
   border-radius: 999px;
   background: var(--pool-bg-surface-3, var(--pool-bg-surface));
   color: var(--pool-text);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   font-weight: 600;
 }
 
@@ -651,7 +684,7 @@
 
 .pool-single-select {
   min-height: 34px;
-  padding: 0 10px;
+  padding: 0 var(--pool-space-2);
   font: inherit;
 }
 
@@ -659,7 +692,7 @@
   z-index: 1300;
   width: var(--radix-popover-trigger-width);
   max-height: min(360px, var(--radix-popover-content-available-height));
-  padding: 8px;
+  padding: var(--pool-space-2);
   overflow: hidden;
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-md);
@@ -668,13 +701,13 @@
 }
 
 .pool-multi-select__search {
-  margin-bottom: 7px;
+  margin-bottom: var(--pool-space-2);
 }
 
 .pool-multi-select__options {
   max-height: 280px;
   display: grid;
-  gap: 2px;
+  gap: 2px; /* optical: 2px gap between select option rows keeps the list scannable as one block */
   overflow-y: auto;
 }
 
@@ -684,8 +717,8 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 7px 9px;
+  gap: var(--pool-space-3);
+  padding: var(--pool-space-2);
   border: 0;
   border-radius: var(--pool-radius-sm);
   background: transparent;
@@ -711,44 +744,44 @@
 }
 
 .pool-multi-select__empty {
-  padding: 16px 8px;
+  padding: var(--pool-space-4) var(--pool-space-2);
   color: var(--pool-text-3);
   text-align: center;
 }
 
 .pool-field {
-  margin-bottom: 13px;
+  margin-bottom: var(--pool-space-3);
 }
 
 .pool-field--left {
   display: grid;
   grid-template-columns: var(--pool-form-label-width, 148px) minmax(0, 1fr);
   align-items: start;
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .pool-field__label {
   display: block;
   color: var(--pool-text-2);
-  font-size: 13px;
-  margin-bottom: 6px;
+  font-size: var(--pool-type-label);
+  margin-bottom: var(--pool-space-1);
 }
 
 .pool-field--left .pool-field__label {
-  margin: 7px 0 0;
+  margin: var(--pool-space-2) 0 0;
   text-align: right;
 }
 
 .pool-field__help {
-  margin-top: 5px;
+  margin-top: var(--pool-space-1);
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-field__error {
-  margin-top: 5px;
+  margin-top: var(--pool-space-1);
   color: var(--pool-danger);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-switch {
@@ -774,7 +807,7 @@
   border-radius: 999px;
   background: white;
   transform: translateX(1px);
-  transition: transform 140ms ease;
+  transition: transform var(--pool-motion-fast) var(--pool-ease-standard);
 }
 
 .pool-switch[data-state='checked'] .pool-switch__thumb {
@@ -785,16 +818,16 @@
 .pool-status-pill {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: var(--pool-space-1);
   max-width: 100%;
   min-width: 0;
   min-height: 22px;
   border-radius: 999px;
-  padding: 0 8px;
+  padding: 0 var(--pool-space-2);
   background: var(--pool-gray-soft);
   color: var(--pool-text-2);
   border: 1px solid var(--pool-border);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
@@ -867,7 +900,7 @@
 .pool-table td {
   min-width: 0;
   border-bottom: 1px solid var(--pool-border);
-  padding: 10px 12px;
+  padding: var(--pool-space-2) var(--pool-space-3);
   text-align: left;
   vertical-align: middle;
   color: var(--pool-text);
@@ -899,7 +932,7 @@
 .pool-table th {
   height: 38px;
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   font-weight: 650;
   background: var(--pool-bg-surface-2);
 }
@@ -927,7 +960,7 @@
   cursor: pointer;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--pool-space-1);
 }
 
 .pool-table-sort span:first-child {
@@ -936,7 +969,7 @@
 }
 
 .pool-table-empty {
-  padding: 28px;
+  padding: var(--pool-space-7);
   text-align: center;
 }
 
@@ -944,8 +977,8 @@
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 10px;
-  padding: 10px 12px;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-2) var(--pool-space-3);
   border-top: 1px solid var(--pool-border);
   color: var(--pool-text-2);
 }
@@ -992,40 +1025,40 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 16px 18px;
+  gap: var(--pool-space-3);
+  padding: var(--pool-space-4);
   border-bottom: 1px solid var(--pool-border);
 }
 
 .pool-modal-title,
 .pool-drawer-title {
   font-weight: 650;
-  font-size: 16px;
+  font-size: var(--pool-type-callout);
 }
 
 .pool-modal-body,
 .pool-drawer-body {
-  padding: 18px;
+  padding: var(--pool-space-4);
 }
 
 .pool-modal-footer,
 .pool-drawer-footer {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
-  padding: 14px 18px;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-3) var(--pool-space-4);
   border-top: 1px solid var(--pool-border);
 }
 
 .pool-banner {
   display: flex;
-  gap: 10px;
+  gap: var(--pool-space-2);
   border: 1px solid var(--pool-border);
   background: var(--pool-bg-surface-2);
   color: var(--pool-text);
   border-radius: var(--pool-radius-md);
-  padding: 12px;
-  margin-bottom: 14px;
+  padding: var(--pool-space-3);
+  margin-bottom: var(--pool-space-3);
 }
 
 .pool-banner--danger {
@@ -1044,7 +1077,7 @@
   right: 16px;
   z-index: 2000;
   display: grid;
-  gap: 10px;
+  gap: var(--pool-space-2);
   width: min(360px, calc(100vw - 24px));
 }
 
@@ -1054,7 +1087,7 @@
   color: var(--pool-text);
   border-radius: var(--pool-radius-md);
   box-shadow: var(--pool-shadow-md);
-  padding: 11px 12px;
+  padding: var(--pool-space-3);
 }
 
 .pool-toast--success {
@@ -1067,7 +1100,7 @@
 
 .pool-tabs {
   display: grid;
-  gap: 14px;
+  gap: var(--pool-space-3);
   min-width: 0;
 }
 
@@ -1078,7 +1111,7 @@
 
 .pool-tabs-list {
   display: flex;
-  gap: 6px;
+  gap: var(--pool-space-1);
   border-bottom: 1px solid var(--pool-border);
   min-width: 0;
   max-width: 100%;
@@ -1088,7 +1121,7 @@
   flex-direction: column;
   border-bottom: 0;
   border-right: 1px solid var(--pool-border);
-  padding-right: 10px;
+  padding-right: var(--pool-space-2);
 }
 
 .pool-tab-trigger {
@@ -1098,7 +1131,7 @@
   border-radius: var(--pool-radius-sm);
   background: transparent;
   color: var(--pool-text-2);
-  padding: 9px 11px;
+  padding: var(--pool-space-2) var(--pool-space-3);
   cursor: pointer;
   text-align: left;
   white-space: nowrap;
@@ -1116,7 +1149,7 @@ so the mark owns the size
 .pool-vendor-logo {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--pool-space-2);
   min-width: 0;
   flex: 0 0 auto;
   line-height: 1;
@@ -1155,7 +1188,7 @@ so the mark owns the size
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 7px;
+  gap: var(--pool-space-2);
   min-width: 0;
   max-width: 100%;
 }
@@ -1175,17 +1208,17 @@ so the mark owns the size
 .pool-oauth-identity {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--pool-space-3);
   min-width: 0;
-  margin-bottom: 16px;
-  padding: 13px 14px;
+  margin-bottom: var(--pool-space-4);
+  padding: var(--pool-space-3);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-lg);
   background: var(--pool-bg-surface-2);
 }
 
 .pool-oauth-identity--compact {
-  padding: 9px 11px;
+  padding: var(--pool-space-2) var(--pool-space-3);
 }
 
 .pool-oauth-identity__name,
@@ -1195,7 +1228,7 @@ so the mark owns the size
 }
 
 .pool-oauth-identity__desc {
-  margin-top: 3px;
+  margin-top: 3px; /* optical: 3px baseline gap between the OAuth identity line and its description */
 }
 
 .pool-oauth-manual-icon,
@@ -1257,11 +1290,11 @@ so the mark owns the size
 }
 
 .pool-nav {
-  padding: 10px 8px;
+  padding: var(--pool-space-2);
 }
 
 .pool-nav-section {
-  margin-bottom: 6px;
+  margin-bottom: var(--pool-space-1);
 }
 
 .pool-nav-group-label,
@@ -1269,13 +1302,13 @@ so the mark owns the size
   min-height: 34px;
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: var(--pool-space-2);
   width: 100%;
   border: 0;
   border-radius: var(--pool-radius-sm);
   background: transparent;
   color: var(--pool-text-2);
-  padding: 0 10px;
+  padding: 0 var(--pool-space-2);
   cursor: pointer;
   text-align: left;
 }
@@ -1286,22 +1319,15 @@ so the mark owns the size
   color: var(--pool-text);
 }
 
-.pool-nav-group-label--static,
-.pool-nav-group-label--static:hover {
-  cursor: default;
-  background: transparent;
-  color: var(--pool-text-3);
-}
-
 .pool-nav-item[aria-current='page'] {
   background: var(--pool-bg-selected);
   color: var(--pool-text);
 }
 
 .pool-nav-children {
-  margin: 4px 0 4px 22px;
+  margin: var(--pool-space-1) 0 var(--pool-space-1) var(--pool-space-5);
   display: grid;
-  gap: 3px;
+  gap: 3px; /* optical: 3px gap between nav child rows; 4px breaks the 36px nav row rhythm */
 }
 
 .pool-sidebar-is-collapsed .pool-nav-text,
@@ -1331,7 +1357,7 @@ so the mark owns the size
   border-radius: var(--pool-radius-md);
   background: var(--pool-bg-elevated);
   box-shadow: var(--pool-shadow-md);
-  padding: 8px;
+  padding: var(--pool-space-2);
   z-index: 300;
 }
 
@@ -1341,8 +1367,8 @@ so the mark owns the size
 
 .pool-account-menu-title {
   display: grid;
-  gap: 2px;
-  padding: 8px;
+  gap: 2px; /* optical: 2px gap between the account menu title and its subtitle (one text block) */
+  padding: var(--pool-space-2);
 }
 
 .pool-account-menu-title small {
@@ -1352,7 +1378,7 @@ so the mark owns the size
 .pool-account-menu-divider {
   height: 1px;
   background: var(--pool-border);
-  margin: 6px 0;
+  margin: var(--pool-space-1) 0;
 }
 
 .pool-account-menu-item {
@@ -1360,12 +1386,12 @@ so the mark owns the size
   min-height: 34px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--pool-space-2);
   border: 0;
   border-radius: var(--pool-radius-sm);
   background: transparent;
   color: var(--pool-text);
-  padding: 0 8px;
+  padding: 0 var(--pool-space-2);
   cursor: pointer;
 }
 
@@ -1376,8 +1402,8 @@ so the mark owns the size
 .pool-empty {
   display: grid;
   justify-items: center;
-  gap: 8px;
-  padding: 30px 18px;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-7) var(--pool-space-4);
   color: var(--pool-text-2);
 }
 
@@ -1393,7 +1419,7 @@ so the mark owns the size
 .pool-action-group {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--pool-space-1);
   flex-wrap: wrap;
 }
 
@@ -1401,7 +1427,7 @@ so the mark owns the size
 .pool-account-summary {
   min-width: 0;
   display: grid;
-  gap: 5px;
+  gap: var(--pool-space-1);
 }
 
 .pool-account-rpm {
@@ -1414,21 +1440,21 @@ so the mark owns the size
 
 .pool-account-rpm strong {
   color: var(--pool-text-primary);
-  font-size: 16px;
+  font-size: var(--pool-type-callout);
   letter-spacing: -0.02em;
 }
 
 .pool-account-rpm strong span {
   color: var(--pool-text-tertiary);
-  font-size: 10px;
+  font-size: var(--pool-type-caption);
   font-weight: 650;
   letter-spacing: 0.04em;
 }
 
 .pool-account-rpm small {
-  margin-top: 4px;
+  margin-top: var(--pool-space-1);
   color: var(--pool-text-tertiary);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   white-space: nowrap;
 }
 
@@ -1447,12 +1473,12 @@ so the mark owns the size
 .pool-account-rpm-chip--active::before {
   width: 5px;
   height: 5px;
-  margin-right: 5px;
+  margin-right: var(--pool-space-1);
   border-radius: 999px;
   background: var(--pool-accent);
   box-shadow: 0 0 0 0 color-mix(in srgb, var(--pool-accent) 35%, transparent);
   content: '';
-  animation: pool-rpm-pulse 2.4s ease-out infinite;
+  animation: pool-rpm-pulse 2.4s var(--pool-ease-enter) infinite;
 }
 
 .pool-account-rpm--active {
@@ -1477,14 +1503,14 @@ so the mark owns the size
 .pool-account-metaline,
 .pool-muted {
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-account-titleline,
 .pool-provider-summary {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--pool-space-2);
   min-width: 0;
 }
 
@@ -1495,7 +1521,7 @@ so the mark owns the size
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 4px 6px;
+  gap: var(--pool-space-1);
   min-width: 0;
   max-width: 100%;
 }
@@ -1597,7 +1623,7 @@ so the mark owns the size
 .pool-quota-cell {
   min-width: 0;
   display: grid;
-  gap: 6px;
+  gap: var(--pool-space-1);
 }
 
 .pool-quota-cell > span {
@@ -1614,10 +1640,10 @@ so the mark owns the size
 .pool-bulkbar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--pool-space-2);
   flex-wrap: wrap;
-  margin-bottom: 12px;
-  padding: 10px 12px;
+  margin-bottom: var(--pool-space-3);
+  padding: var(--pool-space-2) var(--pool-space-3);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-md);
   background: var(--pool-bg-surface);
@@ -1626,28 +1652,28 @@ so the mark owns the size
 .pool-task-progress {
   min-width: 0;
   display: grid;
-  gap: 7px;
+  gap: var(--pool-space-2);
 }
 
 .pool-task-progress__stats {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--pool-space-2);
   flex-wrap: wrap;
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-readiness-panel__body {
   display: grid;
-  gap: 8px;
+  gap: var(--pool-space-2);
 }
 
 .pool-readiness-panel__tags {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--pool-space-1);
 }
 
 /* Readiness reads as a band above the form, not a column beside it. Measured at 1440x900:
@@ -1660,7 +1686,7 @@ so the mark owns the size
 .pool-registration-start-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 18px;
+  gap: var(--pool-space-4);
   align-items: start;
 }
 
@@ -1672,7 +1698,7 @@ so the mark owns the size
 .pool-registration-start-form {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px 14px;
+  gap: var(--pool-space-3);
   align-items: end;
 }
 
@@ -1702,7 +1728,7 @@ so the mark owns the size
 .pool-registration-control {
   min-width: 0;
   display: grid;
-  gap: 6px;
+  gap: var(--pool-space-1);
 }
 
 .pool-registration-field-label {
@@ -1718,9 +1744,9 @@ so the mark owns the size
   grid-column: 1 / -1;
   display: flex;
   align-items: flex-start;
-  gap: 12px;
+  gap: var(--pool-space-3);
   min-width: 0;
-  padding: 12px 14px;
+  padding: var(--pool-space-3);
   border: 1px solid var(--pool-border-subtle);
   border-inline-start: 3px solid var(--pool-accent);
   border-radius: 12px;
@@ -1737,45 +1763,45 @@ so the mark owns the size
   border-radius: 10px;
   color: var(--pool-accent);
   background: color-mix(in srgb, var(--pool-accent) 12%, transparent);
-  font-size: 22px;
+  font-size: var(--pool-type-title-2);
 }
 
 .pool-registration-engine-summary__body {
   display: grid;
   min-width: 0;
-  gap: 5px;
+  gap: var(--pool-space-1);
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: 1.55;
 }
 
 .pool-registration-engine-summary__title {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--pool-space-2);
   flex-wrap: wrap;
   color: var(--pool-text);
-  font-size: 14px;
+  font-size: var(--pool-type-body);
   font-weight: 650;
 }
 
 .pool-sms-market-card .pool-card-body {
   display: grid;
-  gap: 16px;
+  gap: var(--pool-space-4);
 }
 
 .pool-sms-market-head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 20px;
+  gap: var(--pool-space-5);
 }
 
 .pool-sms-market-description {
   max-width: 760px;
-  margin: 6px 0 0;
+  margin: var(--pool-space-1) 0 0;
   color: var(--pool-text-3);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   line-height: 1.65;
 }
 
@@ -1786,9 +1812,9 @@ so the mark owns the size
 .pool-sms-price-policy {
   display: grid;
   grid-template-columns: minmax(150px, 210px) minmax(150px, 210px) auto minmax(180px, 1fr);
-  gap: 12px;
+  gap: var(--pool-space-3);
   align-items: end;
-  padding: 14px;
+  padding: var(--pool-space-3);
   border: 1px solid var(--pool-border-subtle);
   border-radius: 12px;
   background: var(--pool-bg-surface-2);
@@ -1796,10 +1822,10 @@ so the mark owns the size
 
 .pool-sms-price-policy label {
   display: grid;
-  gap: 7px;
+  gap: var(--pool-space-2);
   min-width: 0;
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-sms-price-policy .pool-input {
@@ -1811,7 +1837,7 @@ so the mark owns the size
   justify-self: end;
   min-width: 0;
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   text-align: right;
 }
 
@@ -1820,7 +1846,7 @@ so the mark owns the size
 .pool-sms-market-charts {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 18px;
+  gap: var(--pool-space-4);
 }
 
 .pool-sms-market-chart {
@@ -1828,9 +1854,9 @@ so the mark owns the size
 }
 
 .pool-sms-market-chart h3 {
-  margin: 0 0 12px;
+  margin: 0 0 var(--pool-space-3);
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   font-weight: 600;
   letter-spacing: 0.02em;
 }
@@ -1870,7 +1896,7 @@ so the mark owns the size
 .pool-registration-strategy-row {
   display: grid;
   grid-template-columns: repeat(3, minmax(150px, 1fr));
-  gap: 12px 14px;
+  gap: var(--pool-space-3);
   align-items: end;
 }
 
@@ -1878,9 +1904,9 @@ so the mark owns the size
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--pool-space-2);
   flex-wrap: wrap;
-  padding: 8px 10px;
+  padding: var(--pool-space-2);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-sm);
   background: var(--pool-bg-surface-2);
@@ -1892,23 +1918,23 @@ so the mark owns the size
 
 .pool-registration-strategy-note-sub {
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-registration-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--pool-space-2);
   flex-wrap: wrap;
-  padding-top: 2px;
+  padding-top: 2px; /* optical: 2px top inset aligns the action row with the adjacent form control baseline */
 }
 
 .pool-compact-record {
   width: 100%;
   min-width: 0;
   display: grid;
-  gap: 11px;
-  padding: 14px;
+  gap: var(--pool-space-3);
+  padding: var(--pool-space-3);
   border: 0;
   border-radius: inherit;
   background: transparent;
@@ -1945,7 +1971,7 @@ so the mark owns the size
 
 .pool-compact-record__head {
   justify-content: space-between;
-  gap: 10px;
+  gap: var(--pool-space-2);
 }
 
 .pool-compact-record__head > .pool-tag,
@@ -1955,7 +1981,7 @@ so the mark owns the size
 }
 
 .pool-compact-record__identity {
-  gap: 7px;
+  gap: var(--pool-space-2);
   overflow: hidden;
 }
 
@@ -1965,13 +1991,13 @@ so the mark owns the size
 
 .pool-compact-record__chips {
   flex: 0 0 auto;
-  gap: 5px;
+  gap: var(--pool-space-1);
 }
 
 .pool-compact-record__foot {
-  gap: 6px;
+  gap: var(--pool-space-1);
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-compact-record__foot > span:not(.pool-compact-record__disclosure) {
@@ -1984,12 +2010,12 @@ so the mark owns the size
 .pool-compact-record__disclosure {
   margin-left: auto;
   color: var(--pool-text-3);
-  font-size: 19px;
+  font-size: var(--pool-type-title-3);
   line-height: 1;
 }
 
 .pool-registration-job-card .pool-task-progress {
-  gap: 6px;
+  gap: var(--pool-space-1);
 }
 
 .pool-registration-metrics .pool-metric-card {
@@ -2006,8 +2032,8 @@ so the mark owns the size
 
 .pool-system-record {
   position: relative;
-  gap: 9px;
-  padding-right: 34px;
+  gap: var(--pool-space-2);
+  padding-right: var(--pool-space-8);
 }
 
 .pool-system-record__title {
@@ -2023,7 +2049,7 @@ so the mark owns the size
   min-width: 0;
   overflow: hidden;
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2031,14 +2057,14 @@ so the mark owns the size
 .pool-system-record__stats {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 7px;
+  gap: var(--pool-space-2);
 }
 
 .pool-system-record__stats > span {
   min-width: 0;
   display: grid;
-  gap: 2px;
-  padding: 5px 8px;
+  gap: 2px; /* optical: 2px gap inside a dense stat cell separated by a hairline border-inline-start */
+  padding: var(--pool-space-1) var(--pool-space-2);
   border-inline-start: 1px solid var(--pool-border);
   border-radius: 0;
   background: transparent;
@@ -2047,14 +2073,14 @@ so the mark owns the size
 .pool-system-record__stats small {
   overflow: hidden;
   color: var(--pool-text-3);
-  font-size: 10.5px;
+  font-size: var(--pool-type-caption);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .pool-system-record__stats strong {
   overflow: hidden;
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2069,7 +2095,7 @@ so the mark owns the size
 
 .pool-system-detail {
   display: grid;
-  gap: 14px;
+  gap: var(--pool-space-3);
 }
 
 .pool-system-detail__badge {
@@ -2080,7 +2106,7 @@ so the mark owns the size
 .pool-system-detail__grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1px;
+  gap: 1px; /* optical: 1px grid gap is the hairline rule itself: the parent background bleeds through as the divider */
   margin: 0;
   overflow: hidden;
   border: 1px solid var(--pool-border);
@@ -2091,14 +2117,14 @@ so the mark owns the size
 .pool-system-detail__grid > div {
   min-width: 0;
   display: grid;
-  gap: 5px;
-  padding: 12px 14px;
+  gap: var(--pool-space-1);
+  padding: var(--pool-space-3);
   background: var(--pool-bg-surface);
 }
 
 .pool-system-detail__grid dt {
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-system-detail__grid dd {
@@ -2106,15 +2132,15 @@ so the mark owns the size
   margin: 0;
   overflow-wrap: anywhere;
   color: var(--pool-text);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
 }
 
 .pool-service-health-strip {
   display: flex;
   align-items: center;
-  gap: 14px;
-  margin-bottom: 12px;
-  padding: 10px 0;
+  gap: var(--pool-space-3);
+  margin-bottom: var(--pool-space-3);
+  padding: var(--pool-space-2) 0;
   border: 0;
   border-block: 1px solid var(--pool-border);
   border-radius: 0;
@@ -2124,7 +2150,7 @@ so the mark owns the size
 .pool-service-health-strip__items {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--pool-space-3);
   flex-wrap: wrap;
   min-width: 0;
 }
@@ -2132,32 +2158,32 @@ so the mark owns the size
 .pool-service-health-strip__item {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--pool-space-1);
   min-width: 0;
 }
 
 .pool-egress-wizard {
   display: grid;
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .pool-egress-quickstart,
 .pool-registration-quickstart .pool-card-body {
   display: grid;
   grid-template-columns: minmax(260px, .72fr) minmax(360px, 1.28fr);
-  gap: 18px;
+  gap: var(--pool-space-4);
   align-items: start;
 }
 
 .pool-registration-quickstart {
-  padding: 18px 0;
+  padding: var(--pool-space-4) 0;
   border-block: 1px solid var(--pool-border);
   background: transparent;
 }
 
 .pool-egress-quickstart {
-  margin-bottom: 16px;
-  padding: 18px 0;
+  margin-bottom: var(--pool-space-4);
+  padding: var(--pool-space-4) 0;
   border: 0;
   border-block: 1px solid var(--pool-border);
   border-radius: 0;
@@ -2166,31 +2192,31 @@ so the mark owns the size
 
 .pool-egress-quickstart h2,
 .pool-registration-quickstart h2 {
-  margin: 9px 0 7px;
+  margin: var(--pool-space-2) 0 var(--pool-space-2);
   color: var(--pool-text);
-  font-size: 18px;
+  font-size: var(--pool-type-title-3);
 }
 
 .pool-egress-quickstart p,
 .pool-registration-quickstart p {
   margin: 0;
   color: var(--pool-text-2);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   line-height: 1.6;
 }
 
 .pool-registration-quickstart__copy > div:last-child {
   display: flex;
   flex-wrap: wrap;
-  gap: 7px;
-  margin-top: 13px;
+  gap: var(--pool-space-2);
+  margin-top: var(--pool-space-3);
 }
 
 .pool-egress-template-grid,
 .pool-egress-form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+  gap: var(--pool-space-2);
 }
 
 .pool-egress-template-grid {
@@ -2199,16 +2225,16 @@ so the mark owns the size
 
 .pool-egress-template {
   display: grid;
-  gap: 4px;
+  gap: var(--pool-space-1);
   min-height: 76px;
-  padding: 10px;
+  padding: var(--pool-space-2);
   text-align: left;
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-md);
   background: var(--pool-bg-surface);
   color: var(--pool-text);
   cursor: pointer;
-  transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
+  transition: border-color var(--pool-motion-fast) var(--pool-ease-standard), box-shadow var(--pool-motion-fast) var(--pool-ease-standard), background var(--pool-motion-fast) var(--pool-ease-standard);
 }
 
 .pool-egress-template:hover {
@@ -2227,7 +2253,7 @@ so the mark owns the size
 
 .pool-egress-template__desc {
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: 1.35;
 }
 
@@ -2235,15 +2261,15 @@ so the mark owns the size
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--pool-space-2);
   min-height: 34px;
 }
 
 .pool-proxy-parser {
   display: grid;
-  gap: 8px;
-  margin-top: -4px;
-  padding: 10px 12px;
+  gap: var(--pool-space-2);
+  margin-top: calc(var(--pool-space-1) * -1);
+  padding: var(--pool-space-2) var(--pool-space-3);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-md);
   background: var(--pool-bg-surface-2);
@@ -2253,22 +2279,22 @@ so the mark owns the size
 .pool-proxy-parser__result {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--pool-space-2);
   min-width: 0;
   flex-wrap: wrap;
 }
 
 .pool-proxy-parser__formats > span {
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-proxy-parser__formats code {
-  padding: 2px 6px;
+  padding: 2px var(--pool-space-1); /* optical: 2px vertical inset on inline `code`; 4px would break the surrounding line box */
   border-radius: 7px;
   background: color-mix(in srgb, var(--pool-bg-elevated) 76%, transparent);
   color: var(--pool-text-2);
-  font-size: 10px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-proxy-parser__result .pool-typography {
@@ -2281,15 +2307,15 @@ so the mark owns the size
 .pool-egress-test-result {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--pool-space-2);
   min-width: 0;
 }
 
 .pool-egress-test-warning,
 .pool-egress-next-step {
   display: grid;
-  gap: 8px;
-  padding: 10px 12px;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-2) var(--pool-space-3);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-md);
   background: var(--pool-bg-surface-2);
@@ -2301,33 +2327,33 @@ so the mark owns the size
 
 .pool-egress-advanced {
   display: grid;
-  gap: 10px;
-  padding-top: 4px;
+  gap: var(--pool-space-2);
+  padding-top: var(--pool-space-1);
 }
 
 .pool-task-detail {
   display: grid;
-  gap: 16px;
+  gap: var(--pool-space-4);
 }
 
 .pool-task-detail__head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .pool-task-detail__grid,
 .pool-kv-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px 14px;
+  gap: var(--pool-space-2) var(--pool-space-3);
 }
 
 .pool-task-detail__grid div,
 .pool-kv-grid div {
   min-width: 0;
-  padding: 10px;
+  padding: var(--pool-space-2);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-sm);
   background: var(--pool-bg-surface-2);
@@ -2335,9 +2361,9 @@ so the mark owns the size
 
 .pool-task-detail__grid dt,
 .pool-kv-grid dt {
-  margin-bottom: 4px;
+  margin-bottom: var(--pool-space-1);
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-task-detail__grid dd,
@@ -2352,8 +2378,8 @@ so the mark owns the size
    sentence, and half the drawer's width would wrap it into six lines inside a bordered cell
    that every other row uses for a single value. */
 .pool-task-detail__failure {
-  margin-top: 12px;
-  padding: 12px;
+  margin-top: var(--pool-space-3);
+  padding: var(--pool-space-3);
   border: 1px solid color-mix(in srgb, var(--pool-danger) 32%, var(--pool-border));
   border-radius: var(--pool-radius-sm);
   background: color-mix(in srgb, var(--pool-danger) 7%, var(--pool-bg-surface-2));
@@ -2361,23 +2387,23 @@ so the mark owns the size
 
 .pool-task-detail__failure-label {
   display: block;
-  margin-bottom: 4px;
+  margin-bottom: var(--pool-space-1);
   color: var(--pool-danger);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   font-weight: 600;
 }
 
 .pool-task-detail__failure p {
   margin: 0;
   color: var(--pool-text);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   line-height: var(--pool-leading-body);
   overflow-wrap: anywhere;
 }
 
 .pool-log-stream {
   display: grid;
-  gap: 10px;
+  gap: var(--pool-space-2);
 }
 
 .pool-log-stream__state {
@@ -2387,7 +2413,7 @@ so the mark owns the size
 
 .pool-log-stream__lines {
   display: grid;
-  gap: 6px;
+  gap: var(--pool-space-1);
   line-height: 1.65;
   white-space: pre-wrap;
 }
@@ -2395,16 +2421,9 @@ so the mark owns the size
 .pool-log-stream__line {
   display: flex;
   align-items: baseline;
-  gap: 7px;
+  gap: var(--pool-space-2);
   min-width: 0;
   overflow-wrap: anywhere;
-}
-
-@media (max-width: 1000px) {
-  .pool-grid.cols-3,
-.pool-grid.cols-2 {
-    grid-template-columns: 1fr;
-  }
 }
 
 @media (max-width: 640px) {
@@ -2435,7 +2454,7 @@ so the mark owns the size
   }
 
   .pool-account-menu-button {
-    padding: 0 6px;
+    padding: 0 var(--pool-space-1);
   }
 
   .pool-cache-breakdown__head {
@@ -2468,7 +2487,7 @@ so the mark owns the size
 
   .pool-field--left .pool-field__label {
     text-align: left;
-    margin: 0 0 6px;
+    margin: 0 0 var(--pool-space-1);
   }
 
   .pool-table {
@@ -2494,7 +2513,7 @@ so the mark owns the size
 
   .pool-table--cards tbody {
     display: grid;
-    gap: 10px;
+    gap: var(--pool-space-2);
   }
 
   .pool-table--cards tbody tr {
@@ -2517,10 +2536,10 @@ so the mark owns the size
   .pool-table--cards td {
     display: grid;
     grid-template-columns: minmax(86px, 34%) minmax(0, 1fr);
-    gap: 12px;
+    gap: var(--pool-space-3);
     align-items: start;
     border-bottom: 1px solid var(--pool-border);
-    padding: 10px 14px;
+    padding: var(--pool-space-2) var(--pool-space-3);
     overflow-wrap: anywhere;
   }
 
@@ -2531,7 +2550,7 @@ so the mark owns the size
   .pool-table--cards td::before {
     content: attr(data-label);
     color: var(--pool-text-3);
-    font-size: 12px;
+    font-size: var(--pool-type-caption);
     font-weight: 650;
     line-height: 1.5;
   }
@@ -2558,7 +2577,7 @@ so the mark owns the size
 /* Upstream error rules */
 .upstream-rules-page {
   display: grid;
-  gap: 18px;
+  gap: var(--pool-space-4);
 }
 
 .upstream-rule-card,
@@ -2577,7 +2596,7 @@ so the mark owns the size
 .upstream-rule-note,
 .upstream-rule-natural {
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: 1.55;
 }
 
@@ -2592,13 +2611,13 @@ so the mark owns the size
   border-block: 1px solid var(--pool-border);
   color: var(--pool-text-2);
   border-radius: 0;
-  padding: 28px;
+  padding: var(--pool-space-7);
   text-align: start;
   background: transparent;
 }
 
 .upstream-rule-card {
-  padding: 14px 0;
+  padding: var(--pool-space-3) 0;
   border-bottom: 1px solid var(--pool-border);
 }
 
@@ -2606,10 +2625,10 @@ so the mark owns the size
    grid that already reads in columns, not a heading, so they sit at the size of the meta text
    they label and never compete with the rule names. */
 .upstream-rule-head {
-  padding-bottom: 8px;
+  padding-bottom: var(--pool-space-2);
   border-bottom: 1px solid var(--pool-border);
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   font-weight: 600;
   letter-spacing: 0.04em;
 }
@@ -2621,7 +2640,7 @@ so the mark owns the size
 .upstream-rule-row {
   display: grid;
   grid-template-columns: 64px minmax(180px, 1.3fr) minmax(180px, 1fr) minmax(170px, 0.9fr) auto;
-  gap: 14px;
+  gap: var(--pool-space-3);
   /* Centring every cell only looks right while all five are one line tall. Once a long rule
      name wraps the row to three lines, the priority number floats to the middle of it and ends
      up beside the scope chips rather than beside the name it numbers, and each column's first
@@ -2643,7 +2662,7 @@ so the mark owns the size
   height: auto;
   min-height: 0;
   place-items: start center;
-  padding-top: 1px;
+  padding-top: 1px; /* optical: 1px top inset optically centres the priority number against the row baseline */
 }
 
 .upstream-rule-priority {
@@ -2664,13 +2683,13 @@ so the mark owns the size
 .upstream-rule-scope-pills {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--pool-space-2);
   flex-wrap: wrap;
 }
 
 .upstream-rule-title strong {
   color: var(--pool-text);
-  font-size: 15px;
+  font-size: var(--pool-type-body);
   /* Rule names and model patterns are free text, and an unbreakable one used to print straight
      across the next column. Measured at 1280px: a 120-char token ended at x=1117 while the
      condition column's text starts at x=548 -- 569px of text sitting on text, and past ~200 chars
@@ -2702,17 +2721,17 @@ so the mark owns the size
    overflow-wrap on the children already binds first. */
 .upstream-rule-main {
   display: grid;
-  gap: 6px;
+  gap: var(--pool-space-1);
 }
 
 .upstream-rule-meta {
   display: flex;
-  gap: 8px;
+  gap: var(--pool-space-2);
   flex-wrap: wrap;
 }
 
 .upstream-rule-meta span {
-  padding: 1px 8px;
+  padding: 1px var(--pool-space-2); /* optical: 1px vertical inset on a hairline-separated meta span, not a spacing step */
   border-inline-start: 1px solid var(--pool-border-strong);
   border-radius: 0;
   background: transparent;
@@ -2722,58 +2741,58 @@ so the mark owns the size
 
 .upstream-rule-condition {
   display: grid;
-  gap: 4px;
+  gap: var(--pool-space-1);
   min-width: 0;
 }
 
 .upstream-rule-condition b {
   color: var(--pool-text);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 /* Indented to the title column: 64px priority track plus the row's 14px gap. Left at the
    card's own edge it began 78px to the left of every other thing in the card, reading as a
    stray link between two rules rather than as this rule's disclosure. */
 .upstream-rule-summary {
-  margin-top: 12px;
-  margin-inline-start: 78px;
+  margin-top: var(--pool-space-3);
+  margin-inline-start: var(--pool-space-20);
   border: 0;
   background: transparent;
   color: var(--pool-accent);
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   padding: 0;
 }
 
 .upstream-rule-natural {
-  margin: 8px 0 0 78px;
-  padding: 4px 0 4px 12px;
+  margin: var(--pool-space-2) 0 0 var(--pool-space-20);
+  padding: var(--pool-space-1) 0 var(--pool-space-1) var(--pool-space-3);
   border-inline-start: 2px solid var(--pool-border-strong);
   border-radius: 0;
   background: transparent;
 }
 
 .upstream-rule-test-panel {
-  padding: 18px 0;
+  padding: var(--pool-space-4) 0;
   border-bottom: 1px solid var(--pool-border);
 }
 
 .upstream-rule-section-head h2 {
   margin: 0;
   color: var(--pool-text);
-  font-size: 18px;
+  font-size: var(--pool-type-title-3);
   letter-spacing: -0.02em;
 }
 
 .upstream-rule-section-head p {
-  margin: 5px 0 0;
+  margin: var(--pool-space-1) 0 0;
 }
 
 .upstream-rule-test-grid {
-  margin-top: 14px;
+  margin-top: var(--pool-space-3);
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr)) auto;
-  gap: 12px 10px;
+  gap: var(--pool-space-3) var(--pool-space-2);
   /* Labels make the fields two rows tall, so the run button aligns to the bottom of
      its row rather than floating level with the labels. */
   align-items: end;
@@ -2781,10 +2800,10 @@ so the mark owns the size
 
 .upstream-rule-test-grid label {
   display: grid;
-  gap: 7px;
+  gap: var(--pool-space-2);
   min-width: 0;
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .upstream-rule-test-body {
@@ -2796,8 +2815,8 @@ so the mark owns the size
 }
 
 .upstream-rule-preview {
-  margin: 14px 0 0;
-  padding: 14px;
+  margin: var(--pool-space-3) 0 0;
+  padding: var(--pool-space-3);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-sm);
   background: var(--pool-bg-surface-2);
@@ -2813,7 +2832,7 @@ so the mark owns the size
 
 .upstream-rule-form {
   display: grid;
-  gap: 18px;
+  gap: var(--pool-space-4);
 }
 
 .upstream-rule-form section,
@@ -2821,34 +2840,34 @@ so the mark owns the size
   border: 0;
   border-top: 1px solid var(--pool-border);
   border-radius: 0;
-  padding: 16px 0;
+  padding: var(--pool-space-4) 0;
   background: transparent;
 }
 
 .upstream-rule-form h3 {
-  margin: 0 0 12px;
+  margin: 0 0 var(--pool-space-3);
   color: var(--pool-text);
-  font-size: 15px;
+  font-size: var(--pool-type-body);
 }
 
 .upstream-rule-form-grid,
 .upstream-rule-cascade {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .upstream-rule-cascade {
-  margin-top: 12px;
+  margin-top: var(--pool-space-3);
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .upstream-rule-form label,
 .upstream-rule-cascade label {
   display: grid;
-  gap: 7px;
+  gap: var(--pool-space-2);
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .upstream-rule-scope-pills {
@@ -2860,7 +2879,7 @@ so the mark owns the size
   background: var(--pool-bg-surface-2);
   color: var(--pool-text-2);
   border-radius: var(--pool-radius-xs);
-  padding: 6px 10px;
+  padding: var(--pool-space-1) var(--pool-space-2);
   cursor: pointer;
 }
 
@@ -2872,7 +2891,7 @@ so the mark owns the size
 
 .upstream-rule-note {
   margin: 0;
-  padding: 4px 0 4px 12px;
+  padding: var(--pool-space-1) 0 var(--pool-space-1) var(--pool-space-3);
   border-inline-start: 2px solid var(--pool-info);
   border-radius: 0;
   background: transparent;
@@ -2881,7 +2900,7 @@ so the mark owns the size
 
 .upstream-rule-note > summary {
   color: var(--pool-text);
-  font-size: 12.5px;
+  font-size: var(--pool-type-caption);
   font-weight: 600;
   line-height: 1.55;
   cursor: pointer;
@@ -2890,7 +2909,7 @@ so the mark owns the size
   list-style: none;
   display: flex;
   align-items: baseline;
-  gap: 7px;
+  gap: var(--pool-space-2);
 }
 
 .upstream-rule-note > summary::-webkit-details-marker {
@@ -2902,7 +2921,7 @@ so the mark owns the size
   flex: 0 0 auto;
   width: 5px;
   height: 5px;
-  margin-top: 5px;
+  margin-top: var(--pool-space-1);
   border-inline-end: 1.5px solid var(--pool-text-3);
   border-block-end: 1.5px solid var(--pool-text-3);
   transform: rotate(-45deg);
@@ -2920,7 +2939,7 @@ so the mark owns the size
 }
 
 .upstream-rule-note > p {
-  margin: 9px 0 0;
+  margin: var(--pool-space-2) 0 0;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -2964,7 +2983,7 @@ so the mark owns the size
   }
 
   .upstream-rule-row {
-    gap: 10px;
+    gap: var(--pool-space-2);
   }
 }
 
@@ -2972,7 +2991,7 @@ so the mark owns the size
 .pool-page-title {
   margin: 0;
   color: var(--pool-text);
-  font-size: 24px;
+  font-size: var(--pool-type-title-2);
   font-weight: 720;
   line-height: 1.4;
   letter-spacing: -0.026em;
@@ -2981,7 +3000,7 @@ so the mark owns the size
 .pool-button {
   min-height: 36px;
   height: auto;
-  padding-block: 7px;
+  padding-block: var(--pool-space-2);
   border-radius: var(--pool-radius-sm);
   background: var(--pool-bg-surface-2);
   transition:
@@ -3028,14 +3047,14 @@ so the mark owns the size
 
 .pool-button--small {
   min-height: 30px;
-  padding: 0 10px;
-  font-size: 12px;
+  padding: 0 var(--pool-space-2);
+  font-size: var(--pool-type-caption);
 }
 
 .pool-button--large {
   min-height: 40px;
-  padding: 0 18px;
-  font-size: 15px;
+  padding: 0 var(--pool-space-4);
+  font-size: var(--pool-type-body);
 }
 
 .pool-icon-button,
@@ -3071,20 +3090,20 @@ so the mark owns the size
 .pool-card,
 .pool-panel,
 .pool-chart-card {
-  padding: 18px 0;
+  padding: var(--pool-space-4) 0;
 }
 
 .pool-panel-head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 14px;
+  gap: var(--pool-space-3);
+  margin-bottom: var(--pool-space-3);
 }
 
 .pool-chart-card .t,
 .pool-section-title {
-  font-size: 17px;
+  font-size: var(--pool-type-callout);
   font-weight: 680;
   letter-spacing: -0.018em;
 }
@@ -3095,7 +3114,7 @@ so the mark owns the size
 
 .pool-stat {
   min-height: 96px;
-  padding: 15px 16px;
+  padding: var(--pool-space-4);
   border: 0;
   border-inline-start: 1px solid var(--pool-border);
   border-radius: 0;
@@ -3119,19 +3138,19 @@ so the mark owns the size
 
 .pool-stat .label {
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   font-weight: 650;
 }
 
 .pool-stat .value {
-  margin-top: 10px;
-  font-size: clamp(22px, 3vw, 30px);
+  margin-top: var(--pool-space-2);
+  font-size: clamp(var(--pool-type-title-2), 3vw, var(--pool-type-title-1));
   font-weight: 760;
   letter-spacing: -0.03em;
 }
 
 .pool-stat .sub {
-  margin-top: 4px;
+  margin-top: var(--pool-space-1);
   color: var(--pool-text-2);
 }
 
@@ -3147,9 +3166,9 @@ so the mark owns the size
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
+  gap: var(--pool-space-2);
   flex-wrap: wrap;
-  margin-bottom: 14px;
+  margin-bottom: var(--pool-space-3);
   padding: 0;
   border: 0;
 }
@@ -3177,7 +3196,7 @@ so the mark owns the size
 
 .pool-field__label {
   color: var(--pool-text-2);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   font-weight: 600;
 }
 
@@ -3223,7 +3242,7 @@ so the mark owns the size
 .pool-table td {
   height: var(--pool-table-row-height, 56px);
   border-bottom-color: var(--pool-border);
-  padding: 10px 14px;
+  padding: var(--pool-space-2) var(--pool-space-3);
   overflow-wrap: normal;
 }
 
@@ -3231,7 +3250,7 @@ so the mark owns the size
   height: 40px;
   background: color-mix(in srgb, var(--pool-bg-surface-2) 86%, transparent);
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   letter-spacing: 0.01em;
 }
 
@@ -3276,7 +3295,7 @@ so the mark owns the size
 }
 
 .pool-table-empty {
-  padding: 22px;
+  padding: var(--pool-space-5);
   text-align: center;
 }
 
@@ -3307,8 +3326,8 @@ so the mark owns the size
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 12px 2px 0;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-3) 2px 0; /* optical: 2px side inset keeps the pager flush with the mobile list edge */
   color: var(--pool-text-2);
 }
 
@@ -3316,10 +3335,10 @@ so the mark owns the size
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 12px;
+  gap: var(--pool-space-3);
   width: 100%;
   min-width: 0;
-  padding: 12px 14px;
+  padding: var(--pool-space-3);
 }
 
 .pool-mobile-row__avatar {
@@ -3344,7 +3363,7 @@ so the mark owns the size
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--pool-space-2);
 }
 
 .pool-mobile-row__title {
@@ -3361,7 +3380,7 @@ so the mark owns the size
   display: inline-flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 5px;
+  gap: var(--pool-space-1);
   min-width: 0;
   flex-wrap: wrap;
 }
@@ -3384,8 +3403,8 @@ so the mark owns the size
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: baseline;
-  gap: 6px 10px;
-  padding: 14px 16px;
+  gap: var(--pool-space-1) var(--pool-space-2);
+  padding: var(--pool-space-3) var(--pool-space-4);
   border: 0;
   border-inline-start: 1px solid var(--pool-border);
   border-radius: 0;
@@ -3478,7 +3497,7 @@ so the mark owns the size
   align-content: start;
   grid-template-columns: minmax(0, 1fr);
   align-items: start;
-  gap: 8px;
+  gap: var(--pool-space-2);
   min-height: 88px;
 }
 
@@ -3489,7 +3508,7 @@ so the mark owns the size
 
 .pool-metric-rail--band .pool-metric-card__value strong {
   color: var(--pool-text);
-  font-size: 24px;
+  font-size: var(--pool-type-title-2);
   line-height: 1;
   letter-spacing: -0.035em;
 }
@@ -3536,7 +3555,7 @@ so the mark owns the size
 
 .pool-responsive-summary {
   display: grid;
-  gap: 10px;
+  gap: var(--pool-space-2);
 }
 
 .pool-responsive-summary__open {
@@ -3552,13 +3571,13 @@ so the mark owns the size
 
 .pool-responsive-summary__actions {
   display: flex;
-  gap: 8px;
+  gap: var(--pool-space-2);
   overflow-x: auto;
 }
 
 .pool-metric-card__detail {
   grid-column: 1 / -1;
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-metric-card__value,
@@ -3581,7 +3600,7 @@ so the mark owns the size
 }
 
 .pool-email-metrics .pool-metric-card {
-  padding: 14px 16px;
+  padding: var(--pool-space-3) var(--pool-space-4);
   border: 0;
   border-inline-start: 1px solid var(--pool-border);
   border-radius: 0;
@@ -3601,7 +3620,7 @@ so the mark owns the size
   display: flex;
   flex: 1 1 auto;
   align-items: center;
-  gap: 8px;
+  gap: var(--pool-space-2);
   min-width: 0;
 }
 
@@ -3657,7 +3676,7 @@ so the mark owns the size
 
 .pool-email-import-help {
   display: block;
-  margin-bottom: 12px;
+  margin-bottom: var(--pool-space-3);
   color: var(--pool-text-2);
   line-height: 1.55;
 }
@@ -3665,7 +3684,7 @@ so the mark owns the size
 .pool-email-import-help code {
   display: inline-block;
   max-width: 100%;
-  margin-top: 5px;
+  margin-top: var(--pool-space-1);
   overflow-wrap: anywhere;
   color: var(--pool-text);
 }
@@ -3680,8 +3699,8 @@ so the mark owns the size
 .pool-email-modal-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
-  margin-top: 16px;
+  gap: var(--pool-space-2);
+  margin-top: var(--pool-space-4);
 }
 
 @media (max-width: 1080px) {
@@ -3729,17 +3748,17 @@ so the mark owns the size
     grid-auto-flow: column;
     grid-auto-columns: minmax(136px, 1fr);
     overflow-x: auto;
-    padding: 1px 1px 7px;
+    padding: 1px 1px var(--pool-space-2); /* optical: 1px side inset prevents the horizontal-scroll container clipping its own focus ring */
   }
 
   .pool-email-metrics .pool-metric-card {
     min-height: 82px;
-    padding: 12px 14px;
+    padding: var(--pool-space-3);
     border-top: 0;
   }
 
   .pool-mobile-list.pool-email-table {
-    gap: 10px;
+    gap: var(--pool-space-2);
     padding: 0;
     border: 0;
   }
@@ -3758,13 +3777,13 @@ so the mark owns the size
       "select main"
       "actions actions";
     align-items: start;
-    column-gap: 12px;
-    row-gap: 10px;
+    column-gap: var(--pool-space-3);
+    row-gap: var(--pool-space-2);
   }
 
   .pool-email-table .pool-mobile-row > input[type='checkbox'] {
     grid-area: select;
-    margin-top: 3px;
+    margin-top: 3px; /* optical: 3px top inset optically centres the checkbox against the first text line */
   }
 
   .pool-email-table .pool-mobile-row__main {
@@ -3792,7 +3811,7 @@ so the mark owns the size
 
 .pool-mobile-row__subtitle {
   display: block;
-  margin-top: 3px;
+  margin-top: 3px; /* optical: 3px baseline gap between mobile row title and subtitle */
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3801,9 +3820,9 @@ so the mark owns the size
 .pool-mobile-row__details {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--pool-space-1);
   flex-wrap: wrap;
-  margin-top: 8px;
+  margin-top: var(--pool-space-2);
 }
 
 .pool-mobile-row__detail {
@@ -3817,7 +3836,7 @@ so the mark owns the size
 .pool-mobile-row__value {
   max-width: 100%;
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-mobile-row__actions {
@@ -3833,8 +3852,8 @@ so the mark owns the size
 
 .pool-diagnostic-card {
   display: grid;
-  gap: 10px;
-  padding: 14px 0;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-3) 0;
   border-bottom: 1px solid var(--pool-border);
 }
 
@@ -3854,7 +3873,7 @@ so the mark owns the size
 
 .pool-diagnostic-card__item {
   min-width: 0;
-  padding: 8px 10px;
+  padding: var(--pool-space-2);
   border-inline-start: 1px solid var(--pool-border);
   border-radius: 0;
   background: transparent;
@@ -3867,16 +3886,16 @@ so the mark owns the size
 .pool-diagnostic-card__label {
   display: block;
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-diagnostic-card__value {
   display: block;
   min-width: 0;
-  margin-top: 3px;
+  margin-top: 3px; /* optical: 3px baseline gap between diagnostic label and value (one text block) */
   overflow: hidden;
   color: var(--pool-text);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3913,12 +3932,12 @@ so the mark owns the size
 
 .pool-modal-header,
 .pool-drawer-header {
-  padding: 16px 18px 14px;
+  padding: var(--pool-space-4) var(--pool-space-4) var(--pool-space-3);
 }
 
 .pool-modal-title,
 .pool-drawer-title {
-  font-size: 17px;
+  font-size: var(--pool-type-callout);
   font-weight: 720;
   letter-spacing: -0.018em;
 }
@@ -3926,12 +3945,12 @@ so the mark owns the size
 .pool-modal-body,
 .pool-drawer-body {
   overflow: auto;
-  padding: 18px;
+  padding: var(--pool-space-4);
 }
 
 .pool-modal-footer,
 .pool-drawer-footer {
-  padding: 12px 18px max(12px, env(safe-area-inset-bottom));
+  padding: var(--pool-space-3) var(--pool-space-4) max(var(--pool-space-3), env(safe-area-inset-bottom));
   background: color-mix(in srgb, var(--pool-bg-elevated) 92%, transparent);
 }
 
@@ -3947,15 +3966,15 @@ so the mark owns the size
 .pool-banner__actions {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 10px;
+  gap: var(--pool-space-2);
+  margin-top: var(--pool-space-2);
 }
 
 .pool-load-error {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .pool-toast-viewport {
@@ -3968,9 +3987,9 @@ so the mark owns the size
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: start;
-  gap: 10px;
+  gap: var(--pool-space-2);
   border-radius: var(--pool-radius-lg);
-  padding: 12px;
+  padding: var(--pool-space-3);
   animation: pool-toast-in var(--pool-motion-slow) var(--pool-motion-ease);
 }
 
@@ -3980,7 +3999,7 @@ so the mark owns the size
   display: inline-grid;
   place-items: center;
   border-radius: 999px;
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   font-weight: 800;
 }
 
@@ -3995,7 +4014,7 @@ so the mark owns the size
 
 .pool-toast__title {
   display: block;
-  margin-bottom: 2px;
+  margin-bottom: 2px; /* optical: 2px baseline gap between toast title and body */
 }
 
 .pool-toast__close {
@@ -4005,8 +4024,8 @@ so the mark owns the size
 }
 
 .pool-tabs-list {
-  gap: 4px;
-  padding: 0 0 5px;
+  gap: var(--pool-space-1);
+  padding: 0 0 var(--pool-space-1);
   border: 0;
   border-bottom: 1px solid var(--pool-border);
   border-radius: 0;
@@ -4014,7 +4033,7 @@ so the mark owns the size
 }
 
 .pool-tabs--left .pool-tabs-list {
-  padding: 0 10px 0 0;
+  padding: 0 var(--pool-space-2) 0 0;
   border: 0;
   border-right: 1px solid var(--pool-border);
   background: transparent;
@@ -4023,7 +4042,7 @@ so the mark owns the size
 .pool-tab-trigger {
   min-height: 34px;
   border-radius: var(--pool-radius-md);
-  padding: 7px 12px;
+  padding: var(--pool-space-2) var(--pool-space-3);
   transition: background-color var(--pool-motion-fast) var(--pool-motion-ease), color var(--pool-motion-fast) var(--pool-motion-ease);
 }
 
@@ -4034,16 +4053,16 @@ so the mark owns the size
 }
 
 .pool-nav {
-  padding: 12px 8px;
+  padding: var(--pool-space-3) var(--pool-space-2);
 }
 
 .pool-nav-section {
-  margin-bottom: 8px;
+  margin-bottom: var(--pool-space-2);
 }
 
 .pool-nav-group-label {
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   font-weight: 700;
   letter-spacing: 0.02em;
   text-transform: none;
@@ -4075,8 +4094,8 @@ so the mark owns the size
 .pool-empty {
   display: grid;
   justify-items: center;
-  gap: 8px;
-  padding: 36px 18px;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-9) var(--pool-space-4);
   color: var(--pool-text-2);
   text-align: center;
 }
@@ -4100,14 +4119,14 @@ so the mark owns the size
 
 .pool-empty-title {
   color: var(--pool-text);
-  font-size: 15px;
+  font-size: var(--pool-type-body);
   font-weight: 700;
 }
 
 .pool-empty-desc {
   max-width: 360px;
   color: var(--pool-text-2);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
 }
 
 .pool-skel {
@@ -4122,7 +4141,7 @@ so the mark owns the size
   inset: 0;
   transform: translateX(-100%);
   background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--pool-bg-elevated) 40%, transparent), transparent);
-  animation: pool-skeleton 1.2s ease-in-out infinite;
+  animation: pool-skeleton 1.2s var(--pool-ease-linear) infinite;
 }
 
 .pool-skeleton-table {
@@ -4146,11 +4165,11 @@ so the mark owns the size
 
 .pool-key-actions {
   display: grid;
-  gap: 8px;
+  gap: var(--pool-space-2);
 }
 
 .pool-key-actions.is-compact .pool-inline {
-  gap: 4px !important;
+  gap: var(--pool-space-1) !important;
 }
 
 .pool-key-mask,
@@ -4166,15 +4185,15 @@ so the mark owns the size
 .pool-key-mobile-cell {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 12px;
+  gap: var(--pool-space-3);
   align-items: center;
-  padding: 12px 14px;
+  padding: var(--pool-space-3);
 }
 
 .pool-key-mobile-info {
   min-width: 0;
   display: grid;
-  gap: 5px;
+  gap: var(--pool-space-1);
 }
 
 .pool-key-mobile-title {
@@ -4188,13 +4207,13 @@ so the mark owns the size
 .pool-key-mobile-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--pool-space-1);
   flex-wrap: wrap;
 }
 
 .pool-key-created {
-  margin-bottom: 16px;
-  padding: 14px;
+  margin-bottom: var(--pool-space-4);
+  padding: var(--pool-space-3);
   border: 1px solid var(--pool-success-soft);
   border-radius: var(--pool-radius-lg);
   background: var(--pool-success-soft);
@@ -4205,13 +4224,13 @@ so the mark owns the size
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: var(--pool-space-2);
 }
 
 .pool-key-reveal {
   display: grid;
-  gap: 10px;
-  margin-top: 10px;
+  gap: var(--pool-space-2);
+  margin-top: var(--pool-space-2);
 }
 
 .pool-key-reveal__warning {
@@ -4226,7 +4245,7 @@ so the mark owns the size
 }
 
 .pool-copy-code {
-  padding: 8px 10px;
+  padding: var(--pool-space-2);
   border-radius: var(--pool-radius-sm);
   background: var(--pool-bg-surface);
 }
@@ -4266,8 +4285,8 @@ so the mark owns the size
   min-width: 0;
   flex-direction: column;
   justify-content: center;
-  gap: 32px;
-  padding: 48px clamp(40px, 7vw, 112px);
+  gap: var(--pool-space-8);
+  padding: var(--pool-space-12) clamp(var(--pool-space-10), 7vw, var(--pool-space-24));
   /*
    * A soft field, not a sticker.
    *
@@ -4298,9 +4317,9 @@ so the mark owns the size
 .pool-login-wordmark {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--pool-space-2);
   color: var(--pool-text);
-  font-size: 15px;
+  font-size: var(--pool-type-body);
   font-weight: 700;
 }
 
@@ -4315,9 +4334,9 @@ so the mark owns the size
 
 .pool-login-eyebrow {
   display: block;
-  margin-bottom: 12px;
+  margin-bottom: var(--pool-space-3);
   color: var(--pool-brand-secondary);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   font-weight: 700;
   letter-spacing: .06em;
   text-transform: uppercase;
@@ -4344,9 +4363,9 @@ so the mark owns the size
 
 .pool-login-copy p {
   max-width: 620px;
-  margin: 18px 0 0;
+  margin: var(--pool-space-4) 0 0;
   color: var(--pool-text-2);
-  font-size: 17px;
+  font-size: var(--pool-type-callout);
   line-height: 1.6;
 }
 
@@ -4363,12 +4382,12 @@ so the mark owns the size
   display: flex;
   min-height: 46px;
   align-items: center;
-  gap: 9px;
-  padding: 0 16px;
+  gap: var(--pool-space-2);
+  padding: 0 var(--pool-space-4);
   background: var(--pool-bg-surface-2);
   border-bottom: 1px solid var(--pool-border);
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   font-weight: 650;
 }
 
@@ -4381,26 +4400,26 @@ so the mark owns the size
 
 .pool-login-preview__bar > b {
   margin-left: auto;
-  padding: 3px 8px;
+  padding: 3px var(--pool-space-2); /* optical: 3px vertical inset on the live badge inside the login preview bar */
   background: var(--pool-success-soft);
   border-radius: var(--pool-radius-pill);
   color: var(--pool-success);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-login-preview__body {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 16px;
-  padding: 18px;
+  gap: var(--pool-space-4);
+  padding: var(--pool-space-4);
 }
 
 .pool-login-preview__usage,
 .pool-login-preview__code {
   display: grid;
   min-width: 0;
-  gap: 10px;
-  padding: 16px;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-4);
   background: var(--pool-bg-surface-2);
   border: 1px solid var(--pool-border-subtle);
   border-radius: var(--pool-radius-card);
@@ -4409,12 +4428,12 @@ so the mark owns the size
 .pool-login-preview__usage > span,
 .pool-login-preview__code > span {
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-login-preview__usage > strong {
   font-family: var(--pool-font-mono);
-  font-size: 18px;
+  font-size: var(--pool-type-title-3);
   font-weight: 600;
 }
 
@@ -4436,7 +4455,7 @@ so the mark owns the size
 .pool-login-preview__code code {
   color: var(--pool-text);
   font-family: var(--pool-font-mono);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   overflow-wrap: anywhere;
 }
 
@@ -4444,7 +4463,7 @@ so the mark owns the size
   display: grid;
   width: min(700px, 100%);
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 18px;
+  gap: var(--pool-space-4);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -4454,7 +4473,7 @@ so the mark owns the size
   display: flex;
   min-width: 0;
   align-items: flex-start;
-  gap: 10px;
+  gap: var(--pool-space-2);
   color: var(--pool-text-2);
 }
 
@@ -4472,13 +4491,13 @@ so the mark owns the size
 
 .pool-login-trust b {
   color: var(--pool-text);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
 }
 
 .pool-login-trust small {
-  margin-top: 3px;
+  margin-top: 3px; /* optical: 3px baseline gap under the login trust footnote */
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   line-height: 1.45;
 }
 
@@ -4486,7 +4505,7 @@ so the mark owns the size
   display: grid;
   min-width: 0;
   place-items: center;
-  padding: 40px clamp(28px, 5vw, 72px);
+  padding: var(--pool-space-10) clamp(var(--pool-space-7), 5vw, var(--pool-space-16));
   /* Transparent, so the field runs unbroken across both columns and the card reads
      as floating on it rather than as the second of two flat panels. */
   position: relative;
@@ -4496,7 +4515,7 @@ so the mark owns the size
 
 .pool-login-card {
   width: min(440px, 100%);
-  padding: 32px;
+  padding: var(--pool-space-8);
   background: var(--pool-glass-bg-strong);
   backdrop-filter: var(--pool-material-blur);
   -webkit-backdrop-filter: var(--pool-material-blur);
@@ -4508,8 +4527,8 @@ so the mark owns the size
 .pool-login-form-head {
   display: flex;
   align-items: flex-start;
-  gap: 13px;
-  margin-bottom: 24px;
+  gap: var(--pool-space-3);
+  margin-bottom: var(--pool-space-6);
 }
 
 .pool-login-form-icon {
@@ -4531,24 +4550,24 @@ so the mark owns the size
 
 .pool-login-form-head h2 {
   margin: 0;
-  font-size: 22px;
+  font-size: var(--pool-type-title-2);
   font-weight: 650;
   line-height: 1.25;
 }
 
 .pool-login-form-head p {
-  margin: 5px 0 0;
+  margin: var(--pool-space-1) 0 0;
   color: var(--pool-text-2);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   line-height: 1.5;
 }
 
 .pool-auth-mode {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 4px;
-  margin-bottom: 20px;
-  padding: 4px;
+  gap: var(--pool-space-1);
+  margin-bottom: var(--pool-space-5);
+  padding: var(--pool-space-1);
   background: var(--pool-bg-surface-2);
   border: 1px solid var(--pool-border);
   border-radius: 11px;
@@ -4556,12 +4575,12 @@ so the mark owns the size
 
 .pool-auth-mode button {
   min-height: 36px;
-  padding: 6px 12px;
+  padding: var(--pool-space-1) var(--pool-space-3);
   background: transparent;
   border: 0;
   border-radius: var(--pool-radius-control);
   color: var(--pool-text-2);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   font-weight: 600;
   cursor: pointer;
 }
@@ -4573,39 +4592,39 @@ so the mark owns the size
 }
 
 .pool-login-error {
-  margin: -8px 0 14px;
+  margin: calc(var(--pool-space-2) * -1) 0 var(--pool-space-3);
   color: var(--pool-danger);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
 }
 
 .pool-setup-notice {
   display: grid;
-  gap: 4px;
-  margin: -4px 0 18px;
-  padding: 12px 14px;
+  gap: var(--pool-space-1);
+  margin: calc(var(--pool-space-1) * -1) 0 var(--pool-space-4);
+  padding: var(--pool-space-3);
   background: color-mix(in srgb, var(--pool-action) 8%, var(--pool-bg-surface-2));
   border: 1px solid color-mix(in srgb, var(--pool-action) 28%, var(--pool-border));
   border-radius: var(--pool-radius-control);
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: 1.5;
 }
 
 .pool-setup-notice b {
   color: var(--pool-text);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
 }
 
 .pool-login-secondary {
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
-  gap: 5px;
-  margin-top: 22px;
-  padding-top: 20px;
+  gap: var(--pool-space-1);
+  margin-top: var(--pool-space-5);
+  padding-top: var(--pool-space-5);
   border-top: 1px solid var(--pool-border);
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   text-align: center;
 }
 
@@ -4620,7 +4639,7 @@ so the mark owns the size
 
 @media (max-width: 1024px) {
   .pool-login-story {
-    padding-inline: 40px;
+    padding-inline: var(--pool-space-10);
   }
 
   .pool-login-preview__body {
@@ -4633,12 +4652,12 @@ so the mark owns the size
 
   .pool-login-trust {
     grid-template-columns: minmax(0, 1fr);
-    gap: 10px;
+    gap: var(--pool-space-2);
   }
 
   .pool-login-trust small {
     display: inline;
-    margin: 0 0 0 5px;
+    margin: 0 0 0 var(--pool-space-1);
   }
 }
 
@@ -4649,25 +4668,25 @@ so the mark owns the size
   }
 
   .pool-login-story {
-    gap: 18px;
-    padding: 24px 20px 18px;
+    gap: var(--pool-space-4);
+    padding: var(--pool-space-6) var(--pool-space-5) var(--pool-space-4);
     background: var(--pool-bg-page);
     border: 0;
     border-bottom: 1px solid var(--pool-border);
   }
 
   .pool-login-wordmark {
-    font-size: 13px;
+    font-size: var(--pool-type-label);
   }
 
   .pool-login-copy h1 {
-    font-size: 36px;
+    font-size: var(--pool-type-title-1);
     line-height: 1.2;
   }
 
   .pool-login-copy p {
-    margin-top: 10px;
-    font-size: 15px;
+    margin-top: var(--pool-space-2);
+    font-size: var(--pool-type-body);
   }
 
   .pool-login-preview {
@@ -4676,7 +4695,7 @@ so the mark owns the size
 
   .pool-login-trust {
     display: flex;
-    gap: 14px;
+    gap: var(--pool-space-3);
   }
 
   .pool-login-trust li {
@@ -4689,7 +4708,7 @@ so the mark owns the size
 
   .pool-login-form-column {
     display: block;
-    padding: 22px 20px max(28px, env(safe-area-inset-bottom));
+    padding: var(--pool-space-5) var(--pool-space-5) max(var(--pool-space-7), env(safe-area-inset-bottom));
   }
 
   .pool-login-card {
@@ -4702,7 +4721,7 @@ so the mark owns the size
 
 @media (max-width: 420px) {
   .pool-login-story {
-    padding: 18px 16px 14px;
+    padding: var(--pool-space-4) var(--pool-space-4) var(--pool-space-3);
   }
 
   .pool-login-eyebrow,
@@ -4711,28 +4730,24 @@ so the mark owns the size
     display: none;
   }
 
-  .pool-login-copy h1 {
-    font-size: 32px;
-  }
-
   .pool-login-trust {
     justify-content: space-between;
   }
 
   .pool-login-trust li {
-    gap: 5px;
+    gap: var(--pool-space-1);
   }
 
   .pool-login-trust b {
-    font-size: 11px;
+    font-size: var(--pool-type-caption);
   }
 
   .pool-login-form-column {
-    padding: 18px 16px max(24px, env(safe-area-inset-bottom));
+    padding: var(--pool-space-4) var(--pool-space-4) max(var(--pool-space-6), env(safe-area-inset-bottom));
   }
 
   .pool-login-form-head {
-    margin-bottom: 18px;
+    margin-bottom: var(--pool-space-4);
   }
 }
 
@@ -4742,14 +4757,14 @@ so the mark owns the size
 
 .pool-settings-tabs.pool-tabs--left {
   grid-template-columns: minmax(208px, 228px) minmax(0, 1fr);
-  gap: 24px;
+  gap: var(--pool-space-6);
 }
 
 .pool-settings-tabs.pool-tabs--left > .pool-tabs-list {
   position: sticky;
   top: 76px;
-  gap: 3px;
-  padding: 8px;
+  gap: 3px; /* optical: 3px gap between vertical settings tabs; 4px overflows the sticky rail */
+  padding: var(--pool-space-2);
   border: 1px solid var(--pool-border-subtle);
   border-radius: var(--pool-radius-panel);
   background: var(--pool-bg-material);
@@ -4761,7 +4776,7 @@ so the mark owns the size
 .pool-settings-tabs .pool-tab-trigger {
   min-height: var(--pool-hit-target);
   border-radius: 10px;
-  padding: 9px 12px;
+  padding: var(--pool-space-2) var(--pool-space-3);
   font-weight: 620;
 }
 
@@ -4778,7 +4793,7 @@ so the mark owns the size
 .pool-settings-commandbar {
   display: grid;
   grid-template-columns: minmax(240px, 1fr) auto;
-  gap: 10px;
+  gap: var(--pool-space-2);
   padding: 0;
   border-radius: 0;
   background: transparent;
@@ -4801,7 +4816,7 @@ so the mark owns the size
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
+  gap: var(--pool-space-2);
   min-width: 0;
 }
 
@@ -4811,7 +4826,7 @@ so the mark owns the size
 
 .pool-settings-categories {
   display: grid;
-  gap: 12px;
+  gap: var(--pool-space-3);
   border: 0;
 }
 
@@ -4834,8 +4849,8 @@ so the mark owns the size
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 14px;
-  padding: 13px 16px;
+  gap: var(--pool-space-3);
+  padding: var(--pool-space-3) var(--pool-space-4);
   border: 0;
   background: transparent;
   color: var(--pool-text);
@@ -4868,7 +4883,7 @@ so the mark owns the size
 }
 
 .pool-settings-category__leading {
-  gap: 11px;
+  gap: var(--pool-space-3);
 }
 
 .pool-settings-category__icon {
@@ -4897,12 +4912,12 @@ so the mark owns the size
 .pool-settings-category__copy {
   min-width: 0;
   display: grid;
-  gap: 3px;
+  gap: 3px; /* optical: 3px gap between settings category title and description */
 }
 
 .pool-settings-category__copy strong {
   overflow: hidden;
-  font-size: 14px;
+  font-size: var(--pool-type-body);
   font-weight: 680;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4910,12 +4925,12 @@ so the mark owns the size
 
 .pool-settings-category__copy > span {
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-settings-category__badges {
   justify-content: flex-end;
-  gap: 6px;
+  gap: var(--pool-space-1);
   flex-wrap: wrap;
 }
 
@@ -4924,7 +4939,7 @@ so the mark owns the size
 }
 
 .pool-settings-category__body {
-  padding: 0 18px 3px;
+  padding: 0 var(--pool-space-4) 3px; /* optical: 3px bottom inset closes the category body without a full spacing step */
   border-top: 1px solid var(--pool-border-subtle);
   background: color-mix(in srgb, var(--pool-bg-surface-2) 46%, transparent);
 }
@@ -4938,23 +4953,23 @@ so the mark owns the size
 }
 
 .pool-settings-disclosure__body {
-  padding: 16px 18px 18px;
+  padding: var(--pool-space-4);
 }
 
 .pool-registrar-form {
   display: grid;
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .pool-registrar-card-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-  gap: 14px;
+  gap: var(--pool-space-3);
 }
 
 .pool-registrar-provider-card {
   min-width: 0;
-  padding: 15px;
+  padding: var(--pool-space-4);
   border: 1px solid var(--pool-border-subtle);
   border-radius: 14px;
   background: var(--pool-bg-surface);
@@ -4962,19 +4977,19 @@ so the mark owns the size
 }
 
 .pool-registrar-provider-card .pool-card-head {
-  margin-bottom: 14px;
-  padding-bottom: 11px;
+  margin-bottom: var(--pool-space-3);
+  padding-bottom: var(--pool-space-3);
   border-bottom: 1px solid var(--pool-border-subtle);
 }
 
 .pool-registrar-provider-card .pool-card-body {
-  row-gap: 2px !important;
+  row-gap: 2px !important; /* optical: 2px row gap inside the registrar provider card body (dense label/value pairs) */
 }
 
 .pool-registrar-provider-card .pool-field {
   flex: 1 1 150px;
   min-width: 0;
-  margin-bottom: 10px;
+  margin-bottom: var(--pool-space-2);
 }
 
 .pool-registrar-provider-card .pool-field > span,
@@ -4987,7 +5002,7 @@ so the mark owns the size
 .pool-registrar-fields {
   display: flex;
   flex-wrap: wrap;
-  gap: 2px 14px;
+  gap: 2px var(--pool-space-3); /* optical: 2px row gap pairs each registrar field with its label; the 14px column gap carries the rhythm */
 }
 
 .pool-registrar-fields .pool-field {
@@ -5003,15 +5018,15 @@ so the mark owns the size
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
-  padding: 14px 2px 2px;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-3) 2px 2px; /* optical: 2px side and bottom inset keeps the action row inside the hairline top border */
   border-top: 1px solid var(--pool-border-subtle);
 }
 
 .pool-registration-quickstart,
 .pool-registration-start-card,
 .pool-sms-market-card {
-  padding: 20px;
+  padding: var(--pool-space-5);
   border: 1px solid var(--pool-border-subtle);
   border-radius: var(--pool-radius-panel);
   background: var(--pool-bg-material);
@@ -5024,8 +5039,8 @@ so the mark owns the size
 
 .pool-registration-start-card .pool-card-head,
 .pool-sms-market-card .pool-card-head {
-  margin-bottom: 16px;
-  padding-bottom: 12px;
+  margin-bottom: var(--pool-space-4);
+  padding-bottom: var(--pool-space-3);
   border-bottom: 1px solid var(--pool-border-subtle);
 }
 
@@ -5035,7 +5050,7 @@ so the mark owns the size
 }
 
 .pool-registration-jobs.pool-table-wrapper {
-  overflow: hidden;
+  overflow: auto;
   border-color: var(--pool-border-subtle);
   border-radius: var(--pool-radius-panel);
   box-shadow: var(--pool-shadow-panel);
@@ -5051,7 +5066,7 @@ so the mark owns the size
 
 .pool-registration-metrics .pool-metric-card {
   min-height: 78px;
-  padding: 13px 14px;
+  padding: var(--pool-space-3);
   border: 0;
   border-top: 1px solid var(--pool-border-subtle);
 }
@@ -5064,14 +5079,14 @@ so the mark owns the size
    column owns the gap and each child keeps its own surface. */
 .pool-registration-aside {
   display: grid;
-  gap: 14px;
+  gap: var(--pool-space-3);
   min-width: 0;
   align-content: start;
 }
 
 .pool-registration-outcome {
   min-width: 0;
-  padding: 14px;
+  padding: var(--pool-space-3);
   border: 1px solid var(--pool-border-subtle);
   border-radius: var(--pool-radius-panel);
   background: var(--pool-bg-material);
@@ -5079,16 +5094,16 @@ so the mark owns the size
 }
 
 .pool-registration-outcome h3 {
-  margin: 0 0 10px;
+  margin: 0 0 var(--pool-space-2);
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   font-weight: 600;
 }
 
 .pool-registration-outcome__empty {
   margin: 0;
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: var(--pool-leading-body);
 }
 
@@ -5118,7 +5133,7 @@ so the mark owns the size
 }
 
 .pool-registration-job-card__error {
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: var(--pool-leading-body);
 }
 
@@ -5126,7 +5141,7 @@ so the mark owns the size
   min-height: 150px;
   display: grid;
   align-content: center;
-  padding: 24px;
+  padding: var(--pool-space-6);
   border: 1px solid var(--pool-border-subtle);
   border-radius: var(--pool-radius-panel);
   background: var(--pool-bg-material);
@@ -5136,9 +5151,9 @@ so the mark owns the size
 .pool-settings-row {
   display: grid;
   grid-template-columns: minmax(220px, 1fr) minmax(240px, 340px);
-  gap: 16px;
+  gap: var(--pool-space-4);
   align-items: center;
-  padding: 14px 0;
+  padding: var(--pool-space-3) 0;
   border-bottom: 1px solid var(--pool-border);
 }
 
@@ -5153,7 +5168,7 @@ so the mark owns the size
 .pool-settings-row__title {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--pool-space-1);
   flex-wrap: wrap;
   color: var(--pool-text);
   font-weight: 680;
@@ -5163,12 +5178,12 @@ so the mark owns the size
 .pool-settings-row__error,
 .pool-settings-row__key {
   display: block;
-  margin-top: 4px;
+  margin-top: var(--pool-space-1);
 }
 
 .pool-settings-row__key {
   grid-column: 1 / -1;
-  margin-top: -8px;
+  margin-top: calc(var(--pool-space-2) * -1);
   color: var(--pool-text-3);
   font-family: var(--pool-font-mono);
 }
@@ -5207,7 +5222,7 @@ so the mark owns the size
 
 .pool-ai-settings-nav button {
   min-height: var(--pool-hit-target);
-  padding: 10px 12px;
+  padding: var(--pool-space-2) var(--pool-space-3);
   border: 0;
   border-radius: var(--pool-radius-control);
   background: transparent;
@@ -5360,7 +5375,7 @@ so the mark owns the size
 
 .pool-ordered-select {
   display: grid;
-  gap: 8px;
+  gap: var(--pool-space-2);
   min-width: 0;
 }
 
@@ -5376,10 +5391,10 @@ so the mark owns the size
 .pool-ordered-select__list li {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
-  gap: 8px;
+  gap: var(--pool-space-2);
   align-items: center;
   min-height: 40px;
-  padding: 5px 6px;
+  padding: var(--pool-space-1);
   border: 0;
   border-bottom: 1px solid var(--pool-border);
   border-radius: 0;
@@ -5390,8 +5405,8 @@ so the mark owns the size
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 8px;
-  padding: 4px;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-1);
   border: 0;
   background: transparent;
   color: var(--pool-text);
@@ -5413,15 +5428,15 @@ so the mark owns the size
 
 .pool-ordered-select__actions {
   display: flex;
-  gap: 4px;
+  gap: var(--pool-space-1);
 }
 
 .pool-ordered-select__empty {
-  padding: 10px 12px;
+  padding: var(--pool-space-2) var(--pool-space-3);
   border: 1px dashed var(--pool-border);
   border-radius: var(--pool-radius-md);
   color: var(--pool-text-3);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
 }
 
 .pool-multi-select[aria-disabled='true'] {
@@ -5437,26 +5452,26 @@ so the mark owns the size
 .pool-group-editor,
 .pool-user-group-editor {
   display: grid;
-  gap: 16px;
+  gap: var(--pool-space-4);
 }
 
 .pool-group-resource-split {
-  margin-top: 14px;
+  margin-top: var(--pool-space-3);
 }
 
 .pool-user-group-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
+  gap: var(--pool-space-3);
 }
 
 .pool-inline-switch {
   display: flex;
   min-height: 40px;
   align-items: center;
-  gap: 9px;
+  gap: var(--pool-space-2);
   color: var(--pool-text-2);
-  font-size: 14px;
+  font-size: var(--pool-type-body);
 }
 
 .pool-instruction-profiles {
@@ -5467,15 +5482,15 @@ so the mark owns the size
 .pool-instruction-profile {
   display: grid;
   grid-template-columns: minmax(220px, 0.75fr) minmax(280px, 1.25fr);
-  gap: 16px;
+  gap: var(--pool-space-4);
   align-items: center;
-  padding: 14px 0;
+  padding: var(--pool-space-3) 0;
   border-bottom: 1px solid var(--pool-border);
 }
 
 .pool-instruction-profile__label {
   display: grid;
-  gap: 2px;
+  gap: 2px; /* optical: 2px gap between instruction profile label and its hint */
   min-width: 0;
 }
 
@@ -5483,7 +5498,7 @@ so the mark owns the size
 .pool-route-rule-card,
 .pool-routing-summary {
   display: grid;
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .pool-user-routing-editor__head,
@@ -5492,7 +5507,7 @@ so the mark owns the size
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .pool-route-rule-card__head > .pool-field {
@@ -5502,31 +5517,31 @@ so the mark owns the size
 .pool-route-tier {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
-  gap: 10px;
+  gap: var(--pool-space-2);
   align-items: center;
 }
 
 .pool-route-tier__actions {
   display: flex;
-  gap: 4px;
+  gap: var(--pool-space-1);
 }
 
 .pool-route-compatibility {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: var(--pool-space-1);
 }
 
 .pool-routing-summary .pool-card-body {
   display: grid;
-  gap: 8px;
+  gap: var(--pool-space-2);
 }
 
 .pool-traffic-fallback-card .pool-card-body,
 .pool-traffic-fallback-editor {
   display: grid;
-  gap: 14px;
+  gap: var(--pool-space-3);
 }
 
 .pool-fallback-selector__trigger {
@@ -5536,8 +5551,8 @@ so the mark owns the size
   min-width: 0;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 7px 11px;
+  gap: var(--pool-space-3);
+  padding: var(--pool-space-2) var(--pool-space-3);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-md);
   background: var(--pool-bg-surface);
@@ -5575,7 +5590,7 @@ so the mark owns the size
   display: flex;
   min-width: 0;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--pool-space-1);
 }
 
 .pool-fallback-selector__placeholder,
@@ -5587,18 +5602,18 @@ so the mark owns the size
   display: inline-flex;
   min-width: 0;
   align-items: center;
-  gap: 6px;
-  padding: 5px 9px;
+  gap: var(--pool-space-1);
+  padding: var(--pool-space-1) var(--pool-space-2);
   border-radius: 999px;
   background: var(--pool-accent-soft);
   color: var(--pool-accent-text);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   font-weight: 650;
 }
 
 .pool-fallback-selector__pill b {
   min-width: 18px;
-  padding: 1px 5px;
+  padding: 1px var(--pool-space-1); /* optical: 1px vertical inset on the count badge inside a pill */
   border-radius: 999px;
   background: color-mix(in srgb, var(--pool-accent) 15%, transparent);
   text-align: center;
@@ -5632,8 +5647,8 @@ so the mark owns the size
 .pool-fallback-selector__families {
   display: grid;
   align-content: start;
-  gap: 5px;
-  padding: 12px;
+  gap: var(--pool-space-1);
+  padding: var(--pool-space-3);
   border-right: 1px solid var(--pool-border);
   background: color-mix(in srgb, var(--pool-bg-surface-2) 82%, transparent);
 }
@@ -5644,8 +5659,8 @@ so the mark owns the size
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 9px 11px;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-2) var(--pool-space-3);
   border: 0;
   border-radius: var(--pool-radius-md);
   background: transparent;
@@ -5674,7 +5689,7 @@ so the mark owns the size
 .pool-fallback-selector__families b {
   min-width: 22px;
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   text-align: center;
 }
 
@@ -5682,8 +5697,8 @@ so the mark owns the size
   min-width: 0;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 10px;
-  padding: 14px;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-3);
 }
 
 .pool-fallback-selector__groups-head {
@@ -5691,12 +5706,12 @@ so the mark owns the size
   min-width: 0;
   align-items: baseline;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .pool-fallback-selector__groups-head span {
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   white-space: nowrap;
 }
 
@@ -5704,7 +5719,7 @@ so the mark owns the size
   max-height: 292px;
   display: grid;
   align-content: start;
-  gap: 4px;
+  gap: var(--pool-space-1);
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -5715,9 +5730,9 @@ so the mark owns the size
   min-height: 52px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 24px;
-  gap: 10px;
+  gap: var(--pool-space-2);
   align-items: center;
-  padding: 8px 10px;
+  padding: var(--pool-space-2);
   border: 1px solid transparent;
   border-radius: var(--pool-radius-md);
   background: transparent;
@@ -5744,7 +5759,7 @@ so the mark owns the size
 .pool-fallback-selector__option-copy {
   display: grid;
   min-width: 0;
-  gap: 2px;
+  gap: 2px; /* optical: 2px gap between fallback option title and its description */
 }
 
 .pool-fallback-selector__option-copy strong,
@@ -5758,7 +5773,7 @@ so the mark owns the size
 .pool-fallback-selector__option-copy small {
   color: var(--pool-text-3);
   font-family: var(--pool-font-mono);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-fallback-selector__check {
@@ -5769,7 +5784,7 @@ so the mark owns the size
   border: 1px solid var(--pool-border-strong);
   border-radius: 999px;
   color: white;
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   font-weight: 800;
 }
 
@@ -5779,7 +5794,7 @@ so the mark owns the size
 }
 
 .pool-fallback-selector__empty {
-  padding: 34px 12px;
+  padding: var(--pool-space-8) var(--pool-space-3);
   color: var(--pool-text-3);
   text-align: center;
 }
@@ -5787,7 +5802,7 @@ so the mark owns the size
 .pool-fallback-mapping-card .pool-card-body {
   display: grid;
   grid-template-columns: 48px minmax(0, 1fr) auto;
-  gap: 12px;
+  gap: var(--pool-space-3);
   align-items: end;
 }
 
@@ -5795,26 +5810,26 @@ so the mark owns the size
   min-height: 40px;
   display: grid;
   align-content: center;
-  gap: 1px;
+  gap: 1px; /* optical: 1px gap between the mapping index digits and its caption */
   color: var(--pool-text-3);
 }
 
 .pool-fallback-mapping-card__index span {
   color: var(--pool-accent-text);
   font-family: var(--pool-font-mono);
-  font-size: 18px;
+  font-size: var(--pool-type-title-3);
   font-weight: 720;
 }
 
 .pool-fallback-mapping-card__index small {
-  font-size: 10px;
+  font-size: var(--pool-type-caption);
   white-space: nowrap;
 }
 
 .pool-fallback-mapping-card__fields {
   display: grid;
   grid-template-columns: minmax(105px, 0.7fr) minmax(145px, 1.15fr) 24px minmax(145px, 1.15fr) minmax(145px, 1.15fr);
-  gap: 10px;
+  gap: var(--pool-space-2);
   align-items: end;
 }
 
@@ -5834,39 +5849,39 @@ so the mark owns the size
   display: grid;
   place-items: center;
   color: var(--pool-accent-text);
-  font-size: 19px;
+  font-size: var(--pool-type-title-3);
 }
 
 .pool-fallback-validation {
   display: grid;
-  gap: 3px;
-  padding: 11px 13px;
+  gap: 3px; /* optical: 3px gap between validation lines inside the warning block */
+  padding: var(--pool-space-3);
   border: 1px solid color-mix(in srgb, var(--pool-warning) 30%, transparent);
   border-radius: var(--pool-radius-md);
   background: var(--pool-warning-soft);
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-fallback-validation strong {
   color: var(--pool-warning);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
 }
 
 .pool-modal-actions {
   justify-content: flex-end;
-  padding-top: 4px;
+  padding-top: var(--pool-space-1);
 }
 
 .pool-provider-editor {
   display: grid;
-  gap: 16px;
+  gap: var(--pool-space-4);
 }
 
 .pool-provider-routes {
   display: grid;
-  gap: 12px;
-  padding: 14px;
+  gap: var(--pool-space-3);
+  padding: var(--pool-space-3);
   border: 1px solid var(--pool-border);
   border-radius: 10px;
   background: var(--pool-bg-surface-2);
@@ -5877,11 +5892,11 @@ so the mark owns the size
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .pool-provider-routes__empty {
-  padding: 12px;
+  padding: var(--pool-space-3);
   border: 1px dashed var(--pool-border);
   border-radius: 8px;
   color: var(--pool-text-3);
@@ -5889,8 +5904,8 @@ so the mark owns the size
 
 .pool-provider-route-card {
   display: grid;
-  gap: 10px;
-  padding: 12px;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-3);
   border: 1px solid var(--pool-border);
   border-radius: 8px;
   background: var(--pool-bg-surface);
@@ -5899,15 +5914,15 @@ so the mark owns the size
 .pool-provider-profile-cards {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
+  gap: var(--pool-space-2);
 }
 
 .pool-provider-profile-cards button {
   display: grid;
   min-height: 118px;
   align-content: start;
-  gap: 7px;
-  padding: 14px;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-3);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-lg);
   background: var(--pool-bg-surface);
@@ -5919,7 +5934,7 @@ so the mark owns the size
 
 .pool-provider-profile-cards button span {
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: 1.5;
 }
 
@@ -5958,8 +5973,8 @@ so the mark owns the size
   display: inline-flex;
   flex-wrap: wrap;
   max-width: 100%;
-  gap: 4px;
-  padding: 4px;
+  gap: var(--pool-space-1);
+  padding: var(--pool-space-1);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-lg);
   background: var(--pool-bg-surface-2);
@@ -5994,14 +6009,14 @@ so the mark owns the size
 .pool-usage-diagnostics {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 14px;
+  gap: var(--pool-space-3);
 }
 
 .pool-usage-diagnostics__head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--pool-space-3);
   flex-wrap: wrap;
 }
 .pool-chart-empty {
@@ -6009,9 +6024,9 @@ so the mark owns the size
   min-height: 140px;
   display: grid;
   place-items: center;
-  padding: 18px;
+  padding: var(--pool-space-4);
   color: var(--pool-text-2);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   text-align: center;
 }
 
@@ -6073,8 +6088,8 @@ so the mark owns the size
     top: 58px;
     display: flex;
     flex-wrap: wrap;
-    gap: 4px 6px;
-    padding: 6px 0;
+    gap: var(--pool-space-1);
+    padding: var(--pool-space-1) 0;
     border: 0;
     border-bottom: 1px solid var(--pool-border);
     border-radius: 0;
@@ -6127,7 +6142,7 @@ so the mark owns the size
 
   .pool-instruction-profile {
     grid-template-columns: 1fr;
-    gap: 8px;
+    gap: var(--pool-space-2);
   }
 
   .pool-provider-profile-cards {
@@ -6156,18 +6171,18 @@ so the mark owns the size
   .pool-fallback-selector__families {
     grid-auto-flow: column;
     grid-template-columns: repeat(3, minmax(0, 1fr));
-    padding: 8px;
+    padding: var(--pool-space-2);
     border-right: 0;
     border-bottom: 1px solid var(--pool-border);
   }
 
   .pool-fallback-selector__families button {
     min-height: 40px;
-    padding: 7px 8px;
+    padding: var(--pool-space-2);
   }
 
   .pool-fallback-selector__groups {
-    padding: 10px;
+    padding: var(--pool-space-2);
   }
 
   .pool-fallback-selector__list {
@@ -6183,7 +6198,7 @@ so the mark owns the size
     grid-column: 1 / -1;
     grid-auto-flow: column;
     justify-content: start;
-    gap: 6px;
+    gap: var(--pool-space-1);
     min-height: 0;
   }
 
@@ -6212,7 +6227,7 @@ so the mark owns the size
   .pool-settings-tabs.pool-tabs--left {
     min-height: 0 !important;
     align-content: start;
-    gap: 12px;
+    gap: var(--pool-space-3);
   }
 
   /* Wraps rather than scrolling. Seven tabs need 632px, so at 360x800 (336px client) four of the
@@ -6228,8 +6243,8 @@ so the mark owns the size
   .pool-settings-tabs.pool-tabs--left > .pool-tabs-list {
     position: static;
     top: auto;
-    gap: 4px;
-    padding: 6px;
+    gap: var(--pool-space-1);
+    padding: var(--pool-space-1);
     border: 1px solid var(--pool-border-subtle);
     border-radius: 14px;
     background: var(--pool-bg-material);
@@ -6259,7 +6274,7 @@ so the mark owns the size
 
   .pool-settings-commandbar {
     grid-template-columns: minmax(0, 1fr);
-    gap: 8px;
+    gap: var(--pool-space-2);
   }
 
   .pool-settings-commandbar .pool-input-wrap {
@@ -6275,7 +6290,7 @@ so the mark owns the size
 
   .pool-settings-commandbar__actions .pool-button {
     min-width: 0;
-    padding-inline: 10px;
+    padding-inline: var(--pool-space-2);
   }
 
   .pool-settings-commandbar__actions .pool-button__label {
@@ -6300,13 +6315,13 @@ so the mark owns the size
   }
 
   .pool-settings-categories {
-    gap: 10px;
+    gap: var(--pool-space-2);
   }
 
   .pool-settings-category__trigger {
     min-height: 68px;
     align-items: center;
-    padding: 13px 14px;
+    padding: var(--pool-space-3);
   }
 
   .pool-settings-category__leading {
@@ -6318,11 +6333,11 @@ so the mark owns the size
   }
 
   .pool-settings-category__body {
-    padding: 0 14px 2px;
+    padding: 0 var(--pool-space-3) 2px; /* optical: 2px bottom inset closes the mobile category body without a full step */
   }
 
   .pool-settings-disclosure__body {
-    padding: 12px;
+    padding: var(--pool-space-3);
   }
 
   .pool-registrar-card-grid {
@@ -6330,7 +6345,7 @@ so the mark owns the size
   }
 
   .pool-registrar-provider-card {
-    padding: 14px;
+    padding: var(--pool-space-3);
   }
 
   .pool-registrar-provider-card .pool-field,
@@ -6352,7 +6367,7 @@ so the mark owns the size
     position: sticky;
     z-index: 12;
     bottom: max(10px, env(safe-area-inset-bottom));
-    padding: 8px;
+    padding: var(--pool-space-2);
     border: 1px solid var(--pool-border);
     border-radius: var(--pool-radius-sm);
     justify-content: stretch;
@@ -6378,7 +6393,7 @@ so the mark owns the size
     min-height: 74px;
     display: grid;
     align-content: space-between;
-    padding: 12px 14px;
+    padding: var(--pool-space-3);
   }
 
   .pool-system-detail__grid {
@@ -6431,7 +6446,7 @@ so the mark owns the size
   .pool-card,
 .pool-panel,
 .pool-chart-card {
-    padding: 16px 0;
+    padding: var(--pool-space-4) 0;
     border-radius: 0;
   }
 
@@ -6459,7 +6474,7 @@ so the mark owns the size
   .pool-table--cards td {
     min-height: 0;
     grid-template-columns: minmax(92px, 32%) minmax(0, 1fr);
-    padding: 11px 14px;
+    padding: var(--pool-space-3);
   }
 
   .pool-table--cards td[data-label='账号'],
@@ -6545,7 +6560,7 @@ so the mark owns the size
     z-index: 20;
     bottom: max(12px, env(safe-area-inset-bottom));
     display: grid;
-    margin-top: 16px;
+    margin-top: var(--pool-space-4);
   }
 
   .pool-sticky-mobile-action .pool-button {
@@ -6579,7 +6594,7 @@ overlong presentation. */
 
   .pool-registrar-provider-card,
 .pool-settings-empty {
-    padding: 14px;
+    padding: var(--pool-space-3);
     border: 1px solid var(--pool-border-subtle);
     border-radius: 14px;
     background: var(--pool-bg-material);
@@ -6627,7 +6642,7 @@ overlong presentation. */
   .pool-registration-quickstart,
 .pool-registration-start-card,
 .pool-sms-market-card {
-    padding: 16px;
+    padding: var(--pool-space-4);
     border: 1px solid var(--pool-border-subtle);
     border-radius: 14px;
     background: var(--pool-bg-material);
@@ -6654,7 +6669,7 @@ overlong presentation. */
 
   .pool-registration-start-form {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 12px;
+    gap: var(--pool-space-3);
   }
 
   .pool-registration-start-form .pool-input,
@@ -6757,7 +6772,7 @@ overlong presentation. */
   }
 
   .pool-mobile-list.pool-registration-jobs {
-    gap: 10px;
+    gap: var(--pool-space-2);
     padding: 0;
     border: 0;
   }
@@ -6772,11 +6787,6 @@ overlong presentation. */
 }
 
 @media (max-width: 640px) {
-  .pool-stat-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 0;
-  }
-
   .pool-stat-grid > .pool-stat:nth-child(odd) {
     border-inline-start: 0;
   }
@@ -6786,12 +6796,7 @@ overlong presentation. */
   }
 
   .pool-stat {
-    min-height: 94px;
-    padding: 14px;
-  }
-
-  .pool-stat .value {
-    font-size: 22px;
+    padding: var(--pool-space-3);
   }
 
   .pool-mobile-row {
@@ -6811,7 +6816,7 @@ overlong presentation. */
      the row and the separators shift inward while the card title stays put, breaking the shared
      left edge that makes the list read as one column. */
   .pool-diagnostic-card {
-    padding-inline: 10px;
+    padding-inline: var(--pool-space-2);
   }
 
   /* One column, and the label/value pair goes on one line as a settings-list row.
@@ -6831,8 +6836,8 @@ overlong presentation. */
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    gap: 12px;
-    padding: 7px 0;
+    gap: var(--pool-space-3);
+    padding: var(--pool-space-2) 0;
     border-inline-start: 0;
     border-bottom: 1px solid var(--pool-border-subtle);
   }
@@ -6883,7 +6888,7 @@ overlong presentation. */
   .pool-settings-category__badges {
     max-width: 100%;
     justify-content: flex-start;
-    padding-inline-start: 39px;
+    padding-inline-start: var(--pool-space-10);
   }
 
   .pool-registrar-provider-card .pool-field,
@@ -6995,9 +7000,9 @@ overlong presentation. */
 }
 
 .pool-skeleton-title {
-  padding: 14px 14px 4px;
+  padding: var(--pool-space-3) var(--pool-space-3) var(--pool-space-1);
   color: var(--pool-text-2);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   font-weight: 650;
 }
 
@@ -7048,7 +7053,7 @@ overlong presentation. */
   min-width: 0;
   max-width: 100%;
   align-items: center;
-  gap: 8px;
+  gap: var(--pool-space-2);
 }
 
 .pool-account-menu-button .pool-account-avatar,
@@ -7132,7 +7137,7 @@ overlong presentation. */
 
 .pool-account-usage {
   display: grid;
-  gap: 9px;
+  gap: var(--pool-space-2);
   min-width: 0;
   text-align: left;
 }
@@ -7141,26 +7146,26 @@ overlong presentation. */
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--pool-space-2);
   min-width: 0;
 }
 
 .pool-account-usage__totals strong {
   min-width: 0;
   color: var(--pool-text);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   font-weight: 680;
 }
 
 .pool-account-usage__totals span {
   flex: 0 0 auto;
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-account-quota {
   display: grid;
-  gap: 5px;
+  gap: var(--pool-space-1);
   min-width: 0;
 }
 
@@ -7168,20 +7173,20 @@ overlong presentation. */
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--pool-space-2);
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-account-quota__head strong {
   color: var(--pool-text);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   font-weight: 720;
 }
 
 .pool-account-quota__head strong span {
   color: var(--pool-text-2);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   font-weight: 620;
 }
 
@@ -7201,7 +7206,7 @@ overlong presentation. */
   min-width: 0;
   overflow: hidden;
   color: var(--pool-text-3);
-  font-size: 10.5px;
+  font-size: var(--pool-type-caption);
   line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -7211,7 +7216,7 @@ overlong presentation. */
   min-width: 0;
   overflow: hidden;
   color: var(--pool-accent);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   font-weight: 640;
   line-height: 1.35;
   text-overflow: ellipsis;
@@ -7219,14 +7224,14 @@ overlong presentation. */
 }
 
 .pool-account-quota--unknown {
-  padding: 7px 9px;
+  padding: var(--pool-space-2);
   border-radius: var(--pool-radius-sm);
   background: var(--pool-bg-surface-2);
 }
 
 .pool-account-quota--compact {
   width: min(100%, 280px);
-  gap: 4px;
+  gap: var(--pool-space-1);
 }
 
 .pool-account-quota--compact .pool-account-quota__meta {
@@ -7254,10 +7259,10 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 7px 14px;
+  gap: var(--pool-space-2) var(--pool-space-3);
   max-width: 100%;
   margin: 0;
-  padding: 7px 4px 0;
+  padding: var(--pool-space-2) var(--pool-space-1) 0;
   overflow-x: auto;
   list-style: none;
   scrollbar-width: none;
@@ -7271,7 +7276,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
-  gap: 6px;
+  gap: var(--pool-space-1);
   min-width: 0;
   color: var(--pool-text-2);
   font-size: 11px;
@@ -7297,19 +7302,19 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-chart-tooltip {
   min-width: 150px;
   max-width: min(320px, calc(100vw - 32px));
-  padding: 11px 12px;
+  padding: var(--pool-space-3);
   border: 1px solid var(--pool-chart-tooltip-border);
   border-radius: var(--pool-radius-sm);
   background: var(--pool-chart-tooltip-bg);
   box-shadow: var(--pool-shadow-md);
   backdrop-filter: none;
   color: var(--pool-text);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-chart-tooltip__label {
   max-width: 100%;
-  margin-bottom: 8px;
+  margin-bottom: var(--pool-space-2);
   overflow: hidden;
   color: var(--pool-text);
   font-weight: 700;
@@ -7319,14 +7324,14 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-chart-tooltip__rows {
   display: grid;
-  gap: 6px;
+  gap: var(--pool-space-1);
 }
 
 .pool-chart-tooltip__row {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 7px;
+  gap: var(--pool-space-2);
   min-width: 0;
 }
 
@@ -7353,16 +7358,16 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 }
 
 .pool-chart-tooltip__metric {
-  padding: 8px 0 2px;
+  padding: var(--pool-space-2) 0 2px; /* optical: 2px bottom inset above the hairline separator in the chart tooltip */
   border-top: 1px solid var(--pool-border);
 }
 
 .pool-chart-tooltip__metric-title {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--pool-space-2);
   min-width: 0;
-  margin-bottom: 6px;
+  margin-bottom: var(--pool-space-1);
   font-weight: 700;
 }
 
@@ -7376,7 +7381,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-chart-tooltip__metric-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 3px 12px;
+  gap: 3px var(--pool-space-3); /* optical: 3px row gap in the tooltip metric grid; 4px would push the last row out of the panel */
   color: var(--pool-text-2);
 }
 
@@ -7388,7 +7393,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-cache-model {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--pool-space-2);
   min-width: 0;
 }
 
@@ -7398,15 +7403,13 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-@media (min-width: 1101px) {
-}
 
 .pool-dashboard-chart-grid {
-  margin-bottom: 16px;
+  margin-bottom: var(--pool-space-4);
 }
 
 .pool-dashboard-chart-grid > .pool-chart-card {
-  padding: 18px;
+  padding: var(--pool-space-4);
   border: 1px solid var(--pool-border-subtle);
   border-radius: var(--pool-radius-panel);
   background: var(--pool-bg-material);
@@ -7450,14 +7453,14 @@ Apple-like chart treatment with compact legends and readable tooltips. */
      stack and the page scrolls vertically, which is the axis the reader is already on. */
   .pool-dashboard-chart-grid.pool-grid.cols-3 {
     grid-template-columns: minmax(0, 1fr);
-    gap: 12px;
+    gap: var(--pool-space-3);
   }
 
   /* No min-height. The 320px floor existed to keep carousel slides a uniform height; stacked,
      it just pads short cards with a void — the model-token card showed ~180px of empty white
      under its last bar. Each card is now as tall as its own content. */
   .pool-dashboard-chart-grid > .pool-chart-card {
-    padding: 16px;
+    padding: var(--pool-space-4);
     border-radius: 14px;
   }
 
@@ -7467,7 +7470,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
   .pool-chart-legend {
     justify-content: flex-start;
-    padding-inline: 2px;
+    padding-inline: 2px; /* optical: 2px inline inset keeps the legend from clipping its first swatch */
   }
 
   .pool-chart-legend li > b {
@@ -7488,9 +7491,9 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-lifecycle-readiness {
   display: grid;
-  gap: 16px;
-  margin-bottom: 22px;
-  padding: 18px 0;
+  gap: var(--pool-space-4);
+  margin-bottom: var(--pool-space-5);
+  padding: var(--pool-space-4) 0;
   border-block: 1px solid var(--pool-border);
   background: transparent;
 }
@@ -7499,21 +7502,21 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 16px;
+  gap: var(--pool-space-4);
 }
 
 .pool-lifecycle-readiness__head span,
 .pool-lifecycle-kicker {
   color: var(--pool-accent-text);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   font-weight: 720;
   letter-spacing: .06em;
 }
 
 .pool-lifecycle-readiness__head h2 {
-  margin: 4px 0 0;
+  margin: var(--pool-space-1) 0 0;
   color: var(--pool-text);
-  font-size: 18px;
+  font-size: var(--pool-type-title-3);
   line-height: 1.35;
 }
 
@@ -7532,9 +7535,9 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: grid;
   grid-template-columns: 22px minmax(0, 1fr);
   align-content: start;
-  gap: 7px 10px;
+  gap: var(--pool-space-2);
   min-width: 0;
-  padding: 14px 16px;
+  padding: var(--pool-space-3) var(--pool-space-4);
   border: 0;
   border-inline-start: 1px solid var(--pool-border);
   background: transparent;
@@ -7553,7 +7556,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   place-items: center;
   background: transparent;
   color: var(--pool-warning);
-  font-size: 15px;
+  font-size: var(--pool-type-body);
   font-weight: 800;
 }
 
@@ -7570,9 +7573,9 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 }
 
 .pool-lifecycle-readiness__grid p {
-  margin: 4px 0 0;
+  margin: var(--pool-space-1) 0 0;
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: 1.55;
 }
 
@@ -7584,16 +7587,16 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-lifecycle-readiness__next {
   margin: 0;
   color: var(--pool-text-2);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   line-height: 1.5;
 }
 
 .pool-lifecycle-hero {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(150px, 210px);
-  gap: 24px 32px;
-  margin-bottom: 22px;
-  padding: 20px 0 22px;
+  gap: var(--pool-space-6) var(--pool-space-8);
+  margin-bottom: var(--pool-space-5);
+  padding: var(--pool-space-5) 0 var(--pool-space-5);
   border-block: 1px solid var(--pool-border);
   background: transparent;
 }
@@ -7611,8 +7614,8 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-lifecycle-kicker {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  margin-bottom: 8px;
+  gap: var(--pool-space-2);
+  margin-bottom: var(--pool-space-2);
 }
 
 .pool-lifecycle-kicker .pool-icon {
@@ -7624,7 +7627,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   max-width: 680px;
   margin: 0;
   color: var(--pool-text);
-  font-size: clamp(24px, 2.6vw, 32px);
+  font-size: clamp(var(--pool-type-title-2), 2.6vw, var(--pool-type-title-1));
   font-weight: 720;
   letter-spacing: -.025em;
   line-height: 1.4;
@@ -7633,18 +7636,18 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-lifecycle-hero__copy p {
   max-width: 680px;
-  margin: 10px 0 0;
+  margin: var(--pool-space-2) 0 0;
   color: var(--pool-text-2);
-  font-size: 14px;
+  font-size: var(--pool-type-body);
   line-height: 1.65;
 }
 
 .pool-lifecycle-threshold {
   display: grid;
   align-content: center;
-  gap: 4px;
+  gap: var(--pool-space-1);
   min-width: 0;
-  padding: 6px 0 6px 18px;
+  padding: var(--pool-space-1) 0 var(--pool-space-1) var(--pool-space-4);
   border-inline-start: 2px solid var(--pool-warning);
   background: transparent;
   text-align: left;
@@ -7652,7 +7655,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-lifecycle-threshold strong {
   color: var(--pool-text);
-  font-size: 28px;
+  font-size: var(--pool-type-title-1);
   line-height: 1.2;
   font-variant-numeric: tabular-nums;
   letter-spacing: -.03em;
@@ -7660,7 +7663,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-lifecycle-threshold span {
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
@@ -7680,12 +7683,12 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-lifecycle-flow__step {
   display: grid;
   align-content: start;
-  gap: 7px;
+  gap: var(--pool-space-2);
   min-width: 0;
-  padding: 13px 12px 0;
+  padding: var(--pool-space-3) var(--pool-space-3) 0;
   border-inline-start: 1px solid var(--pool-border);
   color: var(--pool-text-2);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   text-align: left;
 }
 
@@ -7701,14 +7704,14 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   background: transparent;
   color: var(--pool-accent-text);
   font-family: var(--pool-font-mono);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   font-weight: 700;
 }
 
 .pool-lifecycle-flow__step > strong {
   max-width: 100%;
   color: var(--pool-text);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: 1.45;
   overflow: visible;
   text-overflow: clip;
@@ -7718,7 +7721,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-lifecycle-metrics {
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  margin-bottom: 22px;
+  margin-bottom: var(--pool-space-5);
 }
 
 .pool-lifecycle-table .pool-table td {
@@ -7730,7 +7733,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-lifecycle-quota {
   display: grid;
   min-width: 0;
-  gap: 4px;
+  gap: var(--pool-space-1);
 }
 
 .pool-lifecycle-identity .pool-text-clamp {
@@ -7743,20 +7746,20 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   max-width: 100%;
   overflow: hidden;
   color: var(--pool-accent-text);
-  font-size: 10px;
+  font-size: var(--pool-type-caption);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .pool-lifecycle-path {
   justify-items: start;
-  gap: 5px;
+  gap: var(--pool-space-1);
 }
 
 .pool-lifecycle-path > span:last-child,
 .pool-lifecycle-quota > span {
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-lifecycle-quota {
@@ -7765,7 +7768,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-lifecycle-quota > strong {
   color: var(--pool-text);
-  font-size: 14px;
+  font-size: var(--pool-type-body);
   font-variant-numeric: tabular-nums;
 }
 
@@ -7776,9 +7779,9 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-lifecycle-form-intro {
   display: grid;
   grid-template-columns: 34px minmax(0, 1fr);
-  gap: 12px;
-  margin: 0 0 18px;
-  padding: 12px 0;
+  gap: var(--pool-space-3);
+  margin: 0 0 var(--pool-space-4);
+  padding: var(--pool-space-3) 0;
   border-block: 1px solid var(--pool-border);
   background: transparent;
 }
@@ -7792,19 +7795,19 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   border-radius: var(--pool-radius-xs);
   background: transparent;
   color: var(--pool-accent-text);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   font-weight: 720;
 }
 
 .pool-lifecycle-form-intro strong {
   color: var(--pool-text);
-  font-size: 14px;
+  font-size: var(--pool-type-body);
 }
 
 .pool-lifecycle-form-intro p {
-  margin: 4px 0 0;
+  margin: var(--pool-space-1) 0 0;
   color: var(--pool-text-3);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: 1.55;
 }
 
@@ -7820,11 +7823,11 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: grid;
   grid-template-columns: auto auto minmax(0, 1fr);
   align-items: center;
-  gap: 6px;
-  margin-bottom: 16px;
-  padding: 11px 12px;
+  gap: var(--pool-space-1);
+  margin-bottom: var(--pool-space-4);
+  padding: var(--pool-space-3);
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-lifecycle-auto-field > span,
@@ -7838,8 +7841,8 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-lifecycle-advanced-fields {
   display: grid;
-  gap: 12px;
-  padding: 14px;
+  gap: var(--pool-space-3);
+  padding: var(--pool-space-3);
   border: 1px solid var(--pool-border);
 }
 
@@ -7847,16 +7850,16 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 14px;
-  padding: 10px 12px;
+  gap: var(--pool-space-1);
+  margin-top: var(--pool-space-3);
+  padding: var(--pool-space-2) var(--pool-space-3);
 }
 
 .pool-lifecycle-cycle-preview span {
-  padding: 4px 7px;
+  padding: var(--pool-space-1) var(--pool-space-2);
   border-inline-start: 2px solid var(--pool-border-strong);
   color: var(--pool-text-2);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-lifecycle-cycle-preview i {
@@ -7868,32 +7871,32 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: flex;
   justify-content: flex-end;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 22px;
+  gap: var(--pool-space-2);
+  margin-top: var(--pool-space-5);
 }
 
 .pool-lifecycle-detail-summary .pool-card-body {
   display: grid;
   grid-template-columns: minmax(0, 1.6fr) minmax(130px, .8fr) minmax(100px, .6fr);
-  gap: 16px;
+  gap: var(--pool-space-4);
 }
 
 .pool-lifecycle-detail-summary .pool-card-body > div {
   display: grid;
   min-width: 0;
-  gap: 6px;
+  gap: var(--pool-space-1);
 }
 
 .pool-lifecycle-detail-summary .pool-card-body > div > span:first-child {
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-lifecycle-events {
   display: grid;
   gap: 0;
   max-height: 440px;
-  margin-top: 18px;
+  margin-top: var(--pool-space-4);
   overflow: auto;
   border-top: 1px solid var(--pool-border);
 }
@@ -7901,9 +7904,9 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-lifecycle-event {
   display: grid;
   grid-template-columns: 22px minmax(0, 1fr);
-  gap: 10px;
+  gap: var(--pool-space-2);
   min-height: 64px;
-  padding: 12px 2px;
+  padding: var(--pool-space-3) 2px; /* optical: 2px side inset aligns lifecycle events with the card edge */
   border-bottom: 1px solid var(--pool-border);
 }
 
@@ -7914,7 +7917,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-lifecycle-event__dot {
   width: 9px;
   height: 9px;
-  margin: 5px;
+  margin: var(--pool-space-1);
   border: 0;
   border-radius: 50%;
   background: var(--pool-accent);
@@ -7923,7 +7926,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-lifecycle-event__head {
   display: flex;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--pool-space-3);
   min-width: 0;
 }
 
@@ -7931,7 +7934,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   min-width: 0;
   overflow: hidden;
   color: var(--pool-text);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -7939,11 +7942,11 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-lifecycle-event__head time,
 .pool-lifecycle-event p {
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-lifecycle-event p {
-  margin: 5px 0 0;
+  margin: var(--pool-space-1) 0 0;
 }
 
 @media (max-width: 1100px) and (min-width: 768px) {
@@ -7990,8 +7993,8 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
   .pool-lifecycle-hero {
     grid-template-columns: minmax(0, 1fr);
-    gap: 18px;
-    padding: 18px 0 20px;
+    gap: var(--pool-space-4);
+    padding: var(--pool-space-4) 0 var(--pool-space-5);
   }
 
   .pool-lifecycle-threshold {
@@ -8044,9 +8047,9 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(240px, 320px);
   align-items: center;
-  gap: 32px;
-  margin-bottom: 22px;
-  padding: 24px 0;
+  gap: var(--pool-space-8);
+  margin-bottom: var(--pool-space-5);
+  padding: var(--pool-space-6) 0;
   border-block: 1px solid var(--pool-border);
   background: transparent;
 }
@@ -8064,10 +8067,10 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-cf-mail-kicker {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  margin-bottom: 9px;
+  gap: var(--pool-space-2);
+  margin-bottom: var(--pool-space-2);
   color: var(--pool-accent-text);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   font-weight: 720;
   letter-spacing: .06em;
 }
@@ -8076,7 +8079,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   max-width: 720px;
   margin: 0;
   color: var(--pool-text);
-  font-size: clamp(26px, 3vw, 34px);
+  font-size: clamp(var(--pool-type-title-2), 3vw, var(--pool-type-title-1));
   font-weight: 720;
   letter-spacing: -.03em;
   line-height: 1.4;
@@ -8085,9 +8088,9 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-cf-mail-hero__copy > p {
   max-width: 700px;
-  margin: 11px 0 0;
+  margin: var(--pool-space-3) 0 0;
   color: var(--pool-text-2);
-  font-size: 14px;
+  font-size: var(--pool-type-body);
   line-height: 1.65;
 }
 
@@ -8096,26 +8099,26 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-cf-mail-profile__actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 7px;
+  gap: var(--pool-space-2);
 }
 
 .pool-cf-mail-hero__badges {
-  margin-top: 16px;
+  margin-top: var(--pool-space-4);
 }
 
 .pool-cf-mail-domain-preview {
   display: grid;
   align-content: center;
-  gap: 3px;
+  gap: 3px; /* optical: 3px gap between the domain preview lines inside the accent-bordered block */
   min-height: 112px;
-  padding: 8px 0 8px 20px;
+  padding: var(--pool-space-2) 0 var(--pool-space-2) var(--pool-space-5);
   border-inline-start: 2px solid var(--pool-accent);
   background: transparent;
 }
 
 .pool-cf-mail-domain-preview > span {
   color: var(--pool-accent-text);
-  font-size: 14px;
+  font-size: var(--pool-type-body);
   font-weight: 650;
 }
 
@@ -8124,7 +8127,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   overflow: hidden;
   color: var(--pool-text);
   font-family: var(--pool-font-mono);
-  font-size: clamp(18px, 2.3vw, 24px);
+  font-size: clamp(var(--pool-type-title-3), 2.3vw, var(--pool-type-title-2));
   line-height: 1.35;
   letter-spacing: -.025em;
   text-overflow: ellipsis;
@@ -8132,7 +8135,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 }
 
 .pool-cf-mail-domain-preview > small {
-  margin-top: 7px;
+  margin-top: var(--pool-space-2);
   color: var(--pool-text-3);
   line-height: 1.45;
 }
@@ -8142,26 +8145,26 @@ Apple-like chart treatment with compact legends and readable tooltips. */
      a fifth metric should wrap inside the frame, not open a fifth column beside four. */
   grid-auto-flow: row;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  margin-bottom: 22px;
+  margin-bottom: var(--pool-space-5);
 }
 
 .pool-cf-mail-layout {
   display: grid;
   grid-template-columns: minmax(0, 1.45fr) minmax(300px, .75fr);
-  gap: 36px;
-  margin-bottom: 24px;
+  gap: var(--pool-space-9);
+  margin-bottom: var(--pool-space-6);
 }
 
 .pool-cf-mail-setup,
 .pool-cf-mail-guide,
 .pool-cf-mail-profiles {
-  padding: 20px 0;
+  padding: var(--pool-space-5) 0;
   border-block: 1px solid var(--pool-border);
   background: transparent;
 }
 
 .pool-cf-mail-guide {
-  padding-inline-start: 28px;
+  padding-inline-start: var(--pool-space-7);
   border-inline-start: 1px solid var(--pool-border);
 }
 
@@ -8172,8 +8175,8 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 18px;
+  gap: var(--pool-space-4);
+  margin-bottom: var(--pool-space-4);
 }
 
 .pool-section-heading > div {
@@ -8182,9 +8185,9 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-section-heading span {
   display: block;
-  margin-bottom: 5px;
+  margin-bottom: var(--pool-space-1);
   color: var(--pool-text-3);
-  font-size: 10px;
+  font-size: var(--pool-type-caption);
   font-weight: 720;
   letter-spacing: .06em;
 }
@@ -8192,7 +8195,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-section-heading h3 {
   margin: 0;
   color: var(--pool-text);
-  font-size: 19px;
+  font-size: var(--pool-type-title-3);
   font-weight: 690;
   letter-spacing: -.015em;
   line-height: 1.4;
@@ -8207,14 +8210,14 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-section-heading__controls {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--pool-space-2);
   flex-wrap: wrap;
   justify-content: flex-end;
 }
 
 .pool-section-heading__controls label {
   color: var(--pool-text-2);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   font-weight: 600;
   white-space: nowrap;
 }
@@ -8222,13 +8225,13 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 /* The heading's own bottom margin is the gap; a table margin on top of it would
    double the space between the name and the thing it names. */
 .pool-egress-pools {
-  margin-top: 20px;
+  margin-top: var(--pool-space-5);
 }
 
 .pool-cf-mail-form {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 2px 14px;
+  gap: 2px var(--pool-space-3); /* optical: 2px row gap pairs each mail form field with its label; the 14px column gap carries the rhythm */
 }
 
 .pool-cf-mail-form > :nth-child(3),
@@ -8242,8 +8245,8 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-cf-mail-switches {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  padding: 13px 0;
+  gap: var(--pool-space-2);
+  padding: var(--pool-space-3) 0;
   border-block: 1px solid var(--pool-border);
   background: transparent;
 }
@@ -8252,8 +8255,8 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
-  gap: 8px;
-  margin-top: 12px;
+  gap: var(--pool-space-2);
+  margin-top: var(--pool-space-3);
 }
 
 .pool-cf-mail-steps {
@@ -8268,9 +8271,9 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-cf-mail-steps li {
   display: grid;
   grid-template-columns: 32px minmax(0, 1fr);
-  gap: 10px;
+  gap: var(--pool-space-2);
   min-height: 62px;
-  padding: 12px 0;
+  padding: var(--pool-space-3) 0;
   border-bottom: 1px solid var(--pool-border);
 }
 
@@ -8286,14 +8289,14 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   background: transparent;
   color: var(--pool-accent-text);
   font-family: var(--pool-font-mono);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   font-weight: 720;
 }
 
 .pool-cf-mail-steps p {
   margin: 0;
   color: var(--pool-text-2);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   line-height: 1.55;
   overflow-wrap: anywhere;
 }
@@ -8302,7 +8305,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   position: relative;
   display: grid;
   min-width: 0;
-  gap: 8px;
+  gap: var(--pool-space-2);
 }
 
 /* Height is set inline by CopyCodeBlock from the content's own measured height — a
@@ -8311,7 +8314,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   box-sizing: border-box;
   width: 100%;
   resize: vertical;
-  padding: 13px 14px;
+  padding: var(--pool-space-3);
   border: 1px solid var(--pool-border-strong);
   border-radius: var(--pool-radius-sm);
   background: var(--pool-bg-page);
@@ -8331,9 +8334,9 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-cf-mail-quickstart,
 .pool-cf-mail-note {
   display: grid;
-  gap: 8px;
-  margin-top: 18px;
-  padding: 4px 0 4px 14px;
+  gap: var(--pool-space-2);
+  margin-top: var(--pool-space-4);
+  padding: var(--pool-space-1) 0 var(--pool-space-1) var(--pool-space-3);
   border: 0;
   border-inline-start: 2px solid var(--pool-accent);
   background: transparent;
@@ -8350,9 +8353,9 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-cf-mail-references {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px 14px;
-  margin-top: 12px;
-  font-size: 12px;
+  gap: var(--pool-space-2) var(--pool-space-3);
+  margin-top: var(--pool-space-3);
+  font-size: var(--pool-type-caption);
 }
 
 .pool-cf-mail-references a {
@@ -8372,13 +8375,13 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-cf-mail-note strong {
   color: var(--pool-text);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-cf-mail-note p {
-  margin: 4px 0 0;
+  margin: var(--pool-space-1) 0 0;
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   line-height: 1.5;
 }
 
@@ -8393,8 +8396,8 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: grid;
   grid-template-columns: minmax(210px, 1.3fr) minmax(150px, .8fr) minmax(150px, .7fr) minmax(160px, .8fr) auto;
   align-items: center;
-  gap: 16px;
-  padding: 14px 0;
+  gap: var(--pool-space-4);
+  padding: var(--pool-space-3) 0;
   border: 0;
   border-top: 1px solid var(--pool-border);
   background: transparent;
@@ -8415,14 +8418,14 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--pool-space-3);
   min-width: 0;
 }
 
 .pool-cf-mail-profile__head > div {
   display: grid;
   min-width: 0;
-  gap: 4px;
+  gap: var(--pool-space-1);
 }
 
 .pool-cf-mail-profile__domain {
@@ -8430,7 +8433,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   overflow: hidden;
   color: var(--pool-text);
   font-family: var(--pool-font-mono);
-  font-size: 15px;
+  font-size: var(--pool-type-body);
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -8439,22 +8442,22 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-cf-mail-profile__meta {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+  gap: var(--pool-space-2);
 }
 
 .pool-cf-mail-profile__meta span {
   display: grid;
-  gap: 3px;
+  gap: 3px; /* optical: 3px gap between mail profile meta lines */
   min-width: 0;
   color: var(--pool-text-3);
-  font-size: 10px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-cf-mail-profile__meta strong {
   min-width: 0;
   overflow: hidden;
   color: var(--pool-text);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -8468,7 +8471,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: grid;
   place-items: center;
   min-height: 180px;
-  padding: 24px;
+  padding: var(--pool-space-6);
   border: 0;
   border-top: 1px solid var(--pool-border);
   background: transparent;
@@ -8485,19 +8488,19 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-cf-mail-empty strong {
   color: var(--pool-text);
-  font-size: 15px;
+  font-size: var(--pool-type-body);
 }
 
 .pool-cf-mail-empty span {
   max-width: 280px;
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: 1.55;
 }
 
 @media (max-width: 1180px) {
   .pool-cf-mail-layout {
     grid-template-columns: minmax(0, 1fr);
-    gap: 22px;
+    gap: var(--pool-space-5);
   }
 
   .pool-cf-mail-guide {
@@ -8526,8 +8529,8 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 @media (max-width: 767px) {
   .pool-cf-mail-hero {
     grid-template-columns: minmax(0, 1fr);
-    gap: 18px;
-    padding: 18px 0 20px;
+    gap: var(--pool-space-4);
+    padding: var(--pool-space-4) 0 var(--pool-space-5);
   }
 
   .pool-cf-mail-domain-preview {
@@ -8541,7 +8544,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   .pool-cf-mail-setup,
 .pool-cf-mail-guide,
 .pool-cf-mail-profiles {
-    padding: 18px 0;
+    padding: var(--pool-space-4) 0;
   }
 
   .pool-cf-mail-form,
@@ -8555,7 +8558,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   }
 
   .pool-cf-mail-profile {
-    gap: 12px;
+    gap: var(--pool-space-3);
   }
 
   .pool-cf-mail-profile__flags,
@@ -8583,7 +8586,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-form-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 14px 16px;
+  gap: var(--pool-space-3) var(--pool-space-4);
   align-items: start;
 }
 
@@ -8595,9 +8598,9 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-form-actions {
   display: flex;
-  gap: 10px;
+  gap: var(--pool-space-2);
   flex-wrap: wrap;
-  margin-top: 18px;
+  margin-top: var(--pool-space-4);
 }
 
 /* Stacked, not side by side.
@@ -8615,14 +8618,14 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .public-chat-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 16px;
-  margin-top: 16px;
+  gap: var(--pool-space-4);
+  margin-top: var(--pool-space-4);
   align-items: start;
 }
 
 .public-chat-list {
   display: grid;
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 /* Summary left, actions right. Was a single column, which stacked five small buttons under the
@@ -8633,8 +8636,8 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 14px 18px;
-  padding: 14px;
+  gap: var(--pool-space-3) var(--pool-space-4);
+  padding: var(--pool-space-3);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-lg);
   background: var(--pool-surface-subtle);
@@ -8642,14 +8645,14 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .public-chat-row__main {
   display: grid;
-  gap: 7px;
+  gap: var(--pool-space-2);
   min-width: 0;
 }
 
 .public-chat-row__title {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--pool-space-2);
   flex-wrap: wrap;
 }
 
@@ -8663,7 +8666,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .public-chat-row__actions {
   display: flex;
-  gap: 8px;
+  gap: var(--pool-space-2);
   flex-wrap: wrap;
   justify-content: flex-start;
   align-content: flex-start;
@@ -8693,8 +8696,8 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   min-height: 36px;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding-inline: 10px;
+  gap: var(--pool-space-2);
+  padding-inline: var(--pool-space-2);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-control);
   color: var(--pool-text-2);
@@ -8710,14 +8713,14 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-export-preflight {
   display: grid;
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .pool-export-preflight__summary {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--pool-space-2);
   color: var(--pool-text-2);
 }
 
@@ -8725,14 +8728,14 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   max-height: min(46vh, 440px);
   overflow: auto;
   display: grid;
-  gap: 8px;
-  padding-right: 4px;
+  gap: var(--pool-space-2);
+  padding-right: var(--pool-space-1);
 }
 
 .pool-export-preflight__item {
   display: grid;
-  gap: 5px;
-  padding: 10px 12px;
+  gap: var(--pool-space-1);
+  padding: var(--pool-space-2) var(--pool-space-3);
   border: 1px solid var(--pool-border);
   border-left: 3px solid var(--pool-success);
   border-radius: var(--pool-radius-control);
@@ -8747,7 +8750,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--pool-space-2);
 }
 
 .pool-export-preflight__item span,
@@ -8757,7 +8760,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 
 .pool-export-preflight__item p {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
   line-height: 1.45;
 }
 
@@ -8770,10 +8773,10 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 }
 
 .pool-callout {
-  padding: 10px 12px;
+  padding: var(--pool-space-2) var(--pool-space-3);
   border: 1px solid var(--pool-border);
   border-radius: var(--pool-radius-control);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   line-height: 1.55;
 }
 
@@ -8804,32 +8807,32 @@ Apple-like chart treatment with compact legends and readable tooltips. */
    a first-run setup. The panel intentionally uses existing pool tokens so the
    same light/glow treatment follows the active theme and reduced-motion rules. */
 .pool-hub-modal .pool-modal-body { padding: 0; }
-.pool-hub-panel { display: grid; gap: 16px; }
-.pool-hub-panel__intro { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
-.pool-hub-panel__intro h3 { margin: 0 0 5px; }
-.pool-hub-panel__toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
-.pool-hub-connection-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+.pool-hub-panel { display: grid; gap: var(--pool-space-4); }
+.pool-hub-panel__intro { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--pool-space-4); }
+.pool-hub-panel__intro h3 { margin: 0 0 var(--pool-space-1); }
+.pool-hub-panel__toolbar { display: flex; align-items: center; justify-content: flex-end; gap: var(--pool-space-2); flex-wrap: wrap; }
+.pool-hub-connection-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: var(--pool-space-3); }
 .pool-hub-connection-card { min-width: 0; overflow: hidden; }
-.pool-hub-connection-card__head, .pool-hub-connection-card__metrics, .pool-hub-connection-card__meta, .pool-hub-connection-card__actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pool-hub-connection-card__head, .pool-hub-connection-card__metrics, .pool-hub-connection-card__meta, .pool-hub-connection-card__actions { display: flex; align-items: center; gap: var(--pool-space-2); flex-wrap: wrap; }
 .pool-hub-connection-card__head { justify-content: space-between; }
-.pool-hub-connection-card__title { font-size: 15px; font-weight: 700; }
+.pool-hub-connection-card__title { font-size: var(--pool-type-body); font-weight: 700; }
 .pool-hub-connection-card__id { font: 11px/1.4 var(--pool-mono, ui-monospace, monospace); overflow-wrap: anywhere; }
-.pool-hub-connection-card__metrics { margin-top: 14px; font-size: 12px; }
-.pool-hub-connection-card__metrics span { padding: 5px 8px; border-radius: 8px; background: color-mix(in srgb, var(--pool-accent) 8%, transparent); }
-.pool-hub-connection-card__meta { margin-top: 10px; font-size: 11px; }
-.pool-hub-connection-card__actions { margin-top: 14px; }
-.pool-hub-connection-card__config { display: grid; gap: 8px; margin-top: 12px; padding: 10px; border: 1px solid var(--pool-border); border-radius: 9px; background: color-mix(in srgb, var(--pool-bg-elevated) 92%, var(--pool-accent)); }
-.pool-hub-connection-card__config-row, .pool-hub-secret__row { display: grid; grid-template-columns: 92px minmax(0, 1fr) auto; align-items: center; gap: 8px; font-size: 12px; }
+.pool-hub-connection-card__metrics { margin-top: var(--pool-space-3); font-size: var(--pool-type-caption); }
+.pool-hub-connection-card__metrics span { padding: var(--pool-space-1) var(--pool-space-2); border-radius: 8px; background: color-mix(in srgb, var(--pool-accent) 8%, transparent); }
+.pool-hub-connection-card__meta { margin-top: var(--pool-space-2); font-size: var(--pool-type-caption); }
+.pool-hub-connection-card__actions { margin-top: var(--pool-space-3); }
+.pool-hub-connection-card__config { display: grid; gap: var(--pool-space-2); margin-top: var(--pool-space-3); padding: var(--pool-space-2); border: 1px solid var(--pool-border); border-radius: 9px; background: color-mix(in srgb, var(--pool-bg-elevated) 92%, var(--pool-accent)); }
+.pool-hub-connection-card__config-row, .pool-hub-secret__row { display: grid; grid-template-columns: 92px minmax(0, 1fr) auto; align-items: center; gap: var(--pool-space-2); font-size: var(--pool-type-caption); }
 .pool-hub-connection-card__config code, .pool-hub-secret code { overflow-wrap: anywhere; font: 11px/1.4 var(--pool-mono, ui-monospace, monospace); }
-.pool-hub-empty { min-height: 230px; display: grid; place-items: center; align-content: center; gap: 10px; padding: 24px; text-align: center; color: var(--pool-text-secondary); border: 1px dashed var(--pool-border); border-radius: 12px; }
+.pool-hub-empty { min-height: 230px; display: grid; place-items: center; align-content: center; gap: var(--pool-space-2); padding: var(--pool-space-6); text-align: center; color: var(--pool-text-secondary); border: 1px dashed var(--pool-border); border-radius: 12px; }
 .pool-hub-empty .pool-icon { width: 30px; height: 30px; color: var(--pool-accent); }
 .pool-hub-empty b { color: var(--pool-text); }
-.pool-hub-editor { display: grid; gap: 14px; }
-.pool-hub-editor__switch { display: flex; align-items: center; gap: 10px; }
-.pool-hub-editor__switch span { display: grid; gap: 2px; font-size: 13px; }
+.pool-hub-editor { display: grid; gap: var(--pool-space-3); }
+.pool-hub-editor__switch { display: flex; align-items: center; gap: var(--pool-space-2); }
+.pool-hub-editor__switch span { display: grid; gap: 2px; /* optical: 2px gap between the hub switch label and its hint */ font-size: var(--pool-type-label); }
 .pool-hub-editor__switch small { color: var(--pool-text-secondary); }
-.pool-hub-secret { display: grid; gap: 14px; }
-.pool-hub-secret__row { padding: 9px 10px; border: 1px solid var(--pool-border); border-radius: 8px; }
+.pool-hub-secret { display: grid; gap: var(--pool-space-3); }
+.pool-hub-secret__row { padding: var(--pool-space-2); border: 1px solid var(--pool-border); border-radius: 8px; }
 .pool-secret-value { color: var(--pool-accent); word-break: break-all; }
 .pool-hub-secret__footer { display: flex; justify-content: flex-end; }
 @media (max-width: 700px) {
@@ -8841,6 +8844,35 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 @media (prefers-reduced-motion: reduce) {
   .pool-hub-connection-card, .pool-hub-empty { transition: none !important; }
 }
-.pool-capacity-estimates { display: grid; gap: 8px; margin-top: 10px; }
-.pool-capacity-estimate { display: grid; gap: 4px; padding: 8px 10px; border: 1px solid var(--pool-border); border-radius: 8px; font-size: 12px; }
-.pool-capacity-estimate > div:first-child { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.pool-capacity-estimates { display: grid; gap: var(--pool-space-2); margin-top: var(--pool-space-2); }
+.pool-capacity-estimate { display: grid; gap: var(--pool-space-1); padding: var(--pool-space-2); border: 1px solid var(--pool-border); border-radius: 8px; font-size: var(--pool-type-caption); }
+.pool-capacity-estimate > div:first-child { display: flex; align-items: center; gap: var(--pool-space-1); flex-wrap: wrap; }
+
+.pool-error-boundary {
+  display: grid;
+  min-height: 220px;
+  place-items: center;
+  padding: var(--pool-space-6);
+}
+
+.pool-error-boundary.is-page {
+  min-height: min(520px, calc(100dvh - 132px));
+}
+
+.pool-error-panel {
+  display: grid;
+  width: min(100%, 560px);
+  gap: var(--pool-space-3);
+  padding: var(--pool-space-5);
+  border: 1px solid color-mix(in srgb, var(--pool-danger) 34%, var(--pool-border));
+  border-radius: var(--pool-radius-lg);
+  background: var(--pool-bg-surface);
+  box-shadow: var(--pool-shadow-sm);
+}
+
+.pool-request-id {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--pool-space-1);
+}

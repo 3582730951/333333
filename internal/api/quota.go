@@ -245,7 +245,10 @@ func (s *Server) captureQuota(ctx context.Context, accountID, provider, model st
 	if snap.LimiterType == "" {
 		snap.LimiterType = snap.Source
 	}
-	s.scheduler.ApplyRateLimitSnapshot(snap)
+	if s.scheduler != nil {
+		s.scheduler.ApplyRateLimitSnapshot(snap)
+		s.wakeRouteAvailability()
+	}
 	s.enqueueWrite(func() {
 		writeCtx, cancel := s.bgWriteContext()
 		defer cancel()

@@ -92,7 +92,7 @@
   display: flex;
   min-width: 0;
   flex-direction: column;
-  gap: 5px;
+  gap: var(--pool-space-1);
 }
 
 .pool-ranked__head {
@@ -107,9 +107,9 @@
   display: flex;
   min-width: 0;              /* lets the label ellipsize instead of pushing the value */
   align-items: center;
-  gap: 7px;
+  gap: var(--pool-space-2);
   color: var(--pool-text-2);
-  font-size: 12.5px;
+  font-size: var(--pool-type-caption);
   line-height: var(--pool-leading-tight);
 }
 
@@ -130,7 +130,7 @@
 .pool-ranked__value {
   flex: 0 0 auto;            /* never compressed by a long label */
   color: var(--pool-text);
-  font-size: 12.5px;
+  font-size: var(--pool-type-caption);
   font-weight: 620;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -163,7 +163,7 @@
   display: flex;
   min-width: 0;
   flex-direction: column;
-  gap: 7px;
+  gap: var(--pool-space-2);
 }
 
 /*
@@ -182,7 +182,7 @@
   /* Hairline separators rather than gutters. At 3px the buckets read as eight
      separate objects; at 1px they read as one trace divided into hours, which is
      what the data actually is. */
-  gap: 1px;
+  gap: 1px;                  /* optical: hairline bucket separator, not a rhythm step */
   border-radius: 3px;
   overflow: hidden;
 }
@@ -199,7 +199,7 @@
   justify-content: space-between;
   gap: var(--pool-space-3);
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   font-variant-numeric: tabular-nums;
   line-height: var(--pool-leading-tight);
 }
@@ -229,7 +229,7 @@
 .pool-stacked-meter__legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px var(--pool-space-4);
+  gap: var(--pool-space-1) var(--pool-space-4);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -239,9 +239,9 @@
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 6px;
+  gap: var(--pool-space-1);
   color: var(--pool-text-3);
-  font-size: 11.5px;
+  font-size: var(--pool-type-caption);
   line-height: var(--pool-leading-tight);
 }
 
@@ -264,10 +264,10 @@
   display: inline-flex;
   min-height: var(--pool-delta-height);
   align-items: center;
-  gap: 3px;
-  padding: 2px 7px;
+  gap: 3px;                          /* optical: glyph-to-number kerning inside the pill */
+  padding: 2px var(--pool-space-2);  /* optical: 2px block keeps the pill on --pool-delta-height */
   border-radius: 999px;
-  font-size: 11.5px;
+  font-size: var(--pool-type-caption);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   line-height: 1.35;
@@ -275,7 +275,7 @@
 }
 
 .pool-delta__arrow {
-  font-size: 10px;
+  font-size: var(--pool-type-caption);
   line-height: 1;
 }
 
@@ -384,7 +384,7 @@
   display: flex;
   min-width: 0;   /* lets the label ellipsis rather than push the badge out */
   align-items: center;
-  gap: 6px;
+  gap: var(--pool-space-1);
 }
 
 .pool-kpi__dot {
@@ -408,7 +408,7 @@
 
 .pool-kpi__value {
   color: var(--pool-text);
-  font-size: 27px;
+  font-size: var(--pool-type-title-1);
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.028em;
@@ -429,7 +429,7 @@
   min-width: 0;
   flex: 1 1 auto;
   color: var(--pool-text-3);
-  font-size: 11.5px;
+  font-size: var(--pool-type-caption);
   line-height: var(--pool-leading-tight);
   overflow-wrap: anywhere;
 }
@@ -475,14 +475,14 @@
   min-width: 0;
   flex: 0 0 auto;
   flex-direction: column;
-  gap: 7px;
+  gap: var(--pool-space-2);
   padding-top: var(--pool-space-3);
   border-top: 1px solid var(--pool-border-subtle);
 }
 
 .pool-ops-split__activity-label {
   color: var(--pool-text-3);
-  font-size: 11.5px;
+  font-size: var(--pool-type-caption);
   font-weight: 550;
   line-height: var(--pool-leading-tight);
 }
@@ -510,8 +510,8 @@
   min-width: 0;
   flex: 1 1 auto;
   flex-direction: column;
-  gap: 3px;
-  padding: 10px var(--pool-space-3);
+  gap: 3px;                                       /* optical: label-to-desc leading tightener */
+  padding: var(--pool-space-2) var(--pool-space-3);
   border: 1px solid transparent;
   border-radius: var(--pool-radius-lg);
   background: var(--pool-bg-surface-2);
@@ -529,7 +529,7 @@
   min-width: 0;
   overflow: hidden;
   color: var(--pool-text-2);
-  font-size: 12.5px;
+  font-size: var(--pool-type-caption);
   font-weight: 560;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -538,7 +538,7 @@
 .pool-attention-card__value {
   flex: 0 0 auto;
   color: var(--pool-text);
-  font-size: 16px;
+  font-size: var(--pool-type-callout);
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   line-height: var(--pool-leading-tight);
@@ -547,7 +547,7 @@
 .pool-attention-card__desc {
   margin: 0;
   color: var(--pool-text-3);
-  font-size: 11.5px;
+  font-size: var(--pool-type-caption);
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
@@ -603,7 +603,7 @@
 
 .pool-subsection-title {
   color: var(--pool-text-2);
-  font-size: 12.5px;
+  font-size: var(--pool-type-caption);
   font-weight: 600;
   letter-spacing: -0.005em;
   line-height: var(--pool-leading-tight);
@@ -632,7 +632,7 @@
   }
 
   .pool-kpi__value {
-    font-size: 24px;
+    font-size: var(--pool-type-title-2);
   }
 
   /* Three across, not auto-fit. A 112px minimum only fits two tracks in the ~326px of
@@ -666,7 +666,7 @@
 /* The rail's inline action is a link-weight affordance, not a full-width control. */
 .pool-attention-card .pool-button {
   align-self: flex-start;
-  margin-top: 3px;
+  margin-top: 3px;           /* optical: link-weight action nudge, not a rhythm step */
   padding-inline: 0;
   color: var(--pool-accent-text);
 }
@@ -676,16 +676,16 @@
    Specificity (0,2,0) intentionally beats the base .pool-stat rules. */
 .pool-admin-shell .pool-stat {
   min-height: 0;
-  padding: 13px var(--pool-space-4);
+  padding: var(--pool-space-3) var(--pool-space-4);
 }
 
 .pool-admin-shell .pool-stat .value {
-  margin-top: 5px;
-  font-size: 25px;
+  margin-top: var(--pool-space-1);
+  font-size: var(--pool-type-title-2);
 }
 
 .pool-admin-shell .pool-stat .sub {
-  margin-top: 4px;
+  margin-top: var(--pool-space-1);
   line-height: var(--pool-leading-tight);
 }
 
@@ -705,7 +705,8 @@
 
      Pinning the track count means the span rules below know how many tracks there are
      to fill. Two columns hold the widest value comfortably — the tiles measure 173px at
-     390px against a ~112px worst-case number ("166.8万" at 27px/700). */
+     390px against a ~116px worst-case number ("166.8万" at the 28px title-1 step /700;
+     it measured ~112px at the 27px this rule carried before the type ladder snap). */
   .pool-kpi-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -834,12 +835,12 @@
 .pool-quota-overview__note {
   margin: 0;
   color: var(--pool-warning);
-  font-size: 11.5px;
+  font-size: var(--pool-type-caption);
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
 
-@media (max-width: 900px) {
+@media (max-width: 767px) {
   .pool-quota-overview {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -881,7 +882,7 @@
   flex: 0 0 auto;
   margin: 0;
   color: var(--pool-text);
-  font-size: 17px;
+  font-size: var(--pool-type-callout);
   font-weight: 650;
   font-variant-numeric: tabular-nums;
   line-height: var(--pool-leading-tight);
@@ -891,7 +892,7 @@
   min-width: 0;
 }
 
-@media (max-width: 900px) {
+@media (max-width: 767px) {
   .pool-quota-credits__body {
     grid-template-columns: minmax(0, 1fr);
     gap: var(--pool-space-4);
@@ -929,7 +930,7 @@
   min-width: 0;
   overflow: hidden;
   color: var(--pool-text-2);
-  font-size: 12.5px;
+  font-size: var(--pool-type-caption);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -937,7 +938,7 @@
 .pool-quota-credits__balances b {
   flex: 0 0 auto;
   color: var(--pool-text);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   font-weight: 650;
   font-variant-numeric: tabular-nums;
 }
@@ -965,7 +966,7 @@
   border-radius: var(--pool-radius-sm);
   background: var(--pool-bg-surface-2);
   color: var(--pool-text-3);
-  font-size: 13px;
+  font-size: var(--pool-type-label);
   line-height: 1;
   cursor: pointer;
   transition: background var(--pool-motion-fast) var(--pool-motion-ease),
@@ -1000,12 +1001,12 @@
   display: flex;
   min-width: 0;
   flex-direction: column;
-  gap: 3px;
+  gap: 3px;                  /* optical: dt-to-dd leading tightener inside one field */
 }
 
 .pool-table-more dt {
   color: var(--pool-text-3);
-  font-size: 11.5px;
+  font-size: var(--pool-type-caption);
   line-height: var(--pool-leading-tight);
 }
 
@@ -1013,7 +1014,7 @@
   margin: 0;
   min-width: 0;
   color: var(--pool-text);
-  font-size: 12.5px;
+  font-size: var(--pool-type-caption);
   line-height: var(--pool-leading-tight);
   overflow-wrap: anywhere;
 }
@@ -1099,14 +1100,16 @@
   justify-content: space-between;
   gap: var(--pool-space-3);
   margin-top: var(--pool-space-2);
+  /* 52px mirrors the label track in .pool-mq-timeline__row exactly; it is a grid-track
+     width echo, not a rhythm step, so it is not snapped to the space ladder. */
   margin-left: calc(52px + var(--pool-space-3));
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   font-variant-numeric: tabular-nums;
   line-height: var(--pool-leading-tight);
 }
 
-@media (max-width: 900px) {
+@media (max-width: 767px) {
   .pool-mq-overview {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1154,18 +1157,18 @@
 .pool-sys-load__net {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 2px;                  /* optical: label-to-figure leading tightener */
   min-width: 0;
 }
 
 .pool-sys-load__net-label {
   color: var(--pool-text-3);
-  font-size: 11.5px;
+  font-size: var(--pool-type-caption);
   line-height: var(--pool-leading-tight);
 }
 
 .pool-sys-load__net strong {
-  font-size: 17px;
+  font-size: var(--pool-type-callout);
   font-weight: 650;
   font-variant-numeric: tabular-nums;
   line-height: var(--pool-leading-tight);
@@ -1174,7 +1177,7 @@
 /* The throughput and goroutine sublines are the longest strings in the card and they sit two to
    a row, so they wrap rather than push the border out. */
 .pool-sys-load__net .pool-muted {
-  font-size: 11.5px;
+  font-size: var(--pool-type-caption);
   line-height: var(--pool-leading-body);
   overflow-wrap: anywhere;
 }
@@ -1223,20 +1226,20 @@
 
 .pool-sys-deployment-storage__draining {
   display: grid;
-  gap: 8px;
-  margin-top: 14px;
+  gap: var(--pool-space-2);
+  margin-top: var(--pool-space-3);
 }
 
 .pool-sys-deployment-storage__draining > div {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 8px 10px;
+  gap: var(--pool-space-3);
+  padding: var(--pool-space-2);
   border: 1px solid color-mix(in srgb, var(--pool-border) 82%, transparent);
   border-radius: 8px;
   background: color-mix(in srgb, var(--pool-surface-raised) 72%, transparent);
-  font-size: 12px;
+  font-size: var(--pool-type-caption);
 }
 
 .pool-sys-deployment-storage__draining code {
@@ -1271,14 +1274,14 @@
 .pool-sys-guard__note {
   margin-top: var(--pool-space-2);
   color: var(--pool-text-3);
-  font-size: 11.5px;
+  font-size: var(--pool-type-caption);
   line-height: var(--pool-leading-body);
 }
 
 .pool-sys-guard__error {
   margin-top: var(--pool-space-2);
   color: var(--pool-danger);
-  font-size: 11.5px;
+  font-size: var(--pool-type-caption);
   line-height: var(--pool-leading-body);
   overflow-wrap: anywhere;
 }
@@ -1311,7 +1314,7 @@
 
 .pool-sys-timeline__label {
   color: var(--pool-text-3);
-  font-size: 11.5px;
+  font-size: var(--pool-type-caption);
   line-height: var(--pool-leading-tight);
 }
 
@@ -1320,9 +1323,11 @@
   justify-content: space-between;
   gap: var(--pool-space-3);
   margin-top: var(--pool-space-2);
+  /* 52px mirrors the label track in .pool-sys-timeline__row exactly; it is a grid-track
+     width echo, not a rhythm step, so it is not snapped to the space ladder. */
   margin-left: calc(52px + var(--pool-space-3));
   color: var(--pool-text-3);
-  font-size: 11px;
+  font-size: var(--pool-type-caption);
   font-variant-numeric: tabular-nums;
   line-height: var(--pool-leading-tight);
 }

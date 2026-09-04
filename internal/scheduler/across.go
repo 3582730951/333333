@@ -62,6 +62,12 @@ func (s *Scheduler) SelectAcross(ctx context.Context, choices []RouteChoice) (Ro
 	}
 
 	normalized := make([]RouteChoice, 0, len(choices))
+	egressPolicy, hasEgressPolicy := dynamicPoolBalancePolicyFromContext(ctx)
+	var egressOrder []string
+	if hasEgressPolicy && egressPolicy.Enabled && egressPolicy.EgressRPMBalanceEnabled &&
+		egressPolicy.EgressRPMBalanceThreshold > 0 && s.dynamicBalance != nil {
+		egressOrder = s.orderedEgressRPMIDs(ctx, egressPolicy, Route{}, storage.AccountEgressBinding{}, storage.Now())
+	}
 	seenChoices := make(map[string]struct{}, len(choices))
 	for index, choice := range choices {
 		choice.ChoiceKey = strings.TrimSpace(choice.ChoiceKey)
@@ -70,6 +76,12 @@ func (s *Scheduler) SelectAcross(ctx context.Context, choices []RouteChoice) (Ro
 		}
 		if _, duplicate := seenChoices[choice.ChoiceKey]; duplicate {
 			return RoutedLease{}, fmt.Errorf("duplicate route choice key %q", choice.ChoiceKey)
+		}
+		if hasEgressPolicy && egressPolicy.Enabled && egressPolicy.EgressRPMBalanceEnabled && egressPolicy.Fresh && !egressPolicy.Bound && egressPolicy.OnlyAccountPoolTier && storage.NormalizeAgentClass(egressPolicy.AgentClass) == storage.AgentClassRoot && len(egressPolicy.EgressRPMBalanceEgressIDs) > 0 && !choice.Route.ImmutableAffinity && choice.Route.RequiredEgressID == "" && !choice.Route.ServerSideState && !choice.Route.FairScheduling {
+			if len(egressOrder) == 0 {
+				egressOrder = egressPolicy.EgressRPMBalanceEgressIDs
+			}
+			choice.Route.PreferredEgressIDs = append([]string(nil), egressOrder...)
 		}
 		seenChoices[choice.ChoiceKey] = struct{}{}
 		if err := s.normalizeAcrossRoute(ctx, &choice.Route); err != nil {
@@ -123,6 +135,12 @@ func (s *Scheduler) SelectAcross(ctx context.Context, choices []RouteChoice) (Ro
 		}
 		return RoutedLease{}, &NoAccountError{Group: acrossGroups(normalized), Model: normalized[0].Route.Model, Counters: counters, EmptyPool: poolSize == 0}
 	}
+	policy, policyPresent := dynamicPoolBalancePolicyFromContext(ctx)
+	dynamicDecision := dynamicPoolBalanceDecision{}
+	if policyPresent && policy.Enabled && policy.RPMThreshold > 0 {
+		dynamicDecision = s.dynamicPoolBalanceDecision(ctx, policy, evaluated, storage.Now())
+		s.recordDynamicPoolBalanceDecision(dynamicDecision)
+	}
 
 	requests := make([]LeaseCandidateRequest, 0, len(evaluated))
 	lookup := make(map[string]acrossEvaluatedCandidate, len(evaluated))
@@ -133,9 +151,13 @@ func (s *Scheduler) SelectAcross(ctx context.Context, choices []RouteChoice) (Ro
 			continue
 		}
 		lookup[key] = item
+		balancePriority := 0
+		if dynamicDecision.Priorities != nil {
+			balancePriority = dynamicDecision.Priorities[key]
+		}
 		requests = append(requests, LeaseCandidateRequest{
 			ChoiceKey: item.choiceKey, Request: leaseRequestForCandidate(item.candidate, item.route, cfg),
-			AccountScore: item.candidate.score, Pending: item.pending,
+			AccountScore: item.candidate.score, Pending: item.pending, BalancePriority: balancePriority,
 		})
 	}
 	if len(requests) == 0 {
@@ -162,6 +184,31 @@ func (s *Scheduler) SelectAcross(ctx context.Context, choices []RouteChoice) (Ro
 		return RoutedLease{}, fmt.Errorf("coordinator selected unknown route/account pair %q/%q", selection.ChoiceKey, selection.AccountID)
 	}
 	lease := s.activateCoordinatedCandidate(item.candidate, item.route, selection.Lease)
+	var balanceReleases []func()
+	if dynamicDecision.Applied {
+		now := storage.Now()
+		s.reserveDynamicPoolBalance(ctx, policy, lease.Account.ID, now)
+		balanceReleases = append(balanceReleases, func() { s.releaseDynamicPoolBalanceReservation(ctx, policy) })
+		atomic.AddInt64(&s.metrics.DynamicPoolBalanceSelections, 1)
+		if len(normalized) > 1 {
+			atomic.AddInt64(&s.metrics.DynamicPoolBalanceTargetSelections, 1)
+		}
+	}
+	if egressPolicy, active := egressRPMBalancePolicyActive(ctx, item.route, lease.Binding); active {
+		egressID := strings.TrimSpace(lease.Egress.ID)
+		if egressID != "" {
+			s.reserveEgressRPMBalance(ctx, egressPolicy, egressID, storage.Now())
+			balanceReleases = append(balanceReleases, func() { s.releaseDynamicPoolBalanceReservation(ctx, egressPolicy) })
+		}
+	}
+	if len(balanceReleases) > 0 {
+		lease.dynamicRelease = func() {
+			for _, release := range balanceReleases {
+				fn := release
+				fn()
+			}
+		}
+	}
 	if trueAffinity.Hash != "" {
 		stored, bindErr := s.upsertAffinityResult(ctx, storage.AffinityBinding{
 			RouteKeyHash: trueAffinity.Hash, RouteKey: trueAffinity.Key, Source: trueAffinity.Source,
@@ -178,6 +225,15 @@ func (s *Scheduler) SelectAcross(ctx context.Context, choices []RouteChoice) (Ro
 func (s *Scheduler) normalizeAcrossRoute(ctx context.Context, route *Route) error {
 	if route.NoEgressFallback {
 		route.ImmutableAffinity = true
+	}
+	if len(route.PreferredEgressIDs) > 0 {
+		if _, active := egressRPMBalancePolicyActive(ctx, *route, storage.AccountEgressBinding{}); active {
+			return nil
+		}
+		// PreferredEgressIDs is a legacy caller hint and cannot override the
+		// account-pool group's primary outlet unless the explicit user-group RPM
+		// policy is active.
+		route.PreferredEgressIDs = nil
 	}
 	if route.Group == "" {
 		route.Group = s.Config().DefaultGroup
@@ -315,7 +371,16 @@ func (s *Scheduler) acquireAcross(ctx context.Context, requests []LeaseCandidate
 	// scan so one process cannot make two non-atomic fresh choices concurrently.
 	s.acrossMu.Lock()
 	defer s.acrossMu.Unlock()
-	for _, request := range requests {
+	ordered := append([]LeaseCandidateRequest(nil), requests...)
+	// An injected legacy coordinator has no cross-target priority axis. Preserve
+	// the soft overlay by trying relief candidates first, while leaving the
+	// historical request order untouched when every priority is zero.
+	if hasDynamicBalancePriority(ordered) {
+		sort.SliceStable(ordered, func(i, j int) bool {
+			return ordered[i].BalancePriority > ordered[j].BalancePriority
+		})
+	}
+	for _, request := range ordered {
 		lease, reason, err := s.coordinator.TryAcquire(ctx, request.Request)
 		if err != nil {
 			return CoordinatedLeaseSelection{}, reason, err

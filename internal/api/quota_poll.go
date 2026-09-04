@@ -42,10 +42,20 @@ import (
 // capped, with a floor interval so it never overwhelms the backend-api.
 
 const (
-	quotaPollIntervalFloor = 120 // seconds — never poll more often than every 2 min
-	quotaPollInterval      = 300 // seconds — default
+	quotaPollIntervalFloor = 120 // seconds — manual refresh reuse floor
 	quotaPollMaxConcurrent = 5   // max concurrent fetches per tick
 	quotaRefreshTimeout    = 10 * time.Minute
+
+	// Healthy observations are refreshed before the scheduler's 15-minute trust
+	// window expires. Exhausted observations are instead held until their own
+	// reset deadline, with a small deterministic jitter so a shared window does
+	// not wake every account in the same instant.
+	quotaPollHealthyRefreshSeconds = int64(10 * 60)
+	quotaPollResetJitterSeconds    = int64(5)
+	quotaPollBatchWindowSeconds    = int64(30)
+	quotaPollFailureBackoffBase    = int64(30)
+	quotaPollFailureBackoffMax     = int64(15 * 60)
+	quotaPollInitialStagger        = 30 * time.Second
 )
 
 var whamUsageURL = "https://chatgpt.com/backend-api/wham/usage"
@@ -236,18 +246,30 @@ type quotaPollTarget struct {
 }
 
 type quotaRefreshResult struct {
-	Updated     int   `json:"updated"`
-	Failed      int   `json:"failed"`
-	Candidates  int   `json:"candidates"`
-	StartedAt   int64 `json:"started_at"`
-	CompletedAt int64 `json:"completed_at"`
-	Coalesced   bool  `json:"coalesced,omitempty"`
-	Reused      bool  `json:"reused,omitempty"`
+	Updated           int      `json:"updated"`
+	Failed            int      `json:"failed"`
+	Candidates        int      `json:"candidates"`
+	StartedAt         int64    `json:"started_at"`
+	CompletedAt       int64    `json:"completed_at"`
+	Coalesced         bool     `json:"coalesced,omitempty"`
+	Reused            bool     `json:"reused,omitempty"`
+	Scoped            bool     `json:"-"`
+	UpdatedAccountIDs []string `json:"-"`
+	FailedAccountIDs  []string `json:"-"`
 }
 
 type quotaRefreshFlight struct {
 	done   chan struct{}
 	result quotaRefreshResult
+	scoped bool
+}
+
+func (s *Server) upsertLiveQuotaSnapshot(ctx context.Context, snapshot storage.AccountRateLimit) error {
+	if s.scheduler != nil {
+		s.scheduler.ApplyRateLimitSnapshot(snapshot)
+		s.wakeRouteAvailability()
+	}
+	return s.store.UpsertAccountRateLimit(ctx, snapshot)
 }
 
 type quotaPollError struct {
@@ -255,6 +277,198 @@ type quotaPollError struct {
 	statusCode int
 	body       string
 	err        error
+}
+
+type quotaPollScopeContextKey struct{}
+
+// withQuotaPollScope keeps the existing quota refresh flight/coalescing path
+// while allowing the background scheduler to refresh only accounts whose reset
+// or freshness deadline is due. A nil slice means the historical full scan.
+func withQuotaPollScope(ctx context.Context, accountIDs []string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	copyIDs := append([]string(nil), accountIDs...)
+	return context.WithValue(ctx, quotaPollScopeContextKey{}, copyIDs)
+}
+
+func quotaPollScope(ctx context.Context) (map[string]struct{}, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	raw, ok := ctx.Value(quotaPollScopeContextKey{}).([]string)
+	if !ok {
+		return nil, false
+	}
+	scope := make(map[string]struct{}, len(raw))
+	for _, id := range raw {
+		if id = strings.TrimSpace(id); id != "" {
+			scope[id] = struct{}{}
+		}
+	}
+	return scope, true
+}
+
+type quotaPollFailureState struct {
+	attempts int
+	retryAt  int64
+}
+
+type quotaPollPlan struct {
+	NextAt     int64
+	AccountIDs []string
+}
+
+type quotaPollDueAccount struct {
+	ID string
+	At int64
+}
+
+// quotaPollJitter is stable per account, so a process restart does not create a
+// new random burst while still spreading accounts sharing one upstream window.
+func quotaPollJitter(accountID string) int64 {
+	var hash uint32 = 2166136261
+	for i := 0; i < len(accountID); i++ {
+		hash ^= uint32(accountID[i])
+		hash *= 16777619
+	}
+	return int64(hash % uint32(quotaPollResetJitterSeconds+1))
+}
+
+func quotaPollErrorSnapshot(row storage.AccountRateLimit) bool {
+	return strings.TrimSpace(row.LimiterType) == "quota_poll_error" ||
+		strings.TrimSpace(row.Source) == "quota_poll_error" ||
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(row.Status)), "error/")
+}
+
+// buildQuotaPollPlan chooses the next account-level refresh deadline. It is
+// intentionally pure so reset timing, jitter, batching and failure backoff can
+// be tested without sleeping or making an upstream request.
+func buildQuotaPollPlan(accounts []storage.Account, rows []storage.AccountRateLimit, now int64, failures map[string]quotaPollFailureState) quotaPollPlan {
+	byAccount := make(map[string][]storage.AccountRateLimit)
+	for _, row := range rows {
+		byAccount[row.AccountID] = append(byAccount[row.AccountID], row)
+	}
+	plan := quotaPollPlan{}
+	dueAccounts := make([]quotaPollDueAccount, 0, len(accounts))
+	for _, account := range accounts {
+		if !isQuotaPollCandidate(account, now) && !isKiroQuotaPollCandidate(account, now) && !isCursorQuotaPollCandidate(account, now) {
+			continue
+		}
+		accountID := strings.TrimSpace(account.ID)
+		if accountID == "" {
+			continue
+		}
+		latest := int64(0)
+		exhaustedReset := int64(0)
+		dueReset := false
+		for _, row := range byAccount[accountID] {
+			if quotaPollErrorSnapshot(row) {
+				continue
+			}
+			if row.UpdatedAt > latest {
+				latest = row.UpdatedAt
+			}
+			if row.ResetAt <= 0 {
+				continue
+			}
+			if row.UpdatedAt > 0 && now > row.UpdatedAt && now-row.UpdatedAt > storage.AccountRateLimitSnapshotMaxAgeSeconds {
+				continue
+			}
+			if row.ResetAt <= now {
+				dueReset = true
+				continue
+			}
+			if !storage.AccountRateLimitIsExhausted(row) {
+				continue
+			}
+			if exhaustedReset == 0 || row.ResetAt < exhaustedReset {
+				exhaustedReset = row.ResetAt
+			}
+		}
+		baseAt := now
+		switch {
+		case dueReset:
+			baseAt = now
+		case exhaustedReset > now:
+			baseAt = exhaustedReset
+		case latest > 0 && now-latest <= storage.AccountRateLimitSnapshotMaxAgeSeconds:
+			baseAt = latest + quotaPollHealthyRefreshSeconds
+		case latest > 0 && now < latest:
+			baseAt = now + quotaPollHealthyRefreshSeconds
+		}
+		if baseAt < now {
+			baseAt = now
+		}
+		dueAt := baseAt + quotaPollJitter(accountID)
+		if state, ok := failures[accountID]; ok && state.retryAt > dueAt {
+			dueAt = state.retryAt
+		}
+		if plan.NextAt == 0 || dueAt < plan.NextAt {
+			plan.NextAt = dueAt
+		}
+		dueAccounts = append(dueAccounts, quotaPollDueAccount{ID: accountID, At: dueAt})
+	}
+	// Include only accounts close to the earliest deadline. This batches a shared
+	// reset window without polling a later account early merely because the current
+	// wall clock happens to be within the broad batch window.
+	if plan.NextAt > 0 {
+		batchEnd := plan.NextAt + quotaPollBatchWindowSeconds
+		for _, due := range dueAccounts {
+			if due.At <= batchEnd {
+				plan.AccountIDs = append(plan.AccountIDs, due.ID)
+			}
+		}
+	}
+	sort.Strings(plan.AccountIDs)
+	return plan
+}
+
+func quotaPollFailureBackoff(attempts int) int64 {
+	if attempts <= 0 {
+		return quotaPollFailureBackoffBase
+	}
+	backoff := quotaPollFailureBackoffBase
+	for i := 1; i < attempts; i++ {
+		if backoff >= quotaPollFailureBackoffMax/2 {
+			return quotaPollFailureBackoffMax
+		}
+		backoff *= 2
+	}
+	if backoff > quotaPollFailureBackoffMax {
+		return quotaPollFailureBackoffMax
+	}
+	return backoff
+}
+
+func observeQuotaPollResult(failures map[string]quotaPollFailureState, result quotaRefreshResult, now int64) {
+	for _, accountID := range result.UpdatedAccountIDs {
+		delete(failures, accountID)
+	}
+	for _, accountID := range result.FailedAccountIDs {
+		state := failures[accountID]
+		state.attempts++
+		state.retryAt = now + quotaPollFailureBackoff(state.attempts)
+		failures[accountID] = state
+	}
+}
+
+func waitQuotaPollUntil(ctx context.Context, unixAt int64) bool {
+	if ctx == nil {
+		return false
+	}
+	seconds := unixAt - storage.Now()
+	if seconds <= 0 {
+		return true
+	}
+	timer := time.NewTimer(time.Duration(seconds) * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (e quotaPollError) Error() string {
@@ -286,26 +500,80 @@ func newQuotaPollError(reason string, statusCode int, body []byte, err error) qu
 // StartQuotaPoller launches the background quota poller. Called once from main.
 func (s *Server) StartQuotaPoller(ctx context.Context) {
 	supervisor.Go(ctx, "quota-poller", func(ctx context.Context) {
-		// Stagger startup so the server is fully ready before the first poll.
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(30 * time.Second):
-		}
-		log.Printf("[QUOTA-POLL] started (interval=%ds, max_concurrent=%d)", quotaPollInterval, quotaPollMaxConcurrent)
-		ticker := time.NewTicker(time.Duration(quotaPollInterval) * time.Second)
-		defer ticker.Stop()
-		// First poll immediately after the stagger.
-		s.waitForQuotaRefresh(ctx)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				s.waitForQuotaRefresh(ctx)
-			}
-		}
+		s.runQuotaPoller(ctx, quotaPollInitialStagger, nil)
 	})
+}
+
+// runQuotaPoller is split out of StartQuotaPoller so its cancellation behavior can
+// be tested after it has entered a real timer wait. ready is test-only plumbing;
+// production passes nil.
+func (s *Server) runQuotaPoller(ctx context.Context, initialStagger time.Duration, ready chan<- struct{}) {
+	// Stagger startup so the server is fully ready before the first poll.
+	stagger := time.NewTimer(initialStagger)
+	defer stagger.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-stagger.C:
+	}
+	log.Printf("[QUOTA-POLL] started (healthy_refresh=%ds, max_concurrent=%d, reset_jitter=%ds)", quotaPollHealthyRefreshSeconds, quotaPollMaxConcurrent, quotaPollResetJitterSeconds)
+	failures := make(map[string]quotaPollFailureState)
+	// First poll is intentionally full so accounts without a snapshot enter the
+	// reset-driven plan. Subsequent scans are scoped to due accounts.
+	if result, err := s.waitForQuotaRefreshScoped(ctx, nil, true); err == nil {
+		observeQuotaPollResult(failures, result, storage.Now())
+	}
+	if ready != nil {
+		close(ready)
+	}
+	for {
+		accounts, err := s.store.ListAccounts(ctx)
+		if err != nil {
+			if !waitQuotaPollUntil(ctx, storage.Now()+quotaPollFailureBackoffBase) {
+				return
+			}
+			continue
+		}
+		rows, err := s.store.ListAccountRateLimits(ctx)
+		if err != nil {
+			if !waitQuotaPollUntil(ctx, storage.Now()+quotaPollFailureBackoffBase) {
+				return
+			}
+			continue
+		}
+		plan := buildQuotaPollPlan(accounts, rows, storage.Now(), failures)
+		if plan.NextAt == 0 {
+			if !waitQuotaPollUntil(ctx, storage.Now()+quotaPollHealthyRefreshSeconds) {
+				return
+			}
+			continue
+		}
+		if plan.NextAt > storage.Now() {
+			if !waitQuotaPollUntil(ctx, plan.NextAt) {
+				return
+			}
+			continue
+		}
+		if len(plan.AccountIDs) == 0 {
+			// A due account can be just outside the batch window after a clock
+			// tick; recalculate rather than spinning.
+			if !waitQuotaPollUntil(ctx, storage.Now()+1) {
+				return
+			}
+			continue
+		}
+		result, err := s.waitForQuotaRefreshScoped(ctx, plan.AccountIDs, true)
+		if err != nil {
+			for _, accountID := range plan.AccountIDs {
+				state := failures[accountID]
+				state.attempts++
+				state.retryAt = storage.Now() + quotaPollFailureBackoff(state.attempts)
+				failures[accountID] = state
+			}
+			continue
+		}
+		observeQuotaPollResult(failures, result, storage.Now())
+	}
 }
 
 // pollAllCodexQuotas fetches usage snapshots for every active Codex/Claude
@@ -322,6 +590,23 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) (result quotaRefreshRes
 	}
 	now := storage.Now()
 	candidateIDs := quotaPollCandidateAccountIDs(accounts, now)
+	pollAccounts := accounts
+	if scope, scoped := quotaPollScope(ctx); scoped {
+		filtered := candidateIDs[:0]
+		for _, accountID := range candidateIDs {
+			if _, ok := scope[accountID]; ok {
+				filtered = append(filtered, accountID)
+			}
+		}
+		candidateIDs = filtered
+		filteredAccounts := make([]storage.Account, 0, len(candidateIDs))
+		for _, account := range accounts {
+			if _, ok := scope[account.ID]; ok {
+				filteredAccounts = append(filteredAccounts, account)
+			}
+		}
+		pollAccounts = filteredAccounts
+	}
 	if len(candidateIDs) == 0 {
 		return result
 	}
@@ -330,13 +615,20 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) (result quotaRefreshRes
 	if err != nil {
 		log.Printf("[QUOTA-POLL] ListTokensByAccountIDs error: %v", err)
 		result.Failed = len(candidateIDs)
+		result.FailedAccountIDs = uniqueSortedStrings(candidateIDs)
 		return result
 	}
-	codex, missingTokens := codexQuotaPollTargets(accounts, tokens, now)
-	claude := claudeQuotaPollTargets(accounts, tokens, now)
-	kiro := kiroQuotaPollTargets(accounts, tokens, now)
-	cursor := cursorQuotaPollTargets(accounts, tokens, now)
-	if len(codex) == 0 && len(claude) == 0 && len(kiro) == 0 && len(cursor) == 0 && missingTokens == 0 {
+	codex, _ := codexQuotaPollTargets(pollAccounts, tokens, now)
+	claude := claudeQuotaPollTargets(pollAccounts, tokens, now)
+	kiro := kiroQuotaPollTargets(pollAccounts, tokens, now)
+	cursor := cursorQuotaPollTargets(pollAccounts, tokens, now)
+	unattemptedIDs := quotaPollUnattemptedAccountIDs(candidateIDs, codex, claude, kiro, cursor)
+	if len(codex) == 0 && len(claude) == 0 && len(kiro) == 0 && len(cursor) == 0 && len(unattemptedIDs) == 0 {
+		return result
+	}
+	if len(codex) == 0 && len(claude) == 0 && len(kiro) == 0 && len(cursor) == 0 {
+		result.Failed = len(unattemptedIDs)
+		result.FailedAccountIDs = unattemptedIDs
 		return result
 	}
 	s.attachQuotaPollEgresses(ctx, codex)
@@ -344,10 +636,28 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) (result quotaRefreshRes
 	s.attachQuotaPollEgresses(ctx, kiro)
 	s.attachQuotaPollEgresses(ctx, cursor)
 	updated := 0
-	failed := missingTokens
+	failed := len(unattemptedIDs)
+	failedIDs := unattemptedIDs
+	updatedIDs := make([]string, 0, len(codex)+len(claude)+len(kiro)+len(cursor))
 	// Concurrency-capped worker pool so we never open N connections at once.
 	sem := make(chan struct{}, quotaPollMaxConcurrent)
 	var mu sync.Mutex
+	markFailed := func(accountID string) {
+		mu.Lock()
+		failed++
+		if strings.TrimSpace(accountID) != "" {
+			failedIDs = append(failedIDs, accountID)
+		}
+		mu.Unlock()
+	}
+	markUpdated := func(accountID string) {
+		mu.Lock()
+		updated++
+		if strings.TrimSpace(accountID) != "" {
+			updatedIDs = append(updatedIDs, accountID)
+		}
+		mu.Unlock()
+	}
 	var wg sync.WaitGroup
 	for i := range codex {
 		target := codex[i]
@@ -356,32 +666,24 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) (result quotaRefreshRes
 			defer wg.Done()
 			defer func() {
 				if v := recover(); v != nil {
-					mu.Lock()
-					failed++
-					mu.Unlock()
+					markFailed(target.Account.ID)
 					supervisor.LogPanic("quota-poller-worker", v)
 				}
 			}()
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
-				mu.Lock()
-				failed++
-				mu.Unlock()
+				markFailed(target.Account.ID)
 				log.Printf("[QUOTA-POLL] account=%s skipped: %v", target.Account.ID, ctx.Err())
 				return
 			}
 			defer func() { <-sem }()
 			if err := s.pollOneCodexQuota(ctx, target.Account, target.Token, target.Egress); err != nil {
 				s.recordQuotaPollError(ctx, target.Account, "codex", err)
-				mu.Lock()
-				failed++
-				mu.Unlock()
+				markFailed(target.Account.ID)
 				log.Printf("[QUOTA-POLL] account=%s poll failed: %v", target.Account.ID, err)
 			} else {
-				mu.Lock()
-				updated++
-				mu.Unlock()
+				markUpdated(target.Account.ID)
 			}
 		}()
 	}
@@ -392,32 +694,24 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) (result quotaRefreshRes
 			defer wg.Done()
 			defer func() {
 				if v := recover(); v != nil {
-					mu.Lock()
-					failed++
-					mu.Unlock()
+					markFailed(target.Account.ID)
 					supervisor.LogPanic("quota-poller-worker", v)
 				}
 			}()
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
-				mu.Lock()
-				failed++
-				mu.Unlock()
+				markFailed(target.Account.ID)
 				log.Printf("[QUOTA-POLL] account=%s skipped: %v", target.Account.ID, ctx.Err())
 				return
 			}
 			defer func() { <-sem }()
 			if err := s.pollOneClaudeQuota(ctx, target.Account, target.Token, target.Egress); err != nil {
 				s.recordQuotaPollError(ctx, target.Account, "claude", err)
-				mu.Lock()
-				failed++
-				mu.Unlock()
+				markFailed(target.Account.ID)
 				log.Printf("[QUOTA-POLL] account=%s claude poll failed: %v", target.Account.ID, err)
 			} else {
-				mu.Lock()
-				updated++
-				mu.Unlock()
+				markUpdated(target.Account.ID)
 			}
 		}()
 	}
@@ -428,30 +722,22 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) (result quotaRefreshRes
 			defer wg.Done()
 			defer func() {
 				if panicValue := recover(); panicValue != nil {
-					mu.Lock()
-					failed++
-					mu.Unlock()
+					markFailed(target.Account.ID)
 					supervisor.LogPanic("quota-poller-kiro-worker", panicValue)
 				}
 			}()
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
-				mu.Lock()
-				failed++
-				mu.Unlock()
+				markFailed(target.Account.ID)
 				return
 			}
 			defer func() { <-sem }()
 			if err := s.pollOneKiroQuota(ctx, target.Account, target.Token, target.Egress); err != nil {
 				s.recordQuotaPollError(ctx, target.Account, "kiro", err)
-				mu.Lock()
-				failed++
-				mu.Unlock()
+				markFailed(target.Account.ID)
 			} else {
-				mu.Lock()
-				updated++
-				mu.Unlock()
+				markUpdated(target.Account.ID)
 			}
 		}()
 	}
@@ -462,30 +748,22 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) (result quotaRefreshRes
 			defer wg.Done()
 			defer func() {
 				if panicValue := recover(); panicValue != nil {
-					mu.Lock()
-					failed++
-					mu.Unlock()
+					markFailed(target.Account.ID)
 					supervisor.LogPanic("quota-poller-cursor-worker", panicValue)
 				}
 			}()
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
-				mu.Lock()
-				failed++
-				mu.Unlock()
+				markFailed(target.Account.ID)
 				return
 			}
 			defer func() { <-sem }()
 			if err := s.pollOneCursorQuota(ctx, target.Account, target.Token, target.Egress); err != nil {
 				s.recordQuotaPollError(ctx, target.Account, cursorproxy.ProviderID, err)
-				mu.Lock()
-				failed++
-				mu.Unlock()
+				markFailed(target.Account.ID)
 			} else {
-				mu.Lock()
-				updated++
-				mu.Unlock()
+				markUpdated(target.Account.ID)
 			}
 		}()
 	}
@@ -501,6 +779,8 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) (result quotaRefreshRes
 	}
 	result.Updated = updated
 	result.Failed = failed
+	result.UpdatedAccountIDs = uniqueSortedStrings(updatedIDs)
+	result.FailedAccountIDs = uniqueSortedStrings(failedIDs)
 	return result
 }
 
@@ -508,23 +788,35 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) (result quotaRefreshRes
 // refresh into one global flight. This prevents repeated clicks, multiple admin
 // tabs, and a coincident ticker from multiplying upstream requests.
 func (s *Server) beginQuotaRefresh(base context.Context) (*quotaRefreshFlight, bool) {
+	return s.beginQuotaRefreshWithScope(base, nil, false)
+}
+
+func (s *Server) beginQuotaRefreshWithScope(base context.Context, accountIDs []string, bypassFloor bool) (*quotaRefreshFlight, bool) {
 	s.quotaRefreshMu.Lock()
 	if current := s.quotaRefreshFlight; current != nil {
 		s.quotaRefreshMu.Unlock()
 		return current, false
 	}
-	if last := s.quotaRefreshLast; last.CompletedAt > 0 && storage.Now()-last.CompletedAt < quotaPollIntervalFloor {
-		last.Reused = true
-		flight := &quotaRefreshFlight{done: make(chan struct{}), result: last}
-		close(flight.done)
-		s.quotaRefreshMu.Unlock()
-		return flight, false
+	if !bypassFloor {
+		if last := s.quotaRefreshLast; last.CompletedAt > 0 && storage.Now()-last.CompletedAt < quotaPollIntervalFloor {
+			if !last.Scoped {
+				last.Reused = true
+				flight := &quotaRefreshFlight{done: make(chan struct{}), result: last}
+				close(flight.done)
+				s.quotaRefreshMu.Unlock()
+				return flight, false
+			}
+		}
 	}
-	flight := &quotaRefreshFlight{done: make(chan struct{})}
+	flight := &quotaRefreshFlight{done: make(chan struct{}), scoped: accountIDs != nil}
 	s.quotaRefreshFlight = flight
 	s.quotaRefreshMu.Unlock()
 	if base == nil {
 		base = context.Background()
+	}
+	pollBase := base
+	if accountIDs != nil {
+		pollBase = withQuotaPollScope(pollBase, accountIDs)
 	}
 	go func() {
 		defer func() {
@@ -535,6 +827,7 @@ func (s *Server) beginQuotaRefresh(base context.Context) (*quotaRefreshFlight, b
 			if flight.result.StartedAt == 0 {
 				flight.result.StartedAt = storage.Now()
 			}
+			flight.result.Scoped = flight.scoped
 			flight.result.CompletedAt = storage.Now()
 			s.quotaRefreshMu.Lock()
 			if s.quotaRefreshFlight == flight {
@@ -544,7 +837,7 @@ func (s *Server) beginQuotaRefresh(base context.Context) (*quotaRefreshFlight, b
 			close(flight.done)
 			s.quotaRefreshMu.Unlock()
 		}()
-		ctx, cancel := context.WithTimeout(base, quotaRefreshTimeout)
+		ctx, cancel := context.WithTimeout(pollBase, quotaRefreshTimeout)
 		defer cancel()
 		flight.result = s.pollAllCodexQuotas(ctx)
 	}()
@@ -557,6 +850,36 @@ func (s *Server) waitForQuotaRefresh(ctx context.Context) (quotaRefreshResult, e
 		base = ctx
 	}
 	flight, leader := s.beginQuotaRefresh(base)
+	select {
+	case <-flight.done:
+		result := flight.result
+		if result.Scoped {
+			// A manual refresh that arrived during (or immediately after) a targeted
+			// background scan must still mean "refresh all", not merely return the
+			// targeted subset. This second full flight coalesces concurrent manual
+			// callers and bypasses the manual reuse floor for the scoped predecessor.
+			fullFlight, fullLeader := s.beginQuotaRefreshWithScope(base, nil, true)
+			select {
+			case <-fullFlight.done:
+				result = fullFlight.result
+				result.Coalesced = !leader || !fullLeader
+				return result, nil
+			case <-ctx.Done():
+				return quotaRefreshResult{Coalesced: !leader || !fullLeader}, ctx.Err()
+			}
+		}
+		result.Coalesced = !leader
+		return result, nil
+	case <-ctx.Done():
+		return quotaRefreshResult{Coalesced: !leader}, ctx.Err()
+	}
+}
+
+func (s *Server) waitForQuotaRefreshScoped(ctx context.Context, accountIDs []string, bypassFloor bool) (quotaRefreshResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	flight, leader := s.beginQuotaRefreshWithScope(ctx, accountIDs, bypassFloor)
 	select {
 	case <-flight.done:
 		result := flight.result
@@ -627,7 +950,7 @@ func (s *Server) pollOneCursorQuota(ctx context.Context, account storage.Account
 		return newQuotaPollError("partial", 0, nil, errors.New("Cursor usage response contained no model pools"))
 	}
 	for _, snapshot := range cursorUsageSnapshots(account.ID, usage, storage.Now()) {
-		if err := s.store.UpsertAccountRateLimit(ctx, snapshot); err != nil {
+		if err := s.upsertLiveQuotaSnapshot(ctx, snapshot); err != nil {
 			return err
 		}
 	}
@@ -729,7 +1052,7 @@ func (s *Server) pollOneKiroQuota(ctx context.Context, acc storage.Account, toke
 		return newQuotaPollError("partial", 0, nil, err)
 	}
 	raw, _ := json.Marshal(limits)
-	return s.store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+	return s.upsertLiveQuotaSnapshot(ctx, storage.AccountRateLimit{
 		AccountID: acc.ID, Provider: "kiro", LimiterType: "kiro_usage", Source: "kiro_usage",
 		UsedPercent: usage.UsedPercent, LimitTokens: int64(usage.Limit),
 		RemainingTokens: int64(usage.Remaining), LimitRequests: -1, RemainingRequests: -1,
@@ -746,6 +1069,28 @@ func quotaPollCandidateAccountIDs(accounts []storage.Account, now int64) []strin
 		ids = append(ids, account.ID)
 	}
 	return ids
+}
+
+func quotaPollUnattemptedAccountIDs(candidateIDs []string, targetSets ...[]quotaPollTarget) []string {
+	attempted := make(map[string]struct{}, len(candidateIDs))
+	for _, targets := range targetSets {
+		for _, target := range targets {
+			if accountID := strings.TrimSpace(target.Account.ID); accountID != "" {
+				attempted[accountID] = struct{}{}
+			}
+		}
+	}
+	unattempted := make([]string, 0)
+	for _, accountID := range candidateIDs {
+		accountID = strings.TrimSpace(accountID)
+		if accountID == "" {
+			continue
+		}
+		if _, ok := attempted[accountID]; !ok {
+			unattempted = append(unattempted, accountID)
+		}
+	}
+	return uniqueSortedStrings(unattempted)
 }
 
 func codexQuotaPollTargets(accounts []storage.Account, tokens map[string]storage.AccountToken, now int64) ([]quotaPollTarget, int) {
@@ -1043,7 +1388,7 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 	// the primary window is missing, so a malformed primary never discards the
 	// rest of the payload. The partial error marker still flags the hole.
 	if sw.LimitWindowSeconds > 0 {
-		_ = s.store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+		snap := storage.AccountRateLimit{
 			AccountID:         acc.ID,
 			Provider:          "codex",
 			LimiterType:       "7d_polled",
@@ -1053,11 +1398,12 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 			LimitTokens:       -1,
 			LimitRequests:     -1,
 			RemainingRequests: -1,
-			ResetAt:           now + sw.ResetAfterSeconds,
+			ResetAt:           codexWhamResetAt(now, sw.ResetAfterSeconds),
 			Status:            statusFromCodexWhamWindow(sw),
 			Raw:               string(rawDetail),
 			UpdatedAt:         now,
-		})
+		}
+		_ = s.upsertLiveQuotaSnapshot(ctx, snap)
 		// Empirical window estimation: snapshot used_percent together with the
 		// recorded cost of the current 7d cycle.
 		s.recordQuotaWindowSample(ctx, acc.ID, quotaWindowKind7d,
@@ -1083,10 +1429,10 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 		snap := storage.AccountRateLimit{
 			AccountID: acc.ID, Provider: "codex", LimiterType: "7d_polled", Source: "7d_polled",
 			UsedPercent: pw.UsedPercent, RemainingTokens: -1, LimitTokens: -1,
-			LimitRequests: -1, RemainingRequests: -1, ResetAt: now + pw.ResetAfterSeconds,
+			LimitRequests: -1, RemainingRequests: -1, ResetAt: codexWhamResetAt(now, pw.ResetAfterSeconds),
 			Status: statusFromReached(wham.RateLimit.LimitReached), Raw: string(rawDetail), UpdatedAt: now,
 		}
-		_ = s.store.UpsertAccountRateLimit(ctx, snap)
+		_ = s.upsertLiveQuotaSnapshot(ctx, snap)
 		s.recordQuotaWindowSample(ctx, acc.ID, quotaWindowKind7d,
 			quotaWindowMinutesForCodex(pw.LimitWindowSeconds), now+pw.ResetAfterSeconds, now, pw.UsedPercent)
 		if _, reviewedPremium := entitlement.ReviewedBusinessPremiumQuotaMapping(whamEvidence, "quota_metadata"); reviewedPremium {
@@ -1105,12 +1451,12 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 		UsedPercent:     pw.UsedPercent,
 		RemainingTokens: -1,
 		LimitTokens:     -1,
-		ResetAt:         now + pw.ResetAfterSeconds,
+		ResetAt:         codexWhamResetAt(now, pw.ResetAfterSeconds),
 		Status:          statusFromReached(wham.RateLimit.LimitReached),
 		Raw:             string(rawDetail),
 		UpdatedAt:       now,
 	}
-	_ = s.store.UpsertAccountRateLimit(ctx, snap)
+	_ = s.upsertLiveQuotaSnapshot(ctx, snap)
 	// Empirical window estimation: snapshot used_percent together with the
 	// recorded cost of the current 5h cycle.
 	s.recordQuotaWindowSample(ctx, acc.ID, quotaWindowKind5h,
@@ -1305,7 +1651,7 @@ func (s *Server) pollOneClaudeQuota(ctx context.Context, acc storage.Account, to
 			Raw:               raw,
 			UpdatedAt:         storage.Now(),
 		}
-		if err := s.store.UpsertAccountRateLimit(ctx, snap); err != nil {
+		if err := s.upsertLiveQuotaSnapshot(ctx, snap); err != nil {
 			return err
 		}
 		// Empirical window estimation: snapshot used_percent together with the
@@ -1503,6 +1849,13 @@ func statusFromReached(reached bool) string {
 		return "rejected"
 	}
 	return "allowed_warning"
+}
+
+func codexWhamResetAt(now, resetAfterSeconds int64) int64 {
+	if resetAfterSeconds <= 0 || now > math.MaxInt64-resetAfterSeconds {
+		return 0
+	}
+	return now + resetAfterSeconds
 }
 
 func statusFromCodexWhamWindow(win whamWindow) string {

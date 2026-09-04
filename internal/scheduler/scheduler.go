@@ -161,6 +161,7 @@ type Scheduler struct {
 	coordinator     LeaseCoordinator
 	coordinatorStop chan struct{}
 	coordinatorWG   sync.WaitGroup
+	dynamicBalance  *dynamicPoolBalanceRuntime
 
 	// accountCache caches the active accounts list per group with a short TTL to reduce
 	// DB queries on the hot path. The cache is invalidated when an account's status
@@ -258,30 +259,37 @@ type waitQueue struct {
 // SchedulerMetrics is a cheap runtime snapshot used by diagnostics and tests. Values
 // are process-local and intentionally monotonic except Queued, which is a gauge.
 type SchedulerMetrics struct {
-	Active                int64 `json:"active"`
-	Queued                int64 `json:"queued"`
-	Waited                int64 `json:"waited"`
-	Cancelled             int64 `json:"cancelled"`
-	AccountSwitches       int64 `json:"account_switches"`
-	WaitConcurrency       int64 `json:"wait_concurrency"`
-	WaitTokenBudget       int64 `json:"wait_token_budget"`
-	WaitCooldown          int64 `json:"wait_cooldown"`
-	WaitRecheck           int64 `json:"wait_recheck"`
-	WaitEgress            int64 `json:"wait_egress"`
-	CooldownWakeups       int64 `json:"cooldown_wakeups"`
-	StateWakeups          int64 `json:"state_wakeups"`
-	WaitNanos             int64 `json:"wait_nanos"`
-	RouteSelects          int64 `json:"route_selects"`
-	RouteNanos            int64 `json:"route_nanos"`
-	RouteAvgNanos         int64 `json:"route_avg_nanos"`
-	RouteMaxNanos         int64 `json:"route_max_nanos"`
-	CandidateEvaluations  int64 `json:"candidate_evaluations"`
-	CandidateFallbacks    int64 `json:"candidate_fallbacks"`
-	CandidateIndexBuilds  int64 `json:"candidate_index_builds"`
-	CandidateIndexEntries int64 `json:"candidate_index_entries"`
-	TrialSelections       int64 `json:"trial_selections"`
-	EgressEWMAOutlets     int64 `json:"egress_ewma_outlets"`
-	EgressEWMASamples     int64 `json:"egress_ewma_samples"`
+	Active                                   int64 `json:"active"`
+	Queued                                   int64 `json:"queued"`
+	Waited                                   int64 `json:"waited"`
+	Cancelled                                int64 `json:"cancelled"`
+	AccountSwitches                          int64 `json:"account_switches"`
+	WaitConcurrency                          int64 `json:"wait_concurrency"`
+	WaitTokenBudget                          int64 `json:"wait_token_budget"`
+	WaitCooldown                             int64 `json:"wait_cooldown"`
+	WaitRecheck                              int64 `json:"wait_recheck"`
+	WaitEgress                               int64 `json:"wait_egress"`
+	CooldownWakeups                          int64 `json:"cooldown_wakeups"`
+	StateWakeups                             int64 `json:"state_wakeups"`
+	WaitNanos                                int64 `json:"wait_nanos"`
+	RouteSelects                             int64 `json:"route_selects"`
+	RouteNanos                               int64 `json:"route_nanos"`
+	RouteAvgNanos                            int64 `json:"route_avg_nanos"`
+	RouteMaxNanos                            int64 `json:"route_max_nanos"`
+	CandidateEvaluations                     int64 `json:"candidate_evaluations"`
+	CandidateFallbacks                       int64 `json:"candidate_fallbacks"`
+	CandidateIndexBuilds                     int64 `json:"candidate_index_builds"`
+	CandidateIndexEntries                    int64 `json:"candidate_index_entries"`
+	TrialSelections                          int64 `json:"trial_selections"`
+	EgressEWMAOutlets                        int64 `json:"egress_ewma_outlets"`
+	EgressEWMASamples                        int64 `json:"egress_ewma_samples"`
+	DynamicPoolBalanceSelections             int64 `json:"dynamic_pool_balance_selections"`
+	DynamicPoolBalanceTargetSelections       int64 `json:"dynamic_pool_balance_target_selections"`
+	DynamicPoolBalanceSkipped                int64 `json:"dynamic_pool_balance_skipped"`
+	DynamicPoolBalanceSkippedUnknownInterval int64 `json:"dynamic_pool_balance_skipped_unknown_interval"`
+	DynamicPoolBalanceSkippedSnapshot        int64 `json:"dynamic_pool_balance_skipped_snapshot"`
+	DynamicPoolBalanceSnapshotErrors         int64 `json:"dynamic_pool_balance_snapshot_errors"`
+	DynamicPoolBalanceReservationCount       int64 `json:"dynamic_pool_balance_reservations"`
 }
 
 type leaseBlockReason string
@@ -594,8 +602,9 @@ type Lease struct {
 	// scheduler tried the soonest-recovering account anyway. A successful
 	// upstream response therefore proves the stale cooldown wrong and the API
 	// layer clears it so the account rejoins the pool immediately.
-	Trial   bool
-	release func()
+	Trial          bool
+	release        func()
+	dynamicRelease func()
 }
 
 func New(store *storage.Store, cfg config.Config) *Scheduler {
@@ -621,6 +630,7 @@ func NewWithLeaseCoordinator(store *storage.Store, cfg config.Config, coordinato
 		admission:        admission.New(cfg.ResourceHeadroomPercent),
 		coordinator:      coordinator,
 		coordinatorStop:  make(chan struct{}),
+		dynamicBalance:   newDynamicPoolBalanceRuntime(),
 	}
 	for i := range s.egressEWMA {
 		s.egressEWMA[i].rows = map[string]egressEWMA{}
@@ -708,6 +718,17 @@ func (s *Scheduler) Metrics() SchedulerMetrics {
 		}
 		shard.mu.RUnlock()
 	}
+	dynamicSelections := atomic.LoadInt64(&s.metrics.DynamicPoolBalanceSelections)
+	dynamicTargetSelections := atomic.LoadInt64(&s.metrics.DynamicPoolBalanceTargetSelections)
+	dynamicSkipped := atomic.LoadInt64(&s.metrics.DynamicPoolBalanceSkipped)
+	dynamicUnknown := atomic.LoadInt64(&s.metrics.DynamicPoolBalanceSkippedUnknownInterval)
+	dynamicSnapshot := atomic.LoadInt64(&s.metrics.DynamicPoolBalanceSkippedSnapshot)
+	dynamicSnapshotErrors := atomic.LoadInt64(&s.metrics.DynamicPoolBalanceSnapshotErrors)
+	dynamicReservations := int64(0)
+	if s.dynamicBalance != nil {
+		dynamicReservations = int64(s.dynamicBalance.reservationCount(storage.Now()))
+		dynamicSnapshotErrors += s.dynamicBalance.snapshotErrorCount()
+	}
 	return SchedulerMetrics{
 		Active: active,
 		Queued: atomic.LoadInt64(&s.metrics.Queued), Waited: atomic.LoadInt64(&s.metrics.Waited),
@@ -721,6 +742,10 @@ func (s *Scheduler) Metrics() SchedulerMetrics {
 		CandidateIndexEntries: s.candidateIndexCount.Load(),
 		TrialSelections:       atomic.LoadInt64(&s.metrics.TrialSelections),
 		EgressEWMAOutlets:     ewmaOutlets, EgressEWMASamples: ewmaSamples,
+		DynamicPoolBalanceSelections: dynamicSelections, DynamicPoolBalanceTargetSelections: dynamicTargetSelections,
+		DynamicPoolBalanceSkipped: dynamicSkipped, DynamicPoolBalanceSkippedUnknownInterval: dynamicUnknown,
+		DynamicPoolBalanceSkippedSnapshot: dynamicSnapshot, DynamicPoolBalanceSnapshotErrors: dynamicSnapshotErrors,
+		DynamicPoolBalanceReservationCount: dynamicReservations,
 	}
 }
 
@@ -788,6 +813,9 @@ func (s *Scheduler) egressEWMAQuality(egressID string) (successBucket int, laten
 }
 
 func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
+	if policy, ok := dynamicPoolBalancePolicyFromContext(ctx); ok && policy.Enabled && policy.EgressRPMBalanceEnabled && policy.Fresh && !policy.Bound && policy.AgentClass == storage.AgentClassRoot && route.RequiredEgressID == "" && !route.ImmutableAffinity && len(route.PreferredEgressIDs) == 0 {
+		route.PreferredEgressIDs = append([]string(nil), policy.EgressRPMBalanceEgressIDs...)
+	}
 	if lease, handled, err := s.selectFromRouteChoiceContext(ctx, route); handled {
 		return lease, err
 	}
@@ -812,7 +840,22 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 	if groupErr != nil {
 		return Lease{}, groupErr
 	}
-	route.PreferredEgressIDs = []string{groupEgressID}
+	// A user-group RPM policy supplies an ordered set of real outlets for fresh
+	// work. Stateful/required routes are left on the persisted group primary; the
+	// candidate-level helper also re-checks the account-scoped pin boundary.
+	if policy, ok := dynamicPoolBalancePolicyFromContext(ctx); ok && policy.Enabled &&
+		policy.EgressRPMBalanceEnabled && policy.EgressRPMBalanceThreshold > 0 &&
+		policy.Fresh && !policy.Bound && policy.OnlyAccountPoolTier &&
+		storage.NormalizeAgentClass(policy.AgentClass) == storage.AgentClassRoot &&
+		route.RequiredAccountID == "" && route.RequiredEgressID == "" &&
+		!route.ServerSideState && !route.ImmutableAffinity && !route.FairScheduling {
+		route.PreferredEgressIDs = normalizeEgressIDs(policy.EgressRPMBalanceEgressIDs)
+	} else {
+		// Ordinary callers cannot override the account-pool group's effective
+		// primary outlet through PreferredEgressIDs; that field is legacy wire
+		// compatibility and remains ignored outside the explicit RPM policy.
+		route.PreferredEgressIDs = []string{groupEgressID}
+	}
 	if strings.TrimSpace(route.RequiredAccountID) != "" {
 		if route.Exclude[route.RequiredAccountID] {
 			return Lease{}, fmt.Errorf("%w: account=%s", ErrBoundAccountUnavailable, route.RequiredAccountID)
@@ -1064,6 +1107,9 @@ func (s *Scheduler) AdmissionSnapshot() admission.Snapshot { return s.admission.
 func (s *Scheduler) Close() {
 	if s.admission != nil {
 		s.admission.Close()
+	}
+	if s.dynamicBalance != nil {
+		s.dynamicBalance.stop()
 	}
 	if s.coordinatorStop != nil {
 		select {
@@ -1343,6 +1389,9 @@ func waitReason(err error) string {
 func (l Lease) Release() {
 	if l.release != nil {
 		l.release()
+	}
+	if l.dynamicRelease != nil {
+		l.dynamicRelease()
 	}
 }
 
@@ -1879,6 +1928,9 @@ func (s *Scheduler) tryLeaseAccount(ctx context.Context, accountID string, route
 
 func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID string, route Route, egressCache map[string]storage.EgressProfile) (Lease, leaseBlockReason, bool) {
 	cfg := s.Config()
+	if egressCache == nil {
+		egressCache = make(map[string]storage.EgressProfile)
+	}
 	selection, err := s.accountsSnapshot(ctx, route.Group)
 	if err != nil {
 		return Lease{}, leaseBlockNotFound, false
@@ -1979,10 +2031,11 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 		egress, err = s.egressProfile(ctx, route.RequiredEgressID, egressCache)
 		ok = err == nil && EgressHealthy(egress, now) && (ignoreTelemetryCooldown || binding.CooldownUntil <= now)
 	} else {
-		if snapshot.Egress.ID == binding.PrimaryEgressID && (ignoreTelemetryCooldown || binding.CooldownUntil <= now) && EgressHealthy(snapshot.Egress, now) {
+		_, balanced := egressRPMBalancePolicyActive(ctx, route, binding)
+		if snapshot.Egress.ID == binding.PrimaryEgressID && !balanced && (ignoreTelemetryCooldown || binding.CooldownUntil <= now) && EgressHealthy(snapshot.Egress, now) {
 			egress, ok = snapshot.Egress, true
 		} else {
-			egress, ok = s.selectEgress(ctx, binding, now, egressCache, ignoreTelemetryCooldown)
+			egress, ok = s.selectEgressForRoute(ctx, binding, route, now, ignoreTelemetryCooldown, &egressCache, &s.egressCacheMutex, &s.egressCacheTime)
 		}
 	}
 	if !ok {
@@ -1994,6 +2047,10 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	egress, ok = s.applyBoundSidecar(ctx, binding, egress, now, egressCache)
 	if !ok {
 		return Lease{}, leaseBlockEgressUnavailable, false
+	}
+	if !strings.EqualFold(strings.TrimSpace(binding.BindingScope), storage.EgressBindingScopeAccount) && route.RequiredEgressID == "" {
+		binding.PrimaryEgressID = egress.ID
+		binding.CookieJarKey = accountID + ":" + egress.ID
 	}
 	coordinated, reason, coordinateErr := s.acquireCoordinatedLease(ctx, accountID, egress, cfg.AccountTokenBudget, route)
 	if coordinateErr != nil {
@@ -2021,7 +2078,9 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 		s.addLocalLoad(accountID, egress, -1, -route.EstimatedTokens)
 		s.NotifyStateChanged()
 	}
-	return Lease{Account: account, Binding: binding, Egress: egress, ResolvedModel: resolvedModel, FencingToken: coordinated.FencingToken(), release: release}, leaseBlockNone, true
+	lease := Lease{Account: account, Binding: binding, Egress: egress, ResolvedModel: resolvedModel, FencingToken: coordinated.FencingToken(), release: release}
+	s.attachEgressRPMReservation(ctx, route, &lease)
+	return lease, leaseBlockNone, true
 }
 
 func (s *Scheduler) acquireCoordinatedLease(ctx context.Context, accountID string, egress storage.EgressProfile, tokenBudget int64, route Route) (CoordinatedLease, leaseBlockReason, error) {
@@ -2844,6 +2903,55 @@ func (s *Scheduler) selectEgressWithCache(ctx context.Context, binding storage.A
 		if egress, ok := s.egressProfileWithCache(ctx, binding.PrimaryEgressID, now, reqCache, procCache); ok && EgressHealthy(egress, now) {
 			return egress, true
 		}
+	}
+	return storage.EgressProfile{}, false
+}
+
+// selectEgressForRoute is the only candidate-level outlet selector. It keeps
+// the historical single-primary behavior unless an explicitly attached,
+// fresh-root user-group RPM policy supplies multiple outlets. Account-scoped
+// bindings and stateful/required routes are intentionally delegated to the
+// primary selector and can never be moved by this policy.
+func (s *Scheduler) selectEgressForRoute(ctx context.Context, binding storage.AccountEgressBinding, route Route, now int64, ignoreBindingCooldown bool, reqCache *map[string]storage.EgressProfile, procCache *sync.RWMutex, cacheTime *time.Time) (storage.EgressProfile, bool) {
+	policy, active := egressRPMBalancePolicyActive(ctx, route, binding)
+	if !active || len(route.PreferredEgressIDs) < 2 {
+		return s.selectEgressWithCache(ctx, binding, now, ignoreBindingCooldown, reqCache, procCache, cacheTime)
+	}
+	ordered := s.orderedEgressRPMIDs(ctx, policy, route, binding, now)
+	for _, id := range ordered {
+		if !ignoreBindingCooldown && binding.CooldownUntil > now {
+			return storage.EgressProfile{}, false
+		}
+		egress, ok := s.egressProfileWithCache(ctx, id, now, reqCache, procCache)
+		if !ok || !EgressHealthy(egress, now) {
+			continue
+		}
+		sidecarLimit := 0
+		// The sidecar is a transport dependency of every candidate outlet. Skip
+		// only this outlet when it is unhealthy so the next configured exit can
+		// still receive the request.
+		if sidecarID := strings.TrimSpace(binding.SidecarEgressID); sidecarID != "" && !storage.IsSidecarEgress(egress) {
+			sidecar, sidecarOK := s.egressProfileWithCache(ctx, sidecarID, now, reqCache, procCache)
+			if !sidecarOK || !EgressHealthy(sidecar, now) {
+				continue
+			}
+			if _, wrapErr := storage.WrapEgressWithSidecar(egress, sidecar); wrapErr != nil {
+				continue
+			}
+			sidecarLimit = sidecar.MaxConcurrency
+		}
+		egressLoad := s.currentEgressLoad(egress.ID)
+		sidecarLoad := 0
+		if sidecarID := strings.TrimSpace(binding.SidecarEgressID); sidecarID != "" {
+			sidecarLoad = s.currentEgressLoad(sidecarID)
+		}
+		if concurrencyLimited(egress.MaxConcurrency, egressLoad) {
+			continue
+		}
+		if strings.TrimSpace(binding.SidecarEgressID) != "" && concurrencyLimited(sidecarLimit, sidecarLoad) {
+			continue
+		}
+		return egress, true
 	}
 	return storage.EgressProfile{}, false
 }

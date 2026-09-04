@@ -72,7 +72,10 @@ func (s *Server) handleMessagesViaCodex(w http.ResponseWriter, r *http.Request, 
 	inner.Header.Set("Content-Type", "application/json")
 	inner.Header.Del("Content-Length")
 
-	bridge, err := newCodexMessagesResponseWriter(r.Context(), w, isStreamRequest(raw), model, converted.ToolNames, converted.InheritModelTools, s.responseBodyCaptureOptions(r.Context()))
+	bridge, err := newCodexMessagesResponseWriter(
+		r.Context(), w, isStreamRequest(raw), model, converted.ToolNames, converted.InheritModelTools,
+		s.responseBodyCaptureOptions(r.Context()), countCodexInputTokens(converted.Body),
+	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -92,37 +95,39 @@ const (
 // Anthropic SSE converter in real time. A non-streaming Claude request still uses the
 // streaming Codex backend and is aggregated into one Messages JSON response.
 type codexMessagesResponseWriter struct {
-	ctx               context.Context
-	downstream        http.ResponseWriter
-	header            http.Header
-	status            int
-	streamRequested   bool
-	model             string
-	toolNames         map[string]string
-	inheritModelTools map[string]bool
-	mode              codexMessagesResponseMode
-	buffer            *bodysource.SpoolBuffer
-	options           bodysource.CaptureOptions
-	pipeWriter        *io.PipeWriter
-	pipeDone          chan struct{}
+	ctx                  context.Context
+	downstream           http.ResponseWriter
+	header               http.Header
+	status               int
+	streamRequested      bool
+	model                string
+	toolNames            map[string]string
+	inheritModelTools    map[string]bool
+	estimatedInputTokens int64
+	mode                 codexMessagesResponseMode
+	buffer               *bodysource.SpoolBuffer
+	options              bodysource.CaptureOptions
+	pipeWriter           *io.PipeWriter
+	pipeDone             chan struct{}
 }
 
-func newCodexMessagesResponseWriter(ctx context.Context, downstream http.ResponseWriter, stream bool, model string, toolNames map[string]string, inheritModelTools map[string]bool, options bodysource.CaptureOptions) (*codexMessagesResponseWriter, error) {
+func newCodexMessagesResponseWriter(ctx context.Context, downstream http.ResponseWriter, stream bool, model string, toolNames map[string]string, inheritModelTools map[string]bool, options bodysource.CaptureOptions, estimatedInputTokens int64) (*codexMessagesResponseWriter, error) {
 	buffer, err := bodysource.NewSpoolBuffer(ctx, options)
 	if err != nil {
 		return nil, err
 	}
 	return &codexMessagesResponseWriter{
-		ctx:               ctx,
-		downstream:        downstream,
-		header:            make(http.Header),
-		streamRequested:   stream,
-		model:             model,
-		toolNames:         toolNames,
-		inheritModelTools: inheritModelTools,
-		mode:              codexMessagesResponseBuffered,
-		buffer:            buffer,
-		options:           options,
+		ctx:                  ctx,
+		downstream:           downstream,
+		header:               make(http.Header),
+		streamRequested:      stream,
+		model:                model,
+		toolNames:            toolNames,
+		inheritModelTools:    inheritModelTools,
+		estimatedInputTokens: estimatedInputTokens,
+		mode:                 codexMessagesResponseBuffered,
+		buffer:               buffer,
+		options:              options,
 	}, nil
 }
 
@@ -149,7 +154,7 @@ func (w *codexMessagesResponseWriter) WriteHeader(status int) {
 			defer supervisor.Recover("messages-codex-sse")
 			defer close(w.pipeDone)
 			defer reader.Close()
-			responsesStreamToAnthropicSSEWithOptions(w.ctx, w.downstream, reader, w.model, w.toolNames, w.inheritModelTools, streamrewrite.New(nil), w.options)
+			responsesStreamToAnthropicSSEWithOptionsAndEstimate(w.ctx, w.downstream, reader, w.model, w.toolNames, w.inheritModelTools, streamrewrite.New(nil), w.options, w.estimatedInputTokens)
 		}()
 	}
 }

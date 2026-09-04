@@ -13,6 +13,7 @@ import { toCSV, downloadCSV } from '../lib/csv.js';
 import { fmtTokens, fmtRelative, fmtInt, middleEllipsis } from '../lib/format.js';
 import { COLORS } from '../lib/chartTheme.js';
 import { t } from '../lib/i18n.js';
+import { isTokenMeteredQuotaLimiter, quotaUsageDetails, quotaWindowUsedPercent } from '../lib/quotaWindows.js';
 import type { QuotaRow } from '../features/observability/model/types';
 import { formatPlanLabel } from '../features/accounts/model/planFormatter.ts';
 
@@ -111,8 +112,8 @@ export default function Quota() {
     const ok = downloadCSV('quota.csv', toCSV(rows, [
       { title: 'account', get: (r: QuotaRow) => r.label || r.account_id }, { title: 'provider', get: (r: QuotaRow) => r.provider },
       { title: 'plan', get: (r: QuotaRow) => formatPlanLabel(r.plan_type, r.plan_presentation) }, { title: 'oauth_rate_limit_tier', get: (r: QuotaRow) => r.oauth_rate_limit_tier },
-      { title: '5h_used_pct', get: (r: QuotaRow) => r.quota_summary?.primary?.used_percent ?? r.used_percent },
-      { title: '7d_used_pct', get: (r: QuotaRow) => r.quota_summary?.secondary?.used_percent ?? r.secondary_7d_used_pct },
+      { title: '5h_used_pct', get: (r: QuotaRow) => quotaWindowUsedPercent(r, '5h') },
+      { title: '7d_used_pct', get: (r: QuotaRow) => quotaWindowUsedPercent(r, '7d') },
       { title: 'remaining_tokens', get: (r: QuotaRow) => r.quota_summary?.primary?.remaining_tokens ?? r.remaining_tokens },
       { title: 'sync_reason', get: (r: QuotaRow) => r.quota_summary?.sync_reason ?? r.status },
     ]));
@@ -127,22 +128,22 @@ export default function Quota() {
     const average = withUsage.length
       ? withUsage.reduce((sum, item) => sum + item.used, 0) / withUsage.length
       : null;
-    // Only token-metered windows can be summed: Claude unified / token windows are
-    // input-token budgets, while Kiro's kiro_usage is a credit count and Cursor's
+    // Only token-metered windows can be summed: Claude's 5h/7d OAuth windows and
+    // unified/token windows are input-token budgets, while Codex's 7d_polled is
+    // percentage-only, Kiro's kiro_usage is a credit count, and Cursor's
     // cursor_monthly is a request count. Summing across those units produced a
     // meaningless headline total, so non-token limiters are excluded and the
     // per-provider breakdown is shown in the panel note instead.
-    const tokenLimiters = new Set(['unified', 'tokens', 'input_tokens', 'output_tokens', '5h_oauth_usage']);
     const remaining = rows.reduce((sum, row) => {
       const limiter = row.quota_summary?.primary?.limiter_type || row.limiter_type || '';
-      if (!tokenLimiters.has(limiter)) return sum;
+      if (!isTokenMeteredQuotaLimiter(limiter)) return sum;
       const value = row.quota_summary?.primary?.remaining_tokens ?? row.remaining_tokens;
       return value == null || Number(value) < 0 ? sum : sum + Number(value);
     }, 0);
     // Per-provider token remainders, so the caption can say what it is summing.
     const remainingByProvider = rows.reduce((acc, row) => {
       const limiter = row.quota_summary?.primary?.limiter_type || row.limiter_type || '';
-      if (!tokenLimiters.has(limiter)) return acc;
+      if (!isTokenMeteredQuotaLimiter(limiter)) return acc;
       const value = row.quota_summary?.primary?.remaining_tokens ?? row.remaining_tokens;
       if (value == null || Number(value) < 0) return acc;
       const provider = row.provider || 'unknown';
@@ -228,8 +229,8 @@ export default function Quota() {
     { title: t('quota.plan'), dataIndex: 'plan_type', width: 140, render: (_v: any, r: QuotaRow) => r.plan_type || r.plan_presentation ? <Tag>{formatPlanLabel(r.plan_type, r.plan_presentation)}</Tag> : '—' },
     { title: 'OAuth Tier', dataIndex: 'oauth_rate_limit_tier', width: 140, render: (v: any) => v ? <span className="pool-mono">{v}</span> : '—' },
     { title: t('quota.window'), dataIndex: 'limiter_type', width: 150, render: (v: any) => v ? <span className="pool-mono">{v}</span> : '—' },
-    { title: t('quota.usage_5h'), dataIndex: 'used_percent', width: 170, sorter: (a: QuotaRow, b: QuotaRow) => ((a.quota_summary?.primary?.used_percent ?? a.used_percent) || 0) - ((b.quota_summary?.primary?.used_percent ?? b.used_percent) || 0), defaultSortOrder: 'descend', render: (v: number, r: QuotaRow) => bar(r.quota_summary?.primary?.used_percent ?? v) },
-    { title: t('quota.usage_7d'), dataIndex: 'secondary_7d_used_pct', width: 170, sorter: (a: QuotaRow, b: QuotaRow) => ((a.quota_summary?.secondary?.used_percent ?? a.secondary_7d_used_pct) || 0) - ((b.quota_summary?.secondary?.used_percent ?? b.secondary_7d_used_pct) || 0), render: (v: number, r: QuotaRow) => bar(r.quota_summary?.secondary?.used_percent ?? v) },
+    { title: t('quota.usage_5h'), dataIndex: 'used_percent', width: 170, sorter: (a: QuotaRow, b: QuotaRow) => (quotaWindowUsedPercent(a, '5h') || 0) - (quotaWindowUsedPercent(b, '5h') || 0), defaultSortOrder: 'descend', render: (_v: number, r: QuotaRow) => bar(quotaWindowUsedPercent(r, '5h')) },
+    { title: t('quota.usage_7d'), dataIndex: 'secondary_7d_used_pct', width: 170, sorter: (a: QuotaRow, b: QuotaRow) => (quotaWindowUsedPercent(a, '7d') || 0) - (quotaWindowUsedPercent(b, '7d') || 0), render: (_v: number, r: QuotaRow) => bar(quotaWindowUsedPercent(r, '7d')) },
     { title: t('quota.remaining_tokens'), dataIndex: 'remaining_tokens', width: 150, sorter: (a: QuotaRow, b: QuotaRow) => ((a.quota_summary?.primary?.remaining_tokens ?? a.remaining_tokens) || 0) - ((b.quota_summary?.primary?.remaining_tokens ?? b.remaining_tokens) || 0), render: (v: number, r: QuotaRow) => {
       const remaining = r.quota_summary?.primary?.remaining_tokens ?? v;
       return remaining == null || remaining < 0 ? '—' : fmtTokens(remaining);
@@ -387,9 +388,15 @@ export default function Quota() {
         skeletonCols={10}
         mobileRenderer={(row: QuotaRow) => {
           const primary = row.quota_summary?.primary || {};
-          const secondary = row.quota_summary?.secondary || {};
-          const primaryUsed = primary.used_percent ?? row.used_percent;
-          const secondaryUsed = secondary.used_percent ?? row.secondary_7d_used_pct;
+          const usageDetails = quotaUsageDetails(row).map(({ kind, usedPercent }) => {
+            const percentage = usedPercent == null ? null : Number(usedPercent);
+            return {
+              label: t(kind === '5h' ? 'quota.usage_5h' : 'quota.usage_7d'),
+              value: percentage == null || !Number.isFinite(percentage) || percentage < 0
+                ? t('common.unknown')
+                : `${Math.round(percentage)}%`,
+            };
+          });
           const remaining = primary.remaining_tokens ?? row.remaining_tokens;
           return (
             <MobileRow
@@ -397,8 +404,7 @@ export default function Quota() {
               subtitle={row.account_id}
               badges={<><Tag>{row.provider || t('common.unknown')}</Tag>{row.plan_type || row.plan_presentation ? <Tag>{formatPlanLabel(row.plan_type, row.plan_presentation)}</Tag> : null}</>}
               details={[
-                { label: t('quota.usage_5h'), value: primaryUsed == null ? t('common.unknown') : `${Math.round(primaryUsed)}%` },
-                { label: t('quota.usage_7d'), value: secondaryUsed == null ? t('common.unknown') : `${Math.round(secondaryUsed)}%` },
+                ...usageDetails,
                 { label: t('quota.remaining_tokens'), value: remaining == null || remaining < 0 ? t('common.unknown') : fmtTokens(remaining) },
                 ...(() => {
                   const credit = extraCredits(row);

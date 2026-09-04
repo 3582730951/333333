@@ -16,10 +16,17 @@ const outDir = path.join(workspaceRoot, '.run', 'overlap');
 const viteBin = path.join(root, 'node_modules', 'vite', 'bin', 'vite.js');
 const serverReadyPattern = /Local:\s+http:\/\/127\.0\.0\.1:/;
 
+// 744 and 414 exist because 391-767px was never rendered by any gate or capture in this repo, so
+// every sub-767 breakpoint in src/styles could be edited without changing a single measurement.
+// 744 lands in the 721-767 band (above every sub-767 tier, below the max-width:767 boundary);
+// 414 lands between the 390 and 420 tiers. Keep this list ordered widest-first: the default
+// sweep is derived from it below, and the order is the order findings are reported in.
 const viewports = [
   { name: '1440x900', width: 1440, height: 900 },
   { name: '1280x720', width: 1280, height: 720 },
   { name: '820x1180', width: 820, height: 1180 },
+  { name: '744x1133', width: 744, height: 1133 },
+  { name: '414x896', width: 414, height: 896, mobile: true },
   { name: '390x844', width: 390, height: 844, mobile: true },
   { name: '360x800', width: 360, height: 800, mobile: true },
 ];
@@ -107,22 +114,46 @@ function assertRouteCoverage() {
   }
 }
 
+function requested(envName) {
+  return String(process.env[envName] || '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
 function pick(list, envName) {
-  const values = String(process.env[envName] || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const values = requested(envName);
   return values.length ? list.filter(([name]) => values.includes(name)) : list;
 }
-// The default matrix is the widest desktop and the narrowest phone in both themes:
-// those four combinations catch essentially every collision the full five-viewport
-// sweep does, while staying fast enough to run in `npm run check`. Override with
-// OVERLAP_VIEWPORTS / OVERLAP_THEMES for an exhaustive pass.
-const DEFAULT_VIEWPORTS = ['1440x900', '360x800'];
 
+// There used to be a second, independent list here -- DEFAULT_VIEWPORTS = ['1440x900','360x800'] --
+// justified as "those four combinations catch essentially every collision the full sweep does".
+// The claim was never true and, worse, was unfalsifiable: 1280x720, 820x1180 and 390x844 were
+// defined directly above and never rendered once, so this gate reported green over three viewports
+// it had never looked at. Two hardcoded lists that must agree will not stay in agreement -- adding
+// a viewport above did not require touching the default, so the default silently stayed stale.
+//
+// The default is now derived from the single list, which makes the drift structurally impossible:
+// a viewport that exists is a viewport that is checked. OVERLAP_VIEWPORTS narrows the sweep for
+// local iteration; it never widens it, so a narrowed run is a deliberate act, not an oversight.
 function pickViewports() {
-  const values = String(process.env.OVERLAP_VIEWPORTS || '').split(',').map((s) => s.trim()).filter(Boolean);
-  const wanted = values.length ? values : DEFAULT_VIEWPORTS;
-  return viewports.filter((v) => wanted.includes(v.name));
+  const wanted = requested('OVERLAP_VIEWPORTS');
+  return wanted.length ? viewports.filter((v) => wanted.includes(v.name)) : viewports;
 }
+
+// A filter naming something that does not exist selects nothing, and selecting nothing used to be
+// indistinguishable from a clean sweep: expectedVisits and routeVisits both collapse to 0, the
+// `routeVisits !== expectedVisits` guard compares 0 against 0 and passes, and the script exits 0
+// having rendered no page at all. One mistyped viewport name was enough to turn this gate off.
+function assertKnownFilter(envName, known) {
+  const unknown = requested(envName).filter((value) => !known.includes(value));
+  if (!unknown.length) return;
+  console.error(`${envName} names nothing that exists: ${unknown.join(', ')}`);
+  console.error(`  known values: ${known.join(', ')}`);
+  process.exit(1);
+}
+
 const activeThemes = String(process.env.OVERLAP_THEMES || 'light,dark').split(',').map((s) => s.trim()).filter(Boolean);
+assertKnownFilter('OVERLAP_VIEWPORTS', viewports.map((v) => v.name));
+assertKnownFilter('OVERLAP_THEMES', ['light', 'dark']);
+assertKnownFilter('OVERLAP_PAGES', [...adminPages, ...userPages].map(([name]) => name));
 
 function canUsePort(port) {
   return new Promise((resolve) => {
@@ -492,9 +523,10 @@ async function gotoApp(page, baseURL, route) {  await page.goto(`${baseURL}${rou
     const content = document.querySelector('.pool-route-content[data-page-ready="true"]');
     return content && content.innerText.trim().length > 10;
   }, { timeout: 45000 }).catch(() => {});
-  await page.waitForNetworkIdle({ idleTime: 300, timeout: 6000 }).catch(() => {});
+  // Many routes keep background polling alive, so this is only a short settle window.
+  await page.waitForNetworkIdle({ idleTime: 100, timeout: 750 }).catch(() => {});
   await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
-  await new Promise((r) => setTimeout(r, 250));
+  await new Promise((r) => setTimeout(r, 100));
   await assertAppRendered(page, route);
 }
 
@@ -515,6 +547,16 @@ async function main() {
   // "never visited at all".
   const expectedVisits = activeThemes.length * pickViewports().length
     * (pick(adminPages, 'OVERLAP_PAGES').length + pick(userPages, 'OVERLAP_PAGES').length);
+  // The completeness check below is `routeVisits !== expectedVisits`, which is satisfied by
+  // 0 === 0. An empty theme list, an empty viewport list or a page filter matching nothing
+  // therefore produced a fully green run that rendered nothing. A sweep with no work in it is a
+  // failure, not a pass, and it has to be caught before the browser starts.
+  if (!expectedVisits) {
+    console.error('empty sweep: the active matrix demands 0 route visits, so nothing would be measured');
+    console.error(`  themes=${activeThemes.length} viewports=${pickViewports().length}`
+      + ` adminPages=${pick(adminPages, 'OVERLAP_PAGES').length} userPages=${pick(userPages, 'OVERLAP_PAGES').length}`);
+    process.exit(1);
+  }
   let routeVisits = 0;
   let probes = 0;
   let selectsSeen = 0;

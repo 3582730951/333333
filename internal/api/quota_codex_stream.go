@@ -39,7 +39,7 @@ func (w codexStreamQuotaWindow) resolvedResetAt(now int64) int64 {
 	if w.resetAt > 0 {
 		return w.resetAt
 	}
-	if w.resetAfterPresent {
+	if w.resetAfterPresent && w.resetAfterSeconds > 0 {
 		return now + w.resetAfterSeconds
 	}
 	if w.windowMinutes > 0 {
@@ -469,6 +469,9 @@ func (s *Server) captureCodexStreamRateLimits(account storage.Account, limits co
 		if s.scheduler != nil {
 			s.scheduler.ApplyRateLimitSnapshot(snapshot)
 		}
+	}
+	if len(snapshots) > 0 {
+		s.wakeRouteAvailability()
 	}
 	snapshots = append([]storage.AccountRateLimit(nil), snapshots...)
 	s.enqueueWrite(func() {

@@ -4,8 +4,13 @@ export type UserGroup = {
   id?: string;
   name: string;
   pinned_egress_no_fallback?: boolean;
-	 gpt_safety_buffering_session_rollover_enabled?: boolean;
-	 gpt_text_refusal_session_rollover_enabled?: boolean;
+  gpt_safety_buffering_session_rollover_enabled?: boolean;
+  gpt_text_refusal_session_rollover_enabled?: boolean;
+  dynamic_pool_balance_enabled?: boolean;
+  dynamic_pool_balance_rpm_threshold?: number;
+  egress_rpm_balance_enabled?: boolean;
+  egress_rpm_balance_threshold?: number;
+  egress_rpm_balance_egress_ids?: string[];
   [key: string]: unknown;
 };
 

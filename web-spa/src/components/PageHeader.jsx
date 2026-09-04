@@ -35,7 +35,7 @@ export function Meter({ label, pct, color = 'var(--pool-accent)', right }) {
   const p = Math.max(0, Math.min(100, Number(pct) || 0));
   return (
     <div style={{ marginBottom: 12 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12.5, marginBottom: 6 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 'var(--pool-type-caption)', marginBottom: 6 }}>
         <span className="pool-muted">{label}</span>
         <span style={{ fontWeight: 600 }}>{right != null ? right : p + '%'}</span>
       </div>

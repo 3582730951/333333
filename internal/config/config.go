@@ -22,10 +22,13 @@ const (
 	// discovery and on version-gated live Codex requests. ChatGPT gates the returned
 	// model catalog and some live models by this value, so old preserved config
 	// values are floored to this default during normalization.
-	// Refreshed 2026-08-27 to Codex CLI 0.150.1, whose wire traits were verified
-	// against the codex-rs tree in third_party/reference/codex. The application-level protocol traits
-	// for every accepted downstream version live in codexCLIFingerprints below.
-	DefaultClientVersion                  = "0.150.1"
+	// Refreshed 2026-09-04 against the released codex-rs 0.152.1, 0.153.0,
+	// 0.153.1, and 0.153.2 stable tags. 0.153.2 is the newest confirmed stable
+	// release and is therefore the default. Prerelease snapshots remain evidence
+	// only and are never used as a default version.
+	// Application-level traits for every accepted downstream version live in the
+	// codexCLIFingerprints table below.
+	DefaultClientVersion                  = "0.153.2"
 	DefaultStickyWaitMillis               = 100
 	DefaultStrictStickyMaxCooldownSeconds = 60
 	DefaultCooldownWaitMaxSeconds         = 30
@@ -138,29 +141,54 @@ type CodexCLIFingerprint struct {
 	CodeModeToolNames       bool
 	ParentTurnID            bool
 	PromptCacheKeyBySession bool
+	TurnMetadataSchema      CodexTurnMetadataSchema
+}
+
+// CodexTurnMetadataSchema identifies the shape of the nested
+// x-codex-turn-metadata JSON emitted by a Codex release. 0.151.0 introduced the
+// window_number field; keeping this as a schema dimension prevents a release
+// profile from being represented by only the four older traits above.
+type CodexTurnMetadataSchema string
+
+const (
+	CodexTurnMetadataSchemaLegacy       CodexTurnMetadataSchema = "pre_window_number"
+	CodexTurnMetadataSchemaWindowNumber CodexTurnMetadataSchema = "window_number"
+)
+
+// IncludesWindowNumber reports whether the schema owns a canonical window_number
+// value. The method keeps callers from depending on the string representation.
+func (s CodexTurnMetadataSchema) IncludesWindowNumber() bool {
+	return s == CodexTurnMetadataSchemaWindowNumber
 }
 
 // codexCLIFingerprints is the fingerprint library verified against the corresponding
-// official Codex releases. Keep newest first.
+// official Codex releases. Keep newest first. The 0.151.0 through 0.153.2 rows
+// are based on stable Release tags; prerelease snapshots remain intentionally
+// excluded.
 //
-// 0.150.1 was verified against the codex-rs tree in third_party/reference/codex: the default
-// x-codex-beta-features value is still exactly "remote_compaction_v2" (the FEATURES
-// table has only two Stage::Experimental entries — network_proxy and prevent_idle_sleep —
-// both default_enabled:false, while RemoteCompactionV2 is Stage::Stable/default_enabled:true
-// and is special-cased into the header), parent_turn_id and the session-scoped
-// prompt_cache_key contract are unchanged, and code_mode_tool_names is now a LEGACY key
-// superseded by tool_namespaces_info. The gateway passes tool_namespaces_info through
-// untouched, so the Responses metadata contract for these four traits is identical to
-// 0.149.1/0.148.0/0.147.0.
+// Trait basis from the released stable line set:
+//   - RequiredBetaFeatures remains exactly remote_compaction_v2.
+//   - CodeModeToolNames remains the legacy compatibility projection.
+//   - ParentTurnID remains conditional on the existing parent_turn_id projection.
+//   - PromptCacheKeyBySession remains the existing session-scoped cache-key
+//     contract.
+//   - TurnMetadataSchema changes from pre_window_number in 0.150.1 to
+//     window_number in 0.151.0 and later.
 var codexCLIFingerprints = [...]CodexCLIFingerprint{
-	{Version: "0.150.1", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
-	{Version: "0.149.1", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
-	{Version: "0.149.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
-	{Version: "0.148.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
-	{Version: "0.147.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true},
-	{Version: "0.146.1", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, PromptCacheKeyBySession: true},
-	{Version: "0.146.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, PromptCacheKeyBySession: true},
-	{Version: "0.145.0", RequiredBetaFeatures: "remote_compaction_v2", PromptCacheKeyBySession: true},
+	{Version: "0.153.2", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaWindowNumber},
+	{Version: "0.153.1", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaWindowNumber},
+	{Version: "0.153.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaWindowNumber},
+	{Version: "0.152.1", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaWindowNumber},
+	{Version: "0.152.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaWindowNumber},
+	{Version: "0.151.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaWindowNumber},
+	{Version: "0.150.1", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaLegacy},
+	{Version: "0.149.1", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaLegacy},
+	{Version: "0.149.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaLegacy},
+	{Version: "0.148.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaLegacy},
+	{Version: "0.147.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaLegacy},
+	{Version: "0.146.1", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaLegacy},
+	{Version: "0.146.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaLegacy},
+	{Version: "0.145.0", RequiredBetaFeatures: "remote_compaction_v2", PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaLegacy},
 }
 
 // SupportedCodexCLIVersions returns a copy so callers cannot mutate the process-

@@ -562,38 +562,56 @@ func stripCodexUnsupportedPromptCacheControls(raw []byte) []byte {
 		if json.Unmarshal(itemRaw, &item) != nil {
 			continue
 		}
-		contentRaw, ok := item["content"]
-		if !ok || !bytes.Contains(contentRaw, []byte(`"prompt_cache_breakpoint"`)) {
-			continue
-		}
-		var content []json.RawMessage
-		if json.Unmarshal(contentRaw, &content) != nil {
-			continue
-		}
+		// Both block arrays must be walked. A message item carries "content"; a
+		// function_call_output item carries "output", and the automatic-breakpoint
+		// writer targets input.N.output.M.prompt_cache_breakpoint for exactly that
+		// shape (see applyCodexGPT56AutomaticCacheBreakpoint / the "output" kind from
+		// stableCodexPrefixBreakpoint). Walking only "content" left a breakpoint
+		// inside a tool-result block on the wire for OAuth accounts — the path that
+		// carries the Codex CLI fingerprint — even though the field appears nowhere in
+		// codex-rs. Only cache metadata is deleted; the block's text/output payload is
+		// untouched, so no model context is altered.
+		itemRawUpdated := itemRaw
 		itemChanged := false
-		for contentIndex, blockRaw := range content {
-			var block map[string]json.RawMessage
-			if json.Unmarshal(blockRaw, &block) != nil {
+		for _, key := range []string{"content", "output"} {
+			blocksRaw, ok := item[key]
+			if !ok || !bytes.Contains(blocksRaw, []byte(`"prompt_cache_breakpoint"`)) {
 				continue
 			}
-			if _, exists := block["prompt_cache_breakpoint"]; !exists {
+			var blocks []json.RawMessage
+			if json.Unmarshal(blocksRaw, &blocks) != nil {
 				continue
 			}
-			updated, err := sjson.DeleteBytes(blockRaw, "prompt_cache_breakpoint")
+			keyChanged := false
+			for blockIndex, blockRaw := range blocks {
+				var block map[string]json.RawMessage
+				if json.Unmarshal(blockRaw, &block) != nil {
+					continue
+				}
+				if _, exists := block["prompt_cache_breakpoint"]; !exists {
+					continue
+				}
+				updated, err := sjson.DeleteBytes(blockRaw, "prompt_cache_breakpoint")
+				if err != nil {
+					return raw
+				}
+				blocks[blockIndex] = updated
+				keyChanged = true
+			}
+			if !keyChanged {
+				continue
+			}
+			updated, err := sjson.SetRawBytes(itemRawUpdated, key, marshalCodexRawArray(blocks))
 			if err != nil {
 				return raw
 			}
-			content[contentIndex] = updated
+			itemRawUpdated = updated
 			itemChanged = true
 		}
 		if !itemChanged {
 			continue
 		}
-		updated, err := sjson.SetRawBytes(itemRaw, "content", marshalCodexRawArray(content))
-		if err != nil {
-			return raw
-		}
-		input[inputIndex] = updated
+		input[inputIndex] = itemRawUpdated
 		changed = true
 	}
 	if !changed {

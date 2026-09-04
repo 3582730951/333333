@@ -1,0 +1,405 @@
+{
+  "note": "Generated file -- do not hand-edit. Regenerate with: node scripts/audit/map-token-migration.mjs --write-baseline",
+  "generatedAt": "2026-09-03T07:57:03.371Z",
+  "contract": {
+    "allowedWidths": [
+      767,
+      768,
+      1100,
+      1101
+    ],
+    "derivedFrom": [
+      {
+        "value": 767,
+        "token": "--pool-breakpoint-page-compact",
+        "complement": 768
+      },
+      {
+        "value": 1100,
+        "token": "--pool-breakpoint-page-expanded",
+        "complement": 1101
+      }
+    ]
+  },
+  "semantics": {
+    "approved": "adjudicated and settled (D class B component-scoped, class C device tier). Silent.",
+    "pending": "a to-do, not an exemption (D class A should converge, class E is dead code). Reported every run, does not fail.",
+    "matching": "on file+params+width and occurrence count only. Lines are informational and are expected to drift."
+  },
+  "source": "adjudication table BREAKPOINT_DECISIONS in scripts/audit/map-token-migration.mjs, from .run/codex-tasks/aurora-P2b-2-D.out.md section 1.1",
+  "groups": [
+    {
+      "key": "src/styles/components.css|(max-width:390px)|390",
+      "file": "src/styles/components.css",
+      "params": "(max-width:390px)",
+      "width": 390,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 6867,
+          "bucket": "approved",
+          "klass": "C",
+          "item": 15,
+          "note": "390 = iPhone 12-15 logical width, real tier; one selector inside is dead (see D 1.5)"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/components.css|(max-width:420px)|420",
+      "file": "src/styles/components.css",
+      "params": "(max-width:420px)",
+      "width": 420,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 4689,
+          "bucket": "approved",
+          "klass": "C",
+          "item": 10,
+          "note": "hand-picked ultra-narrow tier; a sub-767 third tier needs the user signature"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/components.css|(max-width:480px)|480",
+      "file": "src/styles/components.css",
+      "params": "(max-width:480px)",
+      "width": 480,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 6842,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 14,
+          "note": "anti-truncation on .pool-settings-category__trigger, not a grid"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/components.css|(max-width:560px)|560",
+      "file": "src/styles/components.css",
+      "params": "(max-width:560px)",
+      "width": 560,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 1853,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 5,
+          "note": "final collapse of the same sms component"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/components.css|(min-width:620px)|620",
+      "file": "src/styles/components.css",
+      "params": "(min-width:620px)",
+      "width": 620,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 1235,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 2,
+          "note": "tab strip inside OAuthLoginModal; modal width is not viewport width"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/components.css|(max-width:640px)|640",
+      "file": "src/styles/components.css",
+      "params": "(max-width:640px)",
+      "width": 640,
+      "count": 3,
+      "occurrences": [
+        {
+          "line": 2396,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 7,
+          "note": ".pool-egress-* form grid, inside EgressProfileForm.jsx"
+        },
+        {
+          "line": 6756,
+          "bucket": "pending",
+          "klass": "A",
+          "item": 13,
+          "note": "4 declarations dead (shadowed by the pages.css 767 block); nth-child border resets stay"
+        },
+        {
+          "line": 7056,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 16,
+          "note": ".pool-table--cards row heights; optional merge into 767"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/components.css|(max-width:700px)|700",
+      "file": "src/styles/components.css",
+      "params": "(max-width:700px)",
+      "width": 700,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 8805,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 21,
+          "note": "Sub2APIHubPanel.jsx; cheapest B-class merge into 767 if ever wanted"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/components.css|(max-width:900px)|900",
+      "file": "src/styles/components.css",
+      "params": "(max-width:900px)",
+      "width": 900,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 1835,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 4,
+          "note": ".pool-sms-price-policy, content-driven per in-place comment"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/components.css|(min-width:768px) and (max-width:900px)|900",
+      "file": "src/styles/components.css",
+      "params": "(min-width:768px) and (max-width:900px)",
+      "width": 900,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 5325,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 12,
+          "note": "upper bound of the AI settings two-col->one-col; the 768 operand is in contract"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/components.css|(max-width:1024px)|1024",
+      "file": "src/styles/components.css",
+      "params": "(max-width:1024px)",
+      "width": 1024,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 4607,
+          "bucket": "pending",
+          "klass": "A",
+          "item": 9,
+          "note": "login page is off the page grid; scope question needs the user before converging"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/components.css|(max-width:1080px)|1080",
+      "file": "src/styles/components.css",
+      "params": "(max-width:1080px)",
+      "width": 1080,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 3673,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 8,
+          "note": ".pool-email-metrics column count coupled to nth-child(3n+1) borders"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/components.css|(max-width:1180px)|1180",
+      "file": "src/styles/components.css",
+      "params": "(max-width:1180px)",
+      "width": 1180,
+      "count": 2,
+      "occurrences": [
+        {
+          "line": 1678,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 3,
+          "note": ".pool-registration-start-form 4->2 col, intra-form wrap"
+        },
+        {
+          "line": 8467,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 20,
+          "note": ".pool-cf-mail-layout, single page (CloudflareMailbox.tsx)"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/dataviz.css|(max-width:460px)|460",
+      "file": "src/styles/dataviz.css",
+      "params": "(max-width:460px)",
+      "width": 460,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 1345,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 29,
+          "note": "D calls this the model B-class breakpoint: in-place comment gives the exact measurement"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/dataviz.css|(min-width:540px) and (max-width:767px)|540",
+      "file": "src/styles/dataviz.css",
+      "params": "(min-width:540px) and (max-width:767px)",
+      "width": 540,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 788,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 24,
+          "note": "in-band lower bound for the exactly-five-block kpi strip; upper bound 767 is in contract"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/dataviz.css|(max-width:560px)|560",
+      "file": "src/styles/dataviz.css",
+      "params": "(max-width:560px)",
+      "width": 560,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 1263,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 28,
+          "note": ".pool-frontend-performance__controls, System.tsx control bar"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/dataviz.css|(max-width:1180px)|1180",
+      "file": "src/styles/dataviz.css",
+      "params": "(max-width:1180px)",
+      "width": 1180,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 614,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 22,
+          "note": ".pool-ops-split inside a Dashboard panel"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/layout.css|(max-width:520px)|520",
+      "file": "src/styles/layout.css",
+      "params": "(max-width:520px)",
+      "width": 520,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 198,
+          "bucket": "pending",
+          "klass": "A",
+          "item": 31,
+          "note": "half dead: width:100% already set by the 767 block; only max-width:100% on children is live"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/pages.css|(max-width:420px)|420",
+      "file": "src/styles/pages.css",
+      "params": "(max-width:420px)",
+      "width": 420,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 1487,
+          "bucket": "approved",
+          "klass": "C",
+          "item": 37,
+          "note": "pairs with item 10 as the narrow-phone tier; also carries an out-of-contract 12px gutter"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/pages.css|(max-width:900px)|900",
+      "file": "src/styles/pages.css",
+      "params": "(max-width:900px)",
+      "width": 900,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 1198,
+          "bucket": "pending",
+          "klass": "A",
+          "item": 36,
+          "note": "split: .pool-grid halves are dead (shadowed by components.css 1000px), nav item is live -- do not delete the block"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/pages.css|(min-width:768px) and (max-width:1360px)|1360",
+      "file": "src/styles/pages.css",
+      "params": "(min-width:768px) and (max-width:1360px)",
+      "width": 1360,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 1185,
+          "bucket": "approved",
+          "klass": "C",
+          "item": 35,
+          "note": "1360 ~ 1366 laptop tier; every contract-legal rewrite changes behaviour"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/portal.css|(max-width:520px)|520",
+      "file": "src/styles/portal.css",
+      "params": "(max-width:520px)",
+      "width": 520,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 511,
+          "bucket": "approved",
+          "klass": "C",
+          "item": 39,
+          "note": "D7 normalized the overlapping 519px boundary to 520px; portal bento device tier"
+        }
+      ]
+    },
+    {
+      "key": "src/styles/portal.css|(max-width:1080px)|1080",
+      "file": "src/styles/portal.css",
+      "params": "(max-width:1080px)",
+      "width": 1080,
+      "count": 1,
+      "occurrences": [
+        {
+          "line": 452,
+          "bucket": "approved",
+          "klass": "B",
+          "item": 38,
+          "note": ".pool-portal-bento 2 col; the 1080 match with item 8 is coincidence"
+        }
+      ]
+    }
+  ]
+}

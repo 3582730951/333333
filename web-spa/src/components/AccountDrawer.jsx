@@ -7,6 +7,7 @@ import { showErrorToast } from './ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
 import { fmtTokens, fmtInt, fmtDateTime, fmtRelative, fmtUSD } from '../lib/format.js';
+import { quotaSummaryWindows, quotaWindowLabel } from '../lib/quotaWindows.js';
 import {
   healthTestRequestBody, isKiroAccount, isKiroSuspended, isProtectedProbeQuarantine,
   isProviderAPIKeyAccount, requiresPaidHealthTest,
@@ -16,7 +17,7 @@ import { parseCapacityResponse } from '../features/accounts/model/capacity.ts';
 import { formatPlanLabel } from '../features/accounts/model/planFormatter.ts';
 
 const Row = ({ k, v }) => (
-  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, padding: '5px 0', fontSize: 13 }}>
+  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, padding: '5px 0', fontSize: 'var(--pool-type-label)' }}>
     <span className="pool-muted" style={{ flexShrink: 0 }}>{k}</span>
     <span style={{ fontWeight: 500, textAlign: 'right', wordBreak: 'break-all' }}>{v}</span>
   </div>
@@ -457,17 +458,14 @@ export default function AccountDrawer({
       {!providerAPIKey ? (() => {
         const summary = account.quota_summary || {};
         const primary = summary.primary || null;
-        const secondary = summary.secondary || null;
+        const quotaWindows = quotaSummaryWindows(summary);
         const credits = summary.credits || null;
         const estimate = summary.estimate || null;
-        const estUSD = estimate && estimate.estimated
+        // Same rule as the account list: a dollar figure is only shown for a
+        // real upstream credit balance, never for a subscription rate-limit
+        // window. See internal/api/quota_estimate.go.
+        const estUSD = estimate && estimate.estimated && estimate.method === 'payg_credits_balance'
           && Number.isFinite(Number(estimate.remaining_usd)) && Number(estimate.remaining_usd) >= 0;
-        const windowLabel = (w, fallback) => {
-          const limiter = String(w?.limiter_type || '');
-          if (limiter.includes('5h')) return '5 小时窗口';
-          if (limiter.includes('7d')) return '7 天窗口';
-          return fallback;
-        };
         const windowRow = (w, label) => {
           if (!w) return <Row k={label} v="—" />;
           const parts = [];
@@ -481,8 +479,9 @@ export default function AccountDrawer({
         };
         return (
           <Panel title="账号额度" style={{ marginBottom: 14 }}>
-            {windowRow(primary, windowLabel(primary, '主窗口'))}
-            {windowRow(secondary, windowLabel(secondary, '7 天窗口'))}
+            {quotaWindows.length
+              ? quotaWindows.map((window, index) => windowRow(window, quotaWindowLabel(window, index === 0 ? '主窗口' : '附加窗口')))
+              : windowRow(null, '主窗口')}
             <Row k="美元估算" v={estUSD
               ? `≈ ${fmtUSD(estimate.remaining_usd)} 剩余${Number(estimate.extra_usd) > 0 ? ` · +${fmtUSD(estimate.extra_usd)} 额外` : ''}${estimate.plan ? ` · ${estimate.plan}` : ''}`
               : '—'} />
@@ -559,7 +558,7 @@ export default function AccountDrawer({
       <Panel title="调度例外" style={{ marginBottom: 14 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
           <div>
-            <div style={{ fontWeight: 600, fontSize: 13 }}>忽略 429、冷却与隔离</div>
+            <div style={{ fontWeight: 600, fontSize: 'var(--pool-type-label)' }}>忽略 429、冷却与隔离</div>
             <Typography.Text size="small" type="tertiary">
               仅影响此账号。Codex 遇到 429 会保持同账号同链路重试，不向下游透传 429；Cloudflare 命中也不会自动冷却或隔离。
             </Typography.Text>
@@ -575,7 +574,7 @@ export default function AccountDrawer({
         </Typography.Text>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginTop: 14 }}>
           <div>
-            <div style={{ fontWeight: 600, fontSize: 13 }}>Codex 429 Guard（奸商模式）</div>
+            <div style={{ fontWeight: 600, fontSize: 'var(--pool-type-label)' }}>Codex 429 Guard（奸商模式）</div>
             <Typography.Text size="small" type="tertiary">
               默认关闭，仅适用于 Codex OAuth / SetupToken（非 API key）。符合条件的请求会追加合成工具 checkpoint；不会并发轰炸、绕过 quota/cooldown 或承诺新连接复用旧 WebSocket；账号级设置影响所有使用该账号的用户组。
             </Typography.Text>
@@ -620,7 +619,7 @@ export default function AccountDrawer({
       <Panel title="模型与上下文能力" style={{ marginBottom: 14 }}>
         {!capabilities.length ? <Typography.Text type="tertiary">尚无已发现的模型能力</Typography.Text> : capabilities.map((item) => (
           <div key={`${item.model_slug}:${item.source || ''}`} style={{ display: 'flex', justifyContent: 'space-between', gap: 8, padding: '5px 0', borderBottom: '1px solid var(--pool-border)' }}>
-            <span className="pool-mono" style={{ fontSize: 12 }}>{item.model_slug || '—'}</span>
+            <span className="pool-mono" style={{ fontSize: 'var(--pool-type-caption)' }}>{item.model_slug || '—'}</span>
             <span style={{ display: 'flex', gap: 5, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
               <Tag size="small" color={item.availability_state === 'verified' ? 'green' : item.availability_state === 'unsupported' ? 'red' : 'amber'}>{item.availability_state || 'unverified'}</Tag>
               <Tag size="small" color={item.context_1m_state === 'supported' ? 'green' : item.context_1m_state === 'unsupported' ? 'grey' : 'amber'}>1M {item.context_1m_state || 'unknown'}</Tag>
@@ -665,7 +664,7 @@ export default function AccountDrawer({
               <input className="pool-input pool-mono" value={reauthForm.target_workspace_id} onChange={(event) => updateReauthForm('target_workspace_id', event.target.value)} placeholder="可选；填写后 OAuth 会校验 id_token" />
             </label>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-              <span className="pool-muted" style={{ fontSize: 13 }}>auth_expired 时自动排队修复</span>
+              <span className="pool-muted" style={{ fontSize: 'var(--pool-type-label)' }}>auth_expired 时自动排队修复</span>
               <Switch checked={!!reauthForm.auto_enabled} onChange={(checked) => updateReauthForm('auto_enabled', checked)} />
             </div>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -777,7 +776,7 @@ export default function AccountDrawer({
 
       <Panel title="近期审计" style={{ marginBottom: 14 }}>
         {loading ? <Spin /> : !audit.length ? <Typography.Text type="tertiary">暂无审计记录</Typography.Text> : audit.map((a, i) => (
-          <div key={i} style={{ fontSize: 12.5, padding: '5px 0', borderBottom: '1px solid var(--pool-border)' }}>
+          <div key={i} style={{ fontSize: 'var(--pool-type-caption)', padding: '5px 0', borderBottom: '1px solid var(--pool-border)' }}>
             <span className="pool-muted">{fmtDateTime(a.created_at)}</span> <Tag size="small">{a.action}</Tag> {a.state || ''}
           </div>
         ))}

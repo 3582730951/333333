@@ -20,7 +20,7 @@ function ChartFallback({ height = 240 }) {
         alignItems: 'center',
         justifyContent: 'center',
         color: 'var(--pool-text-2)',
-        fontSize: 13,
+        fontSize: 'var(--pool-type-label)',
       }}
     >
       加载图表...

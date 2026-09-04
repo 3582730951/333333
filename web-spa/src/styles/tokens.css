@@ -10,6 +10,52 @@
   --pool-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Noto Sans CJK SC", sans-serif;
   --pool-font-mono: "SFMono-Regular", "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
 
+  /* TYPE-01: the only non-chart font-size source of truth. */
+  --pool-font-size-12: 12px;
+  --pool-font-size-13: 13px;
+  --pool-font-size-14: 14px;
+  --pool-font-size-16: 16px;
+  --pool-font-size-18: 18px;
+  --pool-font-size-24: 24px;
+  --pool-font-size-28: 28px;
+  --pool-font-size-48: 48px;
+
+  --pool-type-caption-desktop: var(--pool-font-size-12);
+  --pool-type-label-desktop: var(--pool-font-size-13);
+  --pool-type-body-desktop: var(--pool-font-size-14);
+  --pool-type-callout-desktop: var(--pool-font-size-16);
+  --pool-type-title-3-desktop: var(--pool-font-size-18);
+  --pool-type-title-2-desktop: var(--pool-font-size-24);
+  --pool-type-title-1-desktop: var(--pool-font-size-28);
+  --pool-type-display-desktop: var(--pool-font-size-48);
+
+  --pool-type-caption-mobile: var(--pool-font-size-12);
+  --pool-type-label-mobile: var(--pool-font-size-13);
+  --pool-type-body-mobile: var(--pool-font-size-14);
+  --pool-type-callout-mobile: var(--pool-font-size-16);
+  --pool-type-title-3-mobile: var(--pool-font-size-16);
+  --pool-type-title-2-mobile: var(--pool-font-size-18);
+  --pool-type-title-1-mobile: var(--pool-font-size-24);
+  --pool-type-display-mobile: var(--pool-font-size-28);
+
+  /* Compatibility roles stay desktop until P2b binds mobile roles at 767px. */
+  --pool-type-caption: var(--pool-type-caption-desktop);
+  --pool-type-label: var(--pool-type-label-desktop);
+  --pool-type-body: var(--pool-type-body-desktop);
+  --pool-type-callout: var(--pool-type-callout-desktop);
+  --pool-type-title-3: var(--pool-type-title-3-desktop);
+  --pool-type-title-2: var(--pool-type-title-2-desktop);
+  --pool-type-title-1: var(--pool-type-title-1-desktop);
+  --pool-type-display: var(--pool-type-display-desktop);
+  --pool-leading-body: 1.6;
+  --pool-leading-title: 1.3;
+  --pool-leading-tight: var(--pool-leading-title);
+  --pool-tracking-display: -0.02em;
+  --pool-prose-measure-desktop: 40ic;
+  --pool-prose-measure-mobile: 24ic;
+  --pool-prose-mixed-word-spacing: 0.25em;
+  --pool-numeric-variant: tabular-nums;
+
   --pool-space-1: 4px;
   --pool-space-2: 8px;
   --pool-space-3: 12px;
@@ -37,31 +83,71 @@
   --pool-radius-xl: var(--pool-radius-card);
   --pool-radius-panel: var(--pool-radius-dialog);
 
+  --pool-card-border-width: 1px;
+  --pool-card-radius: var(--pool-radius-card);
+  --pool-card-padding-compact: var(--pool-space-4);
+  --pool-card-padding-default: var(--pool-space-6);
+  --pool-card-padding-generous: var(--pool-space-8);
+
+  --pool-breakpoint-page-compact: 767px;
+  --pool-breakpoint-page-expanded: 1100px;
+  --pool-grid-page-gutter-compact: var(--pool-space-4);
+  --pool-grid-page-gutter-default: var(--pool-space-8);
+  --pool-grid-column-gap: var(--pool-space-6);
+  --pool-grid-row-gap: var(--pool-space-6);
+
+  --pool-icon-size: var(--pool-font-size-16);
+  --pool-loading-indicator-size: var(--pool-icon-size);
+  --pool-nav-sidebar-expanded: 248px;
+  --pool-nav-sidebar-collapsed: 68px;
+  --pool-nav-row-height: 36px;
+  --pool-nav-group-trigger-size: var(--pool-hit-target);
+  --pool-nav-group-gap: var(--pool-space-6);
+  --pool-nav-child-inset: var(--pool-space-4);
+  --pool-nav-guide-inset: var(--pool-space-3);
+  --pool-nav-group-font-size: var(--pool-type-caption);
+  --pool-nav-group-font-weight: 600;
+  --pool-nav-group-letter-spacing: 0.08em;
+  --pool-nav-active-indicator-width: 2px;
+
+  --pool-motion-instant: 100ms;
   --pool-motion-fast: 150ms;
-  --pool-motion-normal: 180ms;
-  --pool-motion-slow: 240ms;
-  --pool-motion-ease: cubic-bezier(.2, .8, .2, 1);
+  --pool-motion-normal: 200ms;
+  --pool-motion-slow: 300ms;
+  --pool-ease-linear: linear;
+  --pool-ease-standard: cubic-bezier(.2, .8, .2, 1);
+  --pool-ease-emphasized: cubic-bezier(.2, 0, 0, 1);
+  --pool-ease-enter: cubic-bezier(0, 0, .2, 1);
+  --pool-ease-exit: cubic-bezier(.4, 0, 1, 1);
+  --pool-motion-ease: var(--pool-ease-standard);
+  --pool-nav-active-feedback-duration: var(--pool-motion-fast);
+  --pool-nav-active-feedback-ease: var(--pool-ease-standard);
+  --pool-nav-collapse-duration: var(--pool-motion-normal);
+  --pool-nav-collapse-ease: var(--pool-ease-standard);
   --pool-hit-target: 44px;
 
-  --pool-type-caption: 12px;
-  --pool-type-label: 13px;
-  --pool-type-body: 14px;
-  --pool-type-callout: 16px;
-  --pool-type-title-3: 18px;
-  --pool-type-title-2: 24px;
-  --pool-type-title-1: 28px;
-  --pool-type-display: 48px;
-  --pool-leading-tight: 1.25;
-  --pool-leading-body: 1.57;
   --pool-content-admin: 1560px;
   --pool-content-portal: 1184px;
   --pool-kpi-dot: 7px;
-  --pool-delta-height: calc(11.5px * 1.35 + 4px);
+  --pool-delta-height: calc(var(--pool-font-size-12) * 1.35 + var(--pool-space-1));
 }
 
 :root,
 html[data-theme='dark'] {
   color-scheme: dark;
+  /* Dark is the primary theme. These ten stops are designed for low-luminance
+     surfaces, rather than being an inversion of the light scale. */
+  --pool-neutral-0: #06080a;
+  --pool-neutral-100: #0a0d10;
+  --pool-neutral-200: #0e1216;
+  --pool-neutral-300: #141920;
+  --pool-neutral-400: #1c232b;
+  --pool-neutral-500: #222a33;
+  --pool-neutral-600: #39434e;
+  --pool-neutral-700: #5a6672;
+  --pool-neutral-800: #a8b4c0;
+  --pool-neutral-900: #edf1f5;
+
   --pool-bg-page: #06080a;
   --pool-bg-grouped: #0a0d10;
   --pool-bg-surface: #0e1216;
@@ -95,6 +181,8 @@ html[data-theme='dark'] {
   --pool-accent-hover: #7ff0c8;
   --pool-accent-pressed: #43cf9b;
   --pool-accent-soft: rgb(94 233 181 / 16%);
+  --pool-brand-primary: var(--pool-action);
+  --pool-brand-primary-soft: var(--pool-action-soft);
   --pool-brand-secondary: #e39b7f;
   --pool-brand-secondary-soft: rgb(227 155 127 / 15%);
 
@@ -112,21 +200,30 @@ html[data-theme='dark'] {
 
   --pool-focus-color: #5ee9b5;
   --pool-focus: 0 0 0 3px rgb(94 233 181 / 34%);
-  --pool-shadow-control: 0 1px 2px rgb(0 0 0 / 44%);
-  --pool-shadow-popover: 0 16px 40px rgb(0 0 0 / 56%);
-  --pool-shadow-dialog: 0 28px 72px rgb(0 0 0 / 66%);
-  --pool-shadow-sm: none;
-  --pool-shadow-md: var(--pool-shadow-popover);
-  --pool-shadow-lg: var(--pool-shadow-dialog);
+  --pool-shadow-ink-control: rgb(0 0 0 / 44%);
+  --pool-shadow-ink-raised: rgb(0 0 0 / 48%);
+  --pool-shadow-ink-overlay: rgb(0 0 0 / 56%);
+  --pool-shadow-ink-dialog: rgb(0 0 0 / 66%);
+  --pool-elevation-0: none;
+  --pool-elevation-1: 0 1px 2px var(--pool-shadow-ink-control);
+  --pool-elevation-2: 0 8px 24px var(--pool-shadow-ink-raised);
+  --pool-elevation-3: 0 16px 40px var(--pool-shadow-ink-overlay);
+  --pool-elevation-4: 0 28px 72px var(--pool-shadow-ink-dialog);
+  --pool-shadow-control: var(--pool-elevation-1);
+  --pool-shadow-popover: var(--pool-elevation-3);
+  --pool-shadow-dialog: var(--pool-elevation-4);
+  --pool-shadow-sm: var(--pool-elevation-0);
+  --pool-shadow-md: var(--pool-elevation-3);
+  --pool-shadow-lg: var(--pool-elevation-4);
   --pool-shadow-panel: none;
   --pool-shadow-compact: none;
   --pool-shadow-orbit: none;
-  --pool-shadow-card-lift: 0 10px 28px rgb(0 0 0 / 38%);
-  --pool-shadow-glass: 0 24px 64px rgb(0 0 0 / 46%);
+  --pool-shadow-card-lift: var(--pool-elevation-2);
+  --pool-shadow-glass: var(--pool-elevation-3);
   --pool-shadow-hero: none;
   --pool-shadow-hero-lg: none;
-  --pool-shadow-hover: var(--pool-shadow-popover);
-  --pool-shadow: var(--pool-shadow-popover);
+  --pool-shadow-hover: var(--pool-elevation-3);
+  --pool-shadow: var(--pool-elevation-3);
   --pool-material-blur: saturate(150%) blur(22px);
 
   /* Atmosphere: mesh-gradient stops the WebGL layer samples, and the CSS fallback
@@ -178,6 +275,19 @@ html[data-theme='dark'] {
 
 html[data-theme='light'] {
   color-scheme: light;
+  /* Light is an independently designed opt-out palette, not a filter or a
+     transformed copy of dark. */
+  --pool-neutral-0: #ffffff;
+  --pool-neutral-100: #fdfcfa;
+  --pool-neutral-200: #f6f4f0;
+  --pool-neutral-300: #f4f2ee;
+  --pool-neutral-400: #edeae4;
+  --pool-neutral-500: #e8e5df;
+  --pool-neutral-600: #dcd8d1;
+  --pool-neutral-700: #b8b3aa;
+  --pool-neutral-800: #5d6871;
+  --pool-neutral-900: #14181c;
+
   --pool-bg-page: #f4f2ee;
   --pool-bg-grouped: #edeae4;
   --pool-bg-surface: #fdfcfa;
@@ -211,6 +321,8 @@ html[data-theme='light'] {
   --pool-accent-hover: #0c6349;
   --pool-accent-pressed: #094c38;
   --pool-accent-soft: #dff0e8;
+  --pool-brand-primary: var(--pool-action);
+  --pool-brand-primary-soft: var(--pool-action-soft);
   --pool-brand-secondary: #a65a42;
   --pool-brand-secondary-soft: #f8eae3;
 
@@ -228,21 +340,30 @@ html[data-theme='light'] {
 
   --pool-focus-color: #0f7a5c;
   --pool-focus: 0 0 0 3px rgb(15 122 92 / 32%);
-  --pool-shadow-control: 0 1px 2px rgb(20 24 28 / 8%);
-  --pool-shadow-popover: 0 12px 32px rgb(20 24 28 / 12%);
-  --pool-shadow-dialog: 0 24px 64px rgb(20 24 28 / 18%);
-  --pool-shadow-sm: none;
-  --pool-shadow-md: var(--pool-shadow-popover);
-  --pool-shadow-lg: var(--pool-shadow-dialog);
+  --pool-shadow-ink-control: rgb(20 24 28 / 8%);
+  --pool-shadow-ink-raised: rgb(20 24 28 / 10%);
+  --pool-shadow-ink-overlay: rgb(20 24 28 / 12%);
+  --pool-shadow-ink-dialog: rgb(20 24 28 / 18%);
+  --pool-elevation-0: none;
+  --pool-elevation-1: 0 1px 2px var(--pool-shadow-ink-control);
+  --pool-elevation-2: 0 6px 18px var(--pool-shadow-ink-raised);
+  --pool-elevation-3: 0 12px 32px var(--pool-shadow-ink-overlay);
+  --pool-elevation-4: 0 24px 64px var(--pool-shadow-ink-dialog);
+  --pool-shadow-control: var(--pool-elevation-1);
+  --pool-shadow-popover: var(--pool-elevation-3);
+  --pool-shadow-dialog: var(--pool-elevation-4);
+  --pool-shadow-sm: var(--pool-elevation-0);
+  --pool-shadow-md: var(--pool-elevation-3);
+  --pool-shadow-lg: var(--pool-elevation-4);
   --pool-shadow-panel: none;
   --pool-shadow-compact: none;
   --pool-shadow-orbit: none;
-  --pool-shadow-card-lift: 0 8px 24px rgb(20 24 28 / 10%);
-  --pool-shadow-glass: 0 20px 48px rgb(20 24 28 / 12%);
+  --pool-shadow-card-lift: var(--pool-elevation-2);
+  --pool-shadow-glass: var(--pool-elevation-3);
   --pool-shadow-hero: none;
   --pool-shadow-hero-lg: none;
-  --pool-shadow-hover: var(--pool-shadow-popover);
-  --pool-shadow: var(--pool-shadow-popover);
+  --pool-shadow-hover: var(--pool-elevation-3);
+  --pool-shadow: var(--pool-elevation-3);
   --pool-material-blur: saturate(160%) blur(20px);
 
   /* Atmosphere: mesh-gradient stops the WebGL layer samples, and the CSS fallback
@@ -335,4 +456,16 @@ html[data-theme='light'] {
   --chart-indigo: var(--pool-chart-indigo);
   --chart-cyan: var(--pool-chart-cyan);
   --chart-gray: var(--pool-chart-gray);
+}
+
+/* Mobile role bindings live after every base/theme :root block so no later root
+   declaration in this file can restore the desktop aliases. Equal-valued roles
+   (caption/label/body/callout) intentionally remain inherited from desktop. */
+@media (max-width: 767px) {
+  :root {
+    --pool-type-title-3: var(--pool-type-title-3-mobile);
+    --pool-type-title-2: var(--pool-type-title-2-mobile);
+    --pool-type-title-1: var(--pool-type-title-1-mobile);
+    --pool-type-display: var(--pool-type-display-mobile);
+  }
 }

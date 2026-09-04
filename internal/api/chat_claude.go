@@ -390,7 +390,7 @@ func anthropicStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 		// expose usage, even though no Chat client supplied stream_options.
 		_, includeUsage = w.(*customProtocolPipeWriter)
 	}
-	var inputTokens, outputTokens, cacheReadTokens int64
+	var inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens int64
 	usageSeen := false
 
 	emit := func(delta map[string]interface{}, finish interface{}) {
@@ -439,6 +439,9 @@ func anthropicStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 		if cacheReadTokens > 0 {
 			usage["prompt_tokens_details"] = map[string]interface{}{"cached_tokens": cacheReadTokens}
 		}
+		if cacheCreationTokens > 0 {
+			usage["prompt_cache_miss_tokens"] = cacheCreationTokens
+		}
 		chunk := map[string]interface{}{
 			"id": chatID, "object": "chat.completion.chunk", "model": model,
 			"choices": []interface{}{}, "usage": usage,
@@ -478,6 +481,7 @@ func anthropicStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 					inputTokens = anthropicStreamUsageInt64(streamUsage["input_tokens"])
 					outputTokens = anthropicStreamUsageInt64(streamUsage["output_tokens"])
 					cacheReadTokens = anthropicStreamUsageInt64(streamUsage["cache_read_input_tokens"])
+					cacheCreationTokens = anthropicStreamUsageInt64(streamUsage["cache_creation_input_tokens"])
 					usageSeen = true
 				}
 			}
@@ -536,6 +540,9 @@ func anthropicStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 				}
 				if value := anthropicStreamUsageInt64(streamUsage["cache_read_input_tokens"]); value > 0 {
 					cacheReadTokens = value
+				}
+				if value := anthropicStreamUsageInt64(streamUsage["cache_creation_input_tokens"]); value > 0 {
+					cacheCreationTokens = value
 				}
 				usageSeen = true
 			}

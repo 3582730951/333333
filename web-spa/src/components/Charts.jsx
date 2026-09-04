@@ -385,7 +385,7 @@ export function CacheRateBars({ data = [] }) {
         const c = colorOf(r.modelKey);
         return (
           <div key={i} style={{ marginBottom: 14 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12.5, marginBottom: 6 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 'var(--pool-type-caption)', marginBottom: 6 }}>
               <span className="pool-cache-model" title={r.model}>
                 <span style={{ width: 9, height: 9, borderRadius: 3, background: c, display: 'inline-block' }} />
                 <span>{r.model}</span>

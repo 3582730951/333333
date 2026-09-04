@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"math"
 	"strings"
 
@@ -12,10 +11,11 @@ import (
 
 // Sample-side wiring of the calculate_money quota estimation scheme. Every quota
 // poll that sees a live used_percent window records one sample: the upstream
-// used_percent plus the relay's recorded USD cost accumulated inside that window
-// cycle. Expired cycles are finalized (best prefix estimate persisted, raw samples
-// pruned) exactly like the reference implementation, which keeps only the
-// best-quality summary per cycle.
+// used_percent plus the relay's versioned API-list-price-equivalent cost
+// accumulated inside that window cycle. That internal ratio is not an account
+// USD balance. Expired cycles are finalized (best prefix estimate persisted, raw
+// samples pruned) exactly like the reference implementation, which keeps only
+// the best-quality summary per cycle.
 const (
 	quotaWindowKind5h = "5h"
 	quotaWindowKind7d = "7d"
@@ -237,115 +237,4 @@ func quotaWindowStaleAfter(windowKind string) int64 {
 		return quotaWindowStaleAfterSeconds7d
 	}
 	return quotaWindowStaleAfterSeconds5h
-}
-
-// quotaWindowEstimateFor computes the live estimate of the account's current
-// cycle. It returns nil when the account has no samples or the evidence is still
-// too thin (state "waiting").
-func (s *Server) quotaWindowEstimateFor(ctx context.Context, accountID, windowKind string, now int64) *quotaWindowEstimate {
-	if s == nil || s.store == nil || accountID == "" {
-		return nil
-	}
-	cycle, ok, err := s.store.QuotaWindowCurrentCycle(ctx, accountID, windowKind)
-	if err != nil || !ok {
-		return nil
-	}
-	samples, err := s.store.QuotaWindowSamples(ctx, accountID, windowKind, cycle.CycleStart)
-	if err != nil || len(samples) == 0 {
-		return nil
-	}
-	estimate := quotaWindowSelectBest(quotaWindowSamplesFromStorage(samples), now, quotaWindowStaleAfter(windowKind))
-	if estimate.State != "estimated" {
-		return nil
-	}
-	return &estimate
-}
-
-// attachQuotaWindowEstimate replaces the window_based placeholder in the quota
-// summary with the empirical dollar estimate once the current cycle has enough
-// evidence. The upstream-reported credit balance, when present, is preserved as
-// the extra-budget figure.
-func (s *Server) attachQuotaWindowEstimate(ctx context.Context, account storage.Account, summary *QuotaSummary, now int64) {
-	if s == nil || summary == nil || summary.Estimate == nil {
-		return
-	}
-	kind := quotaWindowKindForProvider(summary.Provider)
-	estimate := s.quotaWindowEstimateFor(ctx, account.ID, kind, now)
-	if estimate == nil {
-		return
-	}
-	applyQuotaWindowEstimate(summary, estimate)
-}
-
-func applyQuotaWindowEstimate(summary *QuotaSummary, estimate *quotaWindowEstimate) {
-	if summary == nil || summary.Estimate == nil || estimate == nil {
-		return
-	}
-	existing := summary.Estimate
-	existing.Estimated = true
-	existing.Method = "window_cost_estimate"
-	existing.Confidence = estimate.Confidence
-	existing.LimitUSD = round2(estimate.Cost.Center)
-	existing.LimitUSDMin = round2(estimate.Cost.Lower)
-	existing.LimitUSDMax = round2(estimate.Cost.Upper)
-	existing.UsedUSD = round2(estimate.UsedCost.Center)
-	existing.RemainingUSD = round2(estimate.RemainingCost.Center)
-	existing.UsedPercent = estimate.UsedPercent
-	if estimate.Evidence.CandidateCount > 0 {
-		existing.Note = fmt.Sprintf("empirical window estimate: %d candidates over %d samples, %s confidence (%s)", estimate.Evidence.DeltaCandidateCount, estimate.Evidence.SampleCount, estimate.Confidence, estimate.Method)
-	}
-}
-
-// attachQuotaWindowEstimates batches current-cycle samples for the account list.
-// The storage query is chunked at 100 ids and estimation remains ordinary Go work.
-func (s *Server) attachQuotaWindowEstimates(ctx context.Context, accounts []storage.Account, summaries []QuotaSummary, now int64) error {
-	if s == nil || s.store == nil || len(accounts) == 0 || len(summaries) != len(accounts) {
-		return nil
-	}
-	byKind := make(map[string][]string)
-	indices := make(map[string][]int)
-	for index := range accounts {
-		if summaries[index].Estimate == nil {
-			continue
-		}
-		kind := quotaWindowKindForProvider(summaries[index].Provider)
-		if kind == "" {
-			continue
-		}
-		byKind[kind] = append(byKind[kind], accounts[index].ID)
-		indices[accounts[index].ID] = append(indices[accounts[index].ID], index)
-	}
-	for kind, ids := range byKind {
-		for offset := 0; offset < len(ids); offset += 100 {
-			end := offset + 100
-			if end > len(ids) {
-				end = len(ids)
-			}
-			samplesByAccount, err := s.store.QuotaWindowCurrentSamplesByAccountIDs(ctx, ids[offset:end], kind)
-			if err != nil {
-				return err
-			}
-			for accountID, samples := range samplesByAccount {
-				if len(samples) == 0 {
-					continue
-				}
-				estimate := quotaWindowSelectBest(quotaWindowSamplesFromStorage(samples), now, quotaWindowStaleAfter(kind))
-				if estimate.State != "estimated" {
-					continue
-				}
-				for _, index := range indices[accountID] {
-					applyQuotaWindowEstimate(&summaries[index], &estimate)
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func quotaWindowKindForProvider(provider string) string {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "codex", "chatgpt", "openai", "claude":
-		return quotaWindowKind5h
-	}
-	return ""
 }

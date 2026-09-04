@@ -75,18 +75,33 @@ func frozenRequestClientIdentity(r *http.Request, meta bodysource.BodyMeta) clie
 	if meta.Model != "" {
 		probe["model"] = meta.Model
 	}
-	if meta.ClientFamily != "" {
+	if meta.ClaudeCodeBilling {
+		// The canonical Claude Code billing marker is inside system[0].text,
+		// not an HTTP header.  BodyMeta validated its location and syntax while
+		// the original body was captured, so retain only the fixed family enum.
+		probe["client_family"] = "claude_code"
+	} else if meta.ClientFamily != "" {
 		probe["client_family"] = meta.ClientFamily
 		// The scanner stores originator in ClientFamily for historical body
 		// compatibility. Supplying it under both names preserves Codex's native
 		// high-confidence originator marker.
 		probe["originator"] = meta.ClientFamily
 	}
-	if meta.AgentClass != "" {
+	if meta.ClaudeCodeAgentClass != "" {
+		probe["agent_class"] = meta.ClaudeCodeAgentClass
+	} else if meta.AgentClass != "" {
 		probe["agent_class"] = meta.AgentClass
 	}
 	body, _ := json.Marshal(probe)
-	return clientidentity.FromHeadersAndBody(headers, body, requestInboundProtocol(r))
+	identity := clientidentity.FromHeadersAndBody(headers, body, requestInboundProtocol(r))
+	if headerClass := clientidentity.NormalizeAgent(requestAccountAgentClass(r)); headerClass != clientidentity.AgentUnknown {
+		// Header lineage remains authoritative over a body marker. The historical
+		// helper owns the protocol order (explicit subagent marker, Anthropic
+		// billing header, then Codex parent/fork/thread lineage); reconnecting it
+		// here preserves that order for the frozen HTTP and WebSocket identity.
+		identity.AgentClass = headerClass
+	}
+	return identity.Normalize()
 }
 
 func requestInboundProtocol(r *http.Request) string {

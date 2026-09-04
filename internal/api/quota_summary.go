@@ -86,7 +86,7 @@ func BuildQuotaSummary(account storage.Account, token *storage.AccountToken, sna
 	primary := selectQuotaPrimary(provider, snapshots)
 	secondary := selectQuotaSecondary(primary, snapshots, now)
 	if primary != nil {
-		w := quotaWindowFromSnapshot(*primary)
+		w := quotaWindowFromSnapshot(*primary, now)
 		out.Primary = &w
 		out.SyncedAt = primary.UpdatedAt
 	}
@@ -167,6 +167,10 @@ func BuildQuotaSummary(account storage.Account, token *storage.AccountToken, sna
 		out.Partial = true
 		return out
 	}
+	if _, cooling := storage.AccountRateLimitEffectiveCooldownUntil(*primary, now); cooling {
+		out.SyncReason = "quota_cooldown"
+		return out
+	}
 	out.SyncReason = "ok"
 	return out
 }
@@ -200,24 +204,48 @@ func selectQuotaPrimary(provider string, snapshots []storage.AccountRateLimit) *
 		preferred = []string{"cursor_monthly", "unified"}
 	}
 	for _, limiter := range preferred {
-		if snap := latestSnapshotWithLimiter(snapshots, limiter); snap != nil {
+		if snap := latestQuotaPrimarySnapshotWithLimiter(provider, snapshots, limiter); snap != nil {
 			return snap
 		}
 	}
 	var latest *storage.AccountRateLimit
 	for i := range snapshots {
 		snap := &snapshots[i]
-		limiter := strings.TrimSpace(snap.LimiterType)
-		if limiter == "" {
-			limiter = strings.TrimSpace(snap.Source)
-		}
-		// codexStreamFeaturesLimiterType is a passive observation row (used_percent -1,
-		// status "observed") recording per-feature limit names seen on the wire. It
-		// carries no routable window, so it must never become the primary quota.
-		if limiter == "7d_oauth_usage" || limiter == "7d_polled" || limiter == codexResetCreditsLimiterType || limiter == codexCreditsLimiterType || limiter == codexStreamFeaturesLimiterType || limiter == "quota_poll_error" || strings.HasPrefix(strings.TrimSpace(snap.Status), "error/") {
+		if !quotaPrimarySnapshotEligible(provider, *snap, false) {
 			continue
 		}
-		if provider == "claude" && (limiter == "opus" || limiter == "sonnet" || limiter == "haiku") {
+		if latest == nil || snap.UpdatedAt > latest.UpdatedAt {
+			latest = snap
+		}
+	}
+	if latest != nil {
+		return latest
+	}
+
+	// Premium/5x Business accounts can expose their sole primary quota as a
+	// seven-day window. Keep it behind every ordinary primary candidate so a
+	// normal five-hour window remains primary and seven-day stays secondary.
+	for _, limiter := range quotaSevenDayPrimaryLimiters(provider) {
+		if snap := latestQuotaPrimarySnapshotWithLimiter(provider, snapshots, limiter); snap != nil {
+			return snap
+		}
+	}
+	return nil
+}
+
+func quotaSevenDayPrimaryLimiters(provider string) []string {
+	if provider == "claude" {
+		return []string{"7d_oauth_usage", "7d_polled"}
+	}
+	return []string{"7d_polled", "7d_oauth_usage"}
+}
+
+func latestQuotaPrimarySnapshotWithLimiter(provider string, snapshots []storage.AccountRateLimit, limiter string) *storage.AccountRateLimit {
+	var latest *storage.AccountRateLimit
+	allowSevenDay := limiter == "7d_polled" || limiter == "7d_oauth_usage"
+	for i := range snapshots {
+		snap := &snapshots[i]
+		if !snapshotHasLimiter(*snap, limiter) || !quotaPrimarySnapshotEligible(provider, *snap, allowSevenDay) {
 			continue
 		}
 		if latest == nil || snap.UpdatedAt > latest.UpdatedAt {
@@ -225,6 +253,34 @@ func selectQuotaPrimary(provider string, snapshots []storage.AccountRateLimit) *
 		}
 	}
 	return latest
+}
+
+func quotaPrimarySnapshotEligible(provider string, snap storage.AccountRateLimit, allowSevenDay bool) bool {
+	// codexStreamFeaturesLimiterType is a passive observation row (used_percent -1,
+	// status "observed") recording per-feature limit names seen on the wire. It
+	// carries no routable window, so it must never become the primary quota.
+	if snapshotHasLimiter(snap, codexResetCreditsLimiterType) ||
+		snapshotHasLimiter(snap, codexCreditsLimiterType) ||
+		snapshotHasLimiter(snap, codexStreamFeaturesLimiterType) ||
+		snapshotHasLimiter(snap, "quota_poll_error") ||
+		strings.HasPrefix(strings.TrimSpace(snap.Status), "error/") {
+		return false
+	}
+	if !allowSevenDay && (snapshotHasLimiter(snap, "7d_oauth_usage") || snapshotHasLimiter(snap, "7d_polled")) {
+		return false
+	}
+	if provider == "claude" && (snapshotHasLimiter(snap, "opus") || snapshotHasLimiter(snap, "sonnet") || snapshotHasLimiter(snap, "haiku")) {
+		return false
+	}
+	return true
+}
+
+func snapshotLimiter(snap storage.AccountRateLimit) string {
+	return firstNonEmpty(strings.TrimSpace(snap.LimiterType), strings.TrimSpace(snap.Source))
+}
+
+func snapshotHasLimiter(snap storage.AccountRateLimit, limiter string) bool {
+	return strings.TrimSpace(snap.LimiterType) == limiter || strings.TrimSpace(snap.Source) == limiter
 }
 
 func latestSnapshotWithLimiter(snapshots []storage.AccountRateLimit, limiter string) *storage.AccountRateLimit {
@@ -242,8 +298,11 @@ func latestSnapshotWithLimiter(snapshots []storage.AccountRateLimit, limiter str
 }
 
 func selectQuotaSecondary(primary *storage.AccountRateLimit, snapshots []storage.AccountRateLimit, now int64) *QuotaWindow {
-	if snap := latestSnapshotWithLimiter(snapshots, "7d_polled"); snap != nil {
-		w := quotaWindowFromSnapshot(*snap)
+	if isSevenDayQuotaSnapshot(primary) {
+		return nil
+	}
+	if snap := latestSnapshotWithLimiter(snapshots, "7d_polled"); snap != nil && !sameQuotaSnapshot(primary, snap) {
+		w := quotaWindowFromSnapshot(*snap, now)
 		return &w
 	}
 	if primary != nil {
@@ -251,11 +310,22 @@ func selectQuotaSecondary(primary *storage.AccountRateLimit, snapshots []storage
 			return secondary
 		}
 	}
-	if snap := latestSnapshotWithLimiter(snapshots, "7d_oauth_usage"); snap != nil {
-		w := quotaWindowFromSnapshot(*snap)
+	if snap := latestSnapshotWithLimiter(snapshots, "7d_oauth_usage"); snap != nil && !sameQuotaSnapshot(primary, snap) {
+		w := quotaWindowFromSnapshot(*snap, now)
 		return &w
 	}
 	return nil
+}
+
+func isSevenDayQuotaSnapshot(snap *storage.AccountRateLimit) bool {
+	return snap != nil && (snapshotHasLimiter(*snap, "7d_polled") || snapshotHasLimiter(*snap, "7d_oauth_usage"))
+}
+
+func sameQuotaSnapshot(left, right *storage.AccountRateLimit) bool {
+	return left != nil && right != nil &&
+		strings.TrimSpace(left.LimiterType) == strings.TrimSpace(right.LimiterType) &&
+		strings.TrimSpace(left.Source) == strings.TrimSpace(right.Source) &&
+		left.UpdatedAt == right.UpdatedAt
 }
 
 // selectQuotaCredits rebuilds the extra-balance block from the snapshot the quota
@@ -380,25 +450,100 @@ func secondaryFromRaw(raw string, updatedAt, now int64) *QuotaWindow {
 	}
 }
 
-func quotaWindowFromSnapshot(snap storage.AccountRateLimit) QuotaWindow {
+func quotaWindowFromSnapshot(snap storage.AccountRateLimit, nowValues ...int64) QuotaWindow {
+	now := storage.Now()
+	if len(nowValues) > 0 {
+		now = nowValues[0]
+	}
 	return QuotaWindow{
-		Source:            firstNonEmpty(strings.TrimSpace(snap.Source), strings.TrimSpace(snap.LimiterType)),
-		LimiterType:       firstNonEmpty(strings.TrimSpace(snap.LimiterType), strings.TrimSpace(snap.Source)),
-		UsedPercent:       snap.UsedPercent,
-		RemainingTokens:   snap.RemainingTokens,
-		LimitTokens:       snap.LimitTokens,
-		LimitRequests:     snap.LimitRequests,
-		RemainingRequests: snap.RemainingRequests,
-		ResetAt:           snap.ResetAt,
-		Status:            snap.Status,
-		UpdatedAt:         snap.UpdatedAt,
-		State:             quotaWindowSnapshotState(snap),
+		Source:             firstNonEmpty(strings.TrimSpace(snap.Source), strings.TrimSpace(snap.LimiterType)),
+		LimiterType:        firstNonEmpty(strings.TrimSpace(snap.LimiterType), strings.TrimSpace(snap.Source)),
+		UsedPercent:        snap.UsedPercent,
+		RemainingTokens:    snap.RemainingTokens,
+		LimitTokens:        snap.LimitTokens,
+		LimitRequests:      snap.LimitRequests,
+		RemainingRequests:  snap.RemainingRequests,
+		LimitWindowSeconds: quotaWindowSecondsFromSnapshot(snap),
+		ResetAt:            snap.ResetAt,
+		Status:             snap.Status,
+		UpdatedAt:          snap.UpdatedAt,
+		State:              quotaWindowSnapshotState(snap, now),
 	}
 }
 
-func quotaWindowSnapshotState(snap storage.AccountRateLimit) string {
+func quotaWindowSecondsFromSnapshot(snap storage.AccountRateLimit) int64 {
+	limiter := snapshotLimiter(snap)
+	if seconds := quotaWindowSecondsFromRaw(snap.Raw, limiter); seconds > 0 {
+		return seconds
+	}
+	return quotaWindowSecondsFromLimiter(limiter)
+}
+
+func quotaWindowSecondsFromRaw(raw, limiter string) int64 {
+	if strings.TrimSpace(raw) == "" {
+		return 0
+	}
+	var detail struct {
+		LimitWindowSeconds int64 `json:"limit_window_seconds"`
+		Primary            struct {
+			LimitWindowSeconds int64 `json:"limit_window_seconds"`
+		} `json:"primary"`
+		Secondary struct {
+			LimitWindowSeconds int64 `json:"limit_window_seconds"`
+		} `json:"secondary"`
+	}
+	if json.Unmarshal([]byte(raw), &detail) != nil {
+		return 0
+	}
+
+	limiter = strings.ToLower(strings.TrimSpace(limiter))
+	var candidates []int64
+	switch {
+	case strings.Contains(limiter, "5h"):
+		candidates = []int64{detail.Primary.LimitWindowSeconds, detail.LimitWindowSeconds, detail.Secondary.LimitWindowSeconds}
+	case strings.Contains(limiter, "7d"):
+		candidates = []int64{detail.Secondary.LimitWindowSeconds, detail.LimitWindowSeconds, detail.Primary.LimitWindowSeconds}
+	default:
+		// Without a limiter we can only trust an unambiguous top-level value.
+		candidates = []int64{detail.LimitWindowSeconds}
+	}
+	for _, seconds := range candidates {
+		if seconds > 0 && quotaWindowSecondsMatchLimiter(seconds, limiter) {
+			return seconds
+		}
+	}
+	return 0
+}
+
+func quotaWindowSecondsMatchLimiter(seconds int64, limiter string) bool {
+	switch {
+	case strings.Contains(limiter, "5h"):
+		return seconds < 24*60*60
+	case strings.Contains(limiter, "7d"):
+		return seconds >= 24*60*60
+	default:
+		return true
+	}
+}
+
+func quotaWindowSecondsFromLimiter(limiter string) int64 {
+	limiter = strings.ToLower(strings.TrimSpace(limiter))
+	switch {
+	case strings.Contains(limiter, "5h"):
+		return 5 * 60 * 60
+	case strings.Contains(limiter, "7d"):
+		return 7 * 24 * 60 * 60
+	default:
+		return 0
+	}
+}
+
+func quotaWindowSnapshotState(snap storage.AccountRateLimit, now int64) string {
 	if snap.UpdatedAt <= 0 || snap.UsedPercent < 0 {
 		return "unknown"
+	}
+	if _, cooling := storage.AccountRateLimitEffectiveCooldownUntil(snap, now); cooling {
+		return "cooling"
 	}
 	return "known"
 }

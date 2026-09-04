@@ -341,7 +341,7 @@ export default function Dashboard() {
       <PageHeader title={t('dashboard.title')} subtitle={t('dashboard.subtitle')}
         actions={<>
           <Button icon={<IconRefresh />} onClick={reload} loading={loading}>{t('common.refresh')}</Button>
-          {!loading ? <span className="pool-text-tertiary" style={{ fontSize: 12 }}>
+          {!loading ? <span className="pool-text-tertiary" style={{ fontSize: 'var(--pool-type-caption)' }}>
             {lastRefreshText(lastRefresh)} · {pageVisible ? t('dashboard.auto_refresh').replace('{count}', String(countdown)) : t('dashboard.refresh_paused')}
           </span> : null}
         </>} />

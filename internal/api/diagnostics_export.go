@@ -95,6 +95,11 @@ type diagnosticUsageRecord struct {
 	ActualModel                       string
 	ModelMismatch                     int64
 	ModelMismatchReason               string
+	RequestedServiceTier              string
+	ForwardedServiceTier              string
+	ObservedServiceTier               string
+	BilledServiceTier                 string
+	BilledTierReason                  string
 	RawUsageJSON                      string
 	CreatedAt                         int64
 }
@@ -952,19 +957,21 @@ func applyDiagnosticBillingHoldSummary(ctx context.Context, db storage.ReadQueri
 SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END),
 SUM(CASE WHEN status='held' AND created_at >= ? THEN 1 ELSE 0 END),
 SUM(CASE WHEN status='held' AND created_at < ? THEN 1 ELSE 0 END),
-MIN(CASE WHEN status='held' AND created_at >= ? THEN created_at END)
+MIN(CASE WHEN status='held' AND created_at >= ? THEN created_at END),
+SUM(CASE WHEN status='expired_unsettled' AND usage_expected=0 THEN 1 ELSE 0 END),
+SUM(CASE WHEN status='expired_unsettled' AND usage_expected=1 THEN 1 ELSE 0 END)
 FROM billing_holds GROUP BY status`, now-24*60*60, now-60*60, now-60*60, now-60*60)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	lifetime, last24h := map[string]int{}, map[string]int{}
-	fresh, stale, expired, oldestFresh := int64(0), int64(0), int64(0), int64(0)
+	fresh, stale, expired, expiredNoUsageExpected, expiredUsageExpected, oldestFresh := int64(0), int64(0), int64(0), int64(0), int64(0), int64(0)
 	for rows.Next() {
 		var status string
-		var total, day, freshForStatus, staleForStatus int64
+		var total, day, freshForStatus, staleForStatus, noUsageForStatus, usageExpectedForStatus int64
 		var oldest sql.NullInt64
-		if err := rows.Scan(&status, &total, &day, &freshForStatus, &staleForStatus, &oldest); err != nil {
+		if err := rows.Scan(&status, &total, &day, &freshForStatus, &staleForStatus, &oldest, &noUsageForStatus, &usageExpectedForStatus); err != nil {
 			return err
 		}
 		lifetime[firstNonEmpty(status, "unknown")] = int(total)
@@ -973,6 +980,8 @@ FROM billing_holds GROUP BY status`, now-24*60*60, now-60*60, now-60*60, now-60*
 		stale += staleForStatus
 		if status == "expired_unsettled" {
 			expired = total
+			expiredNoUsageExpected += noUsageForStatus
+			expiredUsageExpected += usageExpectedForStatus
 		}
 		if oldest.Valid && now-oldest.Int64 > oldestFresh {
 			oldestFresh = now - oldest.Int64
@@ -991,7 +1000,13 @@ FROM billing_holds GROUP BY status`, now-24*60*60, now-60*60, now-60*60, now-60*
 	}
 	summary["billing_holds"] = map[string]interface{}{
 		"current_fresh_held": fresh, "historical_stale_held": stale,
-		"expired_unsettled": expired, "oldest_fresh_held_age_seconds": oldestFresh,
+		"expired_unsettled": expired,
+		// Expiration is a terminal cleanup state, not proof of a missing charge.
+		// Consumers must distinguish deliberate no-usage terminalization from a
+		// hold that still expected a usage record when it expired.
+		"expired_unsettled_no_usage_expected": expiredNoUsageExpected,
+		"expired_unsettled_usage_expected":    expiredUsageExpected,
+		"oldest_fresh_held_age_seconds":       oldestFresh,
 	}
 	if current, ok := summary["current_state"].(map[string]interface{}); ok {
 		current["fresh_billing_holds"] = fresh
@@ -1352,7 +1367,7 @@ func streamDiagnosticUsageCSV(ctx context.Context, db storage.ReadQuerier, zw *z
 }
 
 func diagnosticUsageCSVHeader() []string {
-	return []string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "usage_provider", "usage_source", "cache_read_present", "cache_creation_present", "compatibility_losses_json", "cache_capability", "estimated", "cache_miss_tokens", "cache_total_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "affinity_source", "route_class", "prompt_cache_key_present", "prompt_cache_key_source", "prompt_cache_key_hash", "prompt_cache_key_shard", "prompt_cache_key_minute_rpm", "prompt_cache_key_concurrency_peak", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "coordination_prefix_source", "singleflight_wait_reason", "singleflight_release_reason", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch", "raw_usage_json", "kiro_credits", "kiro_credits_present", "billing_hold_id", "requested_model", "resolved_model", "model_override_source", "actual_model", "model_mismatch", "model_mismatch_reason"}
+	return []string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "usage_provider", "usage_source", "cache_read_present", "cache_creation_present", "compatibility_losses_json", "cache_capability", "estimated", "cache_miss_tokens", "cache_total_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "affinity_source", "route_class", "prompt_cache_key_present", "prompt_cache_key_source", "prompt_cache_key_hash", "prompt_cache_key_shard", "prompt_cache_key_minute_rpm", "prompt_cache_key_concurrency_peak", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "coordination_prefix_source", "singleflight_wait_reason", "singleflight_release_reason", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch", "raw_usage_json", "kiro_credits", "kiro_credits_present", "billing_hold_id", "requested_model", "resolved_model", "model_override_source", "actual_model", "model_mismatch", "model_mismatch_reason", "requested_service_tier", "forwarded_service_tier", "observed_service_tier", "billed_service_tier", "billed_tier_reason"}
 }
 
 func streamDiagnosticBillingHoldsCSV(ctx context.Context, db storage.ReadQuerier, zw *zip.Writer, codebook diagnosticCodebook) (int64, error) {
@@ -1693,7 +1708,12 @@ retention_effective, retention_source, claude_cache_ttl, cache_control_injected,
 cache_breakpoints_json, unwritten_tail_tokens, max_possible_cache_read_tokens, cache_hit_after_prewarm, singleflight_waited_requests, coordination_prefix_source, singleflight_wait_reason, singleflight_release_reason, diagnostics_miss_reason,
 latest_user_cache_control, latest_user_auto_context_cache_control, latest_user_tail_cache_control, latest_user_tool_result_cache_control, route_epoch,
 raw_usage_json, created_at, kiro_credits, kiro_credits_present, billing_hold_id, requested_model, resolved_model, model_override_source,
-actual_model, model_mismatch, model_mismatch_reason FROM usage_records`
+actual_model, model_mismatch, model_mismatch_reason,
+COALESCE((SELECT c.requested_service_tier FROM usage_components c WHERE c.usage_event_id=usage_records.usage_event_id),''),
+COALESCE((SELECT c.forwarded_service_tier FROM usage_components c WHERE c.usage_event_id=usage_records.usage_event_id),''),
+COALESCE((SELECT c.observed_service_tier FROM usage_components c WHERE c.usage_event_id=usage_records.usage_event_id),''),
+COALESCE((SELECT c.billed_service_tier FROM usage_components c WHERE c.usage_event_id=usage_records.usage_event_id),''),
+COALESCE((SELECT c.billed_tier_reason FROM usage_components c WHERE c.usage_event_id=usage_records.usage_event_id),'') FROM usage_records`
 }
 
 type usageRecordScanner interface {
@@ -1709,7 +1729,8 @@ func scanDiagnosticUsageRecord(rows usageRecordScanner, r *diagnosticUsageRecord
 		&r.CacheBreakpointsJSON, &r.UnwrittenTailTokens, &r.MaxPossibleCacheReadTokens, &r.CacheHitAfterPrewarm, &r.SingleflightWaitedRequests, &r.CoordinationPrefixSource, &r.SingleflightWaitReason, &r.SingleflightReleaseReason, &r.DiagnosticsMissReason,
 		&r.LatestUserCacheControl, &r.LatestUserAutoContextCacheControl, &r.LatestUserTailCacheControl, &r.LatestUserToolResultCacheControl, &r.RouteEpoch,
 		&r.RawUsageJSON, &r.CreatedAt, &r.KiroCredits, &r.KiroCreditsPresent, &r.BillingHoldID, &r.RequestedModel, &r.ResolvedModel, &r.ModelOverrideSource,
-		&r.ActualModel, &r.ModelMismatch, &r.ModelMismatchReason)
+		&r.ActualModel, &r.ModelMismatch, &r.ModelMismatchReason, &r.RequestedServiceTier, &r.ForwardedServiceTier,
+		&r.ObservedServiceTier, &r.BilledServiceTier, &r.BilledTierReason)
 }
 
 func listDiagnosticBillingHolds(ctx context.Context, db storage.ReadQuerier) ([]diagnosticBillingHold, error) {
@@ -2988,6 +3009,11 @@ func usageRecordRows(rows []diagnosticUsageRecord, codebook diagnosticCodebook) 
 			row.ActualModel,
 			itoa64(row.ModelMismatch),
 			row.ModelMismatchReason,
+			row.RequestedServiceTier,
+			row.ForwardedServiceTier,
+			row.ObservedServiceTier,
+			row.BilledServiceTier,
+			row.BilledTierReason,
 		})
 	}
 	return out
@@ -3127,7 +3153,7 @@ func diagnosticSummary(accounts []storage.Account, tokensByID map[string]storage
 	}
 	lifetime := buildWindow(0)
 	last24h := buildWindow(now - 24*60*60)
-	freshHeld, staleHeld, expiredCount := 0, 0, 0
+	freshHeld, staleHeld, expiredCount, expiredNoUsageExpected, expiredUsageExpected := 0, 0, 0, 0, 0
 	oldestFreshHeldAge := int64(0)
 	for _, hold := range holds {
 		switch hold.Status {
@@ -3143,6 +3169,11 @@ func diagnosticSummary(accounts []storage.Account, tokensByID map[string]storage
 			}
 		case "expired_unsettled":
 			expiredCount++
+			if hold.UsageExpected > 0 {
+				expiredUsageExpected++
+			} else {
+				expiredNoUsageExpected++
+			}
 		}
 	}
 
@@ -3183,18 +3214,7 @@ func diagnosticSummary(accounts []storage.Account, tokensByID map[string]storage
 				g.RecheckPending++
 			}
 		}
-		limited := false
-		if _, ok := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], provider, "", now); ok {
-			limited = true
-		} else {
-			for _, snap := range rateLimitsByAccount[account.ID] {
-				if _, ok := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], provider, snap.Model, now); ok {
-					limited = true
-					break
-				}
-			}
-		}
-		if limited {
+		if diagnosticRateLimitCooldown(rateLimitsByAccount[account.ID], provider, "", now) {
 			g.RateLimitCooldown++
 		}
 	}
@@ -3205,10 +3225,12 @@ func diagnosticSummary(accounts []storage.Account, tokensByID map[string]storage
 		"health_test_models": lifetime.HealthModels,
 		"banned_accounts":    lifetime.Banned,
 		"billing_holds": map[string]interface{}{
-			"current_fresh_held":            freshHeld,
-			"historical_stale_held":         staleHeld,
-			"expired_unsettled":             expiredCount,
-			"oldest_fresh_held_age_seconds": oldestFreshHeldAge,
+			"current_fresh_held":                  freshHeld,
+			"historical_stale_held":               staleHeld,
+			"expired_unsettled":                   expiredCount,
+			"expired_unsettled_no_usage_expected": expiredNoUsageExpected,
+			"expired_unsettled_usage_expected":    expiredUsageExpected,
+			"oldest_fresh_held_age_seconds":       oldestFreshHeldAge,
 		},
 		"groups":   groups,
 		"lifetime": lifetime,
@@ -3219,6 +3241,34 @@ func diagnosticSummary(accounts []storage.Account, tokensByID map[string]storage
 			"stale_historical_holds": staleHeld,
 		},
 	}
+}
+
+func diagnosticRateLimitCooldown(rows []storage.AccountRateLimit, provider, model string, now int64) bool {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	for _, snap := range rows {
+		if snap.UpdatedAt > 0 && now > snap.UpdatedAt && now-snap.UpdatedAt > storage.AccountRateLimitSnapshotMaxAgeSeconds {
+			continue
+		}
+		rowProvider := strings.TrimSpace(snap.Provider)
+		if provider != "" && rowProvider != "" && rowProvider != provider {
+			continue
+		}
+		rowModel := strings.TrimSpace(snap.Model)
+		if model != "" && rowModel != "" && rowModel != model {
+			continue
+		}
+		if _, cooling := storage.AccountRateLimitEffectiveCooldownUntil(snap, now); cooling {
+			return true
+		}
+		if snap.UpdatedAt == 0 {
+			switch strings.ToLower(strings.TrimSpace(snap.Status)) {
+			case "rejected", "exhausted":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func classifyRouting409Detail(detail string) string {

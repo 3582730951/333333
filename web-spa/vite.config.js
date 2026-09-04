@@ -60,6 +60,29 @@ export default defineConfig({
     outDir: '../internal/console/dist',
     emptyOutDir: true,
     chunkSizeWarningLimit: 1500,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          const file = id.replaceAll('\\', '/');
+          // The Aurora entry shell is budgeted on its own by
+          // scripts/check-engine-budget.mjs. Left to natural splitting it lands
+          // inside AtmosphereLayer's chunk, and the gate would then be weighing
+          // React component bytes as if they were engine bytes.
+          if (file.endsWith('/src/engine/bootstrap.js') || file.endsWith('/src/engine/routeEffects.js')) return 'shell';
+          return undefined;
+        },
+        // Aurora chunks carry their identity in the filename. Rollup emits no
+        // source map or manifest here, so a name is the only durable handle the
+        // budget gate has after minification -- and a name only claims "engine"
+        // when every real module in the chunk is one.
+        chunkFileNames(chunk) {
+          const modules = (chunk.moduleIds || []).filter((id) => !id.startsWith('\0'));
+          const engineModules = modules.filter((id) => id.replaceAll('\\', '/').includes('/src/engine/'));
+          const pureEngine = engineModules.length > 0 && engineModules.length === modules.length;
+          return pureEngine ? 'assets/aurora-engine-[name]-[hash].js' : 'assets/[name]-[hash].js';
+        },
+      },
+    },
   },
   server: {
     port: 5188,

@@ -640,6 +640,21 @@ var checkedPostgresMigrations = []checkedPostgresMigration{
 		},
 	},
 	{
+		version: "20260904_account_request_rate_egress_v5",
+		statements: []string{
+			`ALTER TABLE account_usage_rate_events ADD COLUMN IF NOT EXISTS egress_id TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX IF NOT EXISTS idx_account_usage_rate_egress_occurred ON account_usage_rate_events(egress_id,occurred_at)`,
+		},
+	},
+	{
+		version: "20260904_user_group_egress_rpm_balance_v1",
+		statements: []string{
+			`ALTER TABLE user_groups ADD COLUMN IF NOT EXISTS egress_rpm_balance_enabled INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE user_groups ADD COLUMN IF NOT EXISTS egress_rpm_balance_threshold BIGINT NOT NULL DEFAULT 0`,
+			`ALTER TABLE user_groups ADD COLUMN IF NOT EXISTS egress_rpm_balance_egress_ids TEXT NOT NULL DEFAULT '[]'`,
+		},
+	},
+	{
 		version: "20260815_actual_model_audit_v1",
 		statements: []string{
 			`ALTER TABLE usage_records ADD COLUMN IF NOT EXISTS actual_model TEXT NOT NULL DEFAULT ''`,
