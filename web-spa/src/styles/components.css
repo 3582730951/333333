@@ -8848,6 +8848,180 @@ Apple-like chart treatment with compact legends and readable tooltips. */
 .pool-capacity-estimate { display: grid; gap: var(--pool-space-1); padding: var(--pool-space-2); border: 1px solid var(--pool-border); border-radius: 8px; font-size: var(--pool-type-caption); }
 .pool-capacity-estimate > div:first-child { display: flex; align-items: center; gap: var(--pool-space-1); flex-wrap: wrap; }
 
+/* Account details lead with a scan-friendly answer, then reveal evidence on demand. */
+.pool-account-summary {
+  display: grid;
+  gap: var(--pool-space-3);
+  margin-bottom: var(--pool-space-4);
+  padding: var(--pool-space-4);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--pool-accent) 12%, transparent), transparent 58%),
+    var(--pool-bg-surface);
+  border: 1px solid color-mix(in srgb, var(--pool-accent) 28%, var(--pool-border-subtle));
+  border-radius: var(--pool-radius-panel);
+  box-shadow: var(--pool-shadow-sm);
+}
+
+.pool-account-summary__hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--pool-space-4);
+}
+
+.pool-account-summary__eyebrow,
+.pool-account-summary__metric > span {
+  display: block;
+  color: var(--pool-text-3);
+  font-size: var(--pool-type-caption);
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.pool-account-summary__status {
+  display: flex;
+  align-items: center;
+  gap: var(--pool-space-2);
+  margin-top: var(--pool-space-1);
+  font-size: var(--pool-type-title-3);
+  font-weight: 720;
+  line-height: 1.2;
+}
+
+.pool-account-summary__hint,
+.pool-account-summary__identity > span,
+.pool-account-summary__footer {
+  color: var(--pool-text-3);
+  font-size: var(--pool-type-caption);
+}
+
+.pool-account-summary__identity {
+  display: grid;
+  gap: var(--pool-space-1);
+  max-width: 48%;
+  text-align: right;
+}
+
+.pool-account-summary__identity > strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--pool-type-callout);
+}
+
+.pool-account-summary__grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--pool-space-2);
+}
+
+.pool-account-summary__metric {
+  min-width: 0;
+  padding: var(--pool-space-2) var(--pool-space-3);
+  background: color-mix(in srgb, var(--pool-bg-surface-2) 68%, transparent);
+  border: 1px solid var(--pool-border-subtle);
+  border-radius: var(--pool-radius-md);
+}
+
+.pool-account-summary__metric > strong {
+  display: block;
+  overflow: hidden;
+  margin-top: var(--pool-space-1);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--pool-type-label);
+}
+
+.pool-account-summary__footer {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--pool-space-3);
+  overflow: hidden;
+}
+
+.pool-account-summary__footer > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-account-disclosure {
+  border-top: 1px solid var(--pool-border-subtle);
+}
+
+.pool-account-disclosure > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--pool-space-3);
+  min-height: 42px;
+  cursor: pointer;
+  list-style: none;
+  color: var(--pool-text);
+  font-size: var(--pool-type-label);
+  font-weight: 680;
+}
+
+.pool-account-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+.pool-account-disclosure > summary::after {
+  flex: 0 0 auto;
+  width: 18px;
+  color: var(--pool-text-3);
+  content: '+';
+  font-size: var(--pool-type-callout);
+  line-height: 1;
+  text-align: center;
+}
+
+.pool-account-disclosure[open] > summary::after {
+  content: '−';
+}
+
+.pool-account-disclosure > summary:hover {
+  color: var(--pool-accent);
+}
+
+.pool-account-disclosure > section {
+  padding-bottom: var(--pool-space-2);
+}
+
+.pool-account-row {
+  align-items: baseline;
+  min-height: 28px;
+  border-bottom: 1px solid var(--pool-border-subtle);
+}
+
+.pool-account-row:last-child {
+  border-bottom: 0;
+}
+
+.pool-account-row__label {
+  line-height: 1.35;
+}
+
+.pool-account-row__value {
+  min-width: 0;
+  line-height: 1.35;
+}
+
+@media (max-width: 520px) {
+  .pool-account-summary__hero {
+    display: grid;
+  }
+
+  .pool-account-summary__identity {
+    max-width: 100%;
+    text-align: left;
+  }
+
+  .pool-account-summary__grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .pool-error-boundary {
   display: grid;
   min-height: 220px;

@@ -85,6 +85,14 @@ function answerSummary(row) {
   return `${row.last_actual || '∅'} / ${row.last_expected || '∅'}`;
 }
 
+function modelFingerprintLabel(row) {
+  return row.model_fingerprint || (row.metadata_probe_at ? '模型未返回身份' : '尚未询问');
+}
+
+function knowledgeBaseLabel(row) {
+  return row.knowledge_base_updated_at || (row.metadata_probe_at ? '模型回答未知' : '尚未询问');
+}
+
 function QualityStatusDetails({ row, threshold }) {
   const details = [
     ['分组', row.group_name || '默认分组'],
@@ -95,6 +103,10 @@ function QualityStatusDetails({ row, threshold }) {
     ['连续异常', `${row.consecutive_anomalies || 0} / ${threshold}`],
     ['答案 / 标准', <span className="pool-mono">{answerSummary(row)}</span>],
     ['返回模型', row.last_returned_model ? <span className="pool-mono">{row.last_returned_model}</span> : '—'],
+    ['模型指纹', <span className="pool-mono" title={row.model_fingerprint_source || ''}>{modelFingerprintLabel(row)}</span>],
+    ['知识库更新时间', <span title={row.knowledge_base_source || ''}>{knowledgeBaseLabel(row)}</span>],
+    ['模型询问时间', row.metadata_probe_at ? fmtDateTime(row.metadata_probe_at) : '尚未询问'],
+    ['目录观测', row.catalog_observed_at ? fmtDateTime(row.catalog_observed_at) : '—'],
     ['累计 Token', row.total_tokens ? fmtTokens(row.total_tokens) : '—'],
     ['延迟', row.last_latency_ms ? `${row.last_latency_ms} ms` : '—'],
     ['最近检测', row.last_probe_at ? <span title={fmtDateTime(row.last_probe_at)}>{fmtRelative(row.last_probe_at)}</span> : '从未'],
@@ -218,6 +230,8 @@ export default function ModelQuality() {
     { title: '连续异常', dataIndex: 'consecutive_anomalies', width: 105, sorter: (a, b) => (a.consecutive_anomalies || 0) - (b.consecutive_anomalies || 0), render: (v, r) => `${v || 0} / ${data?.degraded_threshold || 2}` },
     { title: '答案 / 标准', key: 'answer', width: 160, render: (_, r) => <span className="pool-mono" title={answerSummary(r)}>{answerSummary(r)}</span> },
     { title: '返回模型', dataIndex: 'last_returned_model', width: 190, render: (v) => v ? <span className="pool-mono">{v}</span> : '—' },
+    { title: '模型指纹', dataIndex: 'model_fingerprint', width: 170, priority: 10, render: (_, r) => <span className="pool-mono" title={r.model_fingerprint_source || ''}>{modelFingerprintLabel(r)}</span> },
+    { title: '知识库更新时间', dataIndex: 'knowledge_base_updated_at', width: 150, priority: 10, render: (_, r) => <span title={r.knowledge_base_source || ''}>{knowledgeBaseLabel(r)}</span> },
     { title: '累计 Token', dataIndex: 'total_tokens', width: 105, sorter: (a, b) => (a.total_tokens || 0) - (b.total_tokens || 0), render: (v) => v ? fmtTokens(v) : '—' },
     { title: '延迟', dataIndex: 'last_latency_ms', width: 90, render: (v) => v ? `${v} ms` : '—' },
     { title: '最近检测', dataIndex: 'last_probe_at', width: 145, sorter: (a, b) => (a.last_probe_at || 0) - (b.last_probe_at || 0), render: (v) => v ? <span title={fmtDateTime(v)}>{fmtRelative(v)}</span> : '从未' },
@@ -254,6 +268,9 @@ export default function ModelQuality() {
       chips={row.provider ? <Tag>{row.provider}</Tag> : null}
       details={[
         { label: '最近结果', value: outcomeTag(row.last_outcome) },
+        { label: '指纹', value: modelFingerprintLabel(row) },
+        { label: '知识库', value: knowledgeBaseLabel(row) },
+        { label: '模型询问', value: row.metadata_probe_at ? fmtRelative(row.metadata_probe_at) : '尚未询问' },
         { label: '连续异常', value: `${row.consecutive_anomalies || 0} / ${degradedThreshold}` },
         { label: '最近检测', value: row.last_probe_at ? fmtRelative(row.last_probe_at) : '从未检测' },
       ]}
@@ -274,12 +291,25 @@ export default function ModelQuality() {
     <div>
       <PageHeader
         title="模型智商 / 降智检测"
-        subtitle="每个分组 × 模型每小时只抽样一次；主检测异常时才追加独立复核，不逐账号消耗 Token"
+        subtitle="每个分组 × 模型每轮只抽样一条短题；GPT、Claude、GPT-6 使用分族题库，异常才追加独立复核"
         actions={<>
           <Button icon={<IconSetting />} onClick={() => navigate('/settings-v2')}>检测设置</Button>
           <Button icon={<IconRefresh />} loading={loading} onClick={reload}>刷新</Button>
         </>}
       />
+
+      <Panel title={`短题探针 ${data?.suite_version || 'family-short-v2'}`} style={{ marginBottom: 18 }}>
+        <Typography.Text type="tertiary">
+          {data?.suite_policy || '短题只验证可重复的行为下限、答案一致性和返回模型身份；行为结果不能单独证明代理使用官方权重。'}
+        </Typography.Text>
+        {Array.isArray(data?.probe_catalog) ? (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
+            {data.probe_catalog.map((item) => (
+              <Tag key={item.family}>{`${item.family} · ${(item.categories || []).join(' / ')}`}</Tag>
+            ))}
+          </div>
+        ) : null}
+      </Panel>
 
       {statuses.length ? (
         <section className="pool-mq-overview">
@@ -375,6 +405,7 @@ export default function ModelQuality() {
           columns={statusColumns}
           rowKey={qualityKey}
           pagination={{ pageSize: 20, currentPage: statusPage, onPageChange: setStatusPage }}
+          onRow={(row) => ({ onClick: () => setSelectedStatus(row) })}
           emptyTitle="暂无可检测的分组模型"
           emptyDesc="请先添加活跃账号及其模型能力；启用定时检测后会自动生成状态。"
           skeletonRows={6}

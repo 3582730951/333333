@@ -38,6 +38,11 @@ func hashPassword(password string) (string, error) {
 		base64.RawStdEncoding.EncodeToString(dk)), nil
 }
 
+// HashPassword is the shared bootstrap/registration entry point. Keep the
+// implementation private so callers cannot accidentally depend on the stored
+// verifier format beyond this package boundary.
+func HashPassword(password string) (string, error) { return hashPassword(password) }
+
 // verifyPassword reports whether plaintext matches the stored verifier. The
 // comparison is constant-time. A malformed/empty verifier never matches.
 func verifyPassword(password, encoded string) bool {
@@ -60,6 +65,11 @@ func verifyPassword(password, encoded string) bool {
 	got := pbkdf2Key([]byte(password), salt, iter, len(want), sha256.New)
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
+
+// HashAPIKey returns the storage-safe digest used for session/API tokens.
+// It is exported for local bootstrap commands which must create a session
+// without putting plaintext credentials in argv or config.
+func HashAPIKey(plain string) string { return hashAPIKey(plain) }
 
 // pbkdf2Key is RFC 8018 PBKDF2 (ported from golang.org/x/crypto/pbkdf2, BSD) so we
 // stay stdlib-only.

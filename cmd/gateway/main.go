@@ -332,10 +332,10 @@ Usage:
 
 Examples:
   # 一键安装
-  gateway quick-install --pool-url https://your-vps.com:1455 --key cap_xxx
+  gateway quick-install --pool-url https://your-vps.com:1455 --key sk-...
 
   # 手动安装
-  gateway init --pool-url https://your-vps.com:1455 --key cap_xxx
+  gateway init --pool-url https://your-vps.com:1455 --key sk-...
   gateway trust-ca
   gateway install-wrapper
   gateway start-background
@@ -387,7 +387,7 @@ func handleStart(configPath string) {
 	}
 
 	if cfg.DownstreamKey == "" {
-		log.Fatal("downstream_key not configured. Run: gateway init --key cap_xxx")
+		log.Fatal("downstream_key not configured. Run: gateway init --key sk-...")
 	}
 
 	proxy, err := NewProxy(cfg)

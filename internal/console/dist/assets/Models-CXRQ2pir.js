@@ -1,1 +1,0 @@
-import"./browserEvents-CHw7ZK7n.js";import{n as e,t}from"./jsx-runtime-C_F8u2c9.js";import{t as n}from"./ModelNameList-DYpiTeAr.js";e();var r=t();function i(){return(0,r.jsx)(n,{endpoint:`/admin/models`,title:`模型列表`,subtitle:`当前账号池能力快照中的模型名称`})}export{i as default};

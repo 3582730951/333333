@@ -187,6 +187,25 @@ void main() {
   colour = mix(colour, uFar,  farRGB  * 0.50);
   colour = mix(colour, uNear, nearRGB * 0.44);
 
+  // A small cursor light makes the field answer the hand directly. The old
+  // interaction only moved the wells by parallax, which was technically live
+  // but visually easy to miss. This halo is local, soft and cheap, so the
+  // dashboard feels tactile without turning the background into a toy.
+  vec2 pointerC = vec2(uPointer.x * 0.40, uPointer.y * 0.28);
+  float pointerHalo = well(q, pointerC, 0.12) * (0.018 + uActivity * 0.075);
+  colour = mix(colour, uGlow, pointerHalo);
+
+  // Two broad aurora ribbons break the smooth wells into a crafted surface.
+  // They share the domain warp already paid for above and fade toward the
+  // centre, keeping text contrast intact while giving pointer/scroll motion a
+  // visible direction.
+  float ribbonPhase = q.x * 4.8 + q.y * 3.1 + t * 3.2 + warp.x * 2.4 - warp.y;
+  float ribbon = pow(max(0.0, 0.5 + 0.5 * sin(ribbonPhase)), 13.0);
+  float ribbonPhase2 = q.x * 3.0 - q.y * 5.2 - t * 2.1 + warp.y * 2.1;
+  float ribbon2 = pow(max(0.0, 0.5 + 0.5 * sin(ribbonPhase2)), 17.0);
+  float ribbonMask = smoothstep(1.05, 0.18, length(p)) * (0.012 + uEnergy * 0.030 + uActivity * 0.038);
+  colour += mix(uNear, uGlow, 0.58) * (ribbon + ribbon2 * 0.72) * ribbonMask;
+
   // The accent is the only saturated thing on screen and it stays scarce: its
   // weight is driven by live pool energy, so the field brightens under load and
   // settles when the pool is idle. That is the whole "show, don't tell" of it.
@@ -219,6 +238,13 @@ void main() {
   // concentrates and most of the screen is within a few percent of the void.
   float vignette = smoothstep(1.02, 0.16, length(p * vec2(0.82, 1.05)));
   colour = mix(uVoid, colour, vignette);
+
+  // Sparse depth glints provide a premium, almost photographic finish. They
+  // are deterministic grid points, so they add no texture allocation and stay
+  // still when the event-driven renderer parks.
+  vec2 glintCell = floor((uv + vec2(t * 0.004, -t * 0.002)) * vec2(54.0, 34.0));
+  float glint = step(0.997, hash21(glintCell));
+  colour += uGlow * glint * (0.010 + uActivity * 0.042) * uQuality;
 
   // A measured dot lattice, not a texture.
   //

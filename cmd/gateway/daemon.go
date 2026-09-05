@@ -32,7 +32,7 @@ func handleStartBackground(configPath string) int {
 		return 1
 	}
 	if strings.TrimSpace(cfg.DownstreamKey) == "" {
-		fmt.Println("downstream_key not configured. Run: gateway init --key cap_xxx")
+		fmt.Println("downstream_key not configured. Run: gateway init --key sk-...")
 		return 1
 	}
 	if gatewayTCPReachable(cfg.ListenAddr) {

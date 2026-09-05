@@ -38,6 +38,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN apt-get update && apt-get install -y --no-install-recommends unzip && \
     rm -rf /var/lib/apt/lists/*
 COPY web-spa/package.json web-spa/package-lock.json ./
+# The final image supplies Chromium; downloading Puppeteer's private browser here
+# only duplicates hundreds of megabytes and slows every rebuild.
+ENV PUPPETEER_SKIP_DOWNLOAD=1
 RUN npm ci
 COPY web-spa/ ./
 RUN mkdir -p /src/internal/console && npm run build:assets
@@ -46,6 +49,9 @@ FROM node:22.23.1-trixie-slim AS registrar-node
 
 WORKDIR /opt/registrar-node
 COPY workers/node-registrar/package.json workers/node-registrar/package-lock.json ./
+# The runtime uses the system Chromium path passed by the registrar. Playwright's
+# bundled browser would duplicate it and make immutable releases needlessly large.
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 RUN npm ci --omit=dev --no-audit --no-fund
 COPY workers/node-registrar/index.js workers/node-registrar/sbom.cdx.json ./
 RUN node --check index.js && \

@@ -17,9 +17,9 @@ import { parseCapacityResponse } from '../features/accounts/model/capacity.ts';
 import { formatPlanLabel } from '../features/accounts/model/planFormatter.ts';
 
 const Row = ({ k, v }) => (
-  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, padding: '5px 0', fontSize: 'var(--pool-type-label)' }}>
-    <span className="pool-muted" style={{ flexShrink: 0 }}>{k}</span>
-    <span style={{ fontWeight: 500, textAlign: 'right', wordBreak: 'break-all' }}>{v}</span>
+  <div className="pool-account-row" style={{ display: 'flex', justifyContent: 'space-between', gap: 16, padding: '5px 0', fontSize: 'var(--pool-type-label)' }}>
+    <span className="pool-account-row__label pool-muted" style={{ flexShrink: 0 }}>{k}</span>
+    <span className="pool-account-row__value" style={{ fontWeight: 500, textAlign: 'right', wordBreak: 'break-all' }}>{v}</span>
   </div>
 );
 
@@ -54,6 +54,11 @@ function premiumFixturePresentation(status) {
   }
 }
 
+function formatCapacityUSD(micro) {
+  const value = Number(micro);
+  return Number.isFinite(value) && value >= 0 ? fmtUSD(value / 1_000_000) : '不可用';
+}
+
 function AccountRatePanel({ account }) {
   const rate = useAccountRequestRate(account.id, account.request_rate);
   const known = rate.state === 'live' || rate.state === 'stale';
@@ -77,6 +82,50 @@ function AccountRatePanel({ account }) {
   );
 }
 
+function AccountSummary({ account, statusTag, planLabel, providerAPIKey, binding, quotaWindows, capacity, actualQuotaWindows }) {
+  const status = statusTag ? statusTag(account) : account.status || 'unknown';
+  const firstWindow = actualQuotaWindows[0];
+  const quotaLabel = firstWindow
+    ? `${actualQuotaWindows.length} 个窗口 · ${String(firstWindow.limiter_type || '已同步')}`
+    : '暂无实时窗口';
+  const valuation = capacity?.last_30d_valuation?.api_micro_usd_settled;
+  const valuationLabel = valuation != null ? formatCapacityUSD(valuation) : '暂无计价';
+  const egressLabel = binding?.primary_egress_id || account.group_name || '随分组';
+  return (
+    <section className="pool-account-summary" aria-label="账号概览">
+      <div className="pool-account-summary__hero">
+        <div>
+          <span className="pool-account-summary__eyebrow">当前状态</span>
+          <div className="pool-account-summary__status">{status}</div>
+          <div className="pool-account-summary__hint">{account.quarantine_reason ? `已隔离 · ${account.quarantine_reason}` : '账号可继续查看与操作'}</div>
+        </div>
+        <div className="pool-account-summary__identity">
+          <strong>{planLabel}</strong>
+          <span>{account.provider || 'codex'} · {providerAPIKey ? 'API Key' : (account.auth_method || 'OAuth')}</span>
+        </div>
+      </div>
+      <div className="pool-account-summary__grid">
+        <div className="pool-account-summary__metric">
+          <span>真实额度窗口</span>
+          <strong title={quotaLabel}>{quotaLabel}</strong>
+        </div>
+        <div className="pool-account-summary__metric">
+          <span>近 30 天计价</span>
+          <strong>{valuationLabel}</strong>
+        </div>
+        <div className="pool-account-summary__metric">
+          <span>请求出口</span>
+          <strong title={egressLabel}>{egressLabel}</strong>
+        </div>
+      </div>
+      <div className="pool-account-summary__footer">
+        <span>{account.email || account.id}</span>
+        <span>{quotaWindows.length ? `列表额度 ${quotaWindows.length} 个窗口` : '列表额度待同步'}</span>
+      </div>
+    </section>
+  );
+}
+
 // Account detail drawer: identity, egress binding, usage, recent audit + quick actions.
 export default function AccountDrawer({
   account,
@@ -92,6 +141,7 @@ export default function AccountDrawer({
   const binding = account?.egress_binding || null;
   const [selectedEgress, setSelectedEgress] = useState('');
   const [selectedSidecar, setSelectedSidecar] = useState('');
+  const [selectedHealthModel, setSelectedHealthModel] = useState('');
   const [selectedGroup, setSelectedGroup] = useState('');
   const [ignoreRateLimitControls, setIgnoreRateLimitControls] = useState(false);
   const [forceCodex429, setForceCodex429] = useState(false);
@@ -138,6 +188,10 @@ export default function AccountDrawer({
     setSelectedEgress(binding?.primary_egress_id || '');
     setSelectedSidecar(binding?.sidecar_egress_id || '');
   }, [account?.id, binding?.primary_egress_id, binding?.sidecar_egress_id]);
+
+  useEffect(() => {
+    setSelectedHealthModel('');
+  }, [account?.id]);
 
   useEffect(() => {
     setSelectedGroup(account?.group_name || '');
@@ -350,6 +404,9 @@ export default function AccountDrawer({
   const paidHealthTest = requiresPaidHealthTest(account);
   const protectedProbeQuarantine = isProtectedProbeQuarantine(account);
   const capabilities = Array.isArray(account.capabilities) ? account.capabilities : [];
+  const healthModelOptions = Array.from(new Set(capabilities
+    .map((item) => String(item?.model_slug || item?.model || '').trim())
+    .filter(Boolean))).map((model) => ({ label: model, value: model }));
   const capacity = details.capacity || null;
   const capacityEstimates = Array.isArray(capacity?.capacity_estimates) ? capacity.capacity_estimates : [];
   const capacityEntitlement = capacity?.entitlement || {};
@@ -370,10 +427,6 @@ export default function AccountDrawer({
     && capacityEntitlement.plan_only?.plan_family === 'business';
   const hasActualFiveHourWindow = actualQuotaWindows.some((window) => String(window?.limiter_type || '').toLowerCase().includes('5h'));
 
-  const formatCapacityUSD = (micro) => {
-    const value = Number(micro);
-    return Number.isFinite(value) && value >= 0 ? fmtUSD(value / 1_000_000) : '不可用';
-  };
   const formatCapacityCredits = (milli) => {
     const value = Number(milli);
     return Number.isFinite(value) && value >= 0 ? `${(value / 1000).toFixed(3)} Credits` : '不可用';
@@ -403,6 +456,16 @@ export default function AccountDrawer({
   return (
     <Drawer title={account.label || account.id} visible={!!account} onCancel={onClose} width={520} className="pool-account-drawer">
       <LoadErrorBanner error={error} onRetry={reload} />
+      <AccountSummary
+        account={account}
+        statusTag={statusTag}
+        planLabel={formatPlanLabel(account.plan_type, capacityPlanPresentation)}
+        providerAPIKey={providerAPIKey}
+        binding={binding}
+        quotaWindows={quotaSummaryWindows(account.quota_summary || {})}
+        capacity={capacity}
+        actualQuotaWindows={actualQuotaWindows}
+      />
       <Panel title="身份" style={{ marginBottom: 14 }}>
         <Row k="账号 ID" v={<span className="pool-mono">{account.id}</span>} />
         <Row k="邮箱" v={account.email || '—'} />
@@ -508,8 +571,9 @@ export default function AccountDrawer({
 
             <hr style={{ border: 0, borderTop: '1px solid var(--pool-border)', margin: '14px 0' }} />
 
-            <section aria-label="最近如何计价">
-              <Typography.Text as="p"><b>B. 最近如何计价</b> <span className="pool-muted">估算与真实余额严格分开</span></Typography.Text>
+            <details className="pool-account-disclosure">
+              <summary><span>B. 最近如何计价</span><span className="pool-muted">近 30 天 · 估算与真实余额分开</span></summary>
+              <section aria-label="最近如何计价">
               <Row k="API 公价等价值（近 30 天）" v={capacity?.last_30d_valuation?.api_micro_usd_settled != null ? `${formatCapacityUSD(capacity.last_30d_valuation.api_micro_usd_settled)}（已结算）` : '不可用'} />
               <Row k="API 公价等价值（暂估）" v={capacity?.last_30d_valuation?.api_micro_usd_provisional != null ? `${formatCapacityUSD(capacity.last_30d_valuation.api_micro_usd_provisional)}（未结算）` : '无未结算计价'} />
               <Row k="ChatGPT Credits（已结算）" v={capacity?.last_30d_valuation?.chatgpt_milli_credits_settled != null ? formatCapacityCredits(capacity.last_30d_valuation.chatgpt_milli_credits_settled) : '无订阅证据'} />
@@ -523,12 +587,14 @@ export default function AccountDrawer({
                   <div className="pool-muted">样本 {estimate.sample_count ?? 0} · {estimate.method || '—'}</div>
                 </div>
               ))}</div> : <Typography.Text type="tertiary" size="small">尚无满足置信度门槛的容量估算；需要额度窗口快照与已结算 Usage。</Typography.Text>}
-            </section>
+              </section>
+            </details>
 
             <hr style={{ border: 0, borderTop: '1px solid var(--pool-border)', margin: '14px 0' }} />
 
-            <section aria-label="为什么系统这样判断">
-              <Typography.Text as="p"><b>C. 为什么系统这样判断</b> <span className="pool-muted">证据与先验，不等同真实额度</span></Typography.Text>
+            <details className="pool-account-disclosure">
+              <summary><span>C. 为什么系统这样判断</span><span className="pool-muted">证据、席位与容量先验</span></summary>
+              <section aria-label="为什么系统这样判断">
               <Row k="产品展示" v={formatPlanLabel(account.plan_type, capacityPlanPresentation)} />
               <Row k="规范化套餐" v={capacityPlanPresentation?.plan_family || capacityEntitlement.plan_only?.plan_family || 'unknown'} />
               <Row k="席位证据" v={currentEntitlementEvidence ? <Tag size="small" color={currentEntitlementEvidence.confidence === 'high' ? 'green' : 'amber'}>{entitlementSeatLabel(currentEntitlementEvidence.seat_type)} · {currentEntitlementEvidence.confidence || 'unknown'}</Tag> : <Tag size="small">未确认</Tag>} />
@@ -550,7 +616,8 @@ export default function AccountDrawer({
                 {currentEntitlementEvidence?.raw_plan_label ? <Row k="raw plan label" v={<span className="pool-mono">{currentEntitlementEvidence.raw_plan_label}</span>} /> : <Typography.Text type="tertiary" size="small">暂无原始套餐证据。</Typography.Text>}
                 {currentEntitlementEvidence?.flags_state ? <Row k="flags state" v={currentEntitlementEvidence.flags_state} /> : null}
               </details>
-            </section>
+              </section>
+            </details>
           </>
         )}
       </Panel>
@@ -783,18 +850,46 @@ export default function AccountDrawer({
       </Panel>
 
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        {healthModelOptions.length ? (
+          <Select
+            value={selectedHealthModel}
+            placeholder="测活模型：自动"
+            optionList={[{ label: '自动选择模型', value: '' }, ...healthModelOptions]}
+            onChange={setSelectedHealthModel}
+            style={{ minWidth: 190 }}
+          />
+        ) : null}
         {paidHealthTest ? (
           <ConfirmDialog
             title={kiroAccount ? '确认执行 Kiro 双层测活？' : '确认执行 API Key 双层测活？'}
             description="将先免费检查认证；认证正常后，会绑定此账号和当前出口发送 1 次最小推理请求，并可能产生少量上游费用。"
             confirmText="确认并测活"
-            onConfirm={() => onAction(account.id, 'health-test', healthTestRequestBody(account, true))}
+            onConfirm={() => onAction(account.id, 'health-test', healthTestRequestBody(account, true, selectedHealthModel))}
           >
             <Button loading={isActionLoading('health-test')} disabled={isActionDisabled('health-test')}>测活</Button>
           </ConfirmDialog>
         ) : (
-          <Button loading={isActionLoading('health-test')} disabled={isActionDisabled('health-test')} onClick={() => onAction(account.id, 'health-test')}>测活</Button>
+          <Button loading={isActionLoading('health-test')} disabled={isActionDisabled('health-test')} onClick={() => onAction(account.id, 'health-test', healthTestRequestBody(account, false, selectedHealthModel))}>测活</Button>
         )}
+        {supportsCodexReauth ? (
+          <ConfirmDialog
+            title="确认使用主动重置卡？"
+            description="仅在确认 7 天额度耗尽且上游返回可用重置卡时执行；会消耗 1 张卡，未确认时不会扣卡。"
+            confirmText="确认重置"
+            onConfirm={() => onAction(account.id, 'reset-credits')}
+          >
+            <Button loading={isActionLoading('reset-credits')} disabled={isActionDisabled('reset-credits')}>主动重置（{formatResetCredits(resetCredits)}）</Button>
+          </ConfirmDialog>
+        ) : null}
+        <ConfirmDialog
+          title="确认强制隔离该账号？"
+          description="账号将无限期停止调度，直到管理员解除隔离；已有凭据和上下文不会删除。"
+          confirmText="强制隔离"
+          destructive
+          onConfirm={() => onAction(account.id, 'force-isolation')}
+        >
+          <Button type="danger" loading={isActionLoading('force-isolation')} disabled={isActionDisabled('force-isolation') || account.quarantine_reason === 'manual_force_isolation'}>强制隔离</Button>
+        </ConfirmDialog>
         <Button loading={isActionLoading('clear-quarantine')} disabled={protectedProbeQuarantine || isActionDisabled('clear-quarantine')} onClick={() => onAction(account.id, 'clear-quarantine')}>解除隔离</Button>
         <Button loading={isActionLoading('clear-cooldown')} disabled={isActionDisabled('clear-cooldown')} onClick={() => onAction(account.id, 'clear-cooldown')}>解除冷却</Button>
         {!providerAPIKey && account.credential_mode !== 'agent_identity' ? <Button loading={isActionLoading('refresh')} disabled={isActionDisabled('refresh')} onClick={() => onAction(account.id, 'refresh')}>刷新</Button> : null}

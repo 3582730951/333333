@@ -305,13 +305,15 @@ function egressPageHTML() {
       <div data-m="endpoint" class="hide"><label class="f">${LANG === "en" ? "Name" : "名称"}</label><input class="t" id="egName" placeholder="jp-1"><label class="f">Endpoint URL</label><input class="t" id="egEndpoint" placeholder="socks5h://user:pass@host:1080"></div>
       <div data-m="batch" class="hide"><label class="f">${LANG === "en" ? "Batch (host:port:user:pass per line)" : "批量（每行 host:port:user:pass）"}</label><textarea class="t" id="egBatch"></textarea></div>
       <label class="row" style="gap:6px;margin-top:10px"><input type="checkbox" id="egDetect" checked> ${LANG === "en" ? "Auto-detect region" : "保存时自动识别地区"}</label>
-      <label class="f" style="margin-top:8px">${LANG === "en" ? "Max concurrency" : "最大并发"}</label><input class="t" id="egConc" type="number" value="16">
+      <label class="f" style="margin-top:8px">${LANG === "en" ? "Max concurrency (0 = adaptive)" : "最大并发（0 = 自适应）"}</label><input class="t" id="egConc" type="number" min="0" value="16">
       <div style="height:12px"></div><button class="btn pri" onclick="addEgress()">${t("act.save")}</button>
     </div></div></div>`;
 }
 async function addEgress() {
   try {
-    const type = $("#egType").value, detect = $("#egDetect").checked, conc = parseInt($("#egConc").value || "16", 10);
+    const type = $("#egType").value, detect = $("#egDetect").checked;
+    const rawConc = $("#egConc").value.trim(), conc = rawConc === "" ? 16 : parseInt(rawConc, 10);
+    if (!Number.isInteger(conc) || conc < 0) { toast(LANG === "en" ? "Concurrency must be 0 or greater" : "并发必须为 0 或更大", "bad"); return; }
     if (egMode === "batch") {
       const lines = $("#egBatch").value.trim(); if (!lines) { toast(LANG === "en" ? "Enter proxies" : "请输入批量代理", "bad"); return; }
       const r = await api("/admin/egress-profiles/import", { method: "POST", body: JSON.stringify({ type, lines, detect_region: detect }) });

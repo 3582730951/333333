@@ -103,7 +103,7 @@ export default function Login({ onSuccess }) {
             </div>
             <div className="pool-login-preview__code">
               <span>POST /v1/responses</span>
-              <code>Authorization: Bearer cap_••••••••</code>
+              <code>Authorization: Bearer sk-••••••••</code>
             </div>
           </div>
         </div>

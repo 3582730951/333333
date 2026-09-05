@@ -16,6 +16,10 @@ const optionalString = z.preprocess(
   (value) => value == null ? undefined : value,
   z.string().optional(),
 );
+const optionalBoolean = z.preprocess(
+  (value) => value == null ? undefined : value,
+  z.boolean().optional(),
+);
 
 const planFamilySchema = z.enum(['unknown', 'free', 'plus', 'pro', 'business', 'enterprise', 'edu', 'api']).catch('unknown');
 const seatTypeSchema = z.enum(['unknown', 'personal', 'business_standard', 'business_premium', 'legacy_codex', 'enterprise_standard']).catch('unknown');
@@ -37,7 +41,7 @@ const entitlementEvidenceSchema = z.object({
   seat_type: seatTypeSchema,
   confidence: confidenceSchema,
   usage_multiplier_milli: optionalPositiveInteger,
-  no_five_hour_limit: z.boolean().optional(),
+  no_five_hour_limit: optionalBoolean,
   raw_plan_label: optionalString,
   observed_at: optionalNonNegativeInteger,
   expires_at: optionalNonNegativeInteger,
@@ -50,7 +54,7 @@ const entitlementPlanSchema = z.object({
   seat_type: seatTypeSchema,
   confidence: confidenceSchema,
   usage_multiplier_milli: optionalPositiveInteger,
-  no_five_hour_limit: z.boolean().optional(),
+  no_five_hour_limit: optionalBoolean,
   flags_state: flagsStateSchema,
   reason: optionalString,
 }).passthrough();

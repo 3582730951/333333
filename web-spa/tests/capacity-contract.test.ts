@@ -68,6 +68,27 @@ describe('capacity response contract', () => {
     expect(parsed.data.entitlement.current_evidence?.usage_multiplier_milli).toBe(5000);
   });
 
+  it('accepts backend nulls for unknown entitlement flags', () => {
+    const backendResponse = {
+      ...validCapacityResponse,
+      entitlement: {
+        ...validCapacityResponse.entitlement,
+        plan_only: {
+          ...validCapacityResponse.entitlement.plan_only,
+          usage_multiplier_milli: null,
+          no_five_hour_limit: null,
+        },
+        current_evidence: {
+          ...validCapacityResponse.entitlement.current_evidence,
+          usage_multiplier_milli: null,
+          no_five_hour_limit: null,
+          payload_redacted: null,
+        },
+      },
+    };
+    expect(parseCapacityResponse(backendResponse)).not.toHaveProperty('error');
+  });
+
   it('rejects raw rate-limit JSON and malformed evidence multiplier', () => {
     const unsafe = {
       ...validCapacityResponse,

@@ -294,7 +294,7 @@ func loadRuntimeIdentity(configPath string) (Config, *CachedIdentity, error) {
 		return Config{}, nil, fmt.Errorf("load gateway config: %w", err)
 	}
 	if strings.TrimSpace(cfg.DownstreamKey) == "" {
-		return Config{}, nil, errors.New("downstream_key not configured. Run: gateway init --key cap_xxx")
+		return Config{}, nil, errors.New("downstream_key not configured. Run: gateway init --key sk-...")
 	}
 	cache := NewIdentityCache(cfg.PoolServerURL, cfg.DownstreamKey, cfg.IdentityTTL, newGatewayPoolClient())
 	identity, err := cache.Get("claude")

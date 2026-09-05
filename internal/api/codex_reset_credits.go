@@ -233,7 +233,11 @@ func codexResetTriggerAllowed(status int, body []byte) bool {
 }
 
 func (s *Server) codexResetCreditsEnabled(ctx context.Context, account storage.Account) bool {
-	if !s.flagEnabled(ctx, "codex_reset_credits_auto_enabled", s.cfg.CodexResetCreditsAutoEnabled) {
+	return s.codexResetCreditsAllowed(ctx, account, true)
+}
+
+func (s *Server) codexResetCreditsAllowed(ctx context.Context, account storage.Account, requireEnabled bool) bool {
+	if requireEnabled && !s.flagEnabled(ctx, "codex_reset_credits_auto_enabled", s.cfg.CodexResetCreditsAutoEnabled) {
 		return false
 	}
 	accountID := strings.TrimSpace(account.ID)
@@ -261,6 +265,64 @@ func (s *Server) codexResetCreditsEnabled(ctx context.Context, account storage.A
 	return false
 }
 
+// adminCodexResetCredits consumes exactly one verified reset card for a manual
+// operator action. It deliberately reuses the same quota gate, reservation,
+// consume endpoint and post-consume verification as automatic recovery.
+func (s *Server) adminCodexResetCredits(w http.ResponseWriter, r *http.Request, accountID string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	account, err := s.store.GetAccount(r.Context(), accountID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	token, err := s.store.GetToken(r.Context(), accountID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	provider := s.accountProvider(account, token)
+	if provider != "codex" || accountprovider.UsesAPIKey(provider, token) || accountprovider.IsAgentIdentity(token) {
+		writePoolCodeError(w, http.StatusBadRequest, "reset_credits_not_applicable", "主动重置仅适用于 Codex OAuth 或 SetupToken 账号")
+		return
+	}
+	if !s.codexResetCreditsAllowed(r.Context(), account, false) {
+		writePoolCodeError(w, http.StatusConflict, "reset_credits_not_allowed", "该账号命中主动重置拒绝列表")
+		return
+	}
+	binding, err := s.store.GetEgressBinding(r.Context(), accountID)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	binding, err = s.store.EffectiveEgressBinding(r.Context(), binding)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	egress, err := s.store.ResolvePrimaryEgressBinding(r.Context(), binding)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	egress, err = s.store.ApplySidecarEgressBinding(r.Context(), binding, egress)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	if !s.tryAutoConsumeCodexResetCredit(r.Context(), account, token, egress, true, http.StatusTooManyRequests, nil, []byte("admin_manual"), "admin_manual") {
+		writePoolCodeError(w, http.StatusConflict, "reset_credits_not_consumed", "未确认 7 天额度已耗尽或没有可用主动重置卡，未执行扣卡")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"account_id": accountID,
+		"consumed":   true,
+		"method":     "codex_reset_credit",
+	})
+}
+
 func (s *Server) codexResetAccountLock(accountID string) func() {
 	accountID = strings.TrimSpace(accountID)
 	s.codexResetMu.Lock()
@@ -278,7 +340,11 @@ func (s *Server) codexResetAccountLock(accountID string) func() {
 }
 
 func (s *Server) tryAutoConsumeCodexResetCredit(ctx context.Context, account storage.Account, token storage.AccountToken, egress storage.EgressProfile, triggerAllowed bool, status int, header http.Header, body []byte, source string) bool {
-	if strings.TrimSpace(account.ID) == "" || accountprovider.UsesAPIKey("codex", token) || !triggerAllowed || !s.codexResetCreditsEnabled(ctx, account) {
+	allowed := s.codexResetCreditsEnabled(ctx, account)
+	if source == "admin_manual" {
+		allowed = s.codexResetCreditsAllowed(ctx, account, false)
+	}
+	if strings.TrimSpace(account.ID) == "" || accountprovider.UsesAPIKey("codex", token) || !triggerAllowed || !allowed {
 		return false
 	}
 	unlock := s.codexResetAccountLock(account.ID)
@@ -314,6 +380,10 @@ func (s *Server) tryAutoConsumeCodexResetCredit(ctx context.Context, account sto
 	}
 	unknownCredits := !ok || !credits.Known
 	if unknownCredits {
+		if source == "admin_manual" {
+			s.auditCodexResetCredit(ctx, account, codexResetAuditSkip, "reset_credits_unknown_manual", map[string]interface{}{"source": source, "quota_updated_at": gate.QuotaUpdatedAt})
+			return false
+		}
 		if !s.flagEnabled(ctx, "codex_reset_credits_unknown_consume_enabled", s.cfg.CodexResetCreditsUnknownConsumeEnabled) {
 			s.auditCodexResetCredit(ctx, account, codexResetAuditSkip, "reset_credits_unknown_disabled", map[string]interface{}{"source": source, "quota_updated_at": gate.QuotaUpdatedAt})
 			return false

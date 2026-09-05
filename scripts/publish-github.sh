@@ -54,6 +54,7 @@ if command -v rsync >/dev/null 2>&1; then
     --exclude 'test/' --exclude 'tests/' --exclude 'testdata/' \
     --exclude 'cmd/extreme-load/' \
     --exclude 'tools/acceptance/' --exclude 'tools/e2e/' --exclude 'tools/visual/' \
+    --exclude 'tools/' \
     --exclude '*_test.go' --exclude '**/testdata/**' \
     --exclude '*_test.py' --exclude 'test_*.py' \
     --exclude '*_test.*' --exclude 'test_*.*' \
@@ -85,7 +86,7 @@ import sys
 root, work = (os.path.realpath(p) for p in sys.argv[1:3])
 excluded_dirs = {
     ".git", ".run", ".codex", ".agents", ".claude", ".build", "node_modules",
-    "archive", "bin", "example_zip", "other", "third_party", "var",
+    "archive", "bin", "example_zip", "other", "third_party", "var", "tools",
     "docs", "data", "diagnostics", "verification", "artifacts",
     "test", "tests", "testdata", "acceptance", "e2e", "visual", "extreme-load",
     "legacy-cache-hit-optimization", "testdata",

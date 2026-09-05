@@ -56,6 +56,7 @@ export function createEffectInputDriver({ session, requestFrame, cancelFrame, no
   const signals = { pointer: [0.5, 0.5], tilt: [0, 0], scrollVelocity: 0, overscroll: 0 };
   const impulses = new Map();
   let rampHandle = null;
+  let continuousHandle = null;
   let loaded = [];
 
   function write(id, uniform, value) {
@@ -77,6 +78,22 @@ export function createEffectInputDriver({ session, requestFrame, cancelFrame, no
       const apply = CONTINUOUS[loaded[index]];
       if (apply) apply(signals, write);
     }
+  }
+
+  // Pointer and scroll events can arrive much faster than the display refresh.
+  // Keep the newest values and write uniforms once per frame; this preserves
+  // immediate visual response while removing redundant GL state updates on
+  // high-Hz mice and trackpads.
+  function scheduleContinuous() {
+    if (typeof requestFrame !== 'function') {
+      applyContinuous();
+      return;
+    }
+    if (continuousHandle !== null) return;
+    continuousHandle = schedule(() => {
+      continuousHandle = null;
+      applyContinuous();
+    });
   }
 
   function step() {
@@ -102,7 +119,7 @@ export function createEffectInputDriver({ session, requestFrame, cancelFrame, no
   return {
     setLoadedEffects(ids) {
       loaded = Array.isArray(ids) ? ids : [];
-      applyContinuous();
+      scheduleContinuous();
     },
     /** Pointer in 0..1 UV space, origin bottom-left to match GL. */
     setPointer(x, y) {
@@ -110,12 +127,12 @@ export function createEffectInputDriver({ session, requestFrame, cancelFrame, no
       signals.pointer[1] = Math.min(1, Math.max(0, y));
       signals.tilt[0] = signals.pointer[0] * 2 - 1;
       signals.tilt[1] = signals.pointer[1] * 2 - 1;
-      applyContinuous();
+      scheduleContinuous();
     },
     setScroll(velocity, overscroll = 0) {
       signals.scrollVelocity = Number.isFinite(velocity) ? velocity : 0;
       signals.overscroll = Number.isFinite(overscroll) ? overscroll : 0;
-      applyContinuous();
+      scheduleContinuous();
     },
     /** Starts the bounded ramp for every impulse effect currently loaded. */
     press(x, y) {
@@ -133,7 +150,9 @@ export function createEffectInputDriver({ session, requestFrame, cancelFrame, no
     },
     dispose() {
       if (rampHandle !== null) unschedule(rampHandle);
+      if (continuousHandle !== null) unschedule(continuousHandle);
       rampHandle = null;
+      continuousHandle = null;
       impulses.clear();
       loaded = [];
     },

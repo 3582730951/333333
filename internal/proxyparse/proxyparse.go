@@ -191,6 +191,41 @@ func NormalizeEndpoint(value, fallbackType string) (string, string, error) {
 	return draft.Endpoint(typ), typ, nil
 }
 
+// IsProxyType reports whether a profile type uses an operator-supplied proxy
+// endpoint. Keeping this in the parser avoids separate protocol lists in the
+// admin and transport layers.
+func IsProxyType(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "http_proxy", "https_proxy", "socks5_proxy", "socks5h_proxy":
+		return true
+	default:
+		return false
+	}
+}
+
+// AlternateEndpoint returns the other common proxy transport for a health
+// probe. A few vendors expose HTTP CONNECT on an address documented as SOCKS5
+// (and vice versa); probing both lets the caller persist the working protocol.
+func AlternateEndpoint(value, fallbackType string) (string, string, bool) {
+	endpoint, typ, err := NormalizeEndpoint(value, fallbackType)
+	if err != nil {
+		return "", "", false
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return "", "", false
+	}
+	switch typ {
+	case "socks5_proxy", "socks5h_proxy":
+		u.Scheme, typ = "http", "http_proxy"
+	case "http_proxy", "https_proxy":
+		u.Scheme, typ = "socks5h", "socks5h_proxy"
+	default:
+		return "", "", false
+	}
+	return u.String(), typ, true
+}
+
 // ParseLines parses a multi-line batch, skipping blank lines and #-comments.
 // It returns the successfully parsed drafts and a slice of per-line errors.
 func ParseLines(text string) ([]Draft, []error) {

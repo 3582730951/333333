@@ -88,6 +88,11 @@ func (s *Server) adminImportAuthDocument(w http.ResponseWriter, r *http.Request,
 			}
 		}
 		parsed := entry.Parsed
+		parsed, hydrateErr := s.hydrateRefreshTokenImport(r.Context(), parsed)
+		if hydrateErr != nil {
+			s.failAuthDocumentItem(&result, &item, hydrateErr)
+			continue
+		}
 		sessionCookie, cookieErr := normalizeImportedSessionCookie(req.SessionCookie, parsed)
 		if cookieErr != nil {
 			s.failAuthDocumentItem(&result, &item, cookieErr)

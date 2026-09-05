@@ -185,6 +185,18 @@ func (s *Server) adminAccountCapacity(w http.ResponseWriter, r *http.Request, ac
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// Evidence payloads are retained for server-side reconciliation, but the
+	// capacity contract is intentionally metadata-only. A redacted payload may
+	// still contain credential-shaped keys, which makes the frontend reject the
+	// whole response even though quota data is valid.
+	for index := range evidence {
+		evidence[index].PayloadRedacted = nil
+	}
+	if currentEvidence != nil {
+		copy := *currentEvidence
+		copy.PayloadRedacted = nil
+		currentEvidence = &copy
+	}
 	baselineRows, err := s.store.ListRecentFiveHourCapacityBaselines(r.Context(), now-capacityPriorMaxAgeSeconds, 512)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)

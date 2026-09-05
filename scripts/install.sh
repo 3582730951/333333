@@ -27,6 +27,9 @@ CURSOR_PROXY_SOURCE="${PROJECT_ROOT}/modules/cursor-proxy"
 CURSOR_PROXY_MODULE_RELATIVE="modules/cursor-proxy"
 CURSOR_PROXY_BINARY_RELATIVE="${CURSOR_PROXY_MODULE_RELATIVE}/node_modules/.bin/cursor-api-proxy"
 CURSOR_PROXY_INSTALL_STATUS="not attempted"
+CURSOR_AGENT_BIN="${CURSOR_AGENT_BIN:-}"
+CURSOR_AGENT_HOME="${CURSOR_AGENT_HOME:-}"
+CURSOR_AGENT_INSTALL_STATUS="not attempted"
 # Node registration engine: installs Node.js + a headless
 # Chrome + Xvfb and the puppeteer-real-browser registrar so the pool can auto-register
 # accounts on a no-display cloud VPS. Default on; disable with --without-registration.
@@ -55,12 +58,23 @@ ADMIN_TOKEN="${ADMIN_TOKEN:-}"
 ADMIN_SETUP_TOKEN=""
 ADMIN_SETUP_PROVISIONED=0
 ADMIN_SETUP_EXPIRES_AT=0
+# Interactive bootstrap is deliberately opt-in outside a TTY. Existing installs
+# continue as normal updates unless the operator explicitly requests a full rebuild.
+FULL_REINSTALL=0
+FULL_REINSTALL_EXPLICIT=0
+BOOTSTRAP_ADMIN=0
+BOOTSTRAP_ADMIN_EMAIL=""
+BOOTSTRAP_ADMIN_PASSWORD=""
+INSTALL_CANCELLED=0
 OPEN_FIREWALL="${OPEN_FIREWALL:-0}"
 PUBLIC_URL="${PUBLIC_URL:-}"
 INSTALL_GO="${INSTALL_GO:-auto}"
 GO_INSTALL_VERSION="${GO_INSTALL_VERSION:-1.25.12}"
 GO_INSTALL_ROOT="${GO_INSTALL_ROOT:-/usr/local}"
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/.build}"
+# Number of independent downloadable gateway targets built concurrently. Keep
+# this bounded because each Go build already parallelizes its own compilation.
+GO_BUILD_JOBS="${GO_BUILD_JOBS:-2}"
 SKIP_OS_PACKAGES="${SKIP_OS_PACKAGES:-0}"
 # Deployment storage is bounded before any candidate can take traffic. The
 # defaults intentionally favor preserving live releases and a healthy filesystem
@@ -134,6 +148,9 @@ if [[ -n "${APP_DIR:-}" ]]; then
 else
   APP_DIR_EXPLICIT=0
   APP_DIR="${INSTALL_PREFIX}/lib/codex-pool"
+fi
+if [[ -z "${CURSOR_AGENT_HOME:-}" ]]; then
+  CURSOR_AGENT_HOME="${APP_DIR%/}/cursor-agent-home"
 fi
 if [[ -n "${CONFIG_FILE:-}" ]]; then
   CONFIG_FILE_EXPLICIT=1
@@ -218,6 +235,8 @@ Options:
   --egress-tcp-port PORT    TCP sidecar egress port; occupied foreign listener is terminated or PORT+1 is used
   --egress-udp-port PORT    UDP/WARP egress base port; occupied foreign listener is terminated or PORT+1 is used
   --admin-token TOKEN       Admin API token. Generated for new externally exposed configs when empty
+  --reinstall               Force a full runtime rebuild (data/config are preserved)
+  --no-reinstall            Keep the existing install/update path (default)
   --public-url URL          Public frontend URL to print in the install summary
   --open-firewall           Try to open the listen TCP port in ufw/firewalld
   --no-open-firewall        Do not change firewall rules (default)
@@ -240,14 +259,16 @@ Environment overrides:
   WITH_WARP, WARP_EXITS, WARP_BASE_PORT, WARP_ACCOUNTS_PER_EXIT, WARP_DIR, CF_SOLVER_URL,
   LISTEN_ADDR, ADMIN_TOKEN, PUBLIC_URL, OPEN_FIREWALL,
   SIDECAR_ADDR, SIDECAR_VENV, SIDECAR_INSTALL_DIR, SIDECAR_COOKIE_DIR,
-  INSTALL_GO, GO_INSTALL_VERSION, GO_INSTALL_ROOT, GO_BIN, HEALTH_TIMEOUT,
+  INSTALL_GO, GO_INSTALL_VERSION, GO_INSTALL_ROOT, GO_BIN, GO_BUILD_JOBS, HEALTH_TIMEOUT,
   WORKER_START_RESTART_LIMIT,
   DRAIN_TIMEOUT (ordinary post-switch background drain log interval),
   MAX_DRAINING_RELEASES, INSTALL_FREE_RESERVE_MIN_BYTES,
   INSTALL_FREE_RESERVE_PERCENT, RELEASE_STORAGE_MAX_BYTES,
   CONSOLE_GENERATION_MAX_BYTES, BUILD_CACHE_MAX_BYTES,
   SKIP_OS_PACKAGES, GO_TARBALL_SHA256,
+  NONINTERACTIVE,
   WITH_REGISTRATION, WITH_CURSOR_PROXY, NODE_MIN_MAJOR, NODE_INSTALL_MAJOR, NODE_BIN, CHROME_BIN,
+  CURSOR_AGENT_BIN, CURSOR_AGENT_HOME,
   REGISTRAR_SOURCE, REGISTRAR_INSTALL, PY_REGISTRAR_SOURCE,
   CODEX_REAUTH_WORKER_SOURCE, CODEX_REAUTH_ADDR, CODEX_REAUTH_CONCURRENCY
 EOF
@@ -367,6 +388,16 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-start)
       START_SERVICE=0
+      shift
+      ;;
+    --reinstall)
+      FULL_REINSTALL=1
+      FULL_REINSTALL_EXPLICIT=1
+      shift
+      ;;
+    --no-reinstall)
+      FULL_REINSTALL=0
+      FULL_REINSTALL_EXPLICIT=1
       shift
       ;;
     --no-tests)
@@ -657,6 +688,60 @@ json_escape() {
   s="${s//$'\r'/\\r}"
   s="${s//$'\t'/\\t}"
   printf '%s' "$s"
+}
+
+installation_present() {
+  [[ -L "${APP_DIR%/}/current" && -f "$CONFIG_FILE" && -f "$DATABASE_PATH" ]]
+}
+
+prepare_full_reinstall_runtime() {
+  (( FULL_REINSTALL == 1 )) || return 0
+  local target previous
+  target="$(run_root readlink "${APP_DIR%/}/current" 2>/dev/null || true)"
+  previous="${target##*/}"
+  if systemd_running; then
+    run_root systemctl stop "${SERVICE_NAME}-handoff.service" "${SERVICE_NAME}.socket" \
+      "${SERVICE_NAME}-sidecar.service" "${SERVICE_NAME}-reauth.service" >/dev/null 2>&1 || true
+    if [[ "$previous" != "$target" && -n "$previous" ]]; then
+      run_root systemctl stop "${SERVICE_NAME}-worker@${previous}.service" >/dev/null 2>&1 || true
+    fi
+  fi
+  run_root rm -f -- "${APP_DIR%/}/current" "${DATA_DIR%/}/run/active-worker.sock"
+}
+
+prepare_interactive_install() {
+  local installed=0 answer email password
+  [[ "${NONINTERACTIVE:-0}" != "1" && -t 0 && -t 1 ]] || return 0
+  if installation_present; then
+    installed=1
+  fi
+  if (( FULL_REINSTALL_EXPLICIT == 0 )); then
+    if (( installed == 1 )); then
+      read -r -p "检测到已安装项目，是否进行完整运行时重装（保留数据和配置）？[y/N] " answer
+      case "$answer" in
+        y|Y|yes|YES) FULL_REINSTALL=1 ;;
+        *) FULL_REINSTALL=0 ;;
+      esac
+    else
+      read -r -p "未检测到安装，继续首次安装？[Y/n] " answer
+      case "$answer" in
+        n|N|no|NO) log "安装已取消"; INSTALL_CANCELLED=1; return 0 ;;
+      esac
+    fi
+  fi
+  if (( FULL_REINSTALL == 1 || installed == 0 )); then
+    read -r -p "管理员邮箱：" email
+    read -r -s -p "管理员密码（至少 8 位）：" password
+    printf '\n'
+    [[ "$email" == *@* ]] || die "管理员邮箱格式无效"
+    (( ${#password} >= 8 )) || die "管理员密码至少需要 8 位"
+    BOOTSTRAP_ADMIN=1
+    BOOTSTRAP_ADMIN_EMAIL="$email"
+    BOOTSTRAP_ADMIN_PASSWORD="$password"
+  fi
+  if (( FULL_REINSTALL == 1 )); then
+    log "执行完整运行时重装；数据库、密钥和现有配置保留"
+  fi
 }
 
 generate_admin_token() {
@@ -1389,7 +1474,10 @@ build_project() {
 
   log "Building downloadable gateway binaries"
   mkdir -p "${BUILD_DIR}/gateway-bin"
-  local target goos goarch ext
+  local target goos goarch ext gateway_jobs gateway_failed=0 pid
+  local -a gateway_pids=()
+  gateway_jobs="${GO_BUILD_JOBS:-2}"
+  [[ "$gateway_jobs" =~ ^[1-9][0-9]*$ ]] || die "GO_BUILD_JOBS must be a positive integer: ${gateway_jobs}"
   for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
     goos="${target%/*}"
     goarch="${target#*/}"
@@ -1397,9 +1485,25 @@ build_project() {
     if [[ "$goos" == "windows" ]]; then
       ext=".exe"
     fi
-    CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
-      "$GO_BIN" build "${buildvcs_flags[@]}" -trimpath -ldflags="-s -w" -o "${BUILD_DIR}/gateway-bin/gateway-${goos}-${goarch}${ext}" ./cmd/gateway
+    (
+      CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+        "$GO_BIN" build "${buildvcs_flags[@]}" -trimpath -ldflags="-s -w" -o "${BUILD_DIR}/gateway-bin/gateway-${goos}-${goarch}${ext}" ./cmd/gateway
+    ) &
+    gateway_pids+=("$!")
+    # Build in bounded batches: each Go invocation can use multiple compiler
+    # workers, so launching all targets at once can exhaust a small VPS.
+    if (( ${#gateway_pids[@]} >= gateway_jobs )); then
+      for pid in "${gateway_pids[@]}"; do
+        wait "$pid" || gateway_failed=1
+      done
+      gateway_pids=()
+      (( gateway_failed == 0 )) || die "gateway binary build failed"
+    fi
   done
+  for pid in "${gateway_pids[@]}"; do
+    wait "$pid" || gateway_failed=1
+  done
+  (( gateway_failed == 0 )) || die "gateway binary build failed"
 }
 
 ensure_persistent_key() {
@@ -1623,6 +1727,32 @@ provision_admin_setup() {
   esac
 }
 
+bootstrap_admin_account() {
+  local binary="${RELEASE_DIR%/}/${APP_NAME}" output status payload
+  [[ -x "$binary" ]] || die "admin bootstrap binary is missing: ${binary}"
+  payload="$(printf '{\"email\":\"%s\",\"password\":\"%s\"}\n' "$(json_escape "$BOOTSTRAP_ADMIN_EMAIL")" "$(json_escape "$BOOTSTRAP_ADMIN_PASSWORD")")"
+  if output="$({ printf '%s' "$payload" | run_service env \
+    CODEX_POOL_DATABASE="$DATABASE_PATH" \
+    CODEX_POOL_MIGRATE_USER_GROUPS="$MIGRATE_USER_GROUPS" \
+    CODEX_POOL_DATA_DIR="${DATA_DIR%/}/data" \
+    CODEX_POOL_MASTER_KEY_FILE="${DATA_DIR%/}/data/keys/master.key" \
+    CODEX_POOL_IDENTITY_KEY_FILE="${DATA_DIR%/}/data/keys/identity.key" \
+    CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE="${DATA_DIR%/}/data/keys/diagnostic-alias.key" \
+    "$binary" --config "$CONFIG_FILE" --bootstrap-admin; } 2>&1)"; then
+    :
+  else
+    status=$?
+    BOOTSTRAP_ADMIN_PASSWORD=""
+    die "管理员初始化失败（exit ${status}）：${output:-no diagnostic output}"
+  fi
+  BOOTSTRAP_ADMIN_PASSWORD=""
+  case "$output" in
+    *'"admin_setup":"created"'*) log "管理员账号已创建，可直接使用输入的邮箱和密码登录" ;;
+    *'"admin_setup":"already_completed"'*) log "已有管理员账号，保留现有账号" ;;
+    *) die "管理员初始化返回未知状态：${output:-no diagnostic output}" ;;
+  esac
+}
+
 systemd_requested() {
   case "$INSTALL_SYSTEMD" in
     1|true|TRUE|yes|YES|on|ON) return 0 ;;
@@ -1760,10 +1890,19 @@ wait_worker_ready() {
   [[ "$WORKER_START_RESTART_LIMIT" =~ ^[1-9][0-9]*$ ]] || die "WORKER_START_RESTART_LIMIT must be a positive integer: ${WORKER_START_RESTART_LIMIT}"
   while (( SECONDS - started < max )); do
     payload="$(curl --noproxy '*' --silent --show-error --max-time 2 --unix-socket "$socket" http://localhost/standbyz 2>&1 || true)"
-    if [[ "$payload" == *'"standby_ready":true'* && "$payload" == *"\"release_id\":\"${expected}\""* ]]; then
+    if [[ "$payload" == *"\"release_id\":\"${expected}\""* ]]; then
       if [[ "$require_warm" == "0" ]]; then
-        [[ "$payload" == *'"schema_compatible":true'* ]] && return 0
-      elif [[ "$payload" == *'"warm":true'* && "$payload" == *'"schema_compatible":true'* && "$payload" == *'"write_side_effects":false'* ]]; then
+        # A first install has no previous active-worker link. The candidate starts
+        # in full mode, so the role controller quite correctly waits for that link
+        # before reporting standby_ready=true. Accept the completed full-start
+        # signal here; the link is created immediately after this gate and the
+        # worker then owns the active role. Rolling updates still require the
+        # strict read-only warm-standby contract below.
+        if [[ "$payload" == *'"schema_compatible":true'* &&
+          ( "$payload" == *'"standby_ready":true'* || "$payload" == *'"write_side_effects":true'* ) ]]; then
+          return 0
+        fi
+      elif [[ "$payload" == *'"standby_ready":true'* && "$payload" == *'"warm":true'* && "$payload" == *'"schema_compatible":true'* && "$payload" == *'"write_side_effects":false'* ]]; then
         return 0
       else
         payload="${payload} (candidate did not prove warm=true, schema_compatible=true, write_side_effects=false)"
@@ -3096,6 +3235,11 @@ install_systemd_unit() {
     extra_env="${extra_env}
 Environment=\"CODEX_POOL_DEFAULT_SIDECAR_ENDPOINT=http://${SIDECAR_ADDR}\""
   fi
+  if [[ -n "${CURSOR_AGENT_BIN:-}" ]]; then
+    extra_env="${extra_env}
+Environment=\"CURSOR_AGENT_BIN=${CURSOR_AGENT_BIN}\"
+Environment=\"PATH=${BIN_DIR%/}:/usr/local/bin:/usr/bin:/bin\""
+  fi
   if bool_enabled "$WITH_REGISTRATION"; then
     if (( REGISTRAR_INSTALL_EXPLICIT == 1 )); then
       node_registrar_unit_dir="$REGISTRAR_INSTALL"
@@ -3567,7 +3711,7 @@ install_cursor_proxy_module() {
     return 0
   fi
 
-  local source npm_bin release_install tmp binary
+  local source npm_bin release_install tmp binary deps_reused=0
   source="${CURSOR_PROXY_SOURCE%/}"
   if [[ ! -f "$source/package.json" || ! -f "$source/package-lock.json" ]]; then
     CURSOR_PROXY_INSTALL_STATUS="source files missing"
@@ -3593,8 +3737,18 @@ install_cursor_proxy_module() {
     return 0
   fi
 
+  if [[ -x "${APP_DIR%/}/current/${CURSOR_PROXY_MODULE_RELATIVE}/node_modules/.bin/cursor-api-proxy" &&
+        -f "${APP_DIR%/}/current/${CURSOR_PROXY_MODULE_RELATIVE}/package.json" &&
+        -f "${APP_DIR%/}/current/${CURSOR_PROXY_MODULE_RELATIVE}/package-lock.json" ]] &&
+      run_root cmp -s "${APP_DIR%/}/current/${CURSOR_PROXY_MODULE_RELATIVE}/package.json" "$tmp/package.json" &&
+      run_root cmp -s "${APP_DIR%/}/current/${CURSOR_PROXY_MODULE_RELATIVE}/package-lock.json" "$tmp/package-lock.json"; then
+    log "Cursor proxy lockfile unchanged; cloning the previous node_modules tree"
+    run_root cp -a "${APP_DIR%/}/current/${CURSOR_PROXY_MODULE_RELATIVE}/node_modules" "$tmp/"
+    deps_reused=1
+  fi
   # npm ci rejects lock/package drift and never resolves a newer dependency range.
-  if ! run_root env HOME="$DATA_DIR" "$npm_bin" --prefix "$tmp" ci --omit=dev --no-audit --no-fund; then
+  if (( deps_reused == 0 )) &&
+      ! run_root env HOME="$DATA_DIR" "$npm_bin" --prefix "$tmp" ci --omit=dev --no-audit --no-fund; then
     CURSOR_PROXY_INSTALL_STATUS="npm ci failed"
     run_root rm -rf -- "$tmp" || warn "could not remove failed Cursor proxy staging tree ${tmp}"
     warn "pinned Cursor proxy npm ci failed; continuing without Cursor support"
@@ -3621,6 +3775,77 @@ install_cursor_proxy_module() {
   CURSOR_PROXY_INSTALL_STATUS="ready"
 }
 
+install_cursor_agent() {
+  if ! bool_enabled "$WITH_CURSOR_PROXY"; then
+    CURSOR_AGENT_INSTALL_STATUS="disabled"
+    return 0
+  fi
+
+  local candidate tmp installer found=""
+  if [[ -n "${CURSOR_AGENT_BIN:-}" && -x "${CURSOR_AGENT_BIN}" ]]; then
+    CURSOR_AGENT_INSTALL_STATUS="configured"
+    return 0
+  fi
+  for candidate in "${BIN_DIR%/}/agent" "${BIN_DIR%/}/cursor-agent"; do
+    if [[ -x "$candidate" ]]; then
+      CURSOR_AGENT_BIN="$candidate"
+      CURSOR_AGENT_INSTALL_STATUS="reused"
+      return 0
+    fi
+  done
+  if command -v agent >/dev/null 2>&1; then
+    CURSOR_AGENT_BIN="$(command -v agent)"
+    CURSOR_AGENT_INSTALL_STATUS="reused"
+    return 0
+  fi
+  if command -v cursor-agent >/dev/null 2>&1; then
+    CURSOR_AGENT_BIN="$(command -v cursor-agent)"
+    CURSOR_AGENT_INSTALL_STATUS="reused"
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    CURSOR_AGENT_INSTALL_STATUS="curl unavailable"
+    warn "curl is unavailable; Cursor Agent cannot be installed automatically"
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+  log "Installing Cursor Agent CLI (the server will inject its absolute path)"
+  if ! run_root install -d -m 0750 "$CURSOR_AGENT_HOME" || \
+      ! curl --fail --silent --show-error --location \
+        --connect-timeout 10 --max-time 300 --retry 2 --retry-delay 10 --retry-max-time 60 \
+        --user-agent 'codex-pool-cursor-module/1.0' --output "$tmp" https://cursor.com/install || \
+      ! run_root grep -q '^#!/usr/bin/env bash' "$tmp" || \
+      ! run_root grep -q 'DOWNLOAD_URL="https://downloads.cursor.com/' "$tmp" || \
+      ! run_root env HOME="$CURSOR_AGENT_HOME" NO_COLOR=1 bash "$tmp"; then
+    CURSOR_AGENT_INSTALL_STATUS="installer failed"
+    rm -f "$tmp"
+    warn "Cursor Agent installer failed; Cursor account login will remain unavailable"
+    return 0
+  fi
+  rm -f "$tmp"
+  found="${CURSOR_AGENT_HOME%/}/.local/bin/cursor-agent"
+  if [[ ! -x "$found" ]]; then
+    found="$(find "${CURSOR_AGENT_HOME%/}/.local/share/cursor-agent" -type f -name cursor-agent -perm -111 2>/dev/null | sort | tail -n 1 || true)"
+  fi
+  if [[ -z "$found" || ! -x "$found" ]]; then
+    CURSOR_AGENT_INSTALL_STATUS="binary missing"
+    warn "Cursor Agent installer completed without an executable"
+    return 0
+  fi
+  if ! run_root chown -R "root:${SERVICE_GROUP}" "$CURSOR_AGENT_HOME" || \
+      ! run_root chmod -R u=rwX,g=rX,o= "$CURSOR_AGENT_HOME" || \
+      ! run_root install -d -m 0755 "$BIN_DIR" || \
+      ! run_root ln -sfn "$found" "${BIN_DIR%/}/cursor-agent" || \
+      ! run_root ln -sfn "$found" "${BIN_DIR%/}/agent"; then
+    CURSOR_AGENT_INSTALL_STATUS="link failed"
+    warn "Cursor Agent was downloaded but could not be exposed on the service PATH"
+    return 0
+  fi
+  CURSOR_AGENT_BIN="${BIN_DIR%/}/agent"
+  CURSOR_AGENT_INSTALL_STATUS="ready"
+}
+
 verify_cursor_proxy_module() {
   local binary
   if ! bool_enabled "$WITH_CURSOR_PROXY"; then
@@ -3638,6 +3863,18 @@ verify_cursor_proxy_module() {
   warn "The gateway remains available, but Cursor support is disabled. Restore Node/npm and registry access, then rerun from this project checkout: sudo ./install.sh --with-cursor-proxy"
   warn "The repair uses the pinned modules/cursor-proxy/package-lock.json via npm ci; do not run npm install -g cursor-api-proxy."
   return 0
+}
+
+verify_cursor_agent() {
+  if ! bool_enabled "$WITH_CURSOR_PROXY"; then
+    CURSOR_AGENT_INSTALL_STATUS="disabled"
+    return 0
+  fi
+  if [[ -n "${CURSOR_AGENT_BIN:-}" && -x "${CURSOR_AGENT_BIN}" ]]; then
+    log "Cursor Agent ready at ${CURSOR_AGENT_BIN} (${CURSOR_AGENT_INSTALL_STATUS})"
+  else
+    warn "Cursor Agent self-check failed; expected an executable for CURSOR_AGENT_BIN"
+  fi
 }
 
 find_chrome() {
@@ -3716,7 +3953,7 @@ install_node_registrar() {
     warn "Node registrar source not found at ${REGISTRAR_SOURCE}; the node auto-registration engine will be unavailable (the relay still runs and serves accounts)."
     return 0
   fi
-  local npm_bin release_install tmp
+  local npm_bin release_install tmp deps_reused=0
   npm_bin="$(find_npm)" || die "npm not found after Node install"
 
   release_install="${RELEASE_DIR%/}/registrar-node"
@@ -3738,9 +3975,23 @@ install_node_registrar() {
   run_root rm -rf "$release_install"
   run_root mv "$tmp" "$release_install"
 
-  log "Installing Node registrar dependencies (pulls puppeteer-real-browser; may take a minute)"
-  local npm_common="--no-audit --no-fund --omit=dev"
-  run_root env HOME="$DATA_DIR" sh -c "cd '$release_install' && '$npm_bin' ci $npm_common"
+  # Dependencies are determined by package.json + package-lock.json. Reuse the
+  # previous immutable node_modules tree when both files match; source files are
+  # still copied above, so code changes take effect without a registry roundtrip.
+  if [[ -f "${APP_DIR%/}/current/registrar-node/node_modules/playwright/package.json" &&
+        -f "${APP_DIR%/}/current/registrar-node/package.json" &&
+        -f "${APP_DIR%/}/current/registrar-node/package-lock.json" ]] &&
+      run_root cmp -s "${APP_DIR%/}/current/registrar-node/package.json" "$release_install/package.json" &&
+      run_root cmp -s "${APP_DIR%/}/current/registrar-node/package-lock.json" "$release_install/package-lock.json"; then
+    log "Node registrar lockfile unchanged; cloning the previous node_modules tree"
+    run_root cp -a "${APP_DIR%/}/current/registrar-node/node_modules" "$release_install/"
+    deps_reused=1
+  fi
+  if (( deps_reused == 0 )); then
+    log "Installing Node registrar dependencies (pulls puppeteer-real-browser; may take a minute)"
+    local npm_common="--no-audit --no-fund --omit=dev"
+    run_root env HOME="$DATA_DIR" sh -c "cd '$release_install' && '$npm_bin' ci $npm_common"
+  fi
   run_root chown -R "root:${SERVICE_GROUP}" "$release_install"
   run_root chmod -R u=rwX,g=rX,o= "$release_install"
 
@@ -3759,7 +4010,7 @@ install_node_registrar() {
 install_python_registrar() {
   bool_enabled "$WITH_REGISTRATION" || return 0
 
-  local release_source release_venv reauth_source reauth_module_dir registrar_file
+  local release_source release_venv reauth_source reauth_module_dir registrar_file reuse_venv=0
   release_source="${RELEASE_DIR%/}/registrar-python"
   release_venv="${RELEASE_DIR%/}/registrar-python-venv"
   reauth_source="${RELEASE_DIR%/}/codex-reauth"
@@ -3780,9 +4031,30 @@ install_python_registrar() {
   run_root install -m 0640 -o root -g "$SERVICE_GROUP" \
     "${PY_REGISTRAR_SOURCE%/}/phone_verify.py" "${reauth_module_dir}/phone_verify.py"
 
-  run_root python3 -m venv "$release_venv"
-  run_root "$release_venv/bin/pip" install --disable-pip-version-check \
-    --requirement "${release_source}/requirements.txt"
+  # Requirements are release-scoped, but the virtualenv itself is reusable when
+  # that lock input is unchanged. Cloning avoids a network-bound pip install on
+  # every update while preserving a complete immutable runtime in the new release.
+  if [[ -f "${APP_DIR%/}/current/registrar-python/requirements.txt" &&
+        -x "${APP_DIR%/}/current/registrar-python-venv/bin/python" ]] &&
+      run_root cmp -s "${APP_DIR%/}/current/registrar-python/requirements.txt" \
+        "${release_source}/requirements.txt" &&
+      run_root "${APP_DIR%/}/current/registrar-python-venv/bin/python" --version >/dev/null 2>&1 &&
+      run_root "${APP_DIR%/}/current/registrar-python-venv/bin/pip" --version >/dev/null 2>&1; then
+    log "Python registrar requirements unchanged; cloning the previous virtualenv"
+    run_root install -d -m 0755 "$release_venv"
+    run_root cp -a "${APP_DIR%/}/current/registrar-python-venv/." "$release_venv/"
+    if run_root "$release_venv/bin/python" --version >/dev/null 2>&1; then
+      reuse_venv=1
+    else
+      warn "Previous Python registrar virtualenv is stale; rebuilding it"
+      run_root rm -rf -- "$release_venv"
+    fi
+  fi
+  if (( reuse_venv == 0 )); then
+    run_root python3 -m venv "$release_venv"
+    run_root "$release_venv/bin/pip" install --disable-pip-version-check \
+      --requirement "${release_source}/requirements.txt"
+  fi
   run_root "$release_venv/bin/pip" check
   for registrar_file in protocol_register.py browser_register.py reg_v3.py phone_verify.py; do
     run_root env PYTHONDONTWRITEBYTECODE=1 "$release_venv/bin/python" -c \
@@ -4027,6 +4299,10 @@ main() {
   apply_port_overrides
   normalize_migrate_user_groups
   ensure_absolute_paths
+  prepare_interactive_install
+  if (( INSTALL_CANCELLED == 1 )); then
+    return 0
+  fi
   validate_deployment_limits
   if (( STATUS_ONLY == 1 )); then
     collect_deployment_storage status
@@ -4037,6 +4313,7 @@ main() {
   validate_codex_reauth_settings
   acquire_deploy_lock
   remove_legacy_auxiliary_units
+  prepare_full_reinstall_runtime
   trap deployment_exit_cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -4060,10 +4337,15 @@ main() {
   prepare_existing_database_permissions
   install_binary_and_config
   run_expand_only_migration
-  provision_admin_setup
+  if (( BOOTSTRAP_ADMIN == 1 )); then
+    bootstrap_admin_account
+  else
+    provision_admin_setup
+  fi
   install_sidecar
   install_nodejs
   install_cursor_proxy_module
+  install_cursor_agent
   install_chrome
   install_node_registrar
   install_python_registrar
@@ -4072,6 +4354,7 @@ main() {
   printf '%s\n' "$RELEASE_ID" | run_root tee "${RELEASE_DIR%/}/.staged-ok" >/dev/null
   install_systemd_unit
   verify_cursor_proxy_module
+  verify_cursor_agent
   open_firewall_port
   run_root rm -rf -- "$BUILD_DIR"
   collect_deployment_storage status

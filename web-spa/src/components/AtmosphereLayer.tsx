@@ -233,34 +233,57 @@ export default function AtmosphereLayer({ subscribe, pathname }: { subscribe?: S
     if (still) {
       atmosphere.renderStill();
     } else {
-      // Pointer parallax. The handler only stores a target; the render loop eases
-      // toward it, so this never schedules work of its own however fast the mouse
-      // moves. Passive because it never calls preventDefault.
+      // Pointer and scroll input are sampled once per paint. High-Hz devices can
+      // deliver hundreds of events between frames; keeping only the newest sample
+      // preserves one-frame feedback while avoiding duplicate math and wakeups.
       let previousPointer = { x: window.innerWidth / 2, y: window.innerHeight / 2, at: performance.now() };
+      let pendingPointer: { x: number; y: number } | null = null;
+      let scrollPending = false;
+      let inputFrame: ReturnType<typeof requestBrowserAnimationFrame> = null;
+      let previousScroll = { y: window.scrollY, at: performance.now() };
+      const flushInputs = () => {
+        inputFrame = null;
+        if (pendingPointer) {
+          const { x, y } = pendingPointer;
+          pendingPointer = null;
+          const w = window.innerWidth || 1;
+          const h = window.innerHeight || 1;
+          atmosphere.setPointer((x / w) * 2 - 1, (y / h) * 2 - 1);
+          inputDriverRef.current?.setPointer(x / w, 1 - y / h);
+          const now = performance.now();
+          const elapsed = Math.max(16, now - previousPointer.at);
+          const distance = Math.hypot(x - previousPointer.x, y - previousPointer.y);
+          atmosphere.setActivity(Math.min(1, distance / elapsed / 1.4));
+          previousPointer = { x, y, at: now };
+        }
+        if (scrollPending) {
+          scrollPending = false;
+          const max = Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
+          const now = performance.now();
+          const y = window.scrollY;
+          const elapsed = Math.max(16, now - previousScroll.at);
+          const velocity = Math.min(1, Math.abs(y - previousScroll.y) / elapsed / 1.2);
+          atmosphere.setScroll((y / max) * 2 - 1, velocity);
+          inputDriverRef.current?.setScroll(velocity, y < 0 ? -y / max : 0);
+          previousScroll = { y, at: now };
+        }
+      };
+      const scheduleInputs = () => {
+        if (inputFrame == null) inputFrame = requestBrowserAnimationFrame(flushInputs);
+      };
       removePointer = addWindowListener('pointermove', (event: PointerEvent) => {
         const w = window.innerWidth || 1;
         const h = window.innerHeight || 1;
-        atmosphere.setPointer((event.clientX / w) * 2 - 1, (event.clientY / h) * 2 - 1);
-        // The atmosphere takes NDC; effect uniforms are declared in 0..1 UV with
-        // GL's bottom-left origin, so the vertical axis is flipped here rather
-        // than inside each shader.
-        inputDriverRef.current?.setPointer(event.clientX / w, 1 - event.clientY / h);
-        const now = performance.now();
-        const elapsed = Math.max(16, now - previousPointer.at);
-        const distance = Math.hypot(event.clientX - previousPointer.x, event.clientY - previousPointer.y);
-        atmosphere.setActivity(Math.min(1, distance / elapsed / 1.4));
-        previousPointer = { x: event.clientX, y: event.clientY, at: now };
+        pendingPointer = {
+          x: Math.min(w, Math.max(0, event.clientX)),
+          y: Math.min(h, Math.max(0, event.clientY)),
+        };
+        scheduleInputs();
       }, { passive: true });
 
-      let previousScroll = { y: window.scrollY, at: performance.now() };
       removeScroll = addWindowListener('scroll', () => {
-        const max = Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
-        const now = performance.now();
-        const elapsed = Math.max(16, now - previousScroll.at);
-        const velocity = Math.min(1, Math.abs(window.scrollY - previousScroll.y) / elapsed / 1.2);
-        atmosphere.setScroll((window.scrollY / max) * 2 - 1, velocity);
-        inputDriverRef.current?.setScroll(velocity, window.scrollY < 0 ? -window.scrollY / max : 0);
-        previousScroll = { y: window.scrollY, at: now };
+        scrollPending = true;
+        scheduleInputs();
       }, { passive: true });
 
       removeFocus = addDocumentListener('focusin', (event: FocusEvent) => {
@@ -296,6 +319,15 @@ export default function AtmosphereLayer({ subscribe, pathname }: { subscribe?: S
       });
 
       if (isDocumentVisible()) atmosphere.start();
+
+      const cancelInputFrame = () => {
+        if (inputFrame != null) cancelBrowserAnimationFrame(inputFrame);
+        inputFrame = null;
+      };
+      const previousRemovePointer = removePointer;
+      const previousRemoveScroll = removeScroll;
+      removePointer = () => { previousRemovePointer(); cancelInputFrame(); };
+      removeScroll = () => { previousRemoveScroll(); cancelInputFrame(); };
     }
 
     if (subscribe) {

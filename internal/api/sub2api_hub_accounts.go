@@ -255,6 +255,11 @@ func parseSub2APIHubImportChunk(raw string) ([]authparse.ImportEntry, error) {
 	if doc, err := authparse.ParseImportDocument([]byte(trimmed)); err == nil {
 		return doc.Entries, nil
 	}
+	if strings.HasPrefix(strings.ToLower(trimmed), "rt_") {
+		return []authparse.ImportEntry{{Index: 1, Parsed: authparse.ParsedAuth{
+			Provider: "codex", RefreshToken: trimmed,
+		}}}, nil
+	}
 	lines := strings.Split(trimmed, "\n")
 	if len(lines) > 1 {
 		entries := []authparse.ImportEntry{}
@@ -264,7 +269,11 @@ func parseSub2APIHubImportChunk(raw string) ([]authparse.ImportEntry, error) {
 			}
 			doc, err := authparse.ParseImportDocument([]byte(strings.TrimSpace(line)))
 			if err != nil {
-				encoded, _ := json.Marshal(map[string]string{"access_token": strings.TrimSpace(line)})
+				field := "access_token"
+				if strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "rt_") {
+					field = "refresh_token"
+				}
+				encoded, _ := json.Marshal(map[string]string{field: strings.TrimSpace(line)})
 				doc, err = authparse.ParseImportDocument(encoded)
 			}
 			if err != nil {
@@ -276,7 +285,11 @@ func parseSub2APIHubImportChunk(raw string) ([]authparse.ImportEntry, error) {
 			return entries, nil
 		}
 	}
-	encoded, _ := json.Marshal(map[string]string{"access_token": trimmed})
+	field := "access_token"
+	if strings.HasPrefix(strings.ToLower(trimmed), "rt_") {
+		field = "refresh_token"
+	}
+	encoded, _ := json.Marshal(map[string]string{field: trimmed})
 	doc, err := authparse.ParseImportDocument(encoded)
 	if err != nil {
 		return nil, err
@@ -431,6 +444,11 @@ func (s *Server) importSub2APIHubEntries(
 			egressID = mapped
 		}
 		parsed := entry.Parsed
+		parsed, hydrateErr := s.hydrateRefreshTokenImport(ctx, parsed)
+		if hydrateErr != nil {
+			fail(hydrateErr)
+			continue
+		}
 		token := accountTokenFromParsed(parsed, parsed.RefreshToken)
 		provider := accountprovider.EffectiveProvider(parsed.Provider, token, true)
 		if provider != "codex" {

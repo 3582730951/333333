@@ -36,11 +36,14 @@ void main() {
   vec2 p = vUv - 0.5;
   p.x *= uResolution.x / max(uResolution.y, 1.0);
   float radius = length(p);
-  float phase = radius * (11.0 + uQuality * 8.0) - uTime * uSpeed;
-  float crest = 0.5 + 0.5 * sin(phase);
-  float ring = smoothstep(0.84, 0.22, abs(radius - (0.22 + crest * uAmplitude)));
-  float edge = smoothstep(0.72, 0.12, radius);
-  float alpha = ring * edge * uIntensity;
+  float drift = sin(p.x * 3.2 + uTime * uSpeed) * 0.035;
+  float phase = radius * (9.0 + uQuality * 7.0) - uTime * uSpeed;
+  float crest = 0.5 + 0.5 * sin(phase + p.y * 2.4 + drift * 18.0);
+  float radiusTarget = 0.20 + crest * uAmplitude;
+  float ring = exp(-abs(radius - radiusTarget) * (22.0 + uQuality * 10.0));
+  float halo = exp(-radius * radius * 3.8) * 0.22;
+  float edge = smoothstep(0.86, 0.10, radius);
+  float alpha = (ring + halo) * edge * uIntensity;
   fragColor = vec4(uAtmoGlow, alpha);
 }
 `;

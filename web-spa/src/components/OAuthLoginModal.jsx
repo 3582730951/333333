@@ -72,6 +72,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [cursorAccountName, setCursorAccountName] = useState('');
   const [cursorModule, setCursorModule] = useState(null);
   const [authMode, setAuthMode] = useState('oauth');
+  const [refreshToken, setRefreshToken] = useState('');
   const [providerApiKey, setProviderApiKey] = useState('');
   const [confirmProviderCost, setConfirmProviderCost] = useState(false);
   const [providerKeyResult, setProviderKeyResult] = useState(null);
@@ -173,6 +174,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     setCursorApiKey('');
     setCursorAccountName('');
     setAuthMode('oauth');
+    setRefreshToken('');
     setProviderApiKey('');
     setConfirmProviderCost(false);
     setProviderKeyResult(null);
@@ -395,6 +397,21 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     } catch (e) {
       setProviderKeyResult(e?.response?.data || e?.data || null);
       showErrorToast(e, { prefix: 'API Key 导入失败' });
+    }
+  });
+
+  const { run: handleRefreshTokenImport, running: refreshTokenLoading } = useAsyncAction(async () => {
+    const value = refreshToken.trim();
+    if (!value) { Toast.warning('请输入 Codex Refresh Token'); return; }
+    try {
+      const result = await post('/admin/accounts/import-token', {
+        refresh_token: value, label, group_name: groupName,
+      }, { timeout: 120000 });
+      Toast.success(`账号 ${result.label || result.email || result.id} 已通过 RT 自动导入`);
+      handleClose();
+      if (onSuccess) onSuccess(result);
+    } catch (error) {
+      showErrorToast(error, { prefix: 'RT 导入失败' });
     }
   });
 
@@ -688,6 +705,12 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
               type={authMode === 'api_key' ? 'primary' : 'tertiary'}
               onClick={() => { setAuthMode('api_key'); setProviderKeyResult(null); }}
             >API Key</Button>
+            {tab === 'chatgpt' ? (
+              <Button
+                type={authMode === 'refresh_token' ? 'primary' : 'tertiary'}
+                onClick={() => { setAuthMode('refresh_token'); setProviderKeyResult(null); }}
+              >RT 导入</Button>
+            ) : null}
           </div>
 
           <Form>
@@ -711,7 +734,19 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
             <Text type="tertiary" as="p">账号不会保存出口副本；请求时动态继承所选账号池分组的主出口与备用出口。</Text>
           </Form>
 
-          {authMode === 'api_key' ? (
+          {authMode === 'refresh_token' ? (
+            <div style={{ display: 'grid', gap: 12, marginTop: 14 }}>
+              <Form>
+                <Form.Slot label="Codex Refresh Token (RT)">
+                  <Input type="password" value={refreshToken} onChange={setRefreshToken} placeholder="rt_..." />
+                </Form.Slot>
+              </Form>
+              <Text type="tertiary">服务端会用 RT 自动换取访问令牌、读取账号元数据并加入账号池；RT 仅在服务端加密保存。</Text>
+              <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                <Button type="primary" theme="solid" loading={refreshTokenLoading} disabled={!refreshToken.trim()} onClick={handleRefreshTokenImport}>自动导入</Button>
+              </div>
+            </div>
+          ) : authMode === 'api_key' ? (
             <div style={{ display: 'grid', gap: 12, marginTop: 14 }}>
               <Form>
                 <Form.Slot label={`${currentInfo.name} 上游 API Key`}>
@@ -726,7 +761,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
               <div style={{ padding: 12, borderRadius: 6, background: 'var(--pool-bg-surface-2)' }}>
                 <Text strong>按量计费凭据</Text>
                 <Text type="tertiary" as="p" style={{ margin: '6px 0 0', lineHeight: 1.6 }}>
-                  该 Key 属于上游 Platform / Console，与下游 cap_* Key 完全分离。系统先免费读取模型列表；认证成功后仅发送一次固定提示“Reply exactly OK”的最小推理。若推理失败，账号会保留但无限期隔离。
+                  该 Key 属于上游 Platform / Console，与下游 sk-* Key 完全分离。系统先免费读取模型列表；认证成功后仅发送一次固定提示“Reply exactly OK”的最小推理。若推理失败，账号会保留但无限期隔离。
                 </Text>
               </div>
               <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 'var(--pool-type-label)', cursor: 'pointer' }}>

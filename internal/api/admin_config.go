@@ -296,15 +296,23 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
-	if s.accountProvider(account, token) == "kiro" {
+	provider := s.accountProvider(account, token)
+	if provider == "kiro" {
 		s.adminKiroHealthTest(w, r, account, token)
 		return
 	}
-	if accountprovider.UsesAPIKey(s.accountProvider(account, token), token) && (s.accountProvider(account, token) == "codex" || s.accountProvider(account, token) == "claude") {
+	if accountprovider.UsesAPIKey(provider, token) && (provider == "codex" || provider == "claude") {
 		s.adminProviderAPIKeyHealthTest(w, r, account, token)
 		return
 	}
-	res := s.probeAccountLiveness(r.Context(), account, token)
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	res := s.probeAccountLivenessModel(r.Context(), account, token, req.Model)
 	if res.Err != nil {
 		_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
 			AccountID: accountID, AccountLabel: firstNonEmpty(account.Label, account.Email, accountID),
@@ -318,7 +326,7 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 		})
 		return
 	}
-	provider := res.Provider
+	provider = res.Provider
 	model := res.Model
 	v := res.Verdict
 	alive := res.Alive
@@ -412,6 +420,10 @@ type livenessResult struct {
 // and the background recheck loop. A setup/transport failure is returned in Err
 // (treated as unreachable); otherwise Status/Body/Verdict/Alive/Ready are populated.
 func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Account, token storage.AccountToken) livenessResult {
+	return s.probeAccountLivenessModel(ctx, account, token, "")
+}
+
+func (s *Server) probeAccountLivenessModel(ctx context.Context, account storage.Account, token storage.AccountToken, modelOverride string) livenessResult {
 	provider := s.accountProvider(account, token)
 	res := livenessResult{Provider: provider, ProbeScope: "model_request", ModelChecked: true}
 	if provider == "kiro" {
@@ -457,7 +469,13 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 	}
 	model := ""
 	if provider != "kiro" {
-		model = s.probeModel(ctx, account.ID, provider)
+		model = strings.TrimSpace(modelOverride)
+		if len(model) > 200 || strings.ContainsAny(model, "\x00\r\n") {
+			model = ""
+		}
+		if model == "" {
+			model = s.probeModel(ctx, account.ID, provider)
+		}
 	}
 	res.Model = model
 	if provider == "kiro" {
@@ -786,7 +804,7 @@ func (s *Server) probeModel(ctx context.Context, accountID, provider string) str
 }
 
 func codexLivenessProbeBody(model string) []byte {
-	return []byte(`{"model":"` + model + `","instructions":"You are a coding agent.","store":false,"input":[{"role":"user","content":"ping"}],"stream":true}`)
+	return []byte(`{"model":` + strconv.Quote(model) + `,"instructions":"You are a coding agent.","store":false,"input":[{"role":"user","content":"ping"}],"stream":true}`)
 }
 
 func claudeCountTokensProbeBody(body []byte) []byte {
@@ -1341,7 +1359,10 @@ func downstreamAPIKeyAttempt(r *http.Request) bool {
 		strings.TrimSpace(r.Header.Get("X-Downstream-Key")),
 		adminBearerToken(r),
 	} {
-		if strings.HasPrefix(plain, "cap_") || strings.HasPrefix(plain, "poolimp_") {
+		// Downstream keys are issued with the OpenAI-compatible sk- prefix. Keep
+		// cap_ recognized here so existing installations are not locked out during
+		// rotation; no new cap_ keys are generated.
+		if strings.HasPrefix(plain, "sk-") || strings.HasPrefix(plain, "cap_") || strings.HasPrefix(plain, "poolimp_") {
 			return true
 		}
 	}

@@ -788,6 +788,66 @@ func (s *Server) exchangeCodexCode(ctx context.Context, d oauthProviderDesc, cod
 	return authparse.ParseOAuthCodex(tr.AccessToken, tr.RefreshToken, tr.IDToken)
 }
 
+// exchangeCodexRefreshToken turns a standalone RT into the normal Codex auth
+// shape. This is used by the admin importer and Sub2API-compatible Hub, so an
+// operator can add an account without first extracting an access token.
+func (s *Server) exchangeCodexRefreshToken(ctx context.Context, refreshToken string) (authparse.ParsedAuth, error) {
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return authparse.ParsedAuth{}, errors.New("refresh_token required")
+	}
+	d, err := s.oauthProvider("codex")
+	if err != nil {
+		return authparse.ParsedAuth{}, err
+	}
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+		"client_id":     {d.clientID},
+		"scope":         {d.scope},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.tokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return authparse.ParsedAuth{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", oauthUserAgent)
+	resp, err := oauthHTTPClient().Do(req)
+	if err != nil {
+		return authparse.ParsedAuth{}, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return authparse.ParsedAuth{}, fmt.Errorf("openai refresh-token exchange failed (%d): %s", resp.StatusCode, bodySnippet(body, 300))
+	}
+	var tr struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		IDToken      string `json:"id_token"`
+	}
+	if err := json.Unmarshal(body, &tr); err != nil {
+		return authparse.ParsedAuth{}, fmt.Errorf("parse refresh-token response: %w", err)
+	}
+	parsed, err := authparse.ParseOAuthCodex(tr.AccessToken, firstNonEmpty(tr.RefreshToken, refreshToken), tr.IDToken)
+	if err != nil {
+		return authparse.ParsedAuth{}, err
+	}
+	parsed.Provider = "codex"
+	return parsed, nil
+}
+
+func (s *Server) hydrateRefreshTokenImport(ctx context.Context, parsed authparse.ParsedAuth) (authparse.ParsedAuth, error) {
+	if strings.TrimSpace(parsed.AccessToken) != "" || strings.TrimSpace(parsed.RefreshToken) == "" {
+		return parsed, nil
+	}
+	if strings.EqualFold(strings.TrimSpace(parsed.Provider), "codex") || parsed.Provider == "" {
+		return s.exchangeCodexRefreshToken(ctx, parsed.RefreshToken)
+	}
+	return parsed, nil
+}
+
 // claudeImportOAuthEgress resolves the egress a Claude login/import should use for its
 // token exchange: the egress the account is about to be bound to. The exchange hits the
 // same Anthropic account perimeter used by inference, so an unresolved future exit fails

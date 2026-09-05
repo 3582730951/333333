@@ -37,6 +37,8 @@ const (
 
 type modelQualityProbe struct {
 	ID       string
+	Family   string
+	Category string
 	Prompt   string
 	Expected string
 }
@@ -45,16 +47,55 @@ type modelQualityProbe struct {
 // steps but only a one-token/short-code answer, which is a much better
 // intelligence-per-token signal than trivia or open-ended grading.
 var modelQualityPrimaryProbes = []modelQualityProbe{
-	{ID: "modular-state-v1", Prompt: "Start n=17. Repeat exactly four times: n=(3*n+5) mod 97. Then compute the bitwise XOR of n and 23. Reply with only the final base-10 integer.", Expected: "14"},
-	{ID: "code-trace-v1", Prompt: "Trace this exactly: x=2; for i in [1,2,3,4], set x=x*i+(i mod 2). Reply with only the final integer x.", Expected: "76"},
-	{ID: "truth-box-v1", Prompt: "A coin is in exactly one of boxes A, B, C. A says 'the coin is not in B'. B says 'the coin is in C'. C says 'the coin is not in C'. Exactly one statement is true. Reply with only A, B, or C for the coin's box.", Expected: "B"},
-	{ID: "crt-v1", Prompt: "Find the smallest positive integer n such that n mod 5=2, n mod 7=4, and n mod 9=8. Reply with only n.", Expected: "242"},
+	{ID: "modular-state-v1", Family: "generic", Category: "reasoning", Prompt: "Start n=17. Repeat exactly four times: n=(3*n+5) mod 97. Then compute the bitwise XOR of n and 23. Reply with only the final base-10 integer.", Expected: "14"},
+	{ID: "code-trace-v1", Family: "generic", Category: "reasoning", Prompt: "Trace this exactly: x=2; for i in [1,2,3,4], set x=x*i+(i mod 2). Reply with only the final integer x.", Expected: "76"},
+	{ID: "truth-box-v1", Family: "generic", Category: "logic", Prompt: "A coin is in exactly one of boxes A, B, C. A says 'the coin is not in B'. B says 'the coin is in C'. C says 'the coin is not in C'. Exactly one statement is true. Reply with only A, B, or C for the coin's box.", Expected: "B"},
+	{ID: "crt-v1", Family: "generic", Category: "reasoning", Prompt: "Find the smallest positive integer n such that n mod 5=2, n mod 7=4, and n mod 9=8. Reply with only n.", Expected: "242"},
+}
+
+// Family probes are short, deterministic and deliberately different from the generic
+// bank. They test arithmetic/state tracking, constraints, contradiction handling and
+// exact instruction following without asking for a long answer that would add noise.
+var modelQualityFamilyProbes = map[string][]modelQualityProbe{
+	"gpt": {
+		{ID: "gpt-arithmetic-v2", Family: "gpt", Category: "reasoning", Prompt: "Compute (19*23+7) mod 29. Reply with only the integer.", Expected: "9"},
+		{ID: "gpt-order-v2", Family: "gpt", Category: "logic", Prompt: "A is left of B; C is immediately right of A; D is left of C. Reply only the four-card order.", Expected: "DACB"},
+		{ID: "gpt-contradiction-v1", Family: "gpt", Category: "consistency", Prompt: "Can an integer n satisfy n mod 4=1 and n mod 4=2? Reply exactly NO-SOLUTION or POSSIBLE.", Expected: "NO-SOLUTION"},
+		{ID: "gpt-format-v1", Family: "gpt", Category: "instruction", Prompt: "Reply exactly G7|31|Q. Do not add text, spaces, or punctuation.", Expected: "G7|31|Q"},
+	},
+	"claude": {
+		{ID: "claude-state-v1", Family: "claude", Category: "reasoning", Prompt: "Start n=11. Repeat three times: n=(5*n+1) mod 31. Then add 7. Reply with only the integer.", Expected: "18"},
+		{ID: "claude-order-v1", Family: "claude", Category: "logic", Prompt: "Order A,B,C,D: C is before A; A is immediately before D; B is after D. Reply only the order.", Expected: "CADB"},
+		{ID: "claude-contradiction-v1", Family: "claude", Category: "consistency", Prompt: "Can an integer be both even and odd? Reply exactly NO or YES.", Expected: "NO"},
+		{ID: "claude-format-v1", Family: "claude", Category: "instruction", Prompt: "Reply exactly C4|OK|17. Do not add text, spaces, or punctuation.", Expected: "C4|OK|17"},
+	},
+	"gpt-6": {
+		{ID: "gpt6-symbolic-v1", Family: "gpt-6", Category: "reasoning", Prompt: "Start a=7,b=11. Three times simultaneously set a,b=(a+b mod 29,a+2*b mod 29), using old values. Then reply with a XOR b.", Expected: "30"},
+		{ID: "gpt6-state-v1", Family: "gpt-6", Category: "reasoning", Prompt: "Start x=3. For i=1..5 set x=(x*x+i) mod 101. Reply only x.", Expected: "1"},
+		{ID: "gpt6-constraint-v1", Family: "gpt-6", Category: "logic", Prompt: "A is left of B; C is immediately right of A; D is left of C. Reply only the four-card order.", Expected: "DACB"},
+		{ID: "gpt6-contradiction-v1", Family: "gpt-6", Category: "consistency", Prompt: "Can an integer n satisfy n mod 6=1 and n mod 6=4? Reply exactly NO-SOLUTION or POSSIBLE.", Expected: "NO-SOLUTION"},
+	},
 }
 
 var modelQualityConfirmationProbe = modelQualityProbe{
 	ID:       "independent-confirm-v1",
+	Family:   "generic",
+	Category: "confirmation",
 	Prompt:   "Solve both independent checks. (1) f(1)=2 and f(n)=2*f(n-1)+n; find f(5). (2) Order W,X,Y,Z given Z is before W, W is immediately before Y, and X is after Y. Reply only as number|four-letter-order, with no spaces.",
 	Expected: "73|ZWYX",
+}
+
+var modelQualityMetadataProbe = modelQualityProbe{
+	ID:       "upstream-metadata-v1",
+	Family:   "generic",
+	Category: "metadata",
+	Prompt:   "Reply with only one compact JSON object, no Markdown: {\"model\":\"exact model identity or unknown\",\"knowledge_cutoff\":\"YYYY-MM-DD or unknown\",\"knowledge_base_updated_at\":\"YYYY-MM-DD or unknown\"}. Do not guess; use unknown when unavailable.",
+}
+
+var modelQualityFamilyConfirmationProbes = map[string]modelQualityProbe{
+	"gpt":    {ID: "gpt-independent-confirm-v1", Family: "gpt", Category: "confirmation", Prompt: "Solve both checks. (1) Start y=4; repeat three times y=3*y-2; (2) order P,Q,R,S with Q before P, P immediately before R, S after R. Reply only number|order.", Expected: "76|QPRS"},
+	"claude": {ID: "claude-independent-confirm-v1", Family: "claude", Category: "confirmation", Prompt: "Solve both checks. (1) Find (17*17+5) mod 23; (2) order L,M,N,O with M before L, L immediately before N, O after N. Reply only number|order.", Expected: "18|MLNO"},
+	"gpt-6":  {ID: "gpt6-independent-confirm-v1", Family: "gpt-6", Category: "confirmation", Prompt: "Solve both checks. (1) Start y=5; repeat four times y=(2*y+3) mod 41; (2) order H,I,J,K with I before H, H immediately before J, K after J. Reply only number|order.", Expected: "2|IHJK"},
 }
 
 type modelQualityCombo struct {
@@ -76,6 +117,20 @@ type modelQualityRunRequest struct {
 	Group    string `json:"group_name"`
 	Model    string `json:"model"`
 	Provider string `json:"provider"`
+}
+
+type modelQualityStatusView struct {
+	storage.ModelQualityStatus
+	ModelFingerprint       string `json:"model_fingerprint,omitempty"`
+	ModelFingerprintSource string `json:"model_fingerprint_source,omitempty"`
+	KnowledgeBaseUpdatedAt string `json:"knowledge_base_updated_at,omitempty"`
+	KnowledgeBaseSource    string `json:"knowledge_base_source,omitempty"`
+	CatalogObservedAt      int64  `json:"catalog_observed_at,omitempty"`
+	MetadataProbeAt        int64  `json:"metadata_probe_at,omitempty"`
+}
+
+type modelQualityCapabilitySignal struct {
+	ObservedAt int64
 }
 
 func (s *Server) adminModelQuality(w http.ResponseWriter, r *http.Request) {
@@ -103,6 +158,7 @@ func (s *Server) adminModelQuality(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	statusViews := s.modelQualityStatusViews(r.Context(), statuses, runs)
 	s.qualityMu.Lock()
 	running := s.qualityRunning
 	s.qualityMu.Unlock()
@@ -116,8 +172,11 @@ func (s *Server) adminModelQuality(w http.ResponseWriter, r *http.Request) {
 		"scope":                     "group_model",
 		"per_account_testing":       false,
 		"anomaly_only_confirmation": true,
+		"suite_version":             "family-short-metadata-v3",
+		"suite_policy":              "每个分组×模型每轮只发一条短题；模型身份和知识库字段最多每天向上游询问一次；只有答案或返回模型异常时才发独立复核。模型自报字段用于交叉校验，不能单凭自报证明官方权重。",
+		"probe_catalog":             modelQualityProbeCatalog(),
 		"running":                   running,
-		"statuses":                  statuses,
+		"statuses":                  statusViews,
 		"runs":                      runs,
 	})
 }
@@ -390,6 +449,21 @@ func (s *Server) evaluateModelQualityCombo(ctx context.Context, combo modelQuali
 	if _, err := s.store.InsertModelQualityRun(ctx, primary.Run); err != nil {
 		return storage.ModelQualityStatus{}, err
 	}
+	var metadataTokens int64
+	if s.modelQualityMetadataDue(ctx, combo, now) {
+		metadata := s.executeModelQualityProbe(ctx, combo, modelQualityMetadataProbe, "metadata", nil)
+		metadataTokens = metadata.Run.TotalTokens
+		if metadata.Run.Outcome == "metadata" {
+			if _, err := s.store.InsertModelQualityRun(ctx, metadata.Run); err != nil {
+				return storage.ModelQualityStatus{}, err
+			}
+		} else {
+			// Metadata is advisory and must never turn a passing quality probe
+			// into a degraded verdict. Keep failures in history for diagnosis.
+			metadata.Run.Outcome = "metadata_error"
+			_, _ = s.store.InsertModelQualityRun(ctx, metadata.Run)
+		}
+	}
 	status := previous
 	if !found {
 		status = storage.ModelQualityStatus{GroupName: combo.Group, ModelSlug: combo.Model, Provider: combo.Provider, State: "unknown"}
@@ -397,7 +471,7 @@ func (s *Server) evaluateModelQualityCombo(ctx context.Context, combo modelQuali
 	status.GroupName, status.ModelSlug, status.Provider = combo.Group, combo.Model, combo.Provider
 	status.LastProbeAt, status.UpdatedAt = now, now
 	status.TotalChecks++
-	status.TotalTokens += primary.Run.TotalTokens
+	status.TotalTokens += primary.Run.TotalTokens + metadataTokens
 	status.LastProbeID = primary.Run.ProbeID
 	status.LastExpected = primary.Run.Expected
 	status.LastActual = primary.Run.Actual
@@ -425,9 +499,10 @@ func (s *Server) evaluateModelQualityCombo(ctx context.Context, combo modelQuali
 	if primary.Run.AccountID != "" {
 		exclude[primary.Run.AccountID] = true
 	}
-	confirmation := s.executeModelQualityProbe(ctx, combo, modelQualityConfirmationProbe, "confirmation", exclude)
+	confirmationProbe := modelQualityConfirmationProbeFor(combo)
+	confirmation := s.executeModelQualityProbe(ctx, combo, confirmationProbe, "confirmation", exclude)
 	if confirmation.Err != nil && strings.Contains(confirmation.Run.ErrorKind, "scheduler") && len(exclude) > 0 {
-		confirmation = s.executeModelQualityProbe(ctx, combo, modelQualityConfirmationProbe, "confirmation", nil)
+		confirmation = s.executeModelQualityProbe(ctx, combo, confirmationProbe, "confirmation", nil)
 	}
 	if _, err := s.store.InsertModelQualityRun(ctx, confirmation.Run); err != nil {
 		return storage.ModelQualityStatus{}, err
@@ -468,6 +543,19 @@ func (s *Server) evaluateModelQualityCombo(ctx context.Context, combo modelQuali
 	return status, s.store.UpsertModelQualityStatus(ctx, status)
 }
 
+func (s *Server) modelQualityMetadataDue(ctx context.Context, combo modelQualityCombo, now int64) bool {
+	runs, err := s.store.ListModelQualityRuns(ctx, combo.Group, combo.Model, 20)
+	if err != nil {
+		return true
+	}
+	for _, run := range runs {
+		if run.ProbeID == modelQualityMetadataProbe.ID && run.Outcome == "metadata" && now-run.CreatedAt < 24*60*60 {
+			return false
+		}
+	}
+	return true
+}
+
 func applyModelQualityPass(status *storage.ModelQualityStatus, now int64, outcome string) {
 	status.LastOutcome = outcome
 	status.LastPassAt = now
@@ -486,10 +574,201 @@ func selectModelQualityProbe(combo modelQualityCombo, now int64, intervalMinutes
 	if intervalMinutes < 1 {
 		intervalMinutes = config.DefaultModelQualityIntervalMinutes
 	}
+	probes := modelQualityProbesForCombo(combo)
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(combo.key()))
 	bucket := uint32(now / int64(intervalMinutes*60))
-	return modelQualityPrimaryProbes[(h.Sum32()+bucket)%uint32(len(modelQualityPrimaryProbes))]
+	return probes[(h.Sum32()+bucket)%uint32(len(probes))]
+}
+
+func modelQualityFamily(combo modelQualityCombo) string {
+	model := strings.ToLower(strings.TrimSpace(combo.Model))
+	if strings.Contains(model, "gpt-6") || strings.Contains(model, "gpt6") {
+		return "gpt-6"
+	}
+	// Kiro exposes Claude model names but has a separate adapter and response
+	// contract; keep its established generic probe path so adapter health is
+	// measured without pretending it is a direct Anthropic endpoint.
+	if combo.Provider == "kiro" {
+		return "generic"
+	}
+	if combo.Provider == "claude" || strings.Contains(model, "claude") {
+		return "claude"
+	}
+	if combo.Provider == "codex" || strings.HasPrefix(model, "gpt") {
+		return "gpt"
+	}
+	return "generic"
+}
+
+func modelQualityProbesForCombo(combo modelQualityCombo) []modelQualityProbe {
+	if probes := modelQualityFamilyProbes[modelQualityFamily(combo)]; len(probes) > 0 {
+		return probes
+	}
+	return modelQualityPrimaryProbes
+}
+
+func modelQualityConfirmationProbeFor(combo modelQualityCombo) modelQualityProbe {
+	if probe, ok := modelQualityFamilyConfirmationProbes[modelQualityFamily(combo)]; ok {
+		return probe
+	}
+	return modelQualityConfirmationProbe
+}
+
+func modelQualityProbeCatalog() []map[string]interface{} {
+	families := []string{"gpt", "claude", "gpt-6", "generic"}
+	catalog := make([]map[string]interface{}, 0, len(families))
+	for _, family := range families {
+		probes := modelQualityPrimaryProbes
+		if familyProbes := modelQualityFamilyProbes[family]; len(familyProbes) > 0 {
+			probes = familyProbes
+		}
+		ids := make([]string, 0, len(probes))
+		categories := make([]string, 0, len(probes))
+		seenCategories := map[string]bool{}
+		for _, probe := range probes {
+			ids = append(ids, probe.ID)
+			if probe.Category != "" && !seenCategories[probe.Category] {
+				categories = append(categories, probe.Category)
+				seenCategories[probe.Category] = true
+			}
+		}
+		confirmation := modelQualityConfirmationProbe
+		if familyProbe, ok := modelQualityFamilyConfirmationProbes[family]; ok {
+			confirmation = familyProbe
+		}
+		catalog = append(catalog, map[string]interface{}{
+			"family": family, "categories": categories, "primary_probe_ids": ids,
+			"confirmation_probe_id": confirmation.ID, "metadata_probe_id": modelQualityMetadataProbe.ID,
+		})
+	}
+	return catalog
+}
+
+func (s *Server) modelQualityStatusViews(ctx context.Context, statuses []storage.ModelQualityStatus, runs []storage.ModelQualityRun) []modelQualityStatusView {
+	signals := s.modelQualityCapabilitySignals(ctx)
+	metadata := map[string]struct {
+		answer modelQualityMetadataAnswer
+		at     int64
+	}{}
+	for _, run := range runs {
+		if run.ProbeID != modelQualityMetadataProbe.ID || run.Outcome != "metadata" {
+			continue
+		}
+		key := modelQualityCombo{Group: run.GroupName, Model: run.ModelSlug, Provider: run.Provider}.key()
+		if current, ok := metadata[key]; ok && current.at >= run.CreatedAt {
+			continue
+		}
+		if answer, ok := parseModelQualityMetadata(run.Actual); ok {
+			metadata[key] = struct {
+				answer modelQualityMetadataAnswer
+				at     int64
+			}{answer: answer, at: run.CreatedAt}
+		}
+	}
+	byStatus := make([]modelQualityStatusView, 0, len(statuses))
+	for _, status := range statuses {
+		key := modelQualityCombo{Group: status.GroupName, Model: status.ModelSlug, Provider: status.Provider}.key()
+		signal := signals[key]
+		fingerprint, source, knowledge, knowledgeSource, metadataAt := "", "", "", "", int64(0)
+		if item, ok := metadata[key]; ok {
+			metadataAt = item.at
+			if item.answer.Model != "" {
+				fingerprint, source = "reported:"+item.answer.Model, "upstream_model_probe"
+			}
+			knowledge = firstNonEmpty(item.answer.KnowledgeBaseUpdatedAt, item.answer.KnowledgeCutoff)
+			if knowledge != "" {
+				knowledgeSource = "upstream_model_probe"
+			}
+		}
+		if fingerprint == "" && status.LastReturnedModel != "" {
+			fingerprint, source = "response:"+status.LastReturnedModel, "upstream_response_header"
+		}
+		if knowledge == "" {
+			knowledgeSource = "model_probe_unreported"
+		}
+		byStatus = append(byStatus, modelQualityStatusView{
+			ModelQualityStatus:     status,
+			ModelFingerprint:       fingerprint,
+			ModelFingerprintSource: source,
+			KnowledgeBaseUpdatedAt: knowledge,
+			KnowledgeBaseSource:    knowledgeSource,
+			CatalogObservedAt:      signal.ObservedAt,
+			MetadataProbeAt:        metadataAt,
+		})
+	}
+	return byStatus
+}
+
+// modelQualityCapabilitySignals only supplies the last catalog observation time.
+// The displayed identity now comes from an explicit upstream model question;
+// catalog hashes are deliberately not presented as model fingerprints.
+func (s *Server) modelQualityCapabilitySignals(ctx context.Context) map[string]modelQualityCapabilitySignal {
+	accounts, err := s.store.ListAccounts(ctx)
+	if err != nil {
+		return nil
+	}
+	active := make([]storage.Account, 0, len(accounts))
+	ids := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		if account.Status == "active" {
+			active = append(active, account)
+			ids = append(ids, account.ID)
+		}
+	}
+	providers, err := s.store.ResolveAccountProviders(ctx, active)
+	if err != nil {
+		return nil
+	}
+	capsByAccount, err := s.store.ListCapabilitiesSummaryByAccountIDs(ctx, ids)
+	if err != nil {
+		return nil
+	}
+	out := map[string]modelQualityCapabilitySignal{}
+	for _, account := range active {
+		provider := strings.TrimSpace(providers[account.ID])
+		for _, cap := range capsByAccount[account.ID] {
+			key := modelQualityCombo{Group: account.GroupName, Model: cap.ModelSlug, Provider: provider}.key()
+			current := out[key]
+			if cap.LastProbeAt < current.ObservedAt {
+				continue
+			}
+			current.ObservedAt = cap.LastProbeAt
+			out[key] = current
+		}
+	}
+	return out
+}
+
+type modelQualityMetadataAnswer struct {
+	Model                  string `json:"model"`
+	KnowledgeCutoff        string `json:"knowledge_cutoff"`
+	KnowledgeBaseUpdatedAt string `json:"knowledge_base_updated_at"`
+}
+
+func parseModelQualityMetadata(actual string) (modelQualityMetadataAnswer, bool) {
+	actual = strings.TrimSpace(actual)
+	if strings.HasPrefix(actual, "```") {
+		actual = strings.TrimSpace(strings.TrimPrefix(actual, "```json"))
+		actual = strings.TrimSpace(strings.TrimSuffix(actual, "```"))
+	}
+	var answer modelQualityMetadataAnswer
+	if json.Unmarshal([]byte(actual), &answer) != nil {
+		return modelQualityMetadataAnswer{}, false
+	}
+	answer.Model = strings.TrimSpace(answer.Model)
+	answer.KnowledgeCutoff = strings.TrimSpace(answer.KnowledgeCutoff)
+	answer.KnowledgeBaseUpdatedAt = strings.TrimSpace(answer.KnowledgeBaseUpdatedAt)
+	if strings.EqualFold(answer.Model, "unknown") {
+		answer.Model = ""
+	}
+	if strings.EqualFold(answer.KnowledgeCutoff, "unknown") {
+		answer.KnowledgeCutoff = ""
+	}
+	if strings.EqualFold(answer.KnowledgeBaseUpdatedAt, "unknown") {
+		answer.KnowledgeBaseUpdatedAt = ""
+	}
+	return answer, answer.Model != "" || answer.KnowledgeCutoff != "" || answer.KnowledgeBaseUpdatedAt != ""
 }
 
 func (s *Server) executeModelQualityProbe(ctx context.Context, combo modelQualityCombo, probe modelQualityProbe, phase string, exclude map[string]bool) modelQualityProbeResult {
@@ -554,6 +833,20 @@ func (s *Server) executeModelQualityProbe(ctx context.Context, combo modelQualit
 	result.Run.PromptTokens = parsed.PromptTokens
 	result.Run.CompletionTokens = parsed.CompletionTokens
 	result.Run.TotalTokens = parsed.TotalTokens
+	if probe.Category == "metadata" {
+		if answer, ok := parseModelQualityMetadata(actual); ok {
+			compact, _ := json.Marshal(answer)
+			result.Run.Actual = string(compact)
+			result.Run.Outcome = "metadata"
+			result.Pass = true
+			result.ModelMatch = true
+			return result
+		}
+		result.Run.Outcome = "metadata_error"
+		result.Run.ErrorKind = "invalid_metadata"
+		result.Run.ErrorMessage = "upstream metadata response was not a compact JSON object"
+		return result
+	}
 	result.Pass = qualityAnswerMatches(actual, probe.Expected)
 	result.ModelMatch = qualityModelMatches(combo.Model, returnedModel)
 	switch {
@@ -610,6 +903,20 @@ func (s *Server) executeKiroModelQualityProbe(ctx context.Context, combo modelQu
 	result.Run.PromptTokens = data.InputTokens
 	result.Run.CompletionTokens = data.OutputTokens
 	result.Run.TotalTokens = data.InputTokens + data.OutputTokens
+	if probe.Category == "metadata" {
+		if answer, ok := parseModelQualityMetadata(data.Text); ok {
+			compact, _ := json.Marshal(answer)
+			result.Run.Actual = string(compact)
+			result.Run.Outcome = "metadata"
+			result.Pass = true
+			result.ModelMatch = true
+			return result
+		}
+		result.Run.Outcome = "metadata_error"
+		result.Run.ErrorKind = "invalid_metadata"
+		result.Run.ErrorMessage = "upstream metadata response was not a compact JSON object"
+		return result
+	}
 	result.Pass = qualityAnswerMatches(data.Text, probe.Expected)
 	result.ModelMatch = qualityModelMatches(combo.Model, data.Model)
 	switch {
@@ -866,7 +1173,24 @@ func qualityModelMatches(requested, returned string) bool {
 	if returned == "" || requested == returned {
 		return true
 	}
-	return strings.HasPrefix(returned, requested+"-")
+	if !strings.HasPrefix(returned, requested+"-") {
+		return false
+	}
+	// Providers commonly append an immutable date/build tag. Do not treat a
+	// named smaller variant (for example "-mini") as the requested model.
+	suffix := strings.TrimPrefix(returned, requested+"-")
+	if suffix == "latest" || suffix == "stable" || suffix == "preview" {
+		return true
+	}
+	if suffix == "" {
+		return false
+	}
+	for _, r := range suffix {
+		if (r < '0' || r > '9') && r != '-' && r != '.' {
+			return false
+		}
+	}
+	return true
 }
 
 func qualitySnippet(value string, limit int) string {

@@ -18,7 +18,7 @@ func generateAPIKey() (string, error) {
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
-	return "cap_" + hex.EncodeToString(buf), nil
+	return "sk-" + hex.EncodeToString(buf), nil
 }
 
 func generatePoolImportKey() (string, error) {

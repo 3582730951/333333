@@ -270,7 +270,7 @@ func (s *Server) adminEgressProfiles(w http.ResponseWriter, r *http.Request) {
 			}
 			profile.Endpoint = d.Endpoint(profile.Type)
 		}
-		if isProxyEgressType(profile.Type) && strings.TrimSpace(profile.Endpoint) != "" {
+		if (strings.TrimSpace(profile.Type) == "" || proxyparse.IsProxyType(profile.Type)) && strings.TrimSpace(profile.Endpoint) != "" {
 			endpoint, inferredType, err := proxyparse.NormalizeEndpoint(profile.Endpoint, profile.Type)
 			if err != nil {
 				writeError(w, http.StatusBadRequest, err)
@@ -291,7 +291,8 @@ func (s *Server) adminEgressProfiles(w http.ResponseWriter, r *http.Request) {
 			detect = *req.DetectRegion
 		}
 		if detect {
-			if pr, perr := s.upstream.ProbeEgress(r.Context(), profile); perr == nil {
+			if pr, detected, perr := s.upstream.ProbeEgressAuto(r.Context(), profile); perr == nil {
+				profile = detected
 				profile.Region = firstNonEmpty(pr.Country, profile.Region)
 				profile.ExitIP = pr.IP
 				profile.LatencyMillis = pr.LatencyMS
@@ -309,20 +310,22 @@ func (s *Server) adminEgressProfiles(w http.ResponseWriter, r *http.Request) {
 }
 
 type egressProfileRequest struct {
-	ID                string          `json:"id"`
-	Name              string          `json:"name"`
-	Type              string          `json:"type"`
-	Endpoint          string          `json:"endpoint"`
-	ChainProxy        string          `json:"chain_proxy"`
-	Region            string          `json:"region"`
-	ExitIP            string          `json:"exit_ip"`
-	StreamCapable     *bool           `json:"stream_capable"`
-	Health            string          `json:"health"`
-	LatencyMillis     int64           `json:"latency_millis"`
-	CFScore           int64           `json:"cf_score"`
-	LastCFRay         string          `json:"last_cf_ray"`
-	CooldownUntil     int64           `json:"cooldown_until"`
-	MaxConcurrency    int             `json:"max_concurrency"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Type          string `json:"type"`
+	Endpoint      string `json:"endpoint"`
+	ChainProxy    string `json:"chain_proxy"`
+	Region        string `json:"region"`
+	ExitIP        string `json:"exit_ip"`
+	StreamCapable *bool  `json:"stream_capable"`
+	Health        string `json:"health"`
+	LatencyMillis int64  `json:"latency_millis"`
+	CFScore       int64  `json:"cf_score"`
+	LastCFRay     string `json:"last_cf_ray"`
+	CooldownUntil int64  `json:"cooldown_until"`
+	// Pointer keeps the API distinction between an omitted value (use the
+	// new-proxy default) and an explicit 0 (unlimited/adaptive).
+	MaxConcurrency    *int            `json:"max_concurrency"`
 	ProxyAuthMode     string          `json:"proxy_auth_mode"`
 	ProxyAPIKey       string          `json:"proxy_api_key"`
 	IPMode            string          `json:"ip_mode"`
@@ -357,6 +360,13 @@ func (r egressProfileRequest) profile() (storage.EgressProfile, error) {
 	if r.StreamCapable != nil {
 		stream = *r.StreamCapable
 	}
+	maxConcurrency := 16
+	if r.MaxConcurrency != nil {
+		maxConcurrency = *r.MaxConcurrency
+	}
+	if maxConcurrency < 0 {
+		return storage.EgressProfile{}, errors.New("max_concurrency must be zero or greater")
+	}
 	return storage.EgressProfile{
 		ID:                strings.TrimSpace(r.ID),
 		Name:              strings.TrimSpace(r.Name),
@@ -371,7 +381,7 @@ func (r egressProfileRequest) profile() (storage.EgressProfile, error) {
 		CFScore:           r.CFScore,
 		LastCFRay:         strings.TrimSpace(r.LastCFRay),
 		CooldownUntil:     r.CooldownUntil,
-		MaxConcurrency:    r.MaxConcurrency,
+		MaxConcurrency:    maxConcurrency,
 		ProxyAuthMode:     strings.TrimSpace(r.ProxyAuthMode),
 		ProxyAPIKey:       strings.TrimSpace(r.ProxyAPIKey),
 		IPMode:            strings.TrimSpace(r.IPMode),
@@ -621,11 +631,12 @@ func (s *Server) adminEgressProfileAction(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusNotFound, err)
 			return
 		}
-		pr, perr := s.upstream.ProbeEgress(r.Context(), profile)
+		pr, detected, perr := s.upstream.ProbeEgressAuto(r.Context(), profile)
 		if perr != nil {
 			writeError(w, http.StatusBadGateway, perr)
 			return
 		}
+		profile = detected
 		profile.Region = firstNonEmpty(pr.Country, profile.Region)
 		profile.ExitIP = pr.IP
 		profile.LatencyMillis = pr.LatencyMS
@@ -670,7 +681,7 @@ func (s *Server) adminEgressProfileTest(w http.ResponseWriter, r *http.Request) 
 	if probeURL == "" {
 		probeURL = config.DefaultGeoProbeURL
 	}
-	result, err := s.probeEgressProfileURL(r.Context(), profile, probeURL)
+	result, detected, err := s.probeEgressProfileURLAuto(r.Context(), profile, probeURL)
 	if err != nil {
 		status := http.StatusBadGateway
 		if isEgressProfileInputError(err) {
@@ -689,8 +700,9 @@ func (s *Server) adminEgressProfileTest(w http.ResponseWriter, r *http.Request) 
 		"city":           result.City,
 		"latency_ms":     result.LatencyMS,
 		"latency_millis": result.LatencyMS,
+		"detected_type":  detected.Type,
 		"probe_url":      probeURL,
-		"warnings":       egressProfileProbeWarnings(profile, result),
+		"warnings":       egressProfileProbeWarnings(detected, result),
 	})
 }
 
@@ -715,7 +727,7 @@ func (s *Server) egressProfileForTest(ctx context.Context, req egressProfileTest
 		}
 		profile.Endpoint = d.Endpoint(profile.Type)
 	}
-	if isProxyEgressType(profile.Type) && strings.TrimSpace(profile.Endpoint) != "" {
+	if (strings.TrimSpace(profile.Type) == "" || proxyparse.IsProxyType(profile.Type)) && strings.TrimSpace(profile.Endpoint) != "" {
 		endpoint, inferredType, err := proxyparse.NormalizeEndpoint(profile.Endpoint, profile.Type)
 		if err != nil {
 			return storage.EgressProfile{}, err
@@ -771,6 +783,24 @@ func (s *Server) cliproxyAPIWhitelistProbeProfile(ctx context.Context, profile s
 	profile.Type = "http_proxy"
 	profile.Endpoint = endpoint
 	return profile, nil
+}
+
+func (s *Server) probeEgressProfileURLAuto(ctx context.Context, profile storage.EgressProfile, probeURL string) (upstream.ProbeResult, storage.EgressProfile, error) {
+	profiles := []storage.EgressProfile{profile}
+	if alternate, ok := upstream.AlternateEgressProfile(profile); ok {
+		profiles = append(profiles, alternate)
+	}
+	var lastErr error
+	for _, candidate := range profiles {
+		attemptCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+		result, err := s.probeEgressProfileURL(attemptCtx, candidate, probeURL)
+		cancel()
+		if err == nil {
+			return result, candidate, nil
+		}
+		lastErr = err
+	}
+	return upstream.ProbeResult{}, profile, lastErr
 }
 
 func (s *Server) probeEgressProfileURL(ctx context.Context, profile storage.EgressProfile, probeURL string) (upstream.ProbeResult, error) {
@@ -853,15 +883,6 @@ func isEgressProfileInputError(err error) bool {
 	return false
 }
 
-func isProxyEgressType(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "http_proxy", "https_proxy", "socks5_proxy", "socks5h_proxy":
-		return true
-	default:
-		return false
-	}
-}
-
 // adminEgressImport bulk-creates proxy egress profiles from newline-separated
 // "host:port:username:password" lines (the batch-import format). Region detection
 // is off by default (one outbound probe per proxy would be slow on large lists);
@@ -898,7 +919,8 @@ func (s *Server) adminEgressImport(w http.ResponseWriter, r *http.Request) {
 			MaxConcurrency: 16,
 		}
 		if detect {
-			if pr, perr := s.upstream.ProbeEgress(r.Context(), p); perr == nil {
+			if pr, detected, perr := s.upstream.ProbeEgressAuto(r.Context(), p); perr == nil {
+				p = detected
 				p.Region = pr.Country
 				p.ExitIP = pr.IP
 				p.LatencyMillis = pr.LatencyMS

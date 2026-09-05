@@ -23,6 +23,13 @@ import (
 	"sync"
 )
 
+const (
+	// A forced operator quarantine is intentionally far beyond any normal
+	// cooldown window. It is cleared explicitly by the administrator.
+	operatorForceIsolationUntil  int64 = 253402300799
+	operatorForceIsolationReason       = "manual_force_isolation"
+)
+
 func (s *Server) adminAccounts(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
 		return
@@ -337,6 +344,11 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parsed := doc.Entries[0].Parsed
+	parsed, err = s.hydrateRefreshTokenImport(r.Context(), parsed)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
 	sessionCookie, err := normalizeImportedSessionCookie(req.SessionCookie, parsed)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -624,20 +636,33 @@ func (s *Server) adminImportToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	provider := accountprovider.InferProviderFromToken(storage.AccountToken{AccessToken: strings.TrimSpace(req.AccessToken)})
-	if (provider == "codex" || provider == "claude") && accountprovider.LooksLikeAPIKey(provider, req.AccessToken) {
-		writePoolCodeError(w, http.StatusBadRequest, "cost_confirmation_required", "upstream API keys must be imported with /admin/accounts/import-key and confirm_cost:true")
+	if strings.TrimSpace(req.AccessToken) == "" && strings.TrimSpace(req.RefreshToken) == "" {
+		writeError(w, http.StatusBadRequest, errors.New("access_token or refresh_token required"))
 		return
 	}
-	parsed, err := authparse.ParseAccessToken(req.AccessToken, req.AccountID)
+	var parsed authparse.ParsedAuth
+	var err error
+	if strings.TrimSpace(req.AccessToken) == "" {
+		parsed, err = s.exchangeCodexRefreshToken(r.Context(), req.RefreshToken)
+	} else {
+		provider := accountprovider.InferProviderFromToken(storage.AccountToken{AccessToken: strings.TrimSpace(req.AccessToken)})
+		if (provider == "codex" || provider == "claude") && accountprovider.LooksLikeAPIKey(provider, req.AccessToken) {
+			writePoolCodeError(w, http.StatusBadRequest, "cost_confirmation_required", "upstream API keys must be imported with /admin/accounts/import-key and confirm_cost:true")
+			return
+		}
+		parsed, err = authparse.ParseAccessToken(req.AccessToken, req.AccountID)
+	}
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeError(w, http.StatusBadGateway, err)
 		return
+	}
+	if strings.TrimSpace(parsed.RefreshToken) == "" {
+		parsed.RefreshToken = strings.TrimSpace(req.RefreshToken)
 	}
 	if strings.TrimSpace(req.RefreshToken) != "" {
 		parsed.CredentialMode = ""
 	}
-	account, err := s.saveImportedAccount(r.Context(), parsed, req.Label, req.GroupName, req.RefreshToken, "", requestedImportEgressID(req.EgressID, req.PrimaryEgressID))
+	account, err := s.saveImportedAccount(r.Context(), parsed, req.Label, req.GroupName, parsed.RefreshToken, "", requestedImportEgressID(req.EgressID, req.PrimaryEgressID))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -777,6 +802,10 @@ func (s *Server) adminAccountAction(w http.ResponseWriter, r *http.Request) {
 		s.adminSetAccountStatus(w, r, accountID, "active")
 	case "clear-quarantine":
 		s.adminClearQuarantine(w, r, accountID)
+	case "reset-credits":
+		s.adminCodexResetCredits(w, r, accountID)
+	case "force-isolation":
+		s.adminForceAccountIsolation(w, r, accountID)
 	case "clear-cooldown":
 		s.adminClearCooldown(w, r, accountID)
 	case "rate-limit-controls":
@@ -1145,6 +1174,47 @@ func (s *Server) adminClearQuarantine(w http.ResponseWriter, r *http.Request, ac
 		Reason:    "cleared by admin",
 	})
 	writeJSON(w, http.StatusOK, map[string]interface{}{"account_id": accountID, "quarantine_until": 0})
+}
+
+func (s *Server) adminForceAccountIsolation(w http.ResponseWriter, r *http.Request, accountID string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	account, err := s.store.GetAccount(r.Context(), accountID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	// The account-scoped bypass would otherwise keep this account schedulable.
+	if account.IgnoreRateLimitControls {
+		if err := s.store.SetAccountIgnoreRateLimitControls(r.Context(), accountID, false); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	if err := s.store.SetAccountQuarantine(r.Context(), accountID, operatorForceIsolationUntil, operatorForceIsolationReason); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if s.scheduler != nil {
+		s.scheduler.RefreshAccountCache()
+		s.scheduler.NotifyStateChanged()
+	}
+	s.wakeRouteAvailability()
+	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+		AccountID:    accountID,
+		AccountLabel: firstNonEmpty(account.Label, account.Email, account.ID),
+		Action:       "force_isolation",
+		State:        "manual",
+		Reason:       operatorForceIsolationReason,
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"account_id":                 accountID,
+		"quarantine_until":           operatorForceIsolationUntil,
+		"quarantine_reason":          operatorForceIsolationReason,
+		"ignore_rate_limit_controls": false,
+	})
 }
 
 func (s *Server) adminClearCooldown(w http.ResponseWriter, r *http.Request, accountID string) {

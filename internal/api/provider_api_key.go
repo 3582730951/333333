@@ -331,9 +331,19 @@ func (s *Server) runProviderAPIKeyAuthProbe(ctx context.Context, account storage
 }
 
 func (s *Server) runProviderAPIKeyInferenceProbe(ctx context.Context, account storage.Account, token storage.AccountToken, egress storage.EgressProfile, caps []storage.ModelCapability) providerProbeStage {
+	return s.runProviderAPIKeyInferenceProbeModel(ctx, account, token, egress, caps, "")
+}
+
+func (s *Server) runProviderAPIKeyInferenceProbeModel(ctx context.Context, account storage.Account, token storage.AccountToken, egress storage.EgressProfile, caps []storage.ModelCapability, modelOverride string) providerProbeStage {
 	stage := providerProbeStage{healthProbeStage: healthProbeStage{Checked: true, State: "unreachable"}}
 	provider := strings.ToLower(strings.TrimSpace(account.Provider))
-	model := providerAPIKeyProbeModel(provider, caps)
+	model := strings.TrimSpace(modelOverride)
+	if len(model) > 200 || strings.ContainsAny(model, "\x00\r\n") {
+		model = ""
+	}
+	if model == "" {
+		model = providerAPIKeyProbeModel(provider, caps)
+	}
 	stage.Model = model
 	if model == "" {
 		stage.State = "inference_failed"
@@ -554,7 +564,7 @@ func (s *Server) auditProviderAPIKeyProbe(ctx context.Context, account storage.A
 }
 
 func (s *Server) adminProviderAPIKeyHealthTest(w http.ResponseWriter, r *http.Request, account storage.Account, token storage.AccountToken) {
-	confirmed, err := decodeConfirmCost(r.Body)
+	confirmed, modelOverride, err := decodeConfirmCostAndModel(r.Body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -583,7 +593,7 @@ func (s *Server) adminProviderAPIKeyHealthTest(w http.ResponseWriter, r *http.Re
 	inference := providerProbeStage{healthProbeStage: healthProbeStage{Checked: false, State: "not_checked"}}
 	if authProbe.Alive {
 		_ = s.store.ReplaceCapabilities(r.Context(), account.ID, caps)
-		inference = s.runProviderAPIKeyInferenceProbe(r.Context(), account, token, egress, caps)
+		inference = s.runProviderAPIKeyInferenceProbeModel(r.Context(), account, token, egress, caps, modelOverride)
 		s.auditProviderAPIKeyProbe(r.Context(), account, "provider_api_key_inference_probe", inference)
 		if inference.Alive {
 			// The billable inference stage exercises the same serving path as downstream
@@ -615,12 +625,18 @@ func (s *Server) adminProviderAPIKeyHealthTest(w http.ResponseWriter, r *http.Re
 }
 
 func decodeConfirmCost(r io.Reader) (bool, error) {
+	confirmed, _, err := decodeConfirmCostAndModel(r)
+	return confirmed, err
+}
+
+func decodeConfirmCostAndModel(r io.Reader) (bool, string, error) {
 	var req struct {
 		ConfirmCost bool `json:"confirm_cost"`
+		Model       string `json:"model"`
 	}
 	err := decodeJSONRequestBody(r, &req, adminJSONBodyLimit)
 	if errors.Is(err, io.EOF) {
-		return false, nil
+		return false, "", nil
 	}
-	return req.ConfirmCost, err
+	return req.ConfirmCost, strings.TrimSpace(req.Model), err
 }

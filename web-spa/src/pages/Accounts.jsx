@@ -19,7 +19,7 @@ import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
 import useResponsiveLayout from '../hooks/useResponsiveLayout.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
 import { fmtInt, fmtRelative, fmtTokens, fmtUSD, middleEllipsis } from '../lib/format.js';
-import { quotaWindowLabel } from '../lib/quotaWindows.js';
+import { quotaWindowForKind, quotaUsageDetails, quotaWindowLabel } from '../lib/quotaWindows.js';
 import { accountQueryKeys, useAccountsPage } from '../features/accounts/queries/accounts.ts';
 import {
   downloadConfirmedAccountExport, fetchAccountArchive, fetchAccountsPage,
@@ -38,6 +38,7 @@ import {
 import { formatPlanLabel } from '../features/accounts/model/planFormatter.ts';
 
 const now = () => Math.floor(Date.now() / 1000);
+const MANUAL_FORCE_ISOLATION_UNTIL = 253402300799;
 
 function statusInfo(a) {
   const n = now();
@@ -74,6 +75,8 @@ const ACCOUNT_ACTION_LABEL = {
   'health-test': '测活',
   'clear-quarantine': '解除隔离',
   'clear-cooldown': '解除冷却',
+  'reset-credits': '主动重置',
+  'force-isolation': '强制隔离',
   delete: '删除',
 };
 
@@ -265,7 +268,54 @@ function quotaEstLabel(est) {
   return parts.join(' · ');
 }
 
+function QuotaWindowMeter({ account, detail, compact = false }) {
+  const fallback = detail.kind === '5h' ? '5 小时窗口' : '7 天窗口';
+  const summary = account?.quota_summary || {};
+  const window = quotaWindowForKind(account, detail.kind)
+    || (detail.kind === '5h' ? summary.primary : null)
+    || {};
+  const percent = detail.usedPercent == null ? null : Math.max(0, Math.min(100, Math.round(Number(detail.usedPercent))));
+  const remaining = percent == null ? null : 100 - percent;
+  const tone = percent == null ? 'muted' : percent >= 90 ? 'danger' : percent >= 70 ? 'warning' : 'success';
+  const details = [];
+  const remainingTokens = Number(window.remaining_tokens);
+  const limitTokens = Number(window.limit_tokens);
+  if (Number.isFinite(remainingTokens) && remainingTokens >= 0) {
+    details.push(`${fmtTokens(remainingTokens)} Token 剩余${Number.isFinite(limitTokens) && limitTokens > 0 ? ` / ${fmtTokens(limitTokens)}` : ''}`);
+  }
+  const resetAt = Number(window.reset_at);
+  if (Number.isFinite(resetAt) && resetAt > 0) details.push(`${fmtRelative(resetAt)}重置`);
+  const label = quotaWindowLabel(window, fallback);
+  if (percent == null) {
+    return (
+      <div className={`pool-account-quota pool-account-quota--unknown${compact ? ' pool-account-quota--compact' : ''}`}>
+        <div className="pool-account-quota__head"><strong>{label}</strong></div>
+        <span className="pool-account-quota__meta">窗口数据待同步</span>
+      </div>
+    );
+  }
+  const ariaLabel = `${label}，已用 ${percent}%，剩余 ${remaining}%${details.length ? `，${details.join(' · ')}` : ''}`;
+  return (
+    <div className={`pool-account-quota pool-account-quota--${tone}${compact ? ' pool-account-quota--compact' : ''}`} aria-label={ariaLabel}>
+      <div className="pool-account-quota__head"><strong>{remaining}% <span>剩余</span></strong><span>{label}</span></div>
+      <TinyMeter value={percent} label={ariaLabel} tone={tone} />
+      <span className="pool-account-quota__meta">{details.join(' · ') || `${percent}% 已用`}</span>
+    </div>
+  );
+}
+
 function AccountQuota({ account, compact = false }) {
+  const windows = quotaUsageDetails(account);
+  if (windows.length) {
+    const fallback = quotaPresentation(account);
+    const estLabel = quotaEstLabel(fallback.estUSD);
+    return (
+      <div className="pool-account-quota-stack">
+        {windows.map((detail) => <QuotaWindowMeter key={detail.kind} account={account} detail={detail} compact={compact} />)}
+        {estLabel ? <span className="pool-account-quota__usd">{estLabel}</span> : null}
+      </div>
+    );
+  }
   const quota = quotaPresentation(account);
   const estLabel = quotaEstLabel(quota.estUSD);
   if (quota.percent == null) {
@@ -484,6 +534,8 @@ export default function Accounts() {
       ? { status: 'active', quarantine_until: 0, quarantine_reason: '' }
       : act === 'clear-cooldown'
         ? clearedCooldownPatch
+        : act === 'force-isolation'
+          ? { quarantine_until: MANUAL_FORCE_ISOLATION_UNTIL, quarantine_reason: 'manual_force_isolation', ignore_rate_limit_controls: false }
         : null;
     if (optimisticPatch) updateCachedAccount(id, optimisticPatch);
     try {
@@ -501,6 +553,11 @@ export default function Accounts() {
         quarantine_reason: '',
       });
       if (act === 'clear-cooldown') updateCachedAccount(id, clearedCooldownPatch);
+      if (act === 'force-isolation') updateCachedAccount(id, {
+        quarantine_until: MANUAL_FORCE_ISOLATION_UNTIL,
+        quarantine_reason: 'manual_force_isolation',
+        ignore_rate_limit_controls: false,
+      });
       void Promise.resolve(load()).then((nextData) => {
         if (act === 'delete') return;
         const fresh = nextData?.rows?.find((row) => row.id === id);

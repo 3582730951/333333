@@ -54,7 +54,7 @@ func (s *Server) handleGatewayInstallScript(w http.ResponseWriter, r *http.Reque
 	if apiKey != "" {
 		apiKeyLine = "API_KEY=" + bashSingleQuote(apiKey)
 	} else {
-		apiKeyLine = `read -p "请输入下游 API Key (cap_xxx): " API_KEY
+		apiKeyLine = `read -p "请输入下游 API Key (sk-...): " API_KEY
 if [ -z "$API_KEY" ]; then
   echo "❌ API Key 不能为空"
   exit 1
@@ -179,7 +179,7 @@ func bashSingleQuote(value string) string {
 func extractAPIKey(r *http.Request) string {
 	// 尝试多种来源
 	if auth := r.Header.Get("Authorization"); auth != "" {
-		// Bearer cap_xxx 或 cap_xxx
+		// Bearer sk-... 或 sk-...
 		if len(auth) > 7 && auth[:7] == "Bearer " {
 			return auth[7:]
 		}

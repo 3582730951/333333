@@ -25,12 +25,18 @@ import (
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
+	"codex-account-pool/internal/proxyparse"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream/tlsclient"
 	"golang.org/x/net/proxy"
 )
 
 const drainAndCloseBodyLimit = 8 << 20
+
+var (
+	proxyConnectPrefix = []byte(http.MethodConnect + " ")
+	proxyHeaderEnd     = []byte("\r\n\r\n")
+)
 
 var errInvalidResponseContract = errors.New("upstream transport returned an invalid response")
 
@@ -104,6 +110,22 @@ func cacheLimitsForMemory(bytes int64) (jarMax, transportMax, tlsClientMax int) 
 		return 32768, 1024, 1024
 	default:
 		return 16384, 256, 256
+	}
+}
+
+// transportLimitsForMemory keeps idle socket pools proportional to the same
+// memory budget used by the cookie/TLS caches. A fixed 256/64/512 pool per
+// egress is fast on a large host but can retain thousands of sockets on a small
+// VPS; the lower tiers preserve connection reuse while avoiding that idle RSS.
+func transportLimitsForMemory(bytes int64) (maxIdle, maxIdlePerHost, maxConnsPerHost int) {
+	const mib = int64(1024 * 1024)
+	switch {
+	case bytes > 0 && bytes <= 64*mib:
+		return 64, 16, 128
+	case bytes > 256*mib:
+		return 256, 64, 512
+	default:
+		return 128, 32, 256
 	}
 }
 
@@ -1048,6 +1070,7 @@ func (c *Client) transportForEgressMode(egress storage.EgressProfile, forceHTTP1
 	c.transportMisses++
 	connectTimeout := c.cfgSnapshot().ConnectTimeout()
 	baseDialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+	maxIdle, maxIdlePerHost, maxConnsPerHost := transportLimitsForMemory(c.cfgSnapshot().EffectiveBodyMemoryBudgetBytes())
 	transport := &http.Transport{
 		// Egress selection is explicit. Reading process proxy variables here can
 		// silently move a "direct" account onto a different exit and also bypass
@@ -1057,9 +1080,9 @@ func (c *Client) transportForEgressMode(egress storage.EgressProfile, forceHTTP1
 		ForceAttemptHTTP2:     !forceHTTP1,
 		TLSHandshakeTimeout:   connectTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
-		MaxIdleConns:          256,
-		MaxIdleConnsPerHost:   64,
-		MaxConnsPerHost:       512,
+		MaxIdleConns:          maxIdle,
+		MaxIdleConnsPerHost:   maxIdlePerHost,
+		MaxConnsPerHost:       maxConnsPerHost,
 		IdleConnTimeout:       90 * time.Second,
 		// Larger socket buffers than the 4KiB stdlib default: this proxy moves very large
 		// request bodies (multi-MB 1M-context turns) and long SSE streams, so 64KiB read/
@@ -1149,11 +1172,11 @@ func (c *proxyStageConn) Write(p []byte) (int, error) {
 	clearDeadline := false
 	if c.deadlineActive {
 		switch {
-		case !c.connectRequest && strings.HasPrefix(string(p), http.MethodConnect+" "):
+		case !c.connectRequest && bytes.HasPrefix(p, proxyConnectPrefix):
 			c.connectRequest = true
-			c.connectHeadersComplete = strings.Contains(string(p), "\r\n\r\n")
+			c.connectHeadersComplete = bytes.Contains(p, proxyHeaderEnd)
 		case c.connectRequest && !c.connectHeadersComplete:
-			c.connectHeadersComplete = strings.Contains(string(p), "\r\n\r\n")
+			c.connectHeadersComplete = bytes.Contains(p, proxyHeaderEnd)
 		case c.connectRequest && c.connectHeadersComplete:
 			// The next write after CONNECT headers is the target TLS ClientHello.
 			// TLSHandshakeTimeout now owns that stage, so the proxy deadline must
@@ -2337,6 +2360,46 @@ func (c *Client) ProbeEgress(ctx context.Context, egress storage.EgressProfile) 
 		City:      pick("city"),
 		LatencyMS: latency,
 	}, nil
+}
+
+// ProbeEgressAuto validates an operator supplied proxy and repairs the common
+// scheme mismatch where a provider labels an HTTP CONNECT endpoint as SOCKS5
+// (the SOCKS handshake then receives the leading 'H' from an HTTP response).
+// The successful candidate is returned so callers can persist the detected type.
+func (c *Client) ProbeEgressAuto(ctx context.Context, egress storage.EgressProfile) (ProbeResult, storage.EgressProfile, error) {
+	profile := egress
+	if strings.TrimSpace(profile.Endpoint) != "" && (strings.TrimSpace(profile.Type) == "" || proxyparse.IsProxyType(profile.Type)) {
+		if endpoint, typ, err := proxyparse.NormalizeEndpoint(profile.Endpoint, profile.Type); err == nil {
+			profile.Endpoint, profile.Type = endpoint, typ
+		}
+	}
+	candidates := []storage.EgressProfile{profile}
+	if alternate, ok := AlternateEgressProfile(profile); ok {
+		candidates = append(candidates, alternate)
+	}
+	var lastErr error
+	for _, candidate := range candidates {
+		attemptCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+		result, err := c.ProbeEgress(attemptCtx, candidate)
+		cancel()
+		if err == nil {
+			return result, candidate, nil
+		}
+		lastErr = err
+	}
+	return ProbeResult{}, profile, lastErr
+}
+
+// AlternateEgressProfile returns the same endpoint using the other supported
+// proxy protocol. It is shared by health probes and admin preview probes so
+// protocol fallback stays identical across both paths.
+func AlternateEgressProfile(profile storage.EgressProfile) (storage.EgressProfile, bool) {
+	endpoint, typ, ok := proxyparse.AlternateEndpoint(profile.Endpoint, profile.Type)
+	if !ok {
+		return storage.EgressProfile{}, false
+	}
+	profile.Type, profile.Endpoint = typ, endpoint
+	return profile, true
 }
 
 func sidecarCookieKey(accountID, egressID, target, fallback string) string {

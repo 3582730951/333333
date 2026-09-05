@@ -139,6 +139,15 @@ func ParseAuthJSON(raw []byte) (ParsedAuth, error) {
 	if out.AccessToken == "" {
 		out.AccessToken = out.OpenAIAPIKey
 	}
+	// A Codex refresh token is sufficient to bootstrap an import: the API layer
+	// exchanges it for a short-lived access token before persisting the account.
+	// Keep this parser network-free so batch and Hub imports can share the same
+	// normalized shape.
+	if out.AccessToken == "" && out.OpenAIAPIKey == "" && out.RefreshToken != "" {
+		out.Provider = "codex"
+		out.AccountID = stableAccountID("refresh:" + out.RefreshToken)
+		return out, nil
+	}
 	if out.AccessToken == "" && out.OpenAIAPIKey == "" {
 		return ParsedAuth{}, errors.New("auth.json has neither tokens.access_token, access_token nor OPENAI_API_KEY")
 	}

@@ -49,8 +49,12 @@ export function isProtectedProbeQuarantine(account?: Pick<AccountRow, 'provider'
     ));
 }
 
-export function healthTestRequestBody(account?: Pick<AccountRow, 'provider' | 'auth_method'> | null, costConfirmed = false) {
-  return requiresPaidHealthTest(account) && costConfirmed ? { confirm_cost: true } : {};
+export function healthTestRequestBody(account?: Pick<AccountRow, 'provider' | 'auth_method'> | null, costConfirmed = false, model = '') {
+  const body: Record<string, unknown> = {};
+  if (requiresPaidHealthTest(account) && costConfirmed) body.confirm_cost = true;
+  const selected = String(model || '').trim();
+  if (selected) body.model = selected;
+  return body;
 }
 
 export function selectedHasKiro(accounts: AccountRow[], selectedIDs: string[]): boolean {

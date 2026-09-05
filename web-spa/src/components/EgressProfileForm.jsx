@@ -203,6 +203,12 @@ export default function EgressProfileForm({ initialValues, saving, onSubmit, get
       const values = formApi.current?.getValues?.() || initial;
       const result = await post('/admin/egress-profiles/test', { profile: profilePayload(values) });
       setTestResult(result);
+      if (result?.detected_type && result.detected_type !== values.type) {
+        formApi.current?.setValue?.('type', result.detected_type);
+        setProfileType(result.detected_type);
+        setSelectedTemplate(result.detected_type.startsWith('socks5') ? 'socks5' : 'proxy_url');
+        Toast.info(`已自动识别为 ${result.detected_type}`);
+      }
       if (result?.exit_ip) formApi.current?.setValue?.('exit_ip', result.exit_ip);
       if (result?.region) formApi.current?.setValue?.('region', result.region);
       if (Array.isArray(result?.warnings) && result.warnings.length) {

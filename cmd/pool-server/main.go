@@ -58,6 +58,7 @@ func run() int {
 	var migrateOnly bool
 	var expandOnly bool
 	var provisionAdminSetup bool
+	var bootstrapAdmin bool
 	flag.StringVar(&configPath, "config", "", "path to JSON configuration file")
 	flag.StringVar(&unixSocket, "unix-socket", "", "serve on a private Unix socket instead of the configured TCP address")
 	flag.StringVar(&releaseID, "release-id", strings.TrimSpace(os.Getenv("CODEX_POOL_RELEASE_ID")), "deployed release identifier exposed by /readyz")
@@ -66,6 +67,7 @@ func run() int {
 	flag.BoolVar(&migrateOnly, "migrate-only", false, "apply storage migrations and exit without opening listeners")
 	flag.BoolVar(&expandOnly, "expand-only", false, "with --migrate-only, permit additive/compatible schema expansion only")
 	flag.BoolVar(&provisionAdminSetup, "provision-admin-setup", false, "read a one-time admin setup token from stdin, store only its HMAC, and exit")
+	flag.BoolVar(&bootstrapAdmin, "bootstrap-admin", false, "read administrator email/password JSON from stdin and atomically create the first admin")
 	flag.Parse()
 	if selfTest {
 		fmt.Println("codex-pool-server self-test ok")
@@ -78,10 +80,17 @@ func run() int {
 		log.Printf("--expand-only requires --migrate-only")
 		return 2
 	}
-	if provisionAdminSetup {
+	if provisionAdminSetup || bootstrapAdmin {
 		if migrateOnly || expandOnly {
-			log.Printf("--provision-admin-setup cannot be combined with migration flags")
+			log.Printf("admin bootstrap flags cannot be combined with migration flags")
 			return 2
+		}
+		if provisionAdminSetup && bootstrapAdmin {
+			log.Printf("--provision-admin-setup and --bootstrap-admin are mutually exclusive")
+			return 2
+		}
+		if bootstrapAdmin {
+			return runBootstrapAdmin(configPath)
 		}
 		return runProvisionAdminSetup(configPath)
 	}

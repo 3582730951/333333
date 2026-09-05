@@ -294,6 +294,109 @@
   font-weight: 680;
 }
 
+/* Shared page rhythm: a quiet accent rail gives every view a clear starting
+   edge while leaving dense tables and forms the full content width. */
+.pool-pagehead {
+  position: relative;
+  padding-inline-start: var(--pool-space-3);
+}
+
+.pool-pagehead::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto var(--pool-space-5) 0;
+  width: 2px;
+  border-radius: var(--pool-radius-pill);
+  background: linear-gradient(180deg, var(--pool-accent), transparent);
+  opacity: 0.82;
+}
+
+.pool-pagehead-copy {
+  max-width: 78rem;
+}
+
+.pool-pagehead .sub {
+  max-width: 72ch;
+  text-wrap: pretty;
+}
+
+/* Feedback is rendered by the compositor, so a click is acknowledged before a
+   React mutation or network round trip completes. The same surface also makes
+   keyboard focus and touch input feel like one coherent control language. */
+.pool-button {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.pool-button > * {
+  position: relative;
+  z-index: 1;
+}
+
+.pool-button::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    circle at var(--pool-press-x, 50%) var(--pool-press-y, 50%),
+    var(--pool-glass-sheen), transparent 42%
+  );
+  opacity: 0;
+  transform: scale(0.45);
+  transition: opacity var(--pool-motion-fast) var(--pool-motion-ease), transform var(--pool-motion-slow) var(--pool-motion-ease);
+}
+
+.pool-button[data-pool-pressed='true']::after {
+  opacity: 0.72;
+  transform: scale(1.45);
+  transition-duration: var(--pool-motion-instant);
+}
+
+.pool-button[aria-busy='true']::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: linear-gradient(105deg, transparent 20%, var(--pool-glass-sheen) 48%, transparent 76%);
+  transform: translate3d(-120%, 0, 0);
+  animation: pool-control-sheen 1.2s var(--pool-motion-ease) infinite;
+}
+
+@keyframes pool-control-sheen {
+  to { transform: translate3d(120%, 0, 0); }
+}
+
+.pool-pagehead-actions,
+.pool-page-actions {
+  padding-top: var(--pool-space-1);
+}
+
+.pool-panel,
+.pool-card,
+.pool-chart-card {
+  transition:
+    border-color var(--pool-motion-normal) var(--pool-motion-ease),
+    background-color var(--pool-motion-normal) var(--pool-motion-ease);
+}
+
+.pool-panel:hover,
+.pool-card:hover,
+.pool-chart-card:hover {
+  border-color: var(--pool-border-strong);
+}
+
+.pool-table tbody tr {
+  transition: background-color var(--pool-motion-fast) var(--pool-motion-ease);
+}
+
+.pool-table tbody tr:focus-within {
+  background: var(--pool-bg-hover);
+}
+
 .pool-pagehead-copy .sub {
   max-width: 68ch;
   color: var(--pool-text-2);
@@ -483,4 +586,10 @@
   .pool-ambient-dot--live { animation: none; }
   .pool-kpi { transition: none; }
   .pool-kpi:hover { transform: none; }
+  .pool-panel,
+  .pool-card,
+  .pool-chart-card,
+  .pool-table tbody tr { transition: none; }
+  .pool-button::after,
+  .pool-button[aria-busy='true']::before { animation: none; transition: none; }
 }
