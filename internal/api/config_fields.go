@@ -454,7 +454,7 @@ func configFields() []configField {
 		{Key: "default_captcha_provider", Label: "默认验证码 Provider", Category: catReg, Type: fieldString, Effect: effectHot,
 			Help: "请求与自动补号未指定验证码服务时使用。", boot: func(c config.Config) interface{} { return c.DefaultCaptchaProvider }},
 		{Key: "codex_install_model", Label: "Codex 安装默认模型", Category: catReg, Type: fieldString, Effect: effectHot,
-			Help: "一键脚本写入 config.toml 的 model（默认 gpt-5.6-sol）。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.CodexInstallModel, "gpt-5.6-sol") }},
+			Help: "一键脚本写入 config.toml 的 model（默认 gpt-5.6-sol；Codex 0.153.4 起可选 gpt-6-astra）。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.CodexInstallModel, "gpt-5.6-sol") }},
 		{Key: "codex_install_effort", Label: "Codex 安装推理强度", Category: catReg, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"", "ultra", "max", "xhigh", "high", "medium", "low", "minimal"},
 			Help:    "空值=保留 Codex 配置；非空时显式写入 model_reasoning_effort。", boot: func(c config.Config) interface{} { return c.CodexInstallEffort }},

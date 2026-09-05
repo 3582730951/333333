@@ -398,6 +398,7 @@ func (s *Server) buildUpstreamErrorRuleModelOptions(ctx context.Context) (upstre
 		return b
 	}
 	chatgpt := ensure("chatgpt", "ChatGPT / Codex")
+	chatgpt.add("gpt-6", "GPT-6 系列", "gpt-6-astra", "GPT-6 Astra")
 	chatgpt.add("gpt-5", "GPT-5 系列", "gpt-5", "GPT-5")
 	chatgpt.add("gpt-5", "GPT-5 系列", "gpt-5.6-sol", "GPT-5.6 Sol")
 	chatgpt.add("gpt-5", "GPT-5 系列", "gpt-5.6-terra", "GPT-5.6 Terra")
@@ -529,6 +530,8 @@ func inferProviderForModel(model string) string {
 func familyIDForModel(provider, model string) string {
 	m := strings.ToLower(strings.TrimSpace(model))
 	switch {
+	case strings.HasPrefix(m, "gpt-6"):
+		return "gpt-6"
 	case strings.HasPrefix(m, "gpt-5"):
 		return "gpt-5"
 	case strings.HasPrefix(m, "gpt-4"):
@@ -548,6 +551,8 @@ func familyIDForModel(provider, model string) string {
 }
 func familyLabelForModel(provider, model string) string {
 	switch familyIDForModel(provider, model) {
+	case "gpt-6":
+		return "GPT-6 系列"
 	case "gpt-5":
 		return "GPT-5 系列"
 	case "gpt-4":

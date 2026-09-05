@@ -22,13 +22,15 @@ const (
 	// discovery and on version-gated live Codex requests. ChatGPT gates the returned
 	// model catalog and some live models by this value, so old preserved config
 	// values are floored to this default during normalization.
-	// Refreshed 2026-09-04 against the released codex-rs 0.152.1, 0.153.0,
-	// 0.153.1, and 0.153.2 stable tags. 0.153.2 is the newest confirmed stable
-	// release and is therefore the default. Prerelease snapshots remain evidence
-	// only and are never used as a default version.
+	// Refreshed 2026-09-05 against the released codex-rs 0.152.1, 0.153.0,
+	// 0.153.1, 0.153.2, 0.153.3, and 0.153.4 stable tags. 0.153.4 is the
+	// newest confirmed stable release and is therefore the default. The 0.153.4
+	// release keeps the established wire traits and promotes gpt-6-astra in the
+	// bundled model catalog; prerelease snapshots remain evidence only and are
+	// never used as a default version.
 	// Application-level traits for every accepted downstream version live in the
 	// codexCLIFingerprints table below.
-	DefaultClientVersion                  = "0.153.2"
+	DefaultClientVersion                  = "0.153.4"
 	DefaultStickyWaitMillis               = 100
 	DefaultStrictStickyMaxCooldownSeconds = 60
 	DefaultCooldownWaitMaxSeconds         = 30
@@ -162,7 +164,7 @@ func (s CodexTurnMetadataSchema) IncludesWindowNumber() bool {
 }
 
 // codexCLIFingerprints is the fingerprint library verified against the corresponding
-// official Codex releases. Keep newest first. The 0.151.0 through 0.153.2 rows
+// official Codex releases. Keep newest first. The 0.151.0 through 0.153.4 rows
 // are based on stable Release tags; prerelease snapshots remain intentionally
 // excluded.
 //
@@ -175,6 +177,8 @@ func (s CodexTurnMetadataSchema) IncludesWindowNumber() bool {
 //   - TurnMetadataSchema changes from pre_window_number in 0.150.1 to
 //     window_number in 0.151.0 and later.
 var codexCLIFingerprints = [...]CodexCLIFingerprint{
+	{Version: "0.153.4", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaWindowNumber},
+	{Version: "0.153.3", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaWindowNumber},
 	{Version: "0.153.2", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaWindowNumber},
 	{Version: "0.153.1", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaWindowNumber},
 	{Version: "0.153.0", RequiredBetaFeatures: "remote_compaction_v2", CodeModeToolNames: true, ParentTurnID: true, PromptCacheKeyBySession: true, TurnMetadataSchema: CodexTurnMetadataSchemaWindowNumber},

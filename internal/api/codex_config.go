@@ -73,8 +73,9 @@ func (s *Server) handleCodexConfigScript(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if model == "" {
-		// Operator-configured install default (gpt-5.6-sol). Falls back to the best probed
-		// codex model only if the configured default is blanked out.
+		// Operator-configured install default (gpt-5.6-sol). The 0.153.4 catalog also
+		// exposes gpt-6-astra; operators may select it explicitly. Falls back to the
+		// best probed Codex model only if the configured default is blanked out.
 		model = strings.TrimSpace(s.settingString(r.Context(), "codex_install_model", s.cfg.CodexInstallModel))
 	}
 	if model == "" {

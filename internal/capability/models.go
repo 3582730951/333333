@@ -34,6 +34,12 @@ const (
 	GPT56ContextWindow         = int64(372000)
 	GPT56AutoCompactTokenLimit = int64(334800)
 	GPT56EffectivePercent      = int64(100)
+	// GPT-6 Astra is visible and API-supported starting with Codex CLI 0.153.4.
+	// Its bundled catalog declares a 272K standard window and an 872K technical
+	// maximum; auto_compact_token_limit is intentionally absent (the client owns
+	// that policy), so this model must not inherit the fixed GPT-5.6 contract.
+	GPT6AstraContextWindow    = int64(272000)
+	GPT6AstraMaxContextWindow = int64(872000)
 )
 
 // RequestedClaudeModel separates the downstream model spelling from the model
@@ -858,9 +864,12 @@ type codexStaticModel struct {
 // codexStaticModels is the current-generation Codex model catalog advertised when
 // the live ChatGPT /models probe is unavailable (network/auth failure). Mirrored
 // from the official Codex CLI bundled model catalog; only client-visible models are
-// listed (the hidden codex-auto-review preset is omitted). Ordered most-capable
-// first. The live probe — when it works — is authoritative and supersedes this.
+// listed (the hidden daybreak and codex-auto-review presets are omitted). The
+// 0.153.4 release made gpt-6-astra visible; its model-level feature contract is
+// recorded below. Ordered most-capable first. The live probe — when it works — is
+// authoritative and supersedes this.
 var codexStaticModels = []codexStaticModel{
+	{slug: "gpt-6-astra", window: GPT6AstraContextWindow, maxWindow: GPT6AstraMaxContextWindow, minimumClientVersion: "0.153.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
 	{slug: "gpt-5.6-sol", window: GPT56ContextWindow, maxWindow: GPT56ContextWindow, autoCompactTokenLimit: GPT56AutoCompactTokenLimit, overrideClientContext: true, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
 	{slug: "gpt-5.6-terra", window: GPT56ContextWindow, maxWindow: GPT56ContextWindow, autoCompactTokenLimit: GPT56AutoCompactTokenLimit, overrideClientContext: true, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
 	{slug: "gpt-5.6-luna", window: GPT56ContextWindow, maxWindow: GPT56ContextWindow, autoCompactTokenLimit: GPT56AutoCompactTokenLimit, overrideClientContext: true, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}},

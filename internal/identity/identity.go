@@ -33,11 +33,11 @@ import (
 
 // Current official client versions. Kept here so a single edit updates the
 // fingerprint everywhere. These should track the real shipping clients.
-// Refreshed 2026-09-04: Claude values remain from the shipping 2.1.236–2.1.241
+// Refreshed 2026-09-05: Claude values remain from the shipping 2.1.236–2.1.241
 // binaries. Codex wire values were rechecked against the released rust-v0.152.1,
-// rust-v0.153.0, rust-v0.153.1, and rust-v0.153.2 tags. The default is the newest
-// confirmed stable 0.153.2; prerelease snapshots are not selected as a client
-// version. Trait decisions are traceable to that released line set: core/src/
+// rust-v0.153.0 through rust-v0.153.4 tags. The default is the newest confirmed
+// stable 0.153.4; prerelease snapshots are not selected as a client version.
+// Trait decisions are traceable to that released line set: core/src/
 // session/mod.rs:1065-1084 plus features/src/lib.rs:1190-1198, :1620-1635,
 // :1656-1659 keep the default beta header at remote_compaction_v2; core/src/
 // responses_metadata.rs:38-39, :400-412 keeps code_mode_tool_names as a legacy
@@ -58,8 +58,8 @@ const (
 	CodexOriginatorVSCode = "codex_vscode"
 	// CodexJA3 is the TLS ClientHello fingerprint (ja3 string) captured from the real
 	// Codex (Rust) binary against api.openai.com — ja3 hash 69d274b521896ab1d71737c4d804e22c
-	// (/tmp/pool-capture-20260710/manifest.json; the 2026-09-01 check against
-	// codex-rs 0.153.0-alpha.2 at commit 73919571 still finds stock
+	// (/tmp/pool-capture-20260710/manifest.json; the 2026-09-05 check against
+	// codex-rs rust-v0.153.4 at commit 3d2ee51c confirms stock
 	// reqwest/rustls without ClientHello customization).
 	// It is REFERENCE DATA, not a default or an alias target: verified against the Codex
 	// source (other_codex), the real client does NO JA3 spoofing — it builds a stock
