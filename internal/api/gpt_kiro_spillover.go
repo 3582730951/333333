@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log"
@@ -45,8 +46,10 @@ func (s *Server) tryServeAutoKiroGPT(w http.ResponseWriter, r *http.Request, raw
 	// Kiro accepts self-contained conversation history, not native Codex response
 	// state. A previous_response_id / turn-state must stay on its account-bound
 	// Codex route. Compaction and WebSocket requests are likewise handled by the
-	// native Codex path only.
-	if isCompact || (!isChat && r.URL.Path != "/v1/responses") || serverSideStateWithMeta(r.URL.Path, r, raw, meta) {
+	// native Codex path only. Plan Mode also stays native: its collaboration
+	// marker controls Codex's native planning/reasoning behavior and cannot be
+	// represented losslessly by the Chat/Anthropic compatibility bridge.
+	if isCompact || codexPlanModeRequest(raw) || (!isChat && r.URL.Path != "/v1/responses") || serverSideStateWithMeta(r.URL.Path, r, raw, meta) {
 		return false
 	}
 	kiroCfg := s.effectiveKiroConfig(r.Context())
@@ -151,6 +154,15 @@ func (s *Server) tryServeAutoKiroGPT(w http.ResponseWriter, r *http.Request, raw
 	s.kiroChatWithLease(writer, r, bridge.anthropicBody, resolvedKiroModel, affinity, lease, false, nil)
 	writer.finish()
 	return true
+}
+
+const codexPlanModeMarker = "<collaboration_mode>plan</collaboration_mode>"
+
+// codexPlanModeRequest identifies the official Codex plan-mode developer item.
+// Keep this as an allocation-free marker scan because raw is already the
+// captured request body and this check runs on every eligible GPT request.
+func codexPlanModeRequest(raw []byte) bool {
+	return bytes.Contains(raw, []byte(codexPlanModeMarker))
 }
 
 func autoKiroGPTModelForCodex(model string) (string, bool) {
