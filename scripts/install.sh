@@ -1588,21 +1588,25 @@ run_expand_only_migration() {
 }
 
 provision_admin_setup() {
-  local binary="${RELEASE_DIR%/}/${APP_NAME}" output
+  local binary="${RELEASE_DIR%/}/${APP_NAME}" output safe_output provision_status
   [[ -x "$binary" ]] || die "admin setup provisioning binary is missing: ${binary}"
   ADMIN_SETUP_TOKEN="$(generate_admin_setup_token)"
   [[ ${#ADMIN_SETUP_TOKEN} -ge 64 ]] || die "CSPRNG returned a short admin setup token"
-  output="$({ printf '%s\n' "$ADMIN_SETUP_TOKEN" | run_service env \
+  if output="$({ printf '%s\n' "$ADMIN_SETUP_TOKEN" | run_service env \
     CODEX_POOL_DATABASE="$DATABASE_PATH" \
     CODEX_POOL_MIGRATE_USER_GROUPS="$MIGRATE_USER_GROUPS" \
     CODEX_POOL_DATA_DIR="${DATA_DIR%/}/data" \
     CODEX_POOL_MASTER_KEY_FILE="${DATA_DIR%/}/data/keys/master.key" \
     CODEX_POOL_IDENTITY_KEY_FILE="${DATA_DIR%/}/data/keys/identity.key" \
     CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE="${DATA_DIR%/}/data/keys/diagnostic-alias.key" \
-    "$binary" --config "$CONFIG_FILE" --provision-admin-setup; } 2>&1)" || {
-      ADMIN_SETUP_TOKEN=""
-      die "one-time admin setup provisioning failed"
-    }
+    "$binary" --config "$CONFIG_FILE" --provision-admin-setup; } 2>&1)"; then
+    :
+  else
+    provision_status=$?
+    safe_output="${output//$ADMIN_SETUP_TOKEN/[redacted]}"
+    ADMIN_SETUP_TOKEN=""
+    die "one-time admin setup provisioning failed (exit ${provision_status}): ${safe_output:-no diagnostic output}"
+  fi
   case "$output" in
     *'"admin_setup":"provisioned"'*)
       ADMIN_SETUP_PROVISIONED=1
@@ -1612,8 +1616,9 @@ provision_admin_setup() {
       ADMIN_SETUP_TOKEN=""
       ;;
     *)
+      safe_output="${output//$ADMIN_SETUP_TOKEN/[redacted]}"
       ADMIN_SETUP_TOKEN=""
-      die "admin setup provisioner returned an unrecognized status"
+      die "admin setup provisioner returned an unrecognized status: ${safe_output:-no diagnostic output}"
       ;;
   esac
 }
