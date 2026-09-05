@@ -42,7 +42,10 @@
 #   SKIP_BACKUP=1 (skip the DB backup — only if you back up yourself),
 #   CLEAN_BUILD_CACHE=1 (wipe the Go build cache even without disk pressure),
 #   CLEAN_MODCACHE=1 (also wipe the Go module cache),
-#   CLEAN_NPM_CACHE=1 (also wipe the npm download cache for the node registrar).
+#   CLEAN_NPM_CACHE=1 (also wipe the npm download cache for the node registrar),
+#   BACKUP_TIMEOUT_SECONDS (default 300; bound each SQLite/gzip backup operation),
+#   BACKUP_LOCK_TIMEOUT_MS (default 5000; maximum SQLite busy-lock wait),
+#   BACKUP_GZIP_LEVEL (default 1; use 1-9 when trading CPU for a smaller snapshot).
 set -Eeuo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,6 +72,12 @@ DEPLOY_LOCK_FILE="${DEPLOY_LOCK_FILE:-/var/lock/codex-pool-install.lock}"
 BACKUP=""
 BEFORE=""
 AFTER=""
+# A backup must never wait forever or monopolize a small VPS. Keep the defaults
+# conservative; operators with very large databases can raise the timeout
+# explicitly after checking available disk and CPU headroom.
+BACKUP_TIMEOUT_SECONDS="${BACKUP_TIMEOUT_SECONDS:-300}"
+BACKUP_LOCK_TIMEOUT_MS="${BACKUP_LOCK_TIMEOUT_MS:-5000}"
+BACKUP_GZIP_LEVEL="${BACKUP_GZIP_LEVEL:-1}"
 
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
@@ -289,6 +298,38 @@ count_accounts() {
 # file_size prints a file's size in bytes (0 if absent).
 file_size() { run_root stat -c %s "$1" 2>/dev/null || echo 0; }
 
+# Run one potentially expensive backup operation with a bounded wall clock and a
+# low scheduler/I/O priority. A busy or undersized VPS must remain usable while an
+# update is being attempted; a timeout returns a clear, recoverable error instead
+# of leaving the operator's shell waiting indefinitely.
+backup_command() {
+  local timeout_seconds="${BACKUP_TIMEOUT_SECONDS:-300}"
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] ||
+    die "BACKUP_TIMEOUT_SECONDS must be a positive integer"
+
+  local -a command=("$@")
+  if command -v nice >/dev/null 2>&1; then
+    command=(nice -n 19 "${command[@]}")
+  fi
+  if command -v ionice >/dev/null 2>&1; then
+    command=(ionice -c 3 "${command[@]}")
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    # Keep the command in timeout's managed process group. `--foreground` looks
+    # friendlier for interactive jobs, but it can leave a nested gzip/sqlite3
+    # child alive after the shell wrapper is timed out. A short kill-after grace
+    # period gives SQLite/gzip time to clean up, then removes any straggler.
+    if timeout --help 2>&1 | grep -q -- '--kill-after'; then
+      command=(timeout --kill-after=5s "${timeout_seconds}s" "${command[@]}")
+    else
+      command=(timeout "${timeout_seconds}s" "${command[@]}")
+    fi
+  else
+    die "timeout is required for bounded database backups; install coreutils and retry"
+  fi
+  run_root "${command[@]}"
+}
+
 backup_pair_equal() {
   local left="$1" right="$2" left_wal="${1%.gz}-wal.gz" right_wal="${2%.gz}-wal.gz"
   [[ -f "$left" && -f "$right" ]] || return 1
@@ -370,7 +411,12 @@ prune_backups() {
 # than risk filling the disk or deploying without a safety net. 200-300 accounts is
 # tiny for SQLite; this guard matters when the history DB grows large.
 backup_db() {
-  local db="$1" dir ts tmp dest dbsize wal free need previous fs_total reserve reserve_percent
+  local db="$1" dir ts tmp dest dbsize wal free need previous fs_total reserve reserve_percent df_output
+  local lock_timeout_ms="${BACKUP_LOCK_TIMEOUT_MS:-5000}" gzip_level="${BACKUP_GZIP_LEVEL:-1}"
+  [[ "$lock_timeout_ms" =~ ^[0-9]+$ ]] ||
+    die "BACKUP_LOCK_TIMEOUT_MS must be a non-negative integer"
+  [[ "$gzip_level" =~ ^[1-9]$ ]] ||
+    die "BACKUP_GZIP_LEVEL must be an integer from 1 to 9"
   if [[ ! -f "$db" ]]; then
     warn "no existing database at ${db} — treating this as a fresh install (nothing to back up)"
     return 0
@@ -379,18 +425,24 @@ backup_db() {
     warn "SKIP_BACKUP=1 — 跳过账号库备份（请确保你已自行备份 ${db}）"
     return 0
   fi
+  command -v timeout >/dev/null 2>&1 ||
+    die "timeout is required for bounded database backups; install coreutils and retry"
+  log "Preparing accounts DB backup: ${db}"
   dir="${BACKUP_DIR:-$(dirname "$db")/backups}"
   run_root install -d -m 0750 "$dir"
-
-  # Prune first, not after allocating another full SQLite snapshot. This bounds
-  # repeated updates even when an earlier backup already reached the count/age cap.
-  prune_backups "$dir" precreate
 
   dbsize=$(file_size "$db")
   wal=$(file_size "${db}-wal")
   dbsize=$(( dbsize + wal ))
-  free=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2{printf "%.0f", $4*1024}')
-  fs_total=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2{printf "%.0f", $2*1024}')
+  if command -v timeout >/dev/null 2>&1; then
+    df_output="$(timeout 10s df -Pk "$dir" 2>/dev/null || true)"
+  else
+    df_output="$(df -Pk "$dir" 2>/dev/null || true)"
+  fi
+  free="$(printf '%s\n' "$df_output" | awk 'NR==2{printf "%.0f", $4*1024}')"
+  fs_total="$(printf '%s\n' "$df_output" | awk 'NR==2{printf "%.0f", $2*1024}')"
+  [[ "$free" =~ ^[0-9]+$ && "$fs_total" =~ ^[0-9]+$ ]] ||
+    die "无法读取备份目录的磁盘容量，已停止更新以避免在未知空间状态下写入快照：${dir}"
   need=$(( dbsize * 13 / 10 + 1048576 )) # temp .backup (~1x) + gzip output + 1MB headroom
   reserve="${INSTALL_FREE_RESERVE_MIN_BYTES:-536870912}"
   reserve_percent="${INSTALL_FREE_RESERVE_PERCENT:-10}"
@@ -401,22 +453,48 @@ backup_db() {
     local percent_bytes=$(( fs_total * reserve_percent / 100 ))
     (( percent_bytes <= reserve )) || reserve="$percent_bytes"
   fi
-  if [[ -n "$free" && "$free" -gt 0 && "$free" -lt $((need + reserve)) ]]; then
+  if [[ "$free" -lt $((need + reserve)) ]]; then
     die "备份空间不足：账号库≈$(human "$dbsize")，快照峰值≈$(human "$need")，更新后必须保留$(human "$reserve")，当前可用$(human "$free")。请先清理磁盘或把 BACKUP_DIR 指向更大分区。"
   fi
+
+  # Prune only after the cheap size/space preflight. If the filesystem is already
+  # unhealthy, scanning a large backup directory first can make the VPS appear
+  # frozen before the operator ever sees the actionable space error. This still
+  # runs before allocating another full SQLite snapshot, preserving the backup
+  # count/age bound during repeated updates.
+  prune_backups "$dir" precreate
 
   ts="$(date -u +%Y%m%d-%H%M%S)-$(date +%N 2>/dev/null || printf '%09d' "$$")"
   tmp="${dir}/.pool-${ts}.tmp"
   dest="${dir}/pool-${ts}.sqlite3.gz"
   if command -v sqlite3 >/dev/null 2>&1; then
     # Online .backup is consistent even while the service is running (WAL-safe),
-    # then we compress and drop the uncompressed temp.
-    run_root sqlite3 "$db" ".backup '${tmp}'"
-    run_root sh -c "gzip -n -c '${tmp}' > '${dest}'"
-    run_root rm -f "${tmp}"
+    # then we compress and drop the uncompressed temp. Both operations have an
+    # independent deadline; `.timeout` bounds lock contention before the outer
+    # wall-clock guard handles a stalled filesystem or unexpectedly large database.
+    log "Creating consistent SQLite snapshot (lock wait <=${lock_timeout_ms}ms, timeout ${BACKUP_TIMEOUT_SECONDS}s)"
+    if ! backup_command sqlite3 "$db" ".timeout ${lock_timeout_ms}" ".backup '${tmp}'"; then
+      run_root rm -f -- "$tmp" "$dest"
+      die "SQLite 数据库备份失败或超时（${BACKUP_TIMEOUT_SECONDS}s）：${db}。请检查数据库锁/磁盘；确认有独立备份后可用 SKIP_BACKUP=1 重试。"
+    fi
+    log "Compressing SQLite snapshot (gzip -${gzip_level}, timeout ${BACKUP_TIMEOUT_SECONDS}s)"
+    if ! backup_command sh -c 'gzip -n "-${3}" -c -- "$1" >"$2"' _ "$tmp" "$dest" "$gzip_level"; then
+      run_root rm -f -- "$tmp" "$dest"
+      die "SQLite 快照压缩失败或超时（${BACKUP_TIMEOUT_SECONDS}s）：${dest}。请检查磁盘空间/IO 后重试。"
+    fi
+    run_root rm -f -- "$tmp"
   else
-    run_root sh -c "gzip -n -c '${db}' > '${dest}'"
-    [[ -f "${db}-wal" ]] && run_root sh -c "gzip -n -c '${db}-wal' > '${dest%.gz}-wal.gz'" || true
+    log "Compressing SQLite file directly (gzip -${gzip_level}, timeout ${BACKUP_TIMEOUT_SECONDS}s)"
+    if ! backup_command sh -c 'gzip -n "-${3}" -c -- "$1" >"$2"' _ "$db" "$dest" "$gzip_level"; then
+      run_root rm -f -- "$dest"
+      die "SQLite 文件备份失败或超时（${BACKUP_TIMEOUT_SECONDS}s）：${db}。"
+    fi
+    if [[ -f "${db}-wal" ]]; then
+      if ! backup_command sh -c 'gzip -n "-${3}" -c -- "$1" >"$2"' _ "${db}-wal" "${dest%.gz}-wal.gz" "$gzip_level"; then
+        run_root rm -f -- "$dest" "${dest%.gz}-wal.gz"
+        die "SQLite WAL 备份失败或超时（${BACKUP_TIMEOUT_SECONDS}s）：${db}-wal。"
+      fi
+    fi
   fi
 
   previous="$(find "$dir" -maxdepth 1 -type f -name 'pool-*.sqlite3.gz' ! -path "$dest" -print 2>/dev/null | sort -r | head -1)"
