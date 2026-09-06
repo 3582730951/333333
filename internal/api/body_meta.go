@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -97,9 +99,30 @@ func streamRequestWithMeta(raw []byte, meta *bodysource.BodyMeta) bool {
 
 func modelWithMeta(raw []byte, meta *bodysource.BodyMeta) string {
 	if meta != nil {
-		return meta.Model
+		// A scanner created by an older caller may not have captured the model.
+		// Keep the metadata fast path, but preserve the parser fallback instead of
+		// silently producing an empty model dimension in cache affinity.
+		if model := strings.TrimSpace(meta.Model); model != "" {
+			return model
+		}
 	}
 	return routing.Model(raw)
+}
+
+func conversationAnchorWithMeta(raw []byte, meta *bodysource.BodyMeta) string {
+	if meta != nil && meta.Size == int64(len(raw)) {
+		span := meta.FirstUserInputItem
+		if span.Length > 0 && span.Offset >= 0 && span.Offset <= int64(len(raw)) && span.Length <= int64(len(raw))-span.Offset {
+			var item interface{}
+			if json.Unmarshal(raw[span.Offset:span.Offset+span.Length], &item) == nil {
+				if encoded, err := json.Marshal(item); err == nil {
+					sum := sha256.Sum256(encoded)
+					return hex.EncodeToString(sum[:])[:16]
+				}
+			}
+		}
+	}
+	return routing.ConversationAnchor(raw)
 }
 
 func promptCacheKeyWithMeta(raw []byte, meta *bodysource.BodyMeta) string {

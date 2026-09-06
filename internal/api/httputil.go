@@ -964,15 +964,22 @@ func codexSelectionAffinityWithMeta(r *http.Request, raw []byte, meta *bodysourc
 	}
 	if meta != nil && meta.Size == int64(len(raw)) && meta.InputItemCount > 0 && meta.LastInputRole != "user" {
 		// StablePromptPrefixFingerprint requires the final input item to be a user
-		// turn. The streaming scanner already observed the top-level item role, so
-		// avoid materializing a 128K-1M tool/assistant-ended history only to reject it.
+		// turn. The scanner still captured the first user item, so keep the
+		// conversation-level cache affinity without materializing a 128K-1M history.
+		if anchor := conversationAnchorWithMeta(raw, meta); anchor != "" {
+			model := modelWithMeta(raw, meta)
+			return routing.AffinityFromKey(strings.Join([]string{"cache_prefix", strings.TrimSpace(group), model, "conversation:" + anchor}, ":"), "cache_prefix_hash")
+		}
 		return base
 	}
 	prefixHash := automaticPromptCachePrefixHash(raw)
 	if prefixHash == "" {
 		return base
 	}
-	model := routing.Model(raw)
+	// BodyMeta already captured the top-level model while the request body was
+	// streamed. Reusing it avoids a second full-body scan on large Codex turns;
+	// fall back to the parser only for callers that do not have metadata.
+	model := modelWithMeta(raw, meta)
 	return routing.AffinityFromKey(strings.Join([]string{"cache_prefix", strings.TrimSpace(group), model, prefixHash}, ":"), "cache_prefix_hash")
 }
 
@@ -980,6 +987,11 @@ func codexRequestUsageDiagnostics(body []byte, meta *bodysource.BodyMeta, affini
 	stableSource, stableReason, stableBytes := "", "", 0
 	if meta != nil && meta.Size == int64(len(body)) && len(body) > 128<<10 && meta.StablePrefixHMAC != "" {
 		stableSource, stableReason, stableBytes = "body_meta_hmac", "bounded_large_body", int(meta.StablePrefixBytes)
+	} else if meta != nil && meta.Size == int64(len(body)) && meta.InputItemCount > 0 && meta.LastInputRole != "user" {
+		// The scanner already knows why a stable prefix cannot be derived for an
+		// assistant/tool-ended turn. Do not decode a potentially multi-megabyte
+		// body again just to report the same reason.
+		stableSource, stableReason = "body_meta", "final_turn_not_user"
 	} else {
 		fp := routing.StablePromptPrefixFingerprint(body)
 		stableSource, stableReason, stableBytes = fp.Source, fp.Reason, fp.PrefixBytes

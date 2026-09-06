@@ -258,8 +258,8 @@ internal/console/dist/assets/Charts-B9Os2QGL.js
 internal/console/dist/assets/Charts-B9Os2QGL.js.br
 internal/console/dist/assets/CloudflareMailbox-DsuiqJv4.js
 internal/console/dist/assets/CloudflareMailbox-DsuiqJv4.js.br
-internal/console/dist/assets/CodexThreads-oJOXqDXk.js
-internal/console/dist/assets/CodexThreads-oJOXqDXk.js.br
+internal/console/dist/assets/CodexThreads-DO7G3d8q.js
+internal/console/dist/assets/CodexThreads-DO7G3d8q.js.br
 internal/console/dist/assets/CopyCodeBlock-C02tEDYm.js
 internal/console/dist/assets/CopyCodeBlock-C02tEDYm.js.br
 internal/console/dist/assets/Dashboard-CzfIUDP_.js
@@ -477,8 +477,8 @@ internal/console/dist/assets/hooks-B-YwFTV6.js
 internal/console/dist/assets/hooks-B-YwFTV6.js.br
 internal/console/dist/assets/i18n-XJT208xU.js
 internal/console/dist/assets/i18n-XJT208xU.js.br
-internal/console/dist/assets/index-BQmD5MFn.js
-internal/console/dist/assets/index-BQmD5MFn.js.br
+internal/console/dist/assets/index-6fCD_ZUT.js
+internal/console/dist/assets/index-6fCD_ZUT.js.br
 internal/console/dist/assets/index-U6jqnsZc.css
 internal/console/dist/assets/index-U6jqnsZc.css.br
 internal/console/dist/assets/jsx-runtime-C_F8u2c9.js

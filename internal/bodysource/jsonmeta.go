@@ -87,6 +87,9 @@ type BodyMeta struct {
 	Kinds                 map[string]byte   `json:"-"`
 	Scalars               map[string][]byte `json:"-"`
 	FirstInputItem        Span              `json:"-"`
+	// FirstUserInputItem lets cache-affinity callers hash one captured item when
+	// the final input item is assistant/tool output and the full body is large.
+	FirstUserInputItem Span `json:"-"`
 }
 
 var trackedJSONFields = map[string]struct{}{
@@ -580,6 +583,9 @@ func (s *jsonMetaScanner) scanInputArray(depth int) error {
 		if first {
 			s.meta.FirstInputItem = Span{Offset: start, Length: s.offset - start}
 			first = false
+		}
+		if s.meta.FirstUserInputItem.Length == 0 && strings.TrimSpace(s.inputRole) == "user" {
+			s.meta.FirstUserInputItem = Span{Offset: start, Length: s.offset - start}
 		}
 		if err := s.skipSpace(); err != nil {
 			return err
