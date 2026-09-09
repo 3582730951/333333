@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 )
@@ -795,7 +794,6 @@ func egressRPMBalancePolicyActive(ctx context.Context, route Route, binding stor
 		!policy.Fresh || policy.Bound || !policy.OnlyAccountPoolTier ||
 		storage.NormalizeAgentClass(policy.AgentClass) != storage.AgentClassRoot ||
 		route.NoEgressFallback || route.ServerSideState || route.ImmutableAffinity || route.FairScheduling ||
-		routing.IsTrueConversationAffinity(route.Affinity) ||
 		strings.TrimSpace(route.RequiredAccountID) != "" || strings.TrimSpace(route.RequiredEgressID) != "" ||
 		strings.EqualFold(strings.TrimSpace(binding.BindingScope), storage.EgressBindingScopeAccount) {
 		return DynamicPoolBalancePolicy{}, false

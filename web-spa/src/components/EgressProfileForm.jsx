@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { t } from '../lib/i18n.js';
 
 import { Button, Form, Tag, Toast, Typography } from './pool/index.jsx';
 import { IconPulse, IconRefresh } from './pool/icons.jsx';
@@ -276,7 +277,7 @@ export default function EgressProfileForm({ initialValues, saving, onSubmit, get
 
       <div className="pool-egress-form-grid">
         <Form.Input field="id" label="ID" disabled={Boolean(initialValues?.id)} placeholder="egress_xxx" />
-        <Form.Input field="name" label="名称" placeholder="cliproxy BR residential" />
+        <Form.Input field="name" label={t('copy.name')} placeholder="cliproxy BR residential" />
       </div>
 
       <div className="pool-egress-form-grid">

@@ -37,8 +37,12 @@ const groupAPI = read('features/groups/api/groups.ts');
 if (!/\/admin\/egress-profiles/.test(groups) && !/\/admin\/egress-profiles/.test(groupAPI)) {
   problems.push('Groups page must load /admin/egress-profiles.');
 }
-if (!/egress_ids:\s*selectedEgress\s*\?\s*\[selectedEgress\]\s*:\s*\[\]/.test(groups) || /OrderedEgressSelect/.test(groups)) {
-  problems.push('Groups page must submit exactly zero or one inference egress.');
+const accountGroupEditor = groups.slice(groups.indexOf('function AccountGroupEditor('), groups.indexOf('\nfunction ', groups.indexOf('function AccountGroupEditor(') + 1));
+if (!/egress_ids:\s*selectedEgress\s*\?\s*\[selectedEgress\]\s*:\s*\[\]/.test(accountGroupEditor) || /OrderedEgressSelect/.test(accountGroupEditor)) {
+  problems.push('Account-pool group editor must submit exactly zero or one inference egress.');
+}
+if (!/<OrderedEgressSelect[\s\S]*?value=\{draft\.egress_rpm_balance_egress_ids\}/.test(groups)) {
+  problems.push('User-group RPM balancing must expose the configured egress order.');
 }
 if (!/账号详情中单独指定的出口优先/.test(groups) || !/统一使用这一个出口/.test(groups)) {
   problems.push('Groups page must explain single-outlet inheritance and account override precedence.');

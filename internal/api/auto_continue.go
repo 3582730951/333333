@@ -182,6 +182,9 @@ func (s *scrubbingFrameWriter) relay(frame []byte) error {
 	} else {
 		if s.provider == "codex" {
 			out, _ = leakfilter.NeutralizeResponsesContextErrorSSEFrame(out)
+			if failure, ok := leakfilter.ParseCodexFailureFrame(out); ok && leakfilter.IsModelCapacityError(failure.StatusCode, failure.Body) {
+				out, _ = leakfilter.NeutralizeCodexRetryableFailureSSEFrame(out)
+			}
 		}
 		if s.words != nil && !s.words.Empty() {
 			out = s.words.ReplaceAll(out)

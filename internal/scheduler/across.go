@@ -62,12 +62,7 @@ func (s *Scheduler) SelectAcross(ctx context.Context, choices []RouteChoice) (Ro
 	}
 
 	normalized := make([]RouteChoice, 0, len(choices))
-	egressPolicy, hasEgressPolicy := dynamicPoolBalancePolicyFromContext(ctx)
 	var egressOrder []string
-	if hasEgressPolicy && egressPolicy.Enabled && egressPolicy.EgressRPMBalanceEnabled &&
-		egressPolicy.EgressRPMBalanceThreshold > 0 && s.dynamicBalance != nil {
-		egressOrder = s.orderedEgressRPMIDs(ctx, egressPolicy, Route{}, storage.AccountEgressBinding{}, storage.Now())
-	}
 	seenChoices := make(map[string]struct{}, len(choices))
 	for index, choice := range choices {
 		choice.ChoiceKey = strings.TrimSpace(choice.ChoiceKey)
@@ -77,9 +72,9 @@ func (s *Scheduler) SelectAcross(ctx context.Context, choices []RouteChoice) (Ro
 		if _, duplicate := seenChoices[choice.ChoiceKey]; duplicate {
 			return RoutedLease{}, fmt.Errorf("duplicate route choice key %q", choice.ChoiceKey)
 		}
-		if hasEgressPolicy && egressPolicy.Enabled && egressPolicy.EgressRPMBalanceEnabled && egressPolicy.Fresh && !egressPolicy.Bound && egressPolicy.OnlyAccountPoolTier && storage.NormalizeAgentClass(egressPolicy.AgentClass) == storage.AgentClassRoot && len(egressPolicy.EgressRPMBalanceEgressIDs) > 0 && !choice.Route.ImmutableAffinity && choice.Route.RequiredEgressID == "" && !choice.Route.ServerSideState && !choice.Route.FairScheduling {
+		if policy, eligible := egressRPMBalancePolicyActive(ctx, choice.Route, storage.AccountEgressBinding{}); eligible {
 			if len(egressOrder) == 0 {
-				egressOrder = egressPolicy.EgressRPMBalanceEgressIDs
+				egressOrder = s.orderedEgressRPMIDs(ctx, policy, choice.Route, storage.AccountEgressBinding{}, storage.Now())
 			}
 			choice.Route.PreferredEgressIDs = append([]string(nil), egressOrder...)
 		}
@@ -226,6 +221,9 @@ func (s *Scheduler) normalizeAcrossRoute(ctx context.Context, route *Route) erro
 	if route.NoEgressFallback {
 		route.ImmutableAffinity = true
 	}
+	if route.Group == "" {
+		route.Group = s.Config().DefaultGroup
+	}
 	if len(route.PreferredEgressIDs) > 0 {
 		if _, active := egressRPMBalancePolicyActive(ctx, *route, storage.AccountEgressBinding{}); active {
 			return nil
@@ -234,9 +232,6 @@ func (s *Scheduler) normalizeAcrossRoute(ctx context.Context, route *Route) erro
 		// account-pool group's primary outlet unless the explicit user-group RPM
 		// policy is active.
 		route.PreferredEgressIDs = nil
-	}
-	if route.Group == "" {
-		route.Group = s.Config().DefaultGroup
 	}
 	egressID, err := s.groupPrimaryEgressID(ctx, route.Group)
 	if err != nil {

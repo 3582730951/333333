@@ -25,10 +25,14 @@ function initialValuesKey(initValues) {
 
 function validateField(value, rules = []) {
   for (const rule of rules) {
-    if (rule?.required && (value === undefined || value === null || value === '')) {
+    const empty = value === undefined
+      || value === null
+      || (typeof value === 'string' && value.trim() === '')
+      || (Array.isArray(value) && value.length === 0);
+    if (rule?.required && empty) {
       return rule.message || '必填';
     }
-    if (value === undefined || value === null || value === '') continue;
+    if (empty) continue;
     const text = String(value);
     if (rule?.type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) {
       return rule.message || '邮箱格式无效';
@@ -207,7 +211,7 @@ function normalizeOptions(optionList = []) {
   });
 }
 
-function SearchableSingleSelect({ controlId, options, current, setCurrent, placeholder, className, style, emptyContent, disabled, ariaLabel }) {
+function SearchableSingleSelect({ controlId, options, current, setCurrent, placeholder, className, style, emptyContent, disabled, ariaLabel, ariaInvalid, ariaDescribedBy }) {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
@@ -306,6 +310,8 @@ function SearchableSingleSelect({ controlId, options, current, setCurrent, place
           aria-expanded={open}
           aria-controls={listboxId}
           aria-activedescendant={open ? activeOptionId : undefined}
+          aria-invalid={ariaInvalid || undefined}
+          aria-describedby={ariaDescribedBy || undefined}
           aria-disabled={disabled || undefined}
           aria-label={ariaLabel || placeholder || '选项'}
           disabled={disabled}
@@ -386,7 +392,7 @@ function SearchableSingleSelect({ controlId, options, current, setCurrent, place
   );
 }
 
-function MultiSelectControl({ controlId, options, current, setCurrent, placeholder, className, style, filter, emptyContent, maxTagCount, disabled, ariaLabel }) {
+function MultiSelectControl({ controlId, options, current, setCurrent, placeholder, className, style, filter, emptyContent, maxTagCount, disabled, ariaLabel, ariaInvalid, ariaDescribedBy }) {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
@@ -472,6 +478,8 @@ function MultiSelectControl({ controlId, options, current, setCurrent, placehold
           aria-expanded={open}
           aria-controls={listboxId}
           aria-activedescendant={open ? activeOptionId : undefined}
+          aria-invalid={ariaInvalid || undefined}
+          aria-describedby={ariaDescribedBy || undefined}
           aria-disabled={disabled || undefined}
           aria-label={ariaLabel}
           tabIndex={disabled ? -1 : 0}
@@ -572,6 +580,9 @@ export function SelectInput({ field, label, help, rules, value, onChange, option
   const controlId = props.id || (field ? `pool-field-${field}-${generatedId}` : generatedId);
   const options = normalizeOptions(optionList);
   const [current, setCurrent] = useField(field, rules, value, onChange, initValue);
+  const fieldError = useContext(FormContext)?.errors?.[field] || '';
+  const describedBy = [props['aria-describedby'], fieldError ? `${controlId}-error` : help ? `${controlId}-help` : ''].filter(Boolean).join(' ') || undefined;
+  const ariaInvalid = props['aria-invalid'] ?? (fieldError ? true : undefined);
   if (multiple) {
     const control = (
       <MultiSelectControl
@@ -587,6 +598,8 @@ export function SelectInput({ field, label, help, rules, value, onChange, option
         maxTagCount={maxTagCount}
         disabled={props.disabled}
         ariaLabel={props['aria-label']}
+        ariaInvalid={ariaInvalid}
+        ariaDescribedBy={describedBy}
       />
     );
     if (!field && !label) return control;
@@ -605,6 +618,8 @@ export function SelectInput({ field, label, help, rules, value, onChange, option
         emptyContent={emptyContent}
         disabled={props.disabled}
         ariaLabel={props['aria-label'] || label}
+        ariaInvalid={ariaInvalid}
+        ariaDescribedBy={describedBy}
       />
     );
     if (!field && !label) return control;
@@ -622,6 +637,8 @@ export function SelectInput({ field, label, help, rules, value, onChange, option
       }}
       style={style}
       {...props}
+      aria-invalid={ariaInvalid}
+      aria-describedby={describedBy}
     >
       {placeholder ? <option value="">{placeholder}</option> : null}
       {!options.length && emptyContent ? <option value="" disabled>{emptyContent}</option> : null}

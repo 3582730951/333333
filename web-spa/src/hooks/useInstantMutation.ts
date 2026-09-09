@@ -12,7 +12,7 @@ type InstantMutationOptions<TVariables, TResult, TSnapshot = unknown> = {
   mutationFn: (variables: TVariables, context: MutationContext) => Promise<TResult>;
   idempotent?: boolean;
   optimistic?: (variables: TVariables) => TSnapshot;
-  rollback?: (snapshot: TSnapshot, variables: TVariables, error: unknown) => void;
+  rollback?: (snapshot: TSnapshot, variables: TVariables, error: unknown) => void | Promise<void>;
   onSuccess?: (result: TResult, variables: TVariables) => void | Promise<void>;
 };
 
@@ -56,15 +56,27 @@ export function useInstantMutation<TVariables, TResult, TSnapshot = unknown>({
       performance.measure('pool:mutation:intent-to-accepted', 'pool:interaction:intent', 'pool:mutation:accepted');
     } catch { /* keyboard/programmatic actions may not have a pointer intent mark */ }
 
-    let snapshot: TSnapshot | undefined;
-    if (optimistic) {
-      snapshot = optimistic(variables);
-      setPhase('optimistic');
-    }
-    const context: MutationContext = idempotent ? { idempotencyKey: idempotencyKey() } : {};
-    const task = mutation.mutateAsync({ variables, context });
-    pending.current = task;
-    void task.then(async (result) => {
+    // Keep the deduplication promise alive through optimistic work, the request,
+    // and the success/error callback. Callers must observe callback failures and
+    // a second click must remain coalesced until every side effect has settled.
+    const task = Promise.resolve().then(async () => {
+      let snapshot: TSnapshot;
+      let hasSnapshot = false;
+      if (optimistic) {
+        snapshot = optimistic(variables);
+        hasSnapshot = true;
+        setPhase('optimistic');
+      }
+      const context: MutationContext = idempotent ? { idempotencyKey: idempotencyKey() } : {};
+      let result: TResult;
+      try {
+        result = await mutation.mutateAsync({ variables, context });
+      } catch (reason) {
+        // Roll back only when the request itself failed. A success callback
+        // failure must not undo a successfully committed server mutation.
+        if (hasSnapshot) await rollback?.(snapshot!, variables, reason);
+        throw reason;
+      }
       await onSuccess?.(result, variables);
       if (mounted.current) setPhase('settled');
       try {
@@ -73,17 +85,19 @@ export function useInstantMutation<TVariables, TResult, TSnapshot = unknown>({
           end: performance.now(),
         });
       } catch { /* optional telemetry */ }
-    }, (reason) => {
-      if (snapshot !== undefined) rollback?.(snapshot, variables, reason);
+      return result;
+    }).catch((reason) => {
       const normalized = normalizeApiError(reason);
       if (mounted.current) {
         setError(normalized);
         setRequestId(normalized.requestId || '');
         setPhase('error');
       }
+      throw reason;
     }).finally(() => {
       if (pending.current === task) pending.current = null;
     });
+    pending.current = task;
     return task;
   }, [idempotent, mutation, onSuccess, optimistic, rollback]);
 

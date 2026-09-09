@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/bodysource"
+	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
@@ -898,6 +899,18 @@ func writeWebSocketSourceMessage(conn webSocketMessageWriter, messageType int, s
 }
 
 func writeWebSocketErrorSource(conn webSocketMessageWriter, status int, source bodysource.BodySource) error {
+	if status >= http.StatusBadRequest && source != nil && source.Size() <= 64<<10 {
+		if body, err := bodysource.ReadAll(source); err == nil {
+			var envelope struct {
+				Error struct{ Code, Message string }
+			}
+			_ = json.Unmarshal(body, &envelope)
+			normalized := envelope.Error.Code == "server_error" && envelope.Error.Message == leakfilter.ModelCapacityPublicErrorMessage
+			if normalized || leakfilter.IsModelCapacityError(status, body) {
+				return writeWebSocketError(conn, http.StatusServiceUnavailable, leakfilter.ModelCapacityPublicErrorMessage)
+			}
+		}
+	}
 	return writeWebSocketError(conn, http.StatusServiceUnavailable, "")
 }
 
@@ -914,18 +927,29 @@ func sseDataPayload(block []byte) string {
 
 func writeWebSocketError(conn webSocketMessageWriter, status int, message string) error {
 	requestID := newRequestID()
+	capacity := message == leakfilter.ModelCapacityPublicErrorMessage
 	if status < 400 || status >= 500 {
 		status = http.StatusServiceUnavailable
-		message = "The relay service is temporarily unavailable. Please retry."
+		if !capacity {
+			message = "The relay service is temporarily unavailable. Please retry."
+		}
 	} else {
 		message, _ = safeClientError(status)
+	}
+	errorType := "invalid_request_error"
+	errorCode := "invalid_request"
+	if status == http.StatusServiceUnavailable {
+		errorType, errorCode = "server_error", "service_unavailable"
+		if capacity {
+			errorCode = "server_error"
+		}
 	}
 	payload := map[string]interface{}{
 		"type":   "error",
 		"status": status,
 		"error": map[string]interface{}{
-			"type":       map[bool]string{true: "server_error", false: "invalid_request_error"}[status == http.StatusServiceUnavailable],
-			"code":       map[bool]string{true: "service_unavailable", false: "invalid_request"}[status == http.StatusServiceUnavailable],
+			"type":       errorType,
+			"code":       errorCode,
 			"message":    message,
 			"request_id": requestID,
 		},

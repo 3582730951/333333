@@ -1737,6 +1737,9 @@ func (m *codexSessionMapping) sanitizePendingRootAgentEncryptedContent(body []by
 // reusing the same upstream session identity creates a repeated-risk loop. Client
 // schema/model errors are deliberately excluded because a new UUID cannot fix them.
 func codexMappedSessionRiskError(status int, body []byte) bool {
+	if leakfilter.IsModelCapacityError(status, body) {
+		return false
+	}
 	switch status {
 	case http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout,
 		http.StatusConflict, http.StatusLocked, http.StatusTooEarly,

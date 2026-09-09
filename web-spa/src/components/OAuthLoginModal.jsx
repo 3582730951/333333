@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
+import { t } from '../lib/i18n.js';
 import {
   Modal, Tabs, TabPane, Form, Input, Textarea, Select, Button, Typography, Toast, Divider, Tooltip, Tag,
 } from './pool/index.jsx';
@@ -251,7 +252,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       Toast.success({
         content: (
           <span>
-            账号 <strong>{result.label || result.email || result.id}</strong> 导入成功！
+            {t('copy.account')} <strong>{result.label || result.email || result.id}</strong> 导入成功！
           </span>
         ),
         duration: 3,
@@ -296,7 +297,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       Toast.success({
         content: (
           <span>
-            账号 <strong>{result.label || result.email || result.id}</strong> 导入成功！
+            {t('copy.account')} <strong>{result.label || result.email || result.id}</strong> 导入成功！
           </span>
         ),
         duration: 3,
@@ -451,7 +452,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       </div>
 
       <Form>
-        <Form.Slot label="标签 (可选)">
+        <Form.Slot label={t('copy.optional_label')}>
           <Input
             placeholder="例如: 高频, 团队A"
             value={label}
@@ -558,7 +559,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         </div>
       </div>
       <Form>
-        <Form.Slot label="标签 (可选)"><Input value={label} onChange={setLabel} placeholder="批量导入时会自动追加序号" /></Form.Slot>
+        <Form.Slot label={t('copy.optional_label')}><Input value={label} onChange={setLabel} placeholder="批量导入时会自动追加序号" /></Form.Slot>
         <Text type="tertiary" as="p">Kiro 账号动态继承 Kiro 账号池分组的有序出口。</Text>
       </Form>
       <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
@@ -635,7 +636,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         </div>
       ) : null}
       <Form>
-        <Form.Slot label="标签 (可选)"><Input value={label} onChange={setLabel} placeholder="例如：Cursor 主账号" /></Form.Slot>
+        <Form.Slot label={t('copy.optional_label')}><Input value={label} onChange={setLabel} placeholder="例如：Cursor 主账号" /></Form.Slot>
         <Form.Slot label="账号池分组 (可选)">
           <Select placeholder="默认使用 cursor 分组" value={groupName} onChange={setGroupName} optionList={groupOptions} />
         </Form.Slot>
@@ -857,15 +858,15 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
                   fontSize: 'var(--pool-type-caption)',
                 }}
               />
-              <Tooltip content={copied ? '已复制' : '复制链接'}>
+              <Tooltip content={copied ? t('copy.copied') : '复制链接'}>
                 <Button
                   icon={copied ? <IconTick /> : <IconCopy />}
                   onClick={handleCopyUrl}
                   aria-label={copied ? '授权链接已复制' : '复制授权链接'}
-                  title={copied ? '已复制' : '复制授权链接'}
+                  title={copied ? t('copy.copied') : '复制授权链接'}
                   style={{ flexShrink: 0 }}
                 >
-                  {copied ? '已复制' : '复制'}
+                  {copied ? t('copy.copied') : '复制'}
                 </Button>
               </Tooltip>
               <Button

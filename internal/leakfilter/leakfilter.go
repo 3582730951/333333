@@ -172,10 +172,14 @@ func looksLikeLimitError(status int, body []byte) bool {
 // status to surface; otherwise it returns the input unchanged with changed=false.
 // provider is "claude" for the Anthropic protocol, anything else for OpenAI.
 func NeutralizeErrorBody(provider string, status int, body []byte) (int, []byte, bool) {
-	if !looksLikeLimitError(status, body) {
+	capacity := IsModelCapacityError(status, body)
+	if !capacity && !looksLikeLimitError(status, body) {
 		return status, body, false
 	}
-	const msg = responsesPublicRetryMessage
+	msg := responsesPublicRetryMessage
+	if capacity {
+		msg = ModelCapacityPublicErrorMessage
+	}
 	var payload map[string]interface{}
 	if provider == "claude" {
 		payload = map[string]interface{}{
@@ -195,15 +199,20 @@ func NeutralizeErrorBody(provider string, status int, body []byte) (int, []byte,
 }
 
 const responsesPublicRetryMessage = "Please retry."
+const ModelCapacityPublicErrorMessage = "upstream failed"
 
-func neutralResponsesFailureSSEFrame() []byte {
+func neutralResponsesFailureSSEFrame(message ...string) []byte {
+	text := responsesPublicRetryMessage
+	if len(message) > 0 && strings.TrimSpace(message[0]) != "" {
+		text = message[0]
+	}
 	payload, err := json.Marshal(map[string]interface{}{
 		"type": "response.failed",
 		"response": map[string]interface{}{
 			"status": "failed",
 			"error": map[string]interface{}{
 				"code":    "server_error",
-				"message": responsesPublicRetryMessage,
+				"message": text,
 			},
 		},
 	})
@@ -254,10 +263,15 @@ func NeutralizeResponsesContextErrorSSEFrame(frame []byte) ([]byte, bool) {
 // the Responses clients recognize. Early failures are retried before reaching this
 // function; this path is for failures received after downstream output committed.
 func NeutralizeCodexRetryableFailureSSEFrame(frame []byte) ([]byte, bool) {
-	if _, ok := ParseRetryableCodexFailureFrame(frame); !ok {
+	failure, ok := ParseRetryableCodexFailureFrame(frame)
+	if !ok {
 		return frame, false
 	}
-	neutral := neutralResponsesFailureSSEFrame()
+	message := responsesPublicRetryMessage
+	if IsModelCapacityError(failure.StatusCode, failure.Body) {
+		message = ModelCapacityPublicErrorMessage
+	}
+	neutral := neutralResponsesFailureSSEFrame(message)
 	if len(neutral) == 0 {
 		return frame, false
 	}
@@ -272,6 +286,14 @@ func NeutralizeCodexRetryableFailureSSEFrame(frame []byte) ([]byte, bool) {
 // "usage limit" is never touched. Returns (neutralBody, true) when it scrubs,
 // otherwise (body, false). The neutral body is the generic OpenAI error envelope.
 func NeutralizeResponsesJSON(body []byte) ([]byte, bool) {
+	if IsModelCapacityError(http.StatusOK, body) {
+		nb, err := json.Marshal(map[string]interface{}{
+			"error": map[string]interface{}{"message": ModelCapacityPublicErrorMessage, "type": "server_error"},
+		})
+		if err == nil {
+			return nb, true
+		}
+	}
 	var root map[string]json.RawMessage
 	if json.Unmarshal(body, &root) != nil {
 		return body, false
@@ -1063,9 +1085,13 @@ func (f *SSEFilter) neutralizeClaudeError(frame []byte) ([]byte, bool) {
 	if !containsAnyFold(lowerData, claudeRetryableErrorSignatures) {
 		return nil, false
 	}
+	message := responsesPublicRetryMessage
+	if IsModelCapacityError(http.StatusServiceUnavailable, data) {
+		message = ModelCapacityPublicErrorMessage
+	}
 	payload, err := json.Marshal(map[string]interface{}{
 		"type":  "error",
-		"error": map[string]interface{}{"type": "api_error", "message": responsesPublicRetryMessage},
+		"error": map[string]interface{}{"type": "api_error", "message": message},
 	})
 	if err != nil {
 		return nil, false

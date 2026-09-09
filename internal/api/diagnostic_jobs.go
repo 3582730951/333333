@@ -793,7 +793,7 @@ func validateDiagnosticEntry(entry *zip.File) error {
 func diagnosticDLPMatch(value string) bool {
 	if diagnosticPrivateKeyRE.MatchString(value) || diagnosticBearerRE.MatchString(value) ||
 		diagnosticJWTRE.MatchString(value) || diagnosticSecretPrefixRE.MatchString(value) ||
-		diagnosticContainsUnsafeRequestID(value) || diagnosticEmailRE.MatchString(value) ||
+		diagnosticContainsUnsafeRequestID(value) || diagnosticUserIDRE.MatchString(value) || diagnosticEmailRE.MatchString(value) ||
 		diagnosticURLRE.MatchString(value) || diagnosticIPv4RE.MatchString(value) ||
 		diagnosticIPv6RE.MatchString(value) || diagnosticWindowsPathRE.MatchString(value) ||
 		diagnosticContainsUnixPath(value) {

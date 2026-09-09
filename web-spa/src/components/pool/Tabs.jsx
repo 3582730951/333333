@@ -27,11 +27,11 @@ export function TabPane(_props) {
 export function Tabs({ children, activeKey, defaultActiveKey, onChange, tabPosition, className, style, keepMounted = false }) {
   const panes = React.Children.toArray(children).filter(Boolean);
   const first = panes[0]?.props?.itemKey;
-  const value = activeKey ?? defaultActiveKey ?? first;
   return (
     <TabsPrimitive.Root
-      value={value}
+      value={activeKey}
       defaultValue={defaultActiveKey ?? first}
+      orientation={tabPosition === 'left' ? 'vertical' : 'horizontal'}
       onValueChange={onChange}
       className={cx('pool-tabs', tabPosition === 'left' ? 'pool-tabs--left' : '', className)}
       style={style}

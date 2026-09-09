@@ -449,21 +449,6 @@ func (s *Server) evaluateModelQualityCombo(ctx context.Context, combo modelQuali
 	if _, err := s.store.InsertModelQualityRun(ctx, primary.Run); err != nil {
 		return storage.ModelQualityStatus{}, err
 	}
-	var metadataTokens int64
-	if s.modelQualityMetadataDue(ctx, combo, now) {
-		metadata := s.executeModelQualityProbe(ctx, combo, modelQualityMetadataProbe, "metadata", nil)
-		metadataTokens = metadata.Run.TotalTokens
-		if metadata.Run.Outcome == "metadata" {
-			if _, err := s.store.InsertModelQualityRun(ctx, metadata.Run); err != nil {
-				return storage.ModelQualityStatus{}, err
-			}
-		} else {
-			// Metadata is advisory and must never turn a passing quality probe
-			// into a degraded verdict. Keep failures in history for diagnosis.
-			metadata.Run.Outcome = "metadata_error"
-			_, _ = s.store.InsertModelQualityRun(ctx, metadata.Run)
-		}
-	}
 	status := previous
 	if !found {
 		status = storage.ModelQualityStatus{GroupName: combo.Group, ModelSlug: combo.Model, Provider: combo.Provider, State: "unknown"}
@@ -471,7 +456,7 @@ func (s *Server) evaluateModelQualityCombo(ctx context.Context, combo modelQuali
 	status.GroupName, status.ModelSlug, status.Provider = combo.Group, combo.Model, combo.Provider
 	status.LastProbeAt, status.UpdatedAt = now, now
 	status.TotalChecks++
-	status.TotalTokens += primary.Run.TotalTokens + metadataTokens
+	status.TotalTokens += primary.Run.TotalTokens
 	status.LastProbeID = primary.Run.ProbeID
 	status.LastExpected = primary.Run.Expected
 	status.LastActual = primary.Run.Actual
@@ -541,19 +526,6 @@ func (s *Server) evaluateModelQualityCombo(ctx context.Context, combo modelQuali
 		status.State = "suspect"
 	}
 	return status, s.store.UpsertModelQualityStatus(ctx, status)
-}
-
-func (s *Server) modelQualityMetadataDue(ctx context.Context, combo modelQualityCombo, now int64) bool {
-	runs, err := s.store.ListModelQualityRuns(ctx, combo.Group, combo.Model, 20)
-	if err != nil {
-		return true
-	}
-	for _, run := range runs {
-		if run.ProbeID == modelQualityMetadataProbe.ID && run.Outcome == "metadata" && now-run.CreatedAt < 24*60*60 {
-			return false
-		}
-	}
-	return true
 }
 
 func applyModelQualityPass(status *storage.ModelQualityStatus, now int64, outcome string) {

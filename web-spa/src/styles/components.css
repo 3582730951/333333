@@ -775,7 +775,10 @@
 .pool-field__help {
   margin-top: var(--pool-space-1);
   color: var(--pool-text-3);
-  font-size: var(--pool-type-caption);
+  /* Help text is supporting content, but 12px is below a comfortable reading
+     size for the dense settings/forms used throughout the console. */
+  font-size: var(--pool-type-label);
+  line-height: 1.5;
 }
 
 .pool-field__error {
@@ -1122,6 +1125,10 @@
   border-bottom: 0;
   border-right: 1px solid var(--pool-border);
   padding-right: var(--pool-space-2);
+}
+
+.pool-tabs--left .pool-tabs-panels {
+  min-width: 0;
 }
 
 .pool-tab-trigger {
@@ -3332,8 +3339,7 @@ so the mark owns the size
 }
 
 .pool-mobile-row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  display: flex;
   align-items: center;
   gap: var(--pool-space-3);
   width: 100%;
@@ -3342,6 +3348,7 @@ so the mark owns the size
 }
 
 .pool-mobile-row__avatar {
+  flex-shrink: 0;
   width: 34px;
   height: 34px;
   display: inline-grid;
@@ -3350,6 +3357,10 @@ so the mark owns the size
   background: var(--pool-accent-soft);
   color: var(--pool-accent);
   font-weight: 750;
+}
+
+.pool-mobile-row__main {
+  flex: 1;
 }
 
 .pool-mobile-row__main,
@@ -3840,6 +3851,7 @@ so the mark owns the size
 }
 
 .pool-mobile-row__actions {
+  flex-shrink: 0;
   display: inline-flex;
   align-items: center;
   justify-content: flex-end;
@@ -4154,6 +4166,52 @@ so the mark owns the size
 .pool-text-clamp--link,
 .pool-table-sort {
   color: var(--pool-accent);
+}
+
+.pool-tag-overflow {
+  display: inline-flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: var(--pool-space-1);
+}
+
+.pool-tag-overflow__trigger {
+  display: inline-flex;
+  appearance: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.pool-tag-overflow__trigger:focus-visible {
+  border-radius: var(--pool-radius-sm);
+}
+
+.pool-tag-overflow__items {
+  display: inline-flex;
+  flex-basis: 100%;
+  flex-wrap: wrap;
+  gap: var(--pool-space-1);
+  padding-top: var(--pool-space-1);
+}
+
+/* Keep the trigger's child tag's normal inline treatment; the trigger owns
+   keyboard focus and the expanded list remains in document flow. */
+.pool-tag-overflow__trigger .pool-tag {
+  pointer-events: none;
+}
+
+.pool-text-clamp--link {
+  appearance: none;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  font: inherit;
+  text-align: inherit;
+  cursor: pointer;
 }
 
 .pool-key-actions,
@@ -4924,7 +4982,7 @@ so the mark owns the size
 }
 
 .pool-settings-category__copy > span {
-  color: var(--pool-text-3);
+  color: var(--pool-text-2);
   font-size: var(--pool-type-caption);
 }
 
@@ -5457,6 +5515,10 @@ so the mark owns the size
 
 .pool-group-resource-split {
   margin-top: var(--pool-space-3);
+}
+
+.pool-user-group-editor > .pool-card {
+  padding: var(--pool-space-4);
 }
 
 .pool-user-group-grid {
@@ -6984,6 +7046,7 @@ overlong presentation. */
 }
 
 .pool-mobile-row > input[type='checkbox'] {
+  flex-shrink: 0;
   width: 22px;
   height: 22px;
   accent-color: var(--pool-accent);
@@ -7161,6 +7224,12 @@ overlong presentation. */
   flex: 0 0 auto;
   color: var(--pool-text-3);
   font-size: var(--pool-type-caption);
+}
+
+.pool-account-quota-stack {
+  display: grid;
+  gap: var(--pool-space-3);
+  min-width: 0;
 }
 
 .pool-account-quota {
@@ -9007,7 +9076,7 @@ Apple-like chart treatment with compact legends and readable tooltips. */
   line-height: 1.35;
 }
 
-@media (max-width: 520px) {
+@media (max-width: 767px) {
   .pool-account-summary__hero {
     display: grid;
   }

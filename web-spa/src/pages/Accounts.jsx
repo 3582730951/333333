@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
+import { t } from '../lib/i18n.js';
 import { useQueryClient } from '@tanstack/react-query';
 import {
   ActionMenu, Button, ConfirmDialog, Tag, Toast, Modal, Form, Typography, Input, Select,
@@ -297,7 +298,7 @@ function QuotaWindowMeter({ account, detail, compact = false }) {
   const ariaLabel = `${label}，已用 ${percent}%，剩余 ${remaining}%${details.length ? `，${details.join(' · ')}` : ''}`;
   return (
     <div className={`pool-account-quota pool-account-quota--${tone}${compact ? ' pool-account-quota--compact' : ''}`} aria-label={ariaLabel}>
-      <div className="pool-account-quota__head"><strong>{remaining}% <span>剩余</span></strong><span>{label}</span></div>
+      <div className="pool-account-quota__head"><strong>{remaining}% <span>{t('copy.remaining')}</span></strong><span>{label}</span></div>
       <TinyMeter value={percent} label={ariaLabel} tone={tone} />
       <span className="pool-account-quota__meta">{details.join(' · ') || `${percent}% 已用`}</span>
     </div>
@@ -333,7 +334,7 @@ function AccountQuota({ account, compact = false }) {
   return (
     <div className={`pool-account-quota pool-account-quota--${quota.tone}${compact ? ' pool-account-quota--compact' : ''}`} aria-label={ariaLabel}>
       <div className="pool-account-quota__head">
-        <strong>{quota.remainingPercent}% <span>剩余</span></strong>
+        <strong>{quota.remainingPercent}% <span>{t('copy.remaining')}</span></strong>
         <span>{quota.percent}% 已用</span>
       </div>
       <TinyMeter value={quota.percent} label={ariaLabel} tone={quota.tone} />
@@ -793,7 +794,7 @@ export default function Accounts() {
       label="账号操作"
       items={[
         {
-          label: isAccountActionLoading(r.id, 'health-test') ? '测活中' : '测活',
+          label: isAccountActionLoading(r.id, 'health-test') ? '测活中' : t('copy.health_check'),
           disabled: batchRunning || (rowRunning && !isAccountActionLoading(r.id, 'health-test')),
           confirm: requiresPaidHealthTest(r) ? {
             title: '确认执行双层测活？',
@@ -828,13 +829,13 @@ export default function Accounts() {
         },
         { label: '详情', disabled: batchRunning || rowRunning, onSelect: () => setDrawerAcct(r) },
         {
-          label: isAccountActionLoading(r.id, 'delete') ? '删除中' : '删除',
+          label: isAccountActionLoading(r.id, 'delete') ? '删除中' : t('copy.delete'),
           destructive: true,
           disabled: batchRunning || (rowRunning && !isAccountActionLoading(r.id, 'delete')),
           confirm: {
             title: '确认删除该账号？',
             description: `账号 ${r.label || r.email || r.id} 删除后不可恢复。`,
-            confirmText: '删除',
+            confirmText: t('copy.delete'),
           },
           onSelect: () => action(r.id, 'delete'),
         },
@@ -925,7 +926,7 @@ export default function Accounts() {
       render: (_, r) => {
         return (
           <div className="pool-resource-summary">
-            <TextClamp>{r.group_name || '默认'}</TextClamp>
+            <TextClamp>{r.group_name || t('copy.default')}</TextClamp>
             <div className="pool-resource-summary__meta">{r.billing_mode === 'pay_as_you_go' ? '按量计费' : formatPlanLabel(r.plan_type, r.plan_presentation)}</div>
           </div>
         );
@@ -1007,7 +1008,7 @@ export default function Accounts() {
         chips={<>
           <Tag size="small">{r.provider || 'codex'}</Tag>
           <Tag size="small" color={credential.color}>{credential.label}</Tag>
-          <Tag size="small" title={r.group_name || '默认'}>{middleEllipsis(r.group_name || '默认', 12, 6)}</Tag>
+          <Tag size="small" title={r.group_name || t('copy.default')}>{middleEllipsis(r.group_name || t('copy.default'), 12, 6)}</Tag>
           {r.plan_type || r.plan_presentation ? <Tag size="small">{formatPlanLabel(r.plan_type, r.plan_presentation)}</Tag> : null}
           {r.billing_mode === 'pay_as_you_go' ? <Tag size="small" color="violet">按量计费</Tag> : null}
           <Tag size="small" color="blue" title={route.primary}>{middleEllipsis(route.primary, 14, 8)}</Tag>
@@ -1112,12 +1113,12 @@ export default function Accounts() {
               title="确认批量执行付费双层测活？"
               description="所选账号中包含 Kiro 或上游 API Key。每个认证正常的此类账号会发送 1 次最小推理请求，并可能产生少量上游费用；其他账号保持免费测活。"
               confirmText="确认并批量测活"
-              onConfirm={() => bulkAction('health-test', '测活', true)}
+              onConfirm={() => bulkAction('health-test', t('copy.health_check'), true)}
             >
               <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning}>批量测活</Button>
             </ConfirmDialog>
           ) : (
-            <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('health-test', '测活')}>批量测活</Button>
+            <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('health-test', t('copy.health_check'))}>批量测活</Button>
           )}
           <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('clear-quarantine', '解除隔离')}>批量解除隔离</Button>
           <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('clear-cooldown', '解除冷却')}>批量解除冷却</Button>
@@ -1128,7 +1129,7 @@ export default function Accounts() {
             description="批量删除后不可恢复，失败项会保留在已选列表中。"
             destructive
             confirmText="批量删除"
-            onConfirm={() => bulkAction('delete', '删除')}
+            onConfirm={() => bulkAction('delete', t('copy.delete'))}
           >
             <Button size="small" type="danger" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning}>批量删除</Button>
           </ConfirmDialog>

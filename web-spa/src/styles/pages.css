@@ -731,7 +731,8 @@ body {
 .pool-field__help {
   margin-top: var(--pool-space-1);
   color: var(--pool-text-3);
-  font-size: var(--pool-type-caption);
+  font-size: var(--pool-type-label);
+  line-height: 1.5;
 }
 
 .pool-tabs-list {

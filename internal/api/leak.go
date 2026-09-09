@@ -596,6 +596,9 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 		} else {
 			if provider == "codex" {
 				out, _ = leakfilter.NeutralizeResponsesContextErrorSSEFrame(out)
+				if failure, ok := leakfilter.ParseCodexFailureFrame(out); ok && leakfilter.IsModelCapacityError(failure.StatusCode, failure.Body) {
+					out, _ = leakfilter.NeutralizeCodexRetryableFailureSSEFrame(out)
+				}
 			}
 			if words != nil && !words.Empty() {
 				out = words.ReplaceAll(out)
@@ -1235,7 +1238,7 @@ func (s *Server) writeFilteredError(ctx context.Context, w http.ResponseWriter, 
 			filteredHeader.Set("Content-Type", "application/json")
 		}
 	}
-	if s.leakScrubEnabled(ctx) {
+	if s.leakScrubEnabled(ctx) || leakfilter.IsModelCapacityError(status, body) {
 		if ns, nb, changed := leakfilter.NeutralizeErrorBody(provider, status, out); changed {
 			status = ns
 			out = nb

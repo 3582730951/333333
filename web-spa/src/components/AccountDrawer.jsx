@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import { t } from '../lib/i18n.js';
 import { ConfirmDialog, Drawer, Modal, Tag, Button, Typography, Spin, Select, Switch, Toast, InputNumber } from './pool/index.jsx';
 import { get, post, put } from '../api.js';
 import LoadErrorBanner from './LoadErrorBanner.jsx';
@@ -75,7 +76,7 @@ function AccountRatePanel({ account }) {
       <Row k="Token 明细" v={known ? `输入 ${fmtTokens(rate.input_tpm)} · 缓存输入 ${fmtTokens(rate.cached_input_tpm)} · 输出 ${fmtTokens(rate.output_tpm)}` : '—'} />
       <Row k="Agent 明细" v={known ? `根任务 ${fmtInt(rate.root_rpm)} · 子 agent ${fmtInt(rate.subagent_rpm)} · 未识别 ${fmtInt(rate.unknown_rpm)}` : '—'} />
       <Row k="上游尝试" v={known ? `${fmtInt(rate.attempt_rpm)} RPM（根 ${fmtInt(rate.attempt_root_rpm)} · 子 ${fmtInt(rate.attempt_subagent_rpm)} · 未识别 ${fmtInt(rate.attempt_unknown_rpm)}）` : '—'} />
-      <Row k="状态" v={<Tag size="small" color={rate.state === 'live' ? 'blue' : rate.state === 'stale' ? 'amber' : 'grey'}>{state}</Tag>} />
+      <Row k={t('copy.status')} v={<Tag size="small" color={rate.state === 'live' ? 'blue' : rate.state === 'stale' ? 'amber' : 'grey'}>{state}</Tag>} />
       <Row k="最近采样" v={rate.sampled_at ? fmtDateTime(rate.sampled_at) : '—'} />
       <Typography.Text size="small" type="tertiary">{reason}</Typography.Text>
     </Panel>
@@ -470,20 +471,20 @@ export default function AccountDrawer({
         <Row k="账号 ID" v={<span className="pool-mono">{account.id}</span>} />
         <Row k="邮箱" v={account.email || '—'} />
         <Row k="提供商" v={<Tag>{account.provider || 'codex'}</Tag>} />
-        <Row k="认证方式" v={<Tag color={providerAPIKey ? 'violet' : 'blue'}>{account.auth_method || 'oauth'}</Tag>} />
+        <Row k={t('copy.auth_method')} v={<Tag color={providerAPIKey ? 'violet' : 'blue'}>{account.auth_method || 'oauth'}</Tag>} />
         {account.credential_mode === 'agent_identity' ? <Row k="凭据模式" v={<Tag color="cyan">Agent Identity</Tag>} /> : null}
         <Row k="计费方式" v={account.billing_mode === 'pay_as_you_go' ? <Tag color="violet">按量计费</Tag> : '订阅'} />
         {providerAPIKey ? <Row k="API Key" v={account.api_key_present ? '已加密保存' : '未检测到'} /> : null}
-        <Row k="分组" v={account.group_name || '默认'} />
+        <Row k="分组" v={account.group_name || t('copy.default')} />
         <Row k="套餐" v={formatPlanLabel(account.plan_type, capacityPlanPresentation)} />
-        <Row k="状态" v={statusTag ? statusTag(account) : account.status} />
-        <Row k="调度例外" v={ignoreRateLimitControls ? <Tag color="orange" size="small">忽略 429 / 冷却 / 隔离</Tag> : '无'} />
-        <Row k="隔离" v={(account.quarantine_until || 0) > Math.floor(Date.now() / 1000) ? (protectedProbeQuarantine ? '无限期' : fmtRelative(account.quarantine_until)) : '否'} />
+        <Row k={t('copy.status')} v={statusTag ? statusTag(account) : account.status} />
+        <Row k={t('copy.scheduling_override')} v={ignoreRateLimitControls ? <Tag color="orange" size="small">忽略 429 / 冷却 / 隔离</Tag> : '无'} />
+        <Row k="隔离" v={(account.quarantine_until || 0) > Math.floor(Date.now() / 1000) ? (protectedProbeQuarantine ? '无限期' : fmtRelative(account.quarantine_until)) : t('copy.no')} />
         {account.quarantine_reason ? <Row k="隔离原因" v={account.quarantine_reason} /> : null}
       </Panel>
 
       {kiroSuspended ? (
-        <Panel title="AWS User ID 已暂停" style={{ marginBottom: 14 }}>
+        <Panel title={t('copy.aws_suspended')} style={{ marginBottom: 14 }}>
           <Typography.Text type="danger" as="p">
             AWS 因安全原因锁定了此身份。账号、API Key、能力和审计已保留，但会无限期停止调度。
           </Typography.Text>
@@ -509,12 +510,12 @@ export default function AccountDrawer({
 
       {account.kiro_auth ? (
         <Panel title="Kiro 认证" style={{ marginBottom: 14 }}>
-          <Row k="认证方式" v={account.kiro_auth.auth_method || '—'} />
+          <Row k={t('copy.auth_method')} v={account.kiro_auth.auth_method || '—'} />
           <Row k="认证区域" v={account.kiro_auth.auth_region || '—'} />
           <Row k="API 区域" v={account.kiro_auth.api_region || '—'} />
           <Row k="端点" v={account.kiro_auth.endpoint || 'Kiro IDE'} />
           <Row k="敏感凭证" v={[account.kiro_auth.has_client_secret && 'Client Secret', account.kiro_auth.has_api_key && 'API Key'].filter(Boolean).join(' / ') || 'OAuth Token'} />
-          <Row k="推理状态" v={kiroSuspended ? <Tag color="red" size="small">AWS User ID 已暂停</Tag> : '需双层测活确认'} />
+          <Row k="推理状态" v={kiroSuspended ? <Tag color="red" size="small">{t('copy.aws_suspended')}</Tag> : '需双层测活确认'} />
         </Panel>
       ) : null}
 
@@ -543,8 +544,8 @@ export default function AccountDrawer({
         return (
           <Panel title="账号额度" style={{ marginBottom: 14 }}>
             {quotaWindows.length
-              ? quotaWindows.map((window, index) => windowRow(window, quotaWindowLabel(window, index === 0 ? '主窗口' : '附加窗口')))
-              : windowRow(null, '主窗口')}
+              ? quotaWindows.map((window, index) => windowRow(window, quotaWindowLabel(window, index === 0 ? t('copy.primary_window') : '附加窗口')))
+              : windowRow(null, t('copy.primary_window'))}
             <Row k="美元估算" v={estUSD
               ? `≈ ${fmtUSD(estimate.remaining_usd)} 剩余${Number(estimate.extra_usd) > 0 ? ` · +${fmtUSD(estimate.extra_usd)} 额外` : ''}${estimate.plan ? ` · ${estimate.plan}` : ''}`
               : '—'} />
@@ -600,7 +601,7 @@ export default function AccountDrawer({
               <Row k="席位证据" v={currentEntitlementEvidence ? <Tag size="small" color={currentEntitlementEvidence.confidence === 'high' ? 'green' : 'amber'}>{entitlementSeatLabel(currentEntitlementEvidence.seat_type)} · {currentEntitlementEvidence.confidence || 'unknown'}</Tag> : <Tag size="small">未确认</Tag>} />
               <Row k="证据新鲜度" v={capacityEntitlement.evidence_freshness || 'unknown'} />
               {currentEntitlementEvidence?.usage_multiplier_milli != null ? <Row k="权益 multiplier" v={`${Number(currentEntitlementEvidence.usage_multiplier_milli) / 1000}×`} /> : null}
-              {currentEntitlementEvidence?.no_five_hour_limit != null ? <Row k="无 5 小时限制" v={currentEntitlementEvidence.no_five_hour_limit ? '是' : '否'} /> : null}
+              {currentEntitlementEvidence?.no_five_hour_limit != null ? <Row k="无 5 小时限制" v={currentEntitlementEvidence.no_five_hour_limit ? t('copy.yes') : t('copy.no')} /> : null}
               {currentEntitlementEvidence ? <Row k="证据来源" v={`${currentEntitlementEvidence.source_kind || 'unknown'} · ${currentEntitlementEvidence.observed_at ? fmtDateTime(currentEntitlementEvidence.observed_at) : '时间未知'}`} /> : null}
               {currentEntitlementEvidence?.expires_at ? <Row k="证据有效至" v={fmtDateTime(currentEntitlementEvidence.expires_at)} /> : null}
               {capacityEntitlement.conflict ? <Typography.Text type="warning" as="p">检测到多来源权益冲突，当前展示已按保守规则降级。</Typography.Text> : null}
@@ -622,7 +623,7 @@ export default function AccountDrawer({
         )}
       </Panel>
 
-      <Panel title="调度例外" style={{ marginBottom: 14 }}>
+      <Panel title={t('copy.scheduling_override')} style={{ marginBottom: 14 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
           <div>
             <div style={{ fontWeight: 600, fontSize: 'var(--pool-type-label)' }}>忽略 429、冷却与隔离</div>
@@ -703,8 +704,8 @@ export default function AccountDrawer({
             <>
               <Row k="配置" v={codexReauth?.configured ? <Tag color="green" size="small">已配置</Tag> : <Tag color="amber" size="small">未配置</Tag>} />
               <Row k="自动修复" v={codexReauthConfig.auto_enabled ? '开启' : '关闭'} />
-              <Row k="密码" v={codexReauthConfig.password_configured ? '已保存（加密）' : '未保存'} />
-              <Row k="OTP URL" v={codexReauthConfig.otp_url_configured ? '已保存（加密）' : '未保存'} />
+              <Row k="密码" v={codexReauthConfig.password_configured ? t('copy.saved_encrypted') : t('copy.not_saved')} />
+              <Row k="OTP URL" v={codexReauthConfig.otp_url_configured ? t('copy.saved_encrypted') : t('copy.not_saved')} />
               <Row k="目标 workspace" v={codexReauthConfig.target_workspace_id || reauthForm.target_workspace_id || '—'} />
               <Row k="最近状态" v={latestCodexReauthJob?.status || codexReauthConfig.last_status || (account.status === 'auth_expired' ? 'auth_expired' : '—')} />
               {latestCodexReauthJob?.last_error || codexReauthConfig.last_error ? (
@@ -720,11 +721,11 @@ export default function AccountDrawer({
             </label>
             <label className="pool-field">
               <span className="pool-field__label">密码（留空保留已保存值）</span>
-              <input className="pool-input" type="password" value={reauthForm.password} onChange={(event) => updateReauthForm('password', event.target.value)} placeholder={codexReauthConfig.password_configured ? '已保存；需要轮换时填写' : '用于 worker 登录'} />
+              <input className="pool-input" type="password" value={reauthForm.password} onChange={(event) => updateReauthForm('password', event.target.value)} placeholder={codexReauthConfig.password_configured ? t('copy.rotate_saved') : '用于 worker 登录'} />
             </label>
             <label className="pool-field">
               <span className="pool-field__label">OTP URL（留空保留已保存值）</span>
-              <input className="pool-input" value={reauthForm.otp_url} onChange={(event) => updateReauthForm('otp_url', event.target.value)} placeholder={codexReauthConfig.otp_url_configured ? '已保存；需要轮换时填写' : '验证码收件箱 API URL'} />
+              <input className="pool-input" value={reauthForm.otp_url} onChange={(event) => updateReauthForm('otp_url', event.target.value)} placeholder={codexReauthConfig.otp_url_configured ? t('copy.rotate_saved') : '验证码收件箱 API URL'} />
             </label>
             <label className="pool-field">
               <span className="pool-field__label">K12 / 教师 workspace id</span>
@@ -758,10 +759,10 @@ export default function AccountDrawer({
             loading={savingGroup}
             disabled={!selectedGroup || selectedGroup === account.group_name}
             onClick={saveGroup}
-          >保存</Button>
+          >{t('copy.save')}</Button>
         </div>
         <Row k="继承模型" v={groupPolicy?.force_model || '默认模型'} />
-        <Row k="继承努力级别" v={groupPolicy?.force_effort || '默认'} />
+        <Row k="继承努力级别" v={groupPolicy?.force_effort || t('copy.default')} />
         <Row k="成员" v={`${groupPolicy?.active_account_count ?? 0} / ${groupPolicy?.account_count ?? 0} 活跃`} />
       </Panel>
 
@@ -792,7 +793,7 @@ export default function AccountDrawer({
                 loading={savingDefaultEgress}
                 disabled={!selectedEgress || (selectedEgress === binding.primary_egress_id && selectedSidecar === (binding.sidecar_egress_id || ''))}
                 onClick={saveDefaultEgress}
-              >保存</Button>
+              >{t('copy.save')}</Button>
             </div>
             {binding.binding_scope === 'account' ? (
               <Button
@@ -825,7 +826,7 @@ export default function AccountDrawer({
               </Typography.Text>
             ) : null}
             <Row k="冷却至" v={binding.cooldown_until ? fmtRelative(binding.cooldown_until) : '—'} />
-            <Row k="待复测" v={binding.recheck_pending ? <Tag color="amber" size="small">是</Tag> : '否'} />
+            <Row k="待复测" v={binding.recheck_pending ? <Tag color="amber" size="small">{t('copy.yes')}</Tag> : t('copy.no')} />
           </>
         )}
       </Panel>

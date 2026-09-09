@@ -823,9 +823,16 @@ retryUserGroupRoute:
 				if lifecycleCtx == nil {
 					lifecycleCtx = context.Background()
 				}
+				accountRPMThreshold := int64(0)
+				if plan.DynamicPoolBalanceEnabled {
+					accountRPMThreshold = plan.DynamicPoolBalanceRPMThreshold
+				}
 				s.scheduler.StartDynamicPoolBalance(lifecycleCtx)
 				candidateContext = scheduler.WithDynamicPoolBalance(candidateContext, scheduler.DynamicPoolBalancePolicy{
-					Enabled: true, RPMThreshold: plan.DynamicPoolBalanceRPMThreshold, UserGroupID: plan.UserGroupID,
+					// A persisted account threshold must not re-enable account
+					// balancing when that dimension is disabled.
+					Enabled:      plan.DynamicPoolBalanceEnabled || plan.EgressRPMBalanceEnabled,
+					RPMThreshold: accountRPMThreshold, UserGroupID: plan.UserGroupID,
 					AgentClass: storage.AgentClassRoot, Fresh: true, Bound: false, OnlyAccountPoolTier: true,
 					EventID: usageEventIDFromContext(r.Context()), EgressRPMBalanceEnabled: plan.EgressRPMBalanceEnabled,
 					EgressRPMBalanceThreshold: plan.EgressRPMBalanceThreshold, EgressRPMBalanceEgressIDs: plan.EgressRPMBalanceEgressIDs,

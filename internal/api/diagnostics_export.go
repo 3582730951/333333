@@ -2167,6 +2167,9 @@ func (b diagnosticCodebook) code(accountID string) string {
 
 func (b diagnosticCodebook) sanitize(text string) string {
 	text = b.replaceIdentities(text)
+	text = diagnosticUserIDRE.ReplaceAllStringFunc(text, func(value string) string {
+		return diagnosticAlias(b.aliasKey, "USR", "user", value)
+	})
 	text = diagnosticPrivateKeyRE.ReplaceAllString(text, "[REDACTED-CREDENTIAL]")
 	text = diagnosticBearerRE.ReplaceAllString(text, "Bearer [REDACTED-CREDENTIAL]")
 	text = diagnosticJWTRE.ReplaceAllStringFunc(text, func(value string) string {
@@ -2404,6 +2407,7 @@ var (
 	diagnosticJWTRE             = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
 	diagnosticSecretPrefixRE    = regexp.MustCompile(`(?i)\b(?:sk|rk|ghp|github_pat|xox[baprs]|ya29|AIza)[_-][A-Za-z0-9._~+/=-]{12,}`)
 	diagnosticRequestIDRE       = regexp.MustCompile(`(?i)\breq[_-][A-Za-z0-9][A-Za-z0-9_-]{11,}\b`)
+	diagnosticUserIDRE          = regexp.MustCompile(`(?i)\busr_[A-Za-z0-9][A-Za-z0-9_-]{5,}\b`)
 	diagnosticPublicRequestIDRE = regexp.MustCompile(`(?i)^REQ-[A-F0-9]{16}$`)
 	diagnosticEmailRE           = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
 	diagnosticURLRE             = regexp.MustCompile(`(?i)\b(?:https?|socks5h?)://[^\s,"'<>]+`)

@@ -813,9 +813,6 @@ func (s *Scheduler) egressEWMAQuality(egressID string) (successBucket int, laten
 }
 
 func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
-	if policy, ok := dynamicPoolBalancePolicyFromContext(ctx); ok && policy.Enabled && policy.EgressRPMBalanceEnabled && policy.Fresh && !policy.Bound && policy.AgentClass == storage.AgentClassRoot && route.RequiredEgressID == "" && !route.ImmutableAffinity && len(route.PreferredEgressIDs) == 0 {
-		route.PreferredEgressIDs = append([]string(nil), policy.EgressRPMBalanceEgressIDs...)
-	}
 	if lease, handled, err := s.selectFromRouteChoiceContext(ctx, route); handled {
 		return lease, err
 	}
@@ -843,13 +840,8 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 	// A user-group RPM policy supplies an ordered set of real outlets for fresh
 	// work. Stateful/required routes are left on the persisted group primary; the
 	// candidate-level helper also re-checks the account-scoped pin boundary.
-	if policy, ok := dynamicPoolBalancePolicyFromContext(ctx); ok && policy.Enabled &&
-		policy.EgressRPMBalanceEnabled && policy.EgressRPMBalanceThreshold > 0 &&
-		policy.Fresh && !policy.Bound && policy.OnlyAccountPoolTier &&
-		storage.NormalizeAgentClass(policy.AgentClass) == storage.AgentClassRoot &&
-		route.RequiredAccountID == "" && route.RequiredEgressID == "" &&
-		!route.ServerSideState && !route.ImmutableAffinity && !route.FairScheduling {
-		route.PreferredEgressIDs = normalizeEgressIDs(policy.EgressRPMBalanceEgressIDs)
+	if policy, eligible := egressRPMBalancePolicyActive(ctx, route, storage.AccountEgressBinding{}); eligible {
+		route.PreferredEgressIDs = policy.EgressRPMBalanceEgressIDs
 	} else {
 		// Ordinary callers cannot override the account-pool group's effective
 		// primary outlet through PreferredEgressIDs; that field is legacy wire
@@ -923,7 +915,16 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 			// affinity to the fresh account so the conversation seamlessly continues
 			// on a healthy one instead of bouncing back to the broken account.
 			if routeAllowsProvider(route, s.providerOf(ctx, bound.AccountID)) && !route.Exclude[bound.AccountID] {
-				lease, reason, ok := s.tryLeaseAccountDetailed(ctx, bound.AccountID, route, nil)
+				// Keep the session's outlet for every attempt on its bound account.
+				// A failed replayable request still uses the original route below
+				// when selecting a replacement account.
+				stickyRoute := route
+				if route.RequiredEgressID == "" && routing.IsTrueConversationAffinity(route.Affinity) {
+					if egressID := strings.TrimSpace(bound.EgressID); egressID != "" {
+						stickyRoute.RequiredEgressID = egressID
+					}
+				}
+				lease, reason, ok := s.tryLeaseAccountDetailed(ctx, bound.AccountID, stickyRoute, nil)
 				if ok {
 					lease.RouteEpoch = bound.Epoch
 					resolvedModel := firstRouteValue(lease.ResolvedModel, route.Model)
@@ -944,46 +945,46 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 				}
 				if route.Strict && route.ServerSideState {
 					if statefulStickyWaitReason(reason) {
-						lease, waitErr := s.waitForStatefulStickyLease(ctx, bound.AccountID, route, reason)
+						lease, waitErr := s.waitForStatefulStickyLease(ctx, bound.AccountID, stickyRoute, reason)
 						lease.RouteEpoch = bound.Epoch
 						return lease, waitErr
 					}
-					return Lease{}, s.diagnoseStickyUnavailability(ctx, bound.AccountID, route)
+					return Lease{}, s.diagnoseStickyUnavailability(ctx, bound.AccountID, stickyRoute)
 				}
 				stickyWait := cfg.StickyWait()
 				if route.AffinityWait > 0 {
 					stickyWait = route.AffinityWait
 				}
 				if waitFor(ctx, stickyWait) {
-					lease, reason, ok = s.tryLeaseAccountDetailed(ctx, bound.AccountID, route, nil)
+					lease, reason, ok = s.tryLeaseAccountDetailed(ctx, bound.AccountID, stickyRoute, nil)
 					if ok {
 						lease.RouteEpoch = bound.Epoch
 						return lease, nil
 					}
 				}
 				if route.Strict {
-					if !s.strictStickyCanFailover(ctx, bound.AccountID, route) {
+					if !s.strictStickyCanFailover(ctx, bound.AccountID, stickyRoute) {
 						// Within-threshold cooldown (or threshold=0, never rebind for a
 						// long cooldown): wait the pinned account out instead of
 						// rebinding. A rebind moves the conversation to a fresh account
 						// with an empty upstream prompt-cache prefix — the next turn
 						// pays the full cold-cache price. waitForStatefulStickyLease
 						// re-diagnoses if the block turns non-waitable mid-wait.
-						if reason, ok := s.strictStickyCooldownWait(ctx, bound.AccountID, route); ok {
+						if reason, ok := s.strictStickyCooldownWait(ctx, bound.AccountID, stickyRoute); ok {
 							// waitForStatefulStickyLease already returns a terminal
 							// diagnosis (wait timeout with the last reason, or the
 							// bound account turning non-waitable mid-wait). Return it
 							// as-is: re-running the diagnosis here sees a cancelled
 							// ctx and reports "account not found", masking the
 							// cooldown that actually pinned us.
-							lease, waitErr := s.waitForStatefulStickyLease(ctx, bound.AccountID, route, reason)
+							lease, waitErr := s.waitForStatefulStickyLease(ctx, bound.AccountID, stickyRoute, reason)
 							if waitErr == nil {
 								lease.RouteEpoch = bound.Epoch
 								return lease, nil
 							}
 							return Lease{}, waitErr
 						}
-						return Lease{}, s.diagnoseStickyUnavailability(ctx, bound.AccountID, route)
+						return Lease{}, s.diagnoseStickyUnavailability(ctx, bound.AccountID, stickyRoute)
 					}
 					log.Printf("[SCHEDULER] strict-sticky falling through to selectFresh for route affinity=%s", route.Affinity.Hash)
 				} else if cfg.StrictStickyMaxCooldownSeconds > 0 {
@@ -993,9 +994,9 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 					// carries its full input, so waiting is lossless. The wait is
 					// bounded by the cooldown threshold; beyond it we fall through to
 					// selectFresh exactly as before (movable failover semantics).
-					if reason, ok := s.strictStickyCooldownWait(ctx, bound.AccountID, route); ok {
+					if reason, ok := s.strictStickyCooldownWait(ctx, bound.AccountID, stickyRoute); ok {
 						waitCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.StrictStickyMaxCooldownSeconds)*time.Second)
-						lease, waitErr := s.waitForStatefulStickyLease(waitCtx, bound.AccountID, route, reason)
+						lease, waitErr := s.waitForStatefulStickyLease(waitCtx, bound.AccountID, stickyRoute, reason)
 						cancel()
 						if waitErr == nil {
 							lease.RouteEpoch = bound.Epoch

@@ -1,4 +1,5 @@
 import React, { useCallback, useMemo, useState } from 'react';
+import { t } from '../lib/i18n.js';
 import { useNavigate } from 'react-router';
 import { Button, Drawer, Tag, Toast, Typography } from '../components/pool/index.jsx';
 import { IconPlay, IconRefresh, IconSetting } from '../components/pool/icons.jsx';
@@ -197,8 +198,8 @@ export default function ModelQuality() {
   if (error && !lastRefresh && !loading) {
     return (
       <div>
-        <PageHeader title="模型质量" subtitle="模型可用性与质量检测" actions={<Button icon={<IconRefresh />} onClick={reload}>重试</Button>} />
-        <LoadErrorBanner error={error} onRetry={reload} title="模型质量数据读取失败" />
+        <PageHeader title={t('copy.model_quality')} subtitle={t('copy.model_quality_help')} actions={<Button icon={<IconRefresh />} onClick={reload}>{t('copy.retry')}</Button>} />
+        <LoadErrorBanner error={error} onRetry={reload} title={t('copy.model_quality_load_failed')} />
       </div>
     );
   }
@@ -222,7 +223,7 @@ export default function ModelQuality() {
   };
 
   const statusColumns = [
-    { title: '分组', dataIndex: 'group_name', width: 130, render: (v) => <b>{v || '默认分组'}</b> },
+    { title: '分组', dataIndex: 'group_name', width: 130, render: (v) => <b>{v || t('copy.default_group')}</b> },
     { title: '模型', dataIndex: 'model', width: 210, render: (v) => <span className="pool-mono">{v || '—'}</span> },
     { title: '提供方', dataIndex: 'provider', width: 100, render: (v) => v ? <Tag>{v}</Tag> : '—' },
     { title: '智力状态', dataIndex: 'state', width: 118, render: stateTag },
@@ -242,7 +243,7 @@ export default function ModelQuality() {
         loading={runningKey === qualityKey(row)}
         disabled={Boolean(runningKey) || Boolean(data?.running)}
         onClick={() => runOne(row)}
-      >立即检测</Button>
+      >{t('copy.check_now')}</Button>
     ) },
   ];
 
@@ -250,7 +251,7 @@ export default function ModelQuality() {
     { title: '时间', dataIndex: 'created_at', width: 145, render: (v) => <span title={fmtDateTime(v)}>{fmtRelative(v)}</span> },
     { title: '分组', dataIndex: 'group_name', width: 120, render: (v) => v || '默认分组' },
     { title: '模型', dataIndex: 'model', width: 190, render: (v) => <span className="pool-mono">{v}</span> },
-    { title: '阶段', dataIndex: 'phase', width: 100, render: (v) => <Tag>{v === 'confirmation' ? '异常复核' : '主检测'}</Tag> },
+    { title: '阶段', dataIndex: 'phase', width: 100, render: (v) => <Tag>{v === 'confirmation' ? t('copy.anomaly_review') : t('copy.primary_check')}</Tag> },
     { title: '结果', dataIndex: 'outcome', width: 105, render: outcomeTag },
     { title: '答案 / 标准', key: 'answer', width: 160, render: (_, r) => <span className="pool-mono">{`${r.actual || '∅'} / ${r.expected || '∅'}`}</span> },
     { title: '返回模型', dataIndex: 'returned_model', width: 190, render: (v) => v ? <span className="pool-mono">{v}</span> : '—' },
@@ -263,14 +264,14 @@ export default function ModelQuality() {
   const renderMobileStatus = (row) => (
     <MobileResourceCell
       title={<span className="pool-mono">{row.model || '—'}</span>}
-      subtitle={row.group_name || '默认分组'}
+      subtitle={row.group_name || t('copy.default_group')}
       badges={stateTag(row.state)}
       chips={row.provider ? <Tag>{row.provider}</Tag> : null}
       details={[
-        { label: '最近结果', value: outcomeTag(row.last_outcome) },
-        { label: '指纹', value: modelFingerprintLabel(row) },
-        { label: '知识库', value: knowledgeBaseLabel(row) },
-        { label: '模型询问', value: row.metadata_probe_at ? fmtRelative(row.metadata_probe_at) : '尚未询问' },
+        { label: t('copy.latest_result'), value: outcomeTag(row.last_outcome) },
+        { label: t('copy.fingerprint'), value: modelFingerprintLabel(row) },
+        { label: t('copy.knowledge'), value: knowledgeBaseLabel(row) },
+        { label: t('copy.model_question'), value: row.metadata_probe_at ? fmtRelative(row.metadata_probe_at) : t('copy.not_queried') },
         { label: '连续异常', value: `${row.consecutive_anomalies || 0} / ${degradedThreshold}` },
         { label: '最近检测', value: row.last_probe_at ? fmtRelative(row.last_probe_at) : '从未检测' },
       ]}
@@ -280,7 +281,7 @@ export default function ModelQuality() {
           aria-label={`查看 ${row.model || '模型'} 详情`}
           onClick={() => setSelectedStatus(row)}
         >
-          详情
+          {t('copy.details')}
         </Button>
       )}
     />
@@ -432,7 +433,7 @@ export default function ModelQuality() {
       <Drawer
         visible={Boolean(selectedStatus)}
         onCancel={() => setSelectedStatus(null)}
-        title={`模型质量 · ${selectedStatus?.model || '详情'}`}
+        title={`模型质量 · ${selectedStatus?.model || t('copy.details')}`}
         footer={selectedStatus ? (
           <Button
             theme="solid"
@@ -444,7 +445,7 @@ export default function ModelQuality() {
               void runOne(row);
             }}
           >
-            立即检测
+            {t('copy.check_now')}
           </Button>
         ) : null}
       >

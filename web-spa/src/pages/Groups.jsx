@@ -5,10 +5,12 @@ import { IconPlus, IconRefresh } from '../components/pool/icons.jsx';
 import { del, patch, post, put } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
+import OrderedEgressSelect from '../components/OrderedEgressSelect.jsx';
 import { MetricRail, TagList, TextClamp } from '../components/DisplayPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
+import { t } from '../lib/i18n.js';
 import {
   useAccountGroupsData,
   useGroupEgressesData,
@@ -30,12 +32,7 @@ const INSTRUCTION_FAMILIES = [
 const FALLBACK_FAMILIES = INSTRUCTION_FAMILIES.map(({ key, label }) => ({ key, label }));
 
 function uniqueStrings(values) {
-  const seen = new Set();
-  return (Array.isArray(values) ? values : []).map((value) => String(value || '').trim()).filter((value) => {
-    if (!value || seen.has(value)) return false;
-    seen.add(value);
-    return true;
-  });
+  return [...new Set((Array.isArray(values) ? values : []).map((value) => String(value || '').trim()).filter(Boolean))];
 }
 
 function blankTrafficFallbackGroups() {
@@ -771,6 +768,8 @@ function UserGroupEditor({
   superSkillsError,
   models,
   egresses,
+  egressesLoading,
+  egressesError,
   modelsError,
   catalogLoading,
   catalogError,
@@ -904,24 +903,29 @@ function UserGroupEditor({
           </div>
         </div>
       </Card>
-      <Card title="账号池内动态均衡" className="pool-card">
+      <Banner
+        type="info"
+        title={t('groups.balance.scope_title')}
+        description={draft.pinned_egress_no_fallback ? t('groups.balance.pinned_help') : t('groups.balance.scope_help')}
+      />
+      <Card title={t('groups.balance.account_title')} className="pool-card">
         <Banner
           type="info"
-          title="按账号的主 CLI Root RPM 分流"
-          description="达到阈值后，新建的主 CLI 请求优先进入同一用户分组内较低负载的账号；当前池全部过载时才比较同层的其他账号池分组。"
+          title={t('groups.balance.account_summary')}
+          description={t('groups.balance.account_help')}
         />
         <div className="pool-user-group-grid">
           <label className="pool-inline-switch">
             <Switch
               checked={Boolean(draft.dynamic_pool_balance_enabled)}
               onChange={(dynamic_pool_balance_enabled) => setDraft((current) => ({ ...current, dynamic_pool_balance_enabled }))}
-              aria-label="启用账号池内动态均衡"
+              aria-label={t('groups.balance.account_enable')}
             />
-            <span>{draft.dynamic_pool_balance_enabled ? '已启用' : '默认关闭'}</span>
+            <span>{t(draft.dynamic_pool_balance_enabled ? 'groups.balance.enabled' : 'groups.balance.disabled')}</span>
           </label>
           <Form.InputNumber
-            label="触发阈值（逻辑 Root RPM）"
-            help="统计最近 60 个整秒窗口；只影响新建的主 CLI 请求。"
+            label={t('groups.balance.account_threshold')}
+            help={t('groups.balance.rpm_help')}
             value={draft.dynamic_pool_balance_rpm_threshold || ''}
             onChange={(dynamic_pool_balance_rpm_threshold) => setDraft((current) => ({
               ...current,
@@ -931,21 +935,47 @@ function UserGroupEditor({
             max={1000000}
             step={1}
             disabled={!draft.dynamic_pool_balance_enabled}
-            aria-label="动态均衡触发阈值"
+            aria-label={t('groups.balance.account_threshold')}
           />
         </div>
         <div className="pool-field__help">
-          子 agent、已固定会话、流量兜底和快照过期时不会介入；负载无法确定时自动保持原调度顺序。
+          {t('groups.balance.account_exclusions')}
         </div>
         {dynamicBalanceError ? <div className="pool-fallback-validation" role="alert"><strong>{dynamicBalanceError}</strong></div> : null}
       </Card>
-      <Card title="用户分组 RPM 均衡（网络出口）" className="pool-card">
-        <Banner type="info" title="按最近 60 秒请求数顺序切换出口" description="达到阈值后，新的主 CLI 请求会跳到下一个健康出口；账号级固定出口、已有会话和流量兜底不会被改写。" />
+      <Card title={t('groups.balance.egress_title')} className="pool-card">
+        <Banner type="info" title={t('groups.balance.egress_summary')} description={t('groups.balance.egress_help')} />
         <div className="pool-user-group-grid">
-          <label className="pool-inline-switch"><Switch checked={Boolean(draft.egress_rpm_balance_enabled)} onChange={(value) => setDraft((current) => ({ ...current, egress_rpm_balance_enabled: value }))} /><span>{draft.egress_rpm_balance_enabled ? '已启用' : '默认关闭'}</span></label>
-          <Form.InputNumber label="出口 RPM 阈值" value={draft.egress_rpm_balance_threshold || ''} min={1} max={1000000} step={1} disabled={!draft.egress_rpm_balance_enabled} onChange={(value) => setDraft((current) => ({ ...current, egress_rpm_balance_threshold: Number(value) || 0 }))} />
+          <label className="pool-inline-switch">
+            <Switch
+              checked={Boolean(draft.egress_rpm_balance_enabled)}
+              onChange={(egress_rpm_balance_enabled) => setDraft((current) => ({ ...current, egress_rpm_balance_enabled }))}
+              aria-label={t('groups.balance.egress_enable')}
+            />
+            <span>{t(draft.egress_rpm_balance_enabled ? 'groups.balance.enabled' : 'groups.balance.disabled')}</span>
+          </label>
+          <Form.InputNumber
+            label={t('groups.balance.egress_threshold')}
+            value={draft.egress_rpm_balance_threshold || ''}
+            min={1}
+            max={1000000}
+            step={1}
+            disabled={!draft.egress_rpm_balance_enabled}
+            onChange={(egress_rpm_balance_threshold) => setDraft((current) => ({ ...current, egress_rpm_balance_threshold: Number(egress_rpm_balance_threshold) || 0 }))}
+          />
         </div>
-        <Form.Select label="参与出口（按顺序）" multiple value={draft.egress_rpm_balance_egress_ids} optionList={(egresses || []).map((e) => ({ label: e.name || e.id, value: e.id }))} disabled={!draft.egress_rpm_balance_enabled} onChange={(value) => setDraft((current) => ({ ...current, egress_rpm_balance_egress_ids: value }))} />
+        {egressesError ? (
+          <Banner type="warning" title={t('groups.balance.egress_load_failed')} description={t('groups.balance.egress_load_help')}
+            actions={[<Button key="retry" size="small" loading={egressesLoading} onClick={onRetryCatalog}>{t('groups.balance.retry')}</Button>]} />
+        ) : null}
+        <OrderedEgressSelect
+          label={t('groups.balance.egress_order')}
+          help={t('groups.balance.egress_order_help')}
+          value={draft.egress_rpm_balance_egress_ids}
+          options={(egresses || []).map((egress) => ({ label: egress.name || egress.id, value: egress.id }))}
+          disabled={!draft.egress_rpm_balance_enabled || egressesLoading || Boolean(egressesError)}
+          onChange={(egress_rpm_balance_egress_ids) => setDraft((current) => ({ ...current, egress_rpm_balance_egress_ids }))}
+        />
         {egressBalanceError ? <div className="pool-fallback-validation" role="alert"><strong>{egressBalanceError}</strong></div> : null}
       </Card>
       <Card title="流量兜底" className="pool-card pool-traffic-fallback-card">
@@ -1164,12 +1194,6 @@ export default function Groups() {
       egressesResource.reload(),
     ]);
   }, [groupsResource.reload, providersResource.reload, instructionsResource.reload, superSkillsResource.reload, modelsResource.reload, egressesResource.reload]);
-  const openUserGroupEditor = useCallback((editor) => {
-    setUserEditor(editor);
-  }, []);
-  const openAccountGroupEditor = useCallback((editor) => {
-    setAccountEditor(editor);
-  }, []);
   const targetCatalogLoading = groupsResource.loading || providersResource.loading || instructionsResource.loading || superSkillsResource.loading || modelsResource.loading;
   const targetCatalogError = groupsResource.error || providersResource.error || instructionsResource.error;
 
@@ -1263,7 +1287,7 @@ export default function Groups() {
       title: '操作', key: 'ops', width: 100,
       render: (_, row) => (
         <ActionMenu label="账号池分组操作" items={[
-          { label: '编辑出口', disabled: savingAccountGroup || removingAccountGroup, onSelect: () => openAccountGroupEditor({ mode: 'edit', row }) },
+          { label: '编辑出口', disabled: savingAccountGroup || removingAccountGroup, onSelect: () => setAccountEditor({ mode: 'edit', row }) },
           {
             label: isRemovingAccountGroup(row.name) ? '删除中' : '删除', destructive: true,
             disabled: savingAccountGroup || (removingAccountGroup && !isRemovingAccountGroup(row.name)),
@@ -1350,7 +1374,7 @@ export default function Groups() {
       title: '操作', key: 'ops', width: 100,
       render: (_, row) => (
         <ActionMenu label="用户分组操作" items={[
-          { label: '编辑完整策略', disabled: savingUserGroup || removingUserGroup, onSelect: () => openUserGroupEditor({ mode: 'edit', row }) },
+          { label: '编辑完整策略', disabled: savingUserGroup || removingUserGroup, onSelect: () => setUserEditor({ mode: 'edit', row }) },
           {
             label: isRemovingUserGroup(row.id) ? '删除中' : '删除', destructive: true,
             disabled: savingUserGroup || (removingUserGroup && !isRemovingUserGroup(row.id)),
@@ -1407,7 +1431,7 @@ export default function Groups() {
             <Button
               icon={<IconPlus />}
               theme="solid"
-              onClick={() => activeTab === 'user' ? openUserGroupEditor({ mode: 'create', row: null }) : openAccountGroupEditor({ mode: 'create', row: null })}
+              onClick={() => activeTab === 'user' ? setUserEditor({ mode: 'create', row: null }) : setAccountEditor({ mode: 'create', row: null })}
             >
               {activeTab === 'user' ? '新建用户分组' : '新建账号池分组'}
             </Button>
@@ -1454,6 +1478,8 @@ export default function Groups() {
             superSkillsError={superSkillsResource.error}
             models={data.models}
             egresses={data.egresses}
+            egressesLoading={egressesResource.loading}
+            egressesError={egressesResource.error}
             modelsError={modelsResource.error}
             catalogLoading={targetCatalogLoading}
             catalogError={targetCatalogError}

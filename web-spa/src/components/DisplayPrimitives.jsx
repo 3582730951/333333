@@ -1,5 +1,6 @@
 import React from 'react';
 import { Space, Tag, Tooltip } from './pool/index.jsx';
+import { t } from '../lib/i18n.js';
 
 function textTitle(value) {
   if (typeof value === 'string' || typeof value === 'number') return String(value);
@@ -36,27 +37,29 @@ export function TextClamp({
   onClick,
 }) {
   const content = children ?? '—';
-  const node = (
-    <span
-      className={[
-        'pool-text-clamp',
-        lines > 1 ? 'pool-text-clamp--multi' : '',
-        strong ? 'pool-text-clamp--strong' : '',
-        muted ? 'pool-text-clamp--muted' : '',
-        onClick ? 'pool-text-clamp--link' : '',
-        className,
-      ].filter(Boolean).join(' ')}
-      style={{ '--pool-clamp-lines': lines, maxWidth }}
-      onClick={onClick}
-      aria-label={ariaLabel}
-    >
-      {content}
-    </span>
-  );
+  const classNames = [
+    'pool-text-clamp',
+    lines > 1 ? 'pool-text-clamp--multi' : '',
+    strong ? 'pool-text-clamp--strong' : '',
+    muted ? 'pool-text-clamp--muted' : '',
+    onClick ? 'pool-text-clamp--link' : '',
+    className,
+  ].filter(Boolean).join(' ');
+  const node = React.createElement(onClick ? 'button' : 'span', {
+    type: onClick ? 'button' : undefined,
+    className: classNames,
+    style: { '--pool-clamp-lines': lines, maxWidth },
+    onClick,
+    'aria-label': ariaLabel,
+  }, content);
   const tooltipTitle = title ?? textTitle(content);
   return tooltipTitle ? <Tooltip content={tooltipTitle}>{node}</Tooltip> : node;
 }
 
+/**
+ * @template T
+ * @param {{ items?: T[], max?: number, empty?: React.ReactNode, color?: string, size?: string, renderItem?: (item: T, index: number) => React.ReactNode }} props
+ */
 export function TagList({
   items = [],
   max = 3,
@@ -65,9 +68,12 @@ export function TagList({
   size = 'small',
   renderItem,
 }) {
+  const [expanded, setExpanded] = React.useState(false);
+  const overflowId = React.useId();
   const list = Array.isArray(items) ? items.filter((item) => item !== null && item !== undefined && item !== '') : [];
   if (!list.length) return empty;
   const visible = list.slice(0, max);
+  const hidden = list.slice(max);
   return (
     <Space className="pool-tag-list" spacing={4} wrap>
       {visible.map((item, index) => (
@@ -75,7 +81,27 @@ export function TagList({
           ? renderItem(item, index)
           : <Tag key={String(item)} size={size} color={color}>{String(item)}</Tag>
       ))}
-      {list.length > max ? <Tag size={size}>+{list.length - max}</Tag> : null}
+      {hidden.length > 0 ? (
+        <span className="pool-tag-overflow">
+          <button
+            type="button"
+            className="pool-tag-overflow__trigger"
+            aria-expanded={expanded}
+            aria-controls={overflowId}
+            aria-label={t('common.show_more_items').replace('{count}', String(hidden.length))}
+            onClick={() => setExpanded((value) => !value)}
+          >
+            <Tag size={size}>+{hidden.length}</Tag>
+          </button>
+          {expanded ? <span id={overflowId} className="pool-tag-overflow__items">
+            {hidden.map((item, index) => (
+              renderItem
+                ? renderItem(item, max + index)
+                : <Tag key={String(item)} size={size} color={color}>{String(item)}</Tag>
+            ))}
+          </span> : null}
+        </span>
+      ) : null}
     </Space>
   );
 }

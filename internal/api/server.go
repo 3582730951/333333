@@ -2556,6 +2556,43 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	codexResetRetried := false
 	statefulRuleRecoveryAttempted := false
 	codex429ConfirmationAttempted := false
+	capacityRetries := 0
+	retryModelCapacity := func(header http.Header) bool {
+		_ = resp.Body.Close()
+		if capacityRetries >= 3 {
+			_ = s.settleBillingHold(r.Context(), holdID, "model_capacity_exhausted")
+			writeModelCapacityFailure(w, streamReq)
+			return false
+		}
+		delay := time.Second << capacityRetries
+		if seconds := retryAfterSeconds(header, storage.Now()); seconds > 0 {
+			// Long Retry-After instructions exceed this short recovery budget.
+			// Return them to the caller instead of retrying before the server permits.
+			if seconds > 30 {
+				_ = s.settleBillingHold(r.Context(), holdID, "model_capacity_retry_after")
+				w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+				writeModelCapacityFailure(w, streamReq)
+				return false
+			}
+			delay = max(delay, time.Duration(seconds)*time.Second)
+		}
+		capacityRetries++
+		if retryErr := waitForIgnoredRateLimitRetry(r.Context(), delay); retryErr != nil {
+			_ = s.settleBillingHold(r.Context(), holdID, "model_capacity_canceled")
+			return false
+		}
+		// Capacity is model pressure, not an expired account or a broken session.
+		next, egress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, true)
+		if retryErr != nil {
+			_ = s.settleBillingHold(r.Context(), holdID, "model_capacity_transport_error")
+			if r.Context().Err() == nil {
+				writeModelCapacityFailure(w, streamReq)
+			}
+			return false
+		}
+		resp, finalEgress = next, egress
+		return true
+	}
 	handleResponsesContextAttemptError := func(status int, header http.Header, body []byte, reason string) (codexAttemptResult, bool) {
 		contextError := responsesContextError(status, body)
 		if contextError == leakfilter.ResponsesContextErrorNone {
@@ -2631,6 +2668,12 @@ codexResponse:
 	if resp.StatusCode >= 400 {
 		errorBody := readUpstreamErrorBody(resp.Body)
 		errorBody = redactAgentIdentityError(token, errorBody)
+		if codexModelAtCapacity(resp.StatusCode, errorBody) {
+			if retryModelCapacity(resp.Header) {
+				goto codexResponse
+			}
+			return codexAttemptResult{Outcome: outcomeDone}
+		}
 		guardConfirmed429 := false
 		// The Guard's only extra wire attempt is a serial confirmation request on
 		// the same leased account, egress, transport and identity. The first 429
@@ -3004,6 +3047,12 @@ codexSuccess:
 			writeError(w, http.StatusBadGateway, err)
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
+		if codexModelAtCapacity(resp.StatusCode, responseBody) {
+			if retryModelCapacity(resp.Header) {
+				goto codexResponse
+			}
+			return codexAttemptResult{Outcome: outcomeDone}
+		}
 		if s.leakScrubEnabled(r.Context()) {
 			responseBody, _ = responsefilter.StripSafetyBufferingJSON(responseBody)
 		}
@@ -3143,12 +3192,11 @@ codexSuccess:
 		if isChat {
 			entrypoint = "chat_completions"
 		}
-		// A configured terminal rule must be able to handle an HTTP-200 SSE
-		// response.failed before its raw frame commits downstream. Compatibility
-		// traffic always uses the existing bounded probe. Strict CPA uses it only
-		// when an administrator has a scope-compatible terminal rule; otherwise it
-		// retains the immediate native relay for long-running sessions.
-		if !strictNativeCPA || (strictNativeCPA && !movable) || codexGoalQuotaGraceFromContext(r.Context()) || lease.Account.IgnoreRateLimitControls || s.hasPotentialTerminalResponseRule(r.Context(), "codex", entrypoint, model) {
+		// The bounded probe also protects new strict CPA sessions from committing
+		// an early model-capacity failure. Its idle grace preserves live streaming.
+		{
+			recoverProbeFailure := !strictNativeCPA || !movable || codexGoalQuotaGraceFromContext(r.Context()) ||
+				lease.Account.IgnoreRateLimitControls || s.hasPotentialTerminalResponseRule(r.Context(), "codex", entrypoint, model)
 			// Hold back only a bounded early prefix so a retryable failure frame can still
 			// fail over before any downstream bytes are committed. As soon as real content
 			// appears (or the 64KiB/8-frame probe budget is reached), stream live. The old
@@ -3168,6 +3216,13 @@ codexSuccess:
 				prefix, relayBody, streamFailure, terminalStream, probeErr = probeEarlyCodexSSEFailureWithIdleRelease(resp.Body, idleRelease)
 			} else {
 				prefix, streamFailure, terminalStream, probeErr = probeEarlyCodexSSEFailure(resp.Body)
+			}
+			if !recoverProbeFailure {
+				// Native fresh roots previously relayed these frames directly. Only
+				// capacity may opt into transparent retry; retain normal terminal/EOF
+				// handling for every other result, including a truncated WebSocket.
+				terminalStream = terminalStream && codexModelAtCapacity(streamFailure.StatusCode, streamFailure.Body)
+				probeErr = nil
 			}
 			if probeErr != nil {
 				if codexUseWebSocket {
@@ -3203,6 +3258,12 @@ codexSuccess:
 				}
 				failureStatus := streamFailure.StatusCode
 				failureBody := streamFailure.Body
+				if codexModelAtCapacity(failureStatus, failureBody) {
+					if retryModelCapacity(failureHeader) {
+						goto codexResponse
+					}
+					return codexAttemptResult{Outcome: outcomeDone}
+				}
 				goalQuotaHeld := codexGoalHoldsNonAuthoritativeQuotaSignal(r.Context(), failureStatus, failureHeader, failureBody)
 				goalQuotaTerminal := codexGoalAuthoritativeUsageLimit(r.Context(), failureStatus, failureBody)
 				decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
@@ -3856,6 +3917,12 @@ codexSuccess:
 		writeError(w, http.StatusBadGateway, err)
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
+	if codexModelAtCapacity(resp.StatusCode, responseBody) {
+		if retryModelCapacity(resp.Header) {
+			goto codexResponse
+		}
+		return codexAttemptResult{Outcome: outcomeDone}
+	}
 	if s.leakScrubEnabled(r.Context()) {
 		responseBody, _ = responsefilter.StripSafetyBufferingJSON(responseBody)
 	}
@@ -4154,6 +4221,10 @@ func (s *Server) doWithCFRetry(ctx context.Context, req upstream.Request, lease 
 			s.recordCodexUpstreamAttempt(ctx, mapping, lease, req.Egress, "egress_failure", resp.StatusCode)
 		}
 		return nil, req.Egress, err
+	}
+	if codexModelAtCapacity(resp.StatusCode, body) {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return resp, req.Egress, nil
 	}
 	detection := cf.Detect(resp.StatusCode, resp.Header, body)
 	if !detection.Matched && resp.StatusCode < http.StatusInternalServerError {
